@@ -12,14 +12,16 @@ import { type ExtensionModule, extensionModuleCapability } from "../capability/e
 import { readFile } from "../capability/fs";
 import { type Hook, hookCapability } from "../capability/hook";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
+import { type Rule, ruleCapability } from "../capability/rule";
 import { type Settings, settingsCapability } from "../capability/settings";
 import { type Skill, skillCapability } from "../capability/skill";
 import { type SlashCommand, slashCommandCapability } from "../capability/slash-command";
 import { type SystemPrompt, systemPromptCapability } from "../capability/system-prompt";
 import { type CustomTool, toolCapability } from "../capability/tool";
-import type { LoadContext, LoadResult } from "../capability/types";
+import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import { settings } from "../config/settings";
 import {
+	buildRuleFromMarkdown,
 	calculateDepth,
 	createSourceMeta,
 	discoverExtensionModulePaths,
@@ -156,6 +158,40 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 			_source: createSourceMeta(PROVIDER_ID, projectClaudeMd, "project"),
 		});
 	}
+
+	return { items, warnings };
+}
+
+// =============================================================================
+// Rules
+// =============================================================================
+
+function transformClaudeRule(name: string, content: string, filePath: string, source: SourceMeta): Rule {
+	return buildRuleFromMarkdown(name, content, filePath, source, { stripNamePattern: /\.(md|mdc)$/ });
+}
+
+async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
+	const items: Rule[] = [];
+	const warnings: string[] = [];
+	const userRulesDir = path.join(getUserClaude(ctx), "rules");
+	const projectRulesDir = path.join(getProjectClaude(ctx), "rules");
+
+	const [userResult, projectResult] = await Promise.all([
+		loadFilesFromDir<Rule>(ctx, userRulesDir, PROVIDER_ID, "user", {
+			extensions: ["md", "mdc"],
+			recursive: true,
+			transform: transformClaudeRule,
+		}),
+		loadFilesFromDir<Rule>(ctx, projectRulesDir, PROVIDER_ID, "project", {
+			extensions: ["md", "mdc"],
+			recursive: true,
+			transform: transformClaudeRule,
+		}),
+	]);
+
+	// `ruleCapability` dedupes by first-seen name; project rules must override user defaults.
+	items.push(...projectResult.items, ...userResult.items);
+	warnings.push(...(userResult.warnings ?? []), ...(projectResult.warnings ?? []));
 
 	return { items, warnings };
 }
@@ -533,6 +569,14 @@ registerProvider<Skill>(skillCapability.id, {
 	description: "Load skills from .claude/skills/*/SKILL.md",
 	priority: PRIORITY,
 	load: loadSkills,
+});
+
+registerProvider<Rule>(ruleCapability.id, {
+	id: PROVIDER_ID,
+	displayName: DISPLAY_NAME,
+	description: "Load rules from .claude/rules/**/*.{md,mdc}",
+	priority: PRIORITY,
+	load: loadRules,
 });
 
 registerProvider<ExtensionModule>(extensionModuleCapability.id, {
