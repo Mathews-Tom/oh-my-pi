@@ -178,8 +178,15 @@ function scopedClaudeRuleDescription(globs: string[]): string {
 	return `Claude Code rule scoped to ${globs.join(", ")}`;
 }
 
-function transformClaudeRule(name: string, content: string, filePath: string, source: SourceMeta): Rule {
-	const rule = buildRuleFromMarkdown(name, content, filePath, source, { stripNamePattern: /\.(md|mdc)$/ });
+function claudeRuleNameFromPath(rulesDir: string, filePath: string): string {
+	const relativePath = path.relative(rulesDir, filePath);
+	const withoutExtension = relativePath.replace(/\.(md|mdc)$/, "");
+	return withoutExtension.split(path.sep).join(":");
+}
+
+function transformClaudeRule(rulesDir: string, content: string, filePath: string, source: SourceMeta): Rule {
+	const ruleName = claudeRuleNameFromPath(rulesDir, filePath);
+	const rule = buildRuleFromMarkdown(ruleName, content, filePath, source, { ruleName });
 	if (rule.alwaysApply === true || hasRulebookOrTtsrMetadata(rule)) return rule;
 	if (rule.globs && rule.globs.length > 0) {
 		return { ...rule, description: scopedClaudeRuleDescription(rule.globs) };
@@ -197,12 +204,13 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 		loadFilesFromDir<Rule>(ctx, userRulesDir, PROVIDER_ID, "user", {
 			extensions: ["md", "mdc"],
 			recursive: true,
-			transform: transformClaudeRule,
+			transform: (_name, content, filePath, source) => transformClaudeRule(userRulesDir, content, filePath, source),
 		}),
 		loadFilesFromDir<Rule>(ctx, projectRulesDir, PROVIDER_ID, "project", {
 			extensions: ["md", "mdc"],
 			recursive: true,
-			transform: transformClaudeRule,
+			transform: (_name, content, filePath, source) =>
+				transformClaudeRule(projectRulesDir, content, filePath, source),
 		}),
 	]);
 

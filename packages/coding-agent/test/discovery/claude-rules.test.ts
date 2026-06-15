@@ -70,7 +70,7 @@ describe("Claude Code rule discovery", () => {
 		const rules = result.items;
 
 		expect(result.warnings).toEqual([]);
-		expect(rules.map(rule => rule.name).sort()).toEqual(["security", "style"]);
+		expect(rules.map(rule => rule.name).sort()).toEqual(["nested:security", "style"]);
 		expect(rules.find(rule => rule.name === "style")).toMatchObject({
 			content: "Use explicit names.",
 			description: "Prefer explicit names",
@@ -78,7 +78,7 @@ describe("Claude Code rule discovery", () => {
 			alwaysApply: true,
 			_source: { level: "user", provider: "claude" },
 		});
-		expect(rules.find(rule => rule.name === "security")).toMatchObject({
+		expect(rules.find(rule => rule.name === "nested:security")).toMatchObject({
 			content: "Validate user input.",
 			description: "Validate inputs",
 			globs: ["**/*.tsx"],
@@ -114,6 +114,17 @@ describe("Claude Code rule discovery", () => {
 			description: "Claude Code rule scoped to **/*.ts",
 			globs: ["**/*.ts"],
 		});
+	});
+
+	test("nested Claude rules keep path-qualified names", async () => {
+		await writeFile(path.join(project, ".claude", "rules", "frontend", "style.md"), "Frontend style.\n");
+		await writeFile(path.join(project, ".claude", "rules", "backend", "style.md"), "Backend style.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+
+		expect(result.items.map(rule => rule.name).sort()).toEqual(["backend:style", "frontend:style"]);
+		expect(result.items.find(rule => rule.name === "frontend:style")?.content).toBe("Frontend style.\n");
+		expect(result.items.find(rule => rule.name === "backend:style")?.content).toBe("Backend style.\n");
 	});
 
 	test("project Claude rules override same-named user rules", async () => {
