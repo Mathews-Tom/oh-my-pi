@@ -5,7 +5,9 @@ import * as path from "node:path";
 import { getCapability, loadCapability } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { type Rule, ruleCapability } from "@oh-my-pi/pi-coding-agent/capability/rule";
+import { bucketRules } from "@oh-my-pi/pi-coding-agent/capability/rule-buckets";
 import type { LoadContext, Provider } from "@oh-my-pi/pi-coding-agent/capability/types";
+import { TtsrManager } from "@oh-my-pi/pi-coding-agent/export/ttsr";
 import "@oh-my-pi/pi-coding-agent/discovery";
 
 async function writeFile(filePath: string, content: string): Promise<void> {
@@ -82,6 +84,35 @@ describe("Claude Code rule discovery", () => {
 			globs: ["**/*.tsx"],
 			alwaysApply: false,
 			_source: { level: "project", provider: "claude" },
+		});
+	});
+
+	test("plain Claude rules are always applied instead of dropped", async () => {
+		await writeFile(path.join(project, ".claude", "rules", "plain.md"), "Use short names for test fixtures.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+		const buckets = bucketRules(result.items, new TtsrManager());
+
+		expect(buckets.alwaysApplyRules.map(rule => rule.name)).toEqual(["plain"]);
+		expect(buckets.alwaysApplyRules[0]?.content).toBe("Use short names for test fixtures.\n");
+		expect(buckets.rulebookRules).toEqual([]);
+	});
+
+	test("glob-only Claude rules stay addressable through the rulebook", async () => {
+		await writeFile(
+			path.join(project, ".claude", "rules", "typescript.md"),
+			"---\nglobs: '**/*.ts'\n---\nUse strict types.\n",
+		);
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+		const buckets = bucketRules(result.items, new TtsrManager());
+
+		expect(buckets.alwaysApplyRules).toEqual([]);
+		expect(buckets.rulebookRules).toHaveLength(1);
+		expect(buckets.rulebookRules[0]).toMatchObject({
+			name: "typescript",
+			description: "Claude Code rule scoped to **/*.ts",
+			globs: ["**/*.ts"],
 		});
 	});
 

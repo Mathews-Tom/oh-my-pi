@@ -166,8 +166,25 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 // Rules
 // =============================================================================
 
+function hasRulebookOrTtsrMetadata(rule: Rule): boolean {
+	return Boolean(
+		rule.description ||
+			(rule.condition && rule.condition.length > 0) ||
+			(rule.astCondition && rule.astCondition.length > 0),
+	);
+}
+
+function scopedClaudeRuleDescription(globs: string[]): string {
+	return `Claude Code rule scoped to ${globs.join(", ")}`;
+}
+
 function transformClaudeRule(name: string, content: string, filePath: string, source: SourceMeta): Rule {
-	return buildRuleFromMarkdown(name, content, filePath, source, { stripNamePattern: /\.(md|mdc)$/ });
+	const rule = buildRuleFromMarkdown(name, content, filePath, source, { stripNamePattern: /\.(md|mdc)$/ });
+	if (rule.alwaysApply === true || hasRulebookOrTtsrMetadata(rule)) return rule;
+	if (rule.globs && rule.globs.length > 0) {
+		return { ...rule, description: scopedClaudeRuleDescription(rule.globs) };
+	}
+	return { ...rule, alwaysApply: true };
 }
 
 async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
