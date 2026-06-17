@@ -98,6 +98,25 @@ describe("Claude Code rule discovery", () => {
 		expect(buckets.rulebookRules).toEqual([]);
 	});
 
+	test("description-only Claude rules still apply globally", async () => {
+		await writeFile(
+			path.join(project, ".claude", "rules", "typescript-style.md"),
+			"---\ndescription: TypeScript style\n---\nPrefer readonly arrays.\n",
+		);
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+		const buckets = bucketRules(result.items, new TtsrManager());
+
+		expect(buckets.alwaysApplyRules).toHaveLength(1);
+		expect(buckets.alwaysApplyRules[0]).toMatchObject({
+			name: "typescript-style",
+			alwaysApply: true,
+			description: "TypeScript style",
+		});
+		expect(buckets.alwaysApplyRules[0]?.content).toBe("Prefer readonly arrays.");
+		expect(buckets.rulebookRules).toEqual([]);
+	});
+
 	test("explicit alwaysApply false Claude rules are not made global", async () => {
 		await writeFile(
 			path.join(project, ".claude", "rules", "inactive.md"),
