@@ -1,7 +1,15 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { resetActiveRulesForTests, setActiveRules } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { splitInternalUrlSel } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 
 describe("splitInternalUrlSel", () => {
+	beforeEach(() => {
+		resetActiveRulesForTests();
+	});
+
+	afterEach(() => {
+		resetActiveRulesForTests();
+	});
 	it("returns the input unchanged when there is no selector tail", () => {
 		expect(splitInternalUrlSel("artifact://3")).toEqual({ path: "artifact://3" });
 		expect(splitInternalUrlSel("agent://reviewer_0")).toEqual({ path: "agent://reviewer_0" });
@@ -47,6 +55,19 @@ describe("splitInternalUrlSel", () => {
 	it("does not peel chunks that are not selector-shaped", () => {
 		// `name` is part of the host, not a selector.
 		expect(splitInternalUrlSel("skill://plugin:name")).toEqual({ path: "skill://plugin:name" });
+	});
+
+	it("does not peel selector-shaped tails from active rule names", () => {
+		setActiveRules([
+			{
+				name: "frontend:raw",
+				path: "/tmp/frontend/raw.md",
+				content: "body",
+				_source: { provider: "test", providerName: "test", path: "/tmp/frontend/raw.md", level: "project" },
+			},
+		]);
+		expect(splitInternalUrlSel("rule://frontend:raw")).toEqual({ path: "rule://frontend:raw" });
+		expect(splitInternalUrlSel("rule://frontend:raw:1-10")).toEqual({ path: "rule://frontend:raw", sel: "1-10" });
 	});
 
 	it("stops at the scheme separator `://`", () => {

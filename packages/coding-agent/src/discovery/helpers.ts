@@ -473,14 +473,62 @@ async function loadIgnoreFile(rules: GitignoreRule[], filePath: string, baseDir:
 	}
 }
 
-function globalGitignorePath(): string {
+function expandHomePath(filePath: string): string {
+	if (filePath === "~") return os.homedir();
+	if (filePath.startsWith("~/")) return path.join(os.homedir(), filePath.slice(2));
+	return filePath;
+}
+
+async function configuredGlobalGitignorePath(): Promise<string | undefined> {
+	const configCandidates = [
+		path.join(os.homedir(), ".gitconfig"),
+		path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "git", "config"),
+	];
+	for (const configPath of configCandidates) {
+		const text = await Bun.file(configPath)
+			.text()
+			.catch(() => null);
+		if (!text) continue;
+		let inCore = false;
+		for (const rawLine of text.split(/\r?\n/)) {
+			const line = rawLine.trim();
+			if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+			const sectionMatch = /^\[(.+)\]$/.exec(line);
+			if (sectionMatch) {
+				inCore = sectionMatch[1]?.trim().toLowerCase() === "core";
+				continue;
+			}
+			if (!inCore) continue;
+			const match = /^excludesFile\s*=\s*(.+)$/.exec(line);
+			if (match?.[1]) return expandHomePath(match[1].trim());
+		}
+	}
+	return undefined;
+}
+async function globalGitignorePath(): Promise<string> {
+	try {
+		const child = Bun.spawn(["git", "config", "--global", "--path", "core.excludesFile"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [exitCode, text] = await Promise.all([
+			child.exited,
+			new Response(child.stdout as ReadableStream<Uint8Array>).text(),
+		]);
+		if (exitCode === 0) {
+			const configured = text.trim();
+			if (configured) return configured;
+		}
+	} catch {}
+	const configured = await configuredGlobalGitignorePath();
+	if (configured) return configured;
 	const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
 	return path.join(configHome, "git", "ignore");
 }
 
 async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<GitignoreRule[]> {
 	const rules: GitignoreRule[] = [];
-	await loadIgnoreFile(rules, globalGitignorePath(), rootDir);
+	await loadIgnoreFile(rules, await globalGitignorePath(), rootDir);
 	await loadIgnoreFile(rules, path.join(rootDir, ".git", "info", "exclude"), rootDir);
 	let current = rootDir;
 	while (true) {

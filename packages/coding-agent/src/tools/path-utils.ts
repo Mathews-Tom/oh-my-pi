@@ -3,7 +3,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
+import { getActiveRules } from "../capability/rule";
+import { InternalUrlRouter, type LocalProtocolOptions, parseInternalUrl } from "../internal-urls";
 import { ToolError } from "./tool-errors";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
@@ -333,6 +334,32 @@ export function splitInternalUrlSel(rawPath: string): { path: string; sel?: stri
 	// legitimately end in selector-shaped tails. Forward verbatim — see
 	// OPAQUE_RESOURCE_SCHEMES.
 	if (OPAQUE_RESOURCE_SCHEMES.has(scheme)) return { path: rawPath };
+
+	if (scheme === "rule") {
+		try {
+			const parsed = parseInternalUrl(rawPath);
+			const ruleName = parsed.rawHost || parsed.hostname;
+			if (ruleName) {
+				const activeRuleNames = new Set(getActiveRules().map(rule => rule.name));
+				if (activeRuleNames.has(ruleName)) return { path: rawPath };
+				const chunks: string[] = [];
+				let candidate = ruleName;
+				while (true) {
+					const colon = candidate.lastIndexOf(":");
+					if (colon < 0) break;
+					const tail = candidate.slice(colon + 1);
+					if (!INTERNAL_URL_SELECTOR_PART_RE.test(tail)) break;
+					chunks.unshift(tail);
+					candidate = candidate.slice(0, colon);
+					if (activeRuleNames.has(candidate)) {
+						return { path: `${scheme}://${candidate}`, sel: chunks.join(":") };
+					}
+				}
+			}
+		} catch {
+			// Fall through to selector peeling.
+		}
+	}
 	if (!INTERNAL_SCHEMES_WITH_SELECTORS[scheme]) return { path: rawPath };
 
 	const schemeEnd = schemeMatch[0].length;
