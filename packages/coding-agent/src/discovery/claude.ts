@@ -204,18 +204,20 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 		loadFilesFromDir<Rule>(ctx, userRulesDir, PROVIDER_ID, "user", {
 			extensions: ["md", "mdc"],
 			recursive: true,
+			followSymlinkDirectories: true,
 			transform: (_name, content, filePath, source) => transformClaudeRule(userRulesDir, content, filePath, source),
 		}),
 		loadFilesFromDir<Rule>(ctx, projectRulesDir, PROVIDER_ID, "project", {
 			extensions: ["md", "mdc"],
 			recursive: true,
+			followSymlinkDirectories: true,
 			transform: (_name, content, filePath, source) =>
 				transformClaudeRule(projectRulesDir, content, filePath, source),
 		}),
 	]);
 
-	// `ruleCapability` dedupes by first-seen name; project rules must override user defaults.
-	items.push(...projectResult.items, ...userResult.items);
+	const projectNames = new Set(projectResult.items.map(rule => rule.name));
+	items.push(...userResult.items.filter(rule => !projectNames.has(rule.name)), ...projectResult.items);
 	warnings.push(...(userResult.warnings ?? []), ...(projectResult.warnings ?? []));
 
 	return { items, warnings };

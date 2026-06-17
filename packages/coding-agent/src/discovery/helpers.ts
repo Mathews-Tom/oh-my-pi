@@ -182,12 +182,7 @@ export function buildRuleFromMarkdown(
 	const { frontmatter, body } = parseFrontmatter(content, { source: filePath });
 	const { condition, astCondition, scope } = parseRuleConditionAndScope(frontmatter as RuleFrontmatter);
 
-	let globs: string[] | undefined;
-	if (Array.isArray(frontmatter.globs)) {
-		globs = frontmatter.globs.filter((item): item is string => typeof item === "string");
-	} else if (typeof frontmatter.globs === "string") {
-		globs = [frontmatter.globs];
-	}
+	const globs = parseArrayOrCSV(frontmatter.globs) ?? parseArrayOrCSV(frontmatter.paths);
 
 	const resolvedName = options?.ruleName ?? name.replace(options?.stripNamePattern ?? /\.(md|mdc)$/, "");
 	const rawMode = frontmatter.interruptMode;
@@ -416,6 +411,60 @@ export function expandEnvVarsDeep<T>(obj: T, extraEnv?: Record<string, string>):
 	return obj;
 }
 
+function matchesExtension(filePath: string, extensions: string[] | undefined): boolean {
+	if (!extensions || extensions.length === 0) return true;
+	const extension = path.extname(filePath).slice(1);
+	return extensions.includes(extension);
+}
+
+async function isDirectoryPath(filePath: string): Promise<boolean> {
+	const stat = await fs.promises.stat(filePath).catch(() => null);
+	return stat?.isDirectory() ?? false;
+}
+
+async function discoverLinkedFilesFromDir(
+	dir: string,
+	extensions: string[] | undefined,
+): Promise<Array<{ path: string }>> {
+	const matches: Array<{ path: string }> = [];
+	const visitedRealDirs = new Set<string>();
+
+	async function collect(currentDir: string, relativeDir: string): Promise<void> {
+		const realDir = await fs.promises.realpath(currentDir).catch(() => currentDir);
+		if (visitedRealDirs.has(realDir)) return;
+		visitedRealDirs.add(realDir);
+
+		const entries = await readDirEntries(currentDir);
+		await Promise.all(
+			entries.map(async entry => {
+				if (entry.name.startsWith(".")) return;
+				const entryPath = path.join(currentDir, entry.name);
+				const relativePath = path.join(relativeDir, entry.name);
+				if (await isDirectoryPath(entryPath)) {
+					await collect(entryPath, relativePath);
+					return;
+				}
+				if (matchesExtension(entry.name, extensions)) {
+					matches.push({ path: relativePath });
+				}
+			}),
+		);
+	}
+
+	const entries = await readDirEntries(dir);
+	await Promise.all(
+		entries.map(async entry => {
+			if (entry.name.startsWith(".") || entry.isDirectory()) return;
+			const entryPath = path.join(dir, entry.name);
+			if (await isDirectoryPath(entryPath)) {
+				await collect(entryPath, entry.name);
+			}
+		}),
+	);
+
+	return matches;
+}
+
 /**
  * Load files from a directory matching extensions.
  * Uses native glob for fast filesystem scanning with gitignore support.
@@ -432,12 +481,14 @@ export async function loadFilesFromDir<T>(
 		transform: (name: string, content: string, path: string, source: SourceMeta) => T | null;
 		/** Whether to recurse into subdirectories (default: false) */
 		recursive?: boolean;
+		/** Also traverse symlinked directories; native glob intentionally skips them. */
+		followSymlinkDirectories?: boolean;
 	},
 ): Promise<LoadResult<T>> {
 	const items: T[] = [];
 	const warnings: string[] = [];
 	// Build glob pattern based on extensions and recursion
-	const { extensions, recursive = false } = options;
+	const { extensions, recursive = false, followSymlinkDirectories = false } = options;
 
 	let pattern: string;
 	if (extensions && extensions.length > 0) {
@@ -461,6 +512,16 @@ export async function loadFilesFromDir<T>(
 	} catch {
 		// Directory doesn't exist or isn't readable
 		return { items, warnings };
+	}
+
+	if (followSymlinkDirectories && recursive) {
+		const linkedMatches = await discoverLinkedFilesFromDir(dir, extensions);
+		const seen = new Set(matches.map(match => match.path));
+		for (const match of linkedMatches) {
+			if (seen.has(match.path)) continue;
+			seen.add(match.path);
+			matches.push(match);
+		}
 	}
 
 	// Read all matching files in parallel

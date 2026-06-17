@@ -29,6 +29,8 @@ export interface ImageOptions {
 
 const EMPTY_IDS: readonly number[] = [];
 const EMPTY_TRANSMITS: readonly string[] = [];
+const SAVE_CURSOR = "\x1b7";
+const RESTORE_CURSOR = "\x1b8";
 // Direct placements reserve height with leading zero-width rows. Keep them
 // non-plain so transcript blank-edge trimming does not collapse image-only blocks.
 const RESERVED_IMAGE_ROW = "\x1b[0m";
@@ -36,6 +38,11 @@ const RESERVED_IMAGE_ROW = "\x1b[0m";
 /** Default count of inline images kept as live graphics before older ones fall back to text. */
 export const DEFAULT_MAX_INLINE_IMAGES = 8;
 
+let nextImageBudgetSeed = Math.floor(Math.random() * 0xffffff);
+function nextImageIdSeed(): number {
+	nextImageBudgetSeed = (nextImageBudgetSeed + 0x10000) & 0xffffff;
+	return nextImageBudgetSeed || 1;
+}
 /**
  * Bounds how many inline images render as live terminal graphics at once.
  *
@@ -56,7 +63,7 @@ export const DEFAULT_MAX_INLINE_IMAGES = 8;
 export class ImageBudget {
 	#cap: number;
 	#requestRender: () => void;
-	#nextId = 1;
+	#nextId = nextImageIdSeed();
 	#keyToId = new Map<string, number>();
 	/** Display-order image ids observed during the in-flight pass. */
 	#passIds: number[] = [];
@@ -122,11 +129,14 @@ export class ImageBudget {
 		if (key) {
 			const existing = this.#keyToId.get(key);
 			if (existing !== undefined) return existing;
-			const id = this.#nextId++;
+			const id = this.#nextId;
+			this.#nextId = (this.#nextId + 1) & 0xffffff || 1;
 			this.#keyToId.set(key, id);
 			return id;
 		}
-		return this.#nextId++;
+		const id = this.#nextId;
+		this.#nextId = (this.#nextId + 1) & 0xffffff || 1;
+		return id;
 	}
 
 	/**
@@ -250,6 +260,20 @@ export class ImageBudget {
 		return sequences;
 	}
 
+	/**
+	 * Drop transmit tracking so every still-live image re-enqueues its data
+	 * (`a=t`) on the next render. Recovers when the terminal dropped the original
+	 * transmit — e.g. Ghostty discarding graphics sent during its post-startup
+	 * window — where a placement-only replay can never bind a Unicode placeholder.
+	 * Pair with a component invalidate + forced repaint so the data and placement
+	 * re-emit together; keeps no base64 in budget state (the transmit-once design).
+	 */
+	forgetTransmitted(): void {
+		if (this.#transmitted.size === 0 && this.#pendingTransmits.length === 0) return;
+		this.#transmitted.clear();
+		this.#pendingTransmits = [];
+	}
+
 	#reconcile(total: number): void {
 		const desired = this.#cap > 0 ? Math.max(0, total - this.#cap) : 0;
 		if (desired === this.#planned) {
@@ -366,16 +390,18 @@ export class Image implements Component {
 			} else if (result) {
 				// Direct placement: return `rows` lines so TUI accounts for image
 				// height. First (rows-1) lines are empty (TUI clears them); the last
-				// moves the cursor back up, emits the image sequence, then restores the
-				// cursor so the renderer's next CRLF starts below the reserved block.
+				// saves the final-row cursor, moves up to the image origin, emits the
+				// image sequence, then restores the final-row cursor. Save/restore is
+				// required because CUU clamps at the viewport top when leading rows are
+				// clipped away.
 				lines = [];
 				for (let i = 0; i < result.rows - 1; i++) {
 					lines.push(RESERVED_IMAGE_ROW);
 				}
 				const cursorRows = result.rows - 1;
 				const moveUp = cursorRows > 0 ? `\x1b[${cursorRows}A` : "";
-				const moveDown = cursorRows > 0 ? `\x1b[${cursorRows}B` : "";
-				lines.push(moveUp + (result.sequence ?? "") + moveDown);
+				const placement = moveUp + (result.sequence ?? "");
+				lines.push(cursorRows > 0 ? SAVE_CURSOR + placement + RESTORE_CURSOR : placement);
 			} else {
 				lines = this.#fallbackLines();
 			}

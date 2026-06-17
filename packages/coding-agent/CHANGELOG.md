@@ -2,12 +2,15 @@
 
 ## [Unreleased]
 
+## [16.0.5] - 2026-06-17
+
 ### Added
 
 - Added Claude Code rule discovery so `.claude/rules/**/*.md` and `.claude/rules/**/*.mdc` files load through the standard rules capability with frontmatter metadata preserved ([#2613](https://github.com/can1357/oh-my-pi/issues/2613)).
 
 ### Added
 
+- Added `tui.tight` setting (default `false`) to enable tight layout by removing the 1-character horizontal padding from terminal output.
 - Added a `providers.antigravityEndpoint` setting (`auto`, `production`, `sandbox`) to control google-antigravity routing for chat, search, image, and discovery calls
 - Added automatic endpoint-mode support for google-antigravity provider calls so users can force production-only or sandbox-only usage
 - Added `images.describeForTextModels` option (default `true`) to control automatic image description for attachments sent to models without vision input

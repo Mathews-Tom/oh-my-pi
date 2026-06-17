@@ -22,7 +22,8 @@ export const BUILTIN_DEFAULTS_PROVIDER_ID = "builtin-defaults";
  */
 export interface RuleFrontmatter {
 	description?: string;
-	globs?: string[];
+	globs?: string | string[];
+	paths?: string | string[];
 	alwaysApply?: boolean;
 	/** New key for TTSR match conditions. */
 	condition?: string | string[];

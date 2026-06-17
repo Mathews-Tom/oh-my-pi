@@ -116,6 +116,24 @@ describe("Claude Code rule discovery", () => {
 		});
 	});
 
+	test("paths-only Claude rules stay path scoped instead of always applying", async () => {
+		await writeFile(
+			path.join(project, ".claude", "rules", "api.md"),
+			"---\npaths:\n  - 'src/api/**/*.ts'\n---\nValidate API inputs.\n",
+		);
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+		const buckets = bucketRules(result.items, new TtsrManager());
+
+		expect(buckets.alwaysApplyRules).toEqual([]);
+		expect(buckets.rulebookRules).toHaveLength(1);
+		expect(buckets.rulebookRules[0]).toMatchObject({
+			name: "api",
+			description: "Claude Code rule scoped to src/api/**/*.ts",
+			globs: ["src/api/**/*.ts"],
+		});
+	});
+
 	test("nested Claude rules keep path-qualified names", async () => {
 		await writeFile(path.join(project, ".claude", "rules", "frontend", "style.md"), "Frontend style.\n");
 		await writeFile(path.join(project, ".claude", "rules", "backend", "style.md"), "Backend style.\n");
@@ -125,6 +143,22 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name).sort()).toEqual(["backend:style", "frontend:style"]);
 		expect(result.items.find(rule => rule.name === "frontend:style")?.content).toBe("Frontend style.\n");
 		expect(result.items.find(rule => rule.name === "backend:style")?.content).toBe("Backend style.\n");
+	});
+
+	test("loads Claude rules from symlinked directories", async () => {
+		const sharedRulesDir = path.join(root, "shared-claude-rules");
+		await writeFile(path.join(sharedRulesDir, "api.md"), "Shared API standards.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRulesDir, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+
+		expect(result.items).toHaveLength(1);
+		expect(result.items[0]).toMatchObject({
+			name: "shared:api",
+			content: "Shared API standards.\n",
+			_source: { level: "project", provider: "claude" },
+		});
 	});
 
 	test("project Claude rules override same-named user rules", async () => {
@@ -139,5 +173,21 @@ describe("Claude Code rule discovery", () => {
 			content: "Project style.\n",
 			_source: { level: "project", provider: "claude" },
 		});
+	});
+
+	test("keeps user rules before project rules except same-name project overrides", async () => {
+		await writeFile(path.join(home, ".claude", "rules", "personal.md"), "Personal style.\n");
+		await writeFile(path.join(home, ".claude", "rules", "shared.md"), "User shared style.\n");
+		await writeFile(path.join(project, ".claude", "rules", "project.md"), "Project style.\n");
+		await writeFile(path.join(project, ".claude", "rules", "shared.md"), "Project shared style.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+
+		expect(result.items.map(rule => `${rule._source.level}:${rule.name}`)).toEqual([
+			"user:personal",
+			"project:project",
+			"project:shared",
+		]);
+		expect(result.items.find(rule => rule.name === "shared")?.content).toBe("Project shared style.\n");
 	});
 });
