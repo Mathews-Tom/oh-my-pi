@@ -134,6 +134,21 @@ describe("Claude Code rule discovery", () => {
 		});
 	});
 
+	test("preserves brace expansions in single-string Claude rule globs", async () => {
+		await writeFile(
+			path.join(project, ".claude", "rules", "typescript.md"),
+			"---\npaths: '**/*.{ts,tsx}'\n---\nUse strict types.\n",
+		);
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+		const rule = result.items.find(item => item.name === "typescript");
+
+		expect(rule).toMatchObject({
+			globs: ["**/*.{ts,tsx}"],
+			description: "Claude Code rule scoped to **/*.{ts,tsx}",
+		});
+	});
+
 	test("nested Claude rules keep path-qualified names", async () => {
 		await writeFile(path.join(project, ".claude", "rules", "frontend", "style.md"), "Frontend style.\n");
 		await writeFile(path.join(project, ".claude", "rules", "backend", "style.md"), "Backend style.\n");

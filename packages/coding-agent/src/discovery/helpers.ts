@@ -166,6 +166,14 @@ export function parseArrayOrCSV(value: unknown): string[] | undefined {
 	return undefined;
 }
 
+function parseRuleGlobs(value: unknown): string[] | undefined {
+	if (Array.isArray(value)) {
+		const filtered = value.filter((item): item is string => typeof item === "string");
+		return filtered.length > 0 ? filtered : undefined;
+	}
+	return typeof value === "string" ? [value] : undefined;
+}
+
 /**
  * Build a canonical rule item from a markdown/markdown-frontmatter document.
  */
@@ -182,7 +190,7 @@ export function buildRuleFromMarkdown(
 	const { frontmatter, body } = parseFrontmatter(content, { source: filePath });
 	const { condition, astCondition, scope } = parseRuleConditionAndScope(frontmatter as RuleFrontmatter);
 
-	const globs = parseArrayOrCSV(frontmatter.globs) ?? parseArrayOrCSV(frontmatter.paths);
+	const globs = parseRuleGlobs(frontmatter.globs) ?? parseRuleGlobs(frontmatter.paths);
 
 	const resolvedName = options?.ruleName ?? name.replace(options?.stripNamePattern ?? /\.(md|mdc)$/, "");
 	const rawMode = frontmatter.interruptMode;
