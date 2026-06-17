@@ -130,6 +130,25 @@ describe("Claude Code rule discovery", () => {
 		});
 	});
 
+	test("scoped alwaysApply false Claude rules stay addressable through the rulebook", async () => {
+		await writeFile(
+			path.join(project, ".claude", "rules", "api.md"),
+			"---\nalwaysApply: false\npaths: 'src/api/**/*.ts'\n---\nValidate API inputs.\n",
+		);
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+		const buckets = bucketRules(result.items, new TtsrManager());
+
+		expect(buckets.alwaysApplyRules).toEqual([]);
+		expect(buckets.rulebookRules).toHaveLength(1);
+		expect(buckets.rulebookRules[0]).toMatchObject({
+			name: "api",
+			alwaysApply: false,
+			description: "Claude Code rule scoped to src/api/**/*.ts",
+			globs: ["src/api/**/*.ts"],
+		});
+	});
+
 	test("paths-only Claude rules stay path scoped instead of always applying", async () => {
 		await writeFile(
 			path.join(project, ".claude", "rules", "api.md"),

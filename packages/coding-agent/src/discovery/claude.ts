@@ -187,10 +187,11 @@ function claudeRuleNameFromPath(rulesDir: string, filePath: string): string {
 function transformClaudeRule(rulesDir: string, content: string, filePath: string, source: SourceMeta): Rule {
 	const ruleName = claudeRuleNameFromPath(rulesDir, filePath);
 	const rule = buildRuleFromMarkdown(ruleName, content, filePath, source, { ruleName });
-	if (rule.alwaysApply === true || rule.alwaysApply === false || hasRulebookOrTtsrMetadata(rule)) return rule;
+	if (rule.alwaysApply === true || hasRulebookOrTtsrMetadata(rule)) return rule;
 	if (rule.globs && rule.globs.length > 0) {
 		return { ...rule, description: scopedClaudeRuleDescription(rule.globs) };
 	}
+	if (rule.alwaysApply === false) return rule;
 	return { ...rule, alwaysApply: true };
 }
 
