@@ -708,6 +708,10 @@ export async function loadFilesFromDir<T>(
 	}
 
 	if (followSymlinkDirectories && recursive) {
+		const filteredNativeMatches = await Promise.all(
+			matches.map(async match => ((await isGitignoredPath(dir, match.path)) ? null : match)),
+		);
+		matches = filteredNativeMatches.filter((match): match is { path: string } => match !== null);
 		const linkedMatches = await Promise.all(
 			(await discoverLinkedFilesFromDir(dir, extensions)).map(async match =>
 				(await isGitignoredPath(dir, match.path)) ? null : match,
