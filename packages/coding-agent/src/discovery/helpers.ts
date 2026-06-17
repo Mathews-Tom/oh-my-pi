@@ -436,6 +436,14 @@ interface GitignoreRule {
 	negated: boolean;
 }
 
+interface GitignoreMatch {
+	matchedAncestor: boolean;
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+	return (await fs.promises.lstat(filePath).catch(() => null)) !== null;
+}
+
 function normalizedRelativePath(from: string, to: string): string {
 	return path.relative(from, to).split(path.sep).join("/");
 }
@@ -444,7 +452,7 @@ async function findGitignoreRoot(dir: string): Promise<string> {
 	let current = path.resolve(dir);
 	let highestIgnoreDir: string | undefined;
 	while (true) {
-		if (await Bun.file(path.join(current, ".git")).exists()) return current;
+		if (await pathExists(path.join(current, ".git"))) return current;
 		if (await Bun.file(path.join(current, ".gitignore")).exists()) highestIgnoreDir = current;
 		const parent = path.dirname(current);
 		if (parent === current) return highestIgnoreDir ?? path.resolve(dir);
@@ -452,21 +460,31 @@ async function findGitignoreRoot(dir: string): Promise<string> {
 	}
 }
 
+async function loadIgnoreFile(rules: GitignoreRule[], filePath: string, baseDir: string): Promise<void> {
+	const ignoreFile = Bun.file(filePath);
+	if (!(await ignoreFile.exists())) return;
+	const lines = (await ignoreFile.text()).split(/\r?\n/);
+	for (const line of lines) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
+		const negated = trimmed.startsWith("!");
+		const pattern = negated ? trimmed.slice(1) : trimmed;
+		if (pattern) rules.push({ baseDir, pattern, negated });
+	}
+}
+
+function globalGitignorePath(): string {
+	const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+	return path.join(configHome, "git", "ignore");
+}
+
 async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<GitignoreRule[]> {
 	const rules: GitignoreRule[] = [];
+	await loadIgnoreFile(rules, globalGitignorePath(), rootDir);
+	await loadIgnoreFile(rules, path.join(rootDir, ".git", "info", "exclude"), rootDir);
 	let current = rootDir;
 	while (true) {
-		const ignoreFile = Bun.file(path.join(current, ".gitignore"));
-		if (await ignoreFile.exists()) {
-			const lines = (await ignoreFile.text()).split(/\r?\n/);
-			for (const line of lines) {
-				const trimmed = line.trim();
-				if (!trimmed || trimmed.startsWith("#")) continue;
-				const negated = trimmed.startsWith("!");
-				const pattern = negated ? trimmed.slice(1) : trimmed;
-				if (pattern) rules.push({ baseDir: current, pattern, negated });
-			}
-		}
+		await loadIgnoreFile(rules, path.join(current, ".gitignore"), current);
 		if (path.resolve(current) === path.resolve(targetDir)) break;
 		const next = path.join(current, path.relative(current, targetDir).split(path.sep)[0] ?? "");
 		if (next === current || !path.relative(current, targetDir)) break;
@@ -475,9 +493,9 @@ async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<G
 	return rules;
 }
 
-function gitignoreRuleMatches(rule: GitignoreRule, filePath: string): boolean {
+function gitignoreRuleMatch(rule: GitignoreRule, filePath: string): GitignoreMatch | undefined {
 	const relativePath = normalizedRelativePath(rule.baseDir, filePath);
-	if (!relativePath || relativePath.startsWith("../")) return false;
+	if (!relativePath || relativePath.startsWith("../")) return undefined;
 
 	const anchored = rule.pattern.startsWith("/");
 	const rawPattern = anchored ? rule.pattern.slice(1) : rule.pattern;
@@ -485,13 +503,13 @@ function gitignoreRuleMatches(rule: GitignoreRule, filePath: string): boolean {
 	const normalizedPattern = rawPattern.replace(/\/+$/, "");
 	const globPattern = normalizedPattern.includes("/") || anchored ? normalizedPattern : `**/${normalizedPattern}`;
 	const glob = new Bun.Glob(directoryOnly ? `${globPattern}/**` : globPattern);
-	if (glob.match(relativePath)) return true;
-	if (directoryOnly) return false;
+	if (glob.match(relativePath)) return { matchedAncestor: directoryOnly };
+	if (directoryOnly) return undefined;
 	const parts = relativePath.split("/");
 	for (let i = 1; i < parts.length; i++) {
-		if (glob.match(parts.slice(0, i).join("/"))) return true;
+		if (glob.match(parts.slice(0, i).join("/"))) return { matchedAncestor: true };
 	}
-	return false;
+	return undefined;
 }
 
 async function isGitignoredPath(dir: string, relativePath: string): Promise<boolean> {
@@ -499,9 +517,17 @@ async function isGitignoredPath(dir: string, relativePath: string): Promise<bool
 	const rootDir = await findGitignoreRoot(dir);
 	const rules = await loadGitignoreRules(rootDir, path.dirname(filePath));
 	let ignored = false;
+	let ignoredParent = false;
 	for (const rule of rules) {
-		if (gitignoreRuleMatches(rule, filePath)) {
-			ignored = !rule.negated;
+		const match = gitignoreRuleMatch(rule, filePath);
+		if (!match) continue;
+		if (rule.negated) {
+			if (ignoredParent && !match.matchedAncestor) continue;
+			ignored = false;
+			if (match.matchedAncestor) ignoredParent = false;
+		} else {
+			ignored = true;
+			if (match.matchedAncestor) ignoredParent = true;
 		}
 	}
 	return ignored;
