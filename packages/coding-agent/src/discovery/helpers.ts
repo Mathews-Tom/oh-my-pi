@@ -478,6 +478,19 @@ async function loadIgnoreFile(rules: GitignoreRule[], filePath: string, baseDir:
 	}
 }
 
+async function resolveGitDir(rootDir: string): Promise<string | undefined> {
+	const dotGitPath = path.join(rootDir, ".git");
+	const stat = await fs.promises.lstat(dotGitPath).catch(() => null);
+	if (stat?.isDirectory()) return dotGitPath;
+	if (!stat?.isFile()) return undefined;
+	const text = await Bun.file(dotGitPath)
+		.text()
+		.catch(() => null);
+	const match = text ? /^gitdir:\s*(.+)\s*$/im.exec(text) : null;
+	if (!match?.[1]) return undefined;
+	return path.resolve(rootDir, match[1].trim());
+}
+
 function expandHomePath(filePath: string): string {
 	if (filePath === "~") return os.homedir();
 	if (filePath.startsWith("~/")) return path.join(os.homedir(), filePath.slice(2));
@@ -534,7 +547,8 @@ async function globalGitignorePath(): Promise<string> {
 async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<GitignoreRule[]> {
 	const rules: GitignoreRule[] = [];
 	await loadIgnoreFile(rules, await globalGitignorePath(), rootDir);
-	await loadIgnoreFile(rules, path.join(rootDir, ".git", "info", "exclude"), rootDir);
+	const gitDir = await resolveGitDir(rootDir);
+	if (gitDir) await loadIgnoreFile(rules, path.join(gitDir, "info", "exclude"), rootDir);
 	let current = rootDir;
 	while (true) {
 		await loadIgnoreFile(rules, path.join(current, ".gitignore"), current);

@@ -284,6 +284,23 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items[0]?.content).toBe("Kept shared rule.\n");
 	});
 
+	test("respects gitfile info excludes for symlinked rule files", async () => {
+		const sharedRulesDir = path.join(root, "shared-claude-rules");
+		const gitDir = path.join(root, "gitdir-store");
+		await fs.rm(path.join(project, ".git"), { recursive: true, force: true });
+		await writeFile(path.join(project, ".git"), `gitdir: ${gitDir}\n`);
+		await writeFile(path.join(gitDir, "info", "exclude"), ".claude/rules/shared/private.md\n");
+		await writeFile(path.join(sharedRulesDir, "private.md"), "Private shared rule.\n");
+		await writeFile(path.join(sharedRulesDir, "kept.md"), "Kept shared rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRulesDir, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+
+		expect(result.items.map(rule => rule.name)).toEqual(["shared:kept"]);
+		expect(result.items[0]?.content).toBe("Kept shared rule.\n");
+	});
+
 	test("respects global gitignore for symlinked rule files", async () => {
 		const sharedRulesDir = path.join(root, "shared-claude-rules");
 		const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
