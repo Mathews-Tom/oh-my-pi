@@ -237,6 +237,33 @@ describe("agents provider project-level discovery", () => {
 			expect(names).toContain("root-rule");
 			expect(names).not.toContain("above-rule");
 		});
+
+		test("preserves quoted alwaysApply flags from frontmatter", () => {
+			const source = {
+				provider: PROVIDER_ID,
+				providerName: "agents",
+				path: path.join(repoRoot, ".agents", "rules", "quoted.md"),
+				level: "project" as const,
+			};
+
+			const disabled = buildRuleFromMarkdown(
+				"quoted.md",
+				'---\nalwaysApply: "false"\n---\nBody.',
+				source.path,
+				source,
+				{ stripNamePattern: /\.(md|mdc)$/ },
+			);
+			const enabled = buildRuleFromMarkdown(
+				"quoted-true.md",
+				'---\nalwaysApply: "true"\n---\nBody.',
+				path.join(repoRoot, ".agents", "rules", "quoted-true.md"),
+				source,
+				{ stripNamePattern: /\.(md|mdc)$/ },
+			);
+
+			expect(disabled?.alwaysApply).toBe(false);
+			expect(enabled?.alwaysApply).toBe(true);
+		});
 	});
 
 	// =========================================================================

@@ -203,7 +203,7 @@ export function buildRuleFromMarkdown(
 		path: filePath,
 		content: body,
 		globs,
-		alwaysApply: typeof frontmatter.alwaysApply === "boolean" ? frontmatter.alwaysApply : undefined,
+		alwaysApply: parseBoolean(frontmatter.alwaysApply),
 		description: typeof frontmatter.description === "string" ? frontmatter.description : undefined,
 		condition,
 		astCondition,
