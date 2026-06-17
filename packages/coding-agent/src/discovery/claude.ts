@@ -40,7 +40,7 @@ const CONFIG_DIR = ".claude";
  * Get user-level .claude path.
  */
 function getUserClaude(ctx: LoadContext): string {
-	return path.join(ctx.home, CONFIG_DIR);
+	return process.env.CLAUDE_CONFIG_DIR || path.join(ctx.home, CONFIG_DIR);
 }
 
 /**
