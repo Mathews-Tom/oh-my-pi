@@ -239,6 +239,18 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items[0]?.content).toBe("Kept shared rule.\n");
 	});
 
+	test("respects gitignore directory patterns for symlinked rule directories", async () => {
+		const sharedRulesDir = path.join(root, "shared-claude-rules");
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared\n");
+		await writeFile(path.join(sharedRulesDir, "kept.md"), "Ignored shared rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRulesDir, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+
+		expect(result.items).toEqual([]);
+	});
+
 	test("project Claude rules override same-named user rules", async () => {
 		await writeFile(path.join(home, ".claude", "rules", "style.md"), "User style.\n");
 		await writeFile(path.join(project, ".claude", "rules", "style.md"), "Project style.\n");
