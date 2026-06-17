@@ -98,6 +98,20 @@ describe("Claude Code rule discovery", () => {
 		expect(buckets.rulebookRules).toEqual([]);
 	});
 
+	test("explicit alwaysApply false Claude rules are not made global", async () => {
+		await writeFile(
+			path.join(project, ".claude", "rules", "inactive.md"),
+			"---\nalwaysApply: false\n---\nDo not apply globally.\n",
+		);
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+		const buckets = bucketRules(result.items, new TtsrManager());
+
+		expect(result.items[0]).toMatchObject({ name: "inactive", alwaysApply: false });
+		expect(buckets.alwaysApplyRules).toEqual([]);
+		expect(buckets.rulebookRules).toEqual([]);
+	});
+
 	test("glob-only Claude rules stay addressable through the rulebook", async () => {
 		await writeFile(
 			path.join(project, ".claude", "rules", "typescript.md"),
@@ -172,6 +186,22 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items[0]).toMatchObject({
 			name: "shared:api",
 			content: "Shared API standards.\n",
+			_source: { level: "project", provider: "claude" },
+		});
+	});
+
+	test("loads Claude rules from nested symlinked directories", async () => {
+		const sharedRulesDir = path.join(root, "shared-claude-rules");
+		await writeFile(path.join(sharedRulesDir, "api.md"), "Nested shared API standards.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules", "frontend"), { recursive: true });
+		await fs.symlink(sharedRulesDir, path.join(project, ".claude", "rules", "frontend", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+
+		expect(result.items).toHaveLength(1);
+		expect(result.items[0]).toMatchObject({
+			name: "frontend:shared:api",
+			content: "Nested shared API standards.\n",
 			_source: { level: "project", provider: "claude" },
 		});
 	});

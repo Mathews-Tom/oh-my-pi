@@ -203,7 +203,7 @@ export function buildRuleFromMarkdown(
 		path: filePath,
 		content: body,
 		globs,
-		alwaysApply: frontmatter.alwaysApply === true,
+		alwaysApply: typeof frontmatter.alwaysApply === "boolean" ? frontmatter.alwaysApply : undefined,
 		description: typeof frontmatter.description === "string" ? frontmatter.description : undefined,
 		condition,
 		astCondition,
@@ -437,7 +437,7 @@ async function discoverLinkedFilesFromDir(
 	const matches: Array<{ path: string }> = [];
 	const visitedRealDirs = new Set<string>();
 
-	async function collect(currentDir: string, relativeDir: string): Promise<void> {
+	async function collectLinkedDir(currentDir: string, relativeDir: string): Promise<void> {
 		const realDir = await fs.promises.realpath(currentDir).catch(() => currentDir);
 		if (visitedRealDirs.has(realDir)) return;
 		visitedRealDirs.add(realDir);
@@ -449,7 +449,7 @@ async function discoverLinkedFilesFromDir(
 				const entryPath = path.join(currentDir, entry.name);
 				const relativePath = path.join(relativeDir, entry.name);
 				if (await isDirectoryPath(entryPath)) {
-					await collect(entryPath, relativePath);
+					await collectLinkedDir(entryPath, relativePath);
 					return;
 				}
 				if (matchesExtension(entry.name, extensions)) {
@@ -459,16 +459,24 @@ async function discoverLinkedFilesFromDir(
 		);
 	}
 
-	const entries = await readDirEntries(dir);
-	await Promise.all(
-		entries.map(async entry => {
-			if (entry.name.startsWith(".") || entry.isDirectory()) return;
-			const entryPath = path.join(dir, entry.name);
-			if (await isDirectoryPath(entryPath)) {
-				await collect(entryPath, entry.name);
-			}
-		}),
-	);
+	async function scanForLinkedDirs(currentDir: string, relativeDir: string): Promise<void> {
+		const entries = await readDirEntries(currentDir);
+		await Promise.all(
+			entries.map(async entry => {
+				if (entry.name.startsWith(".")) return;
+				const entryPath = path.join(currentDir, entry.name);
+				const relativePath = path.join(relativeDir, entry.name);
+				if (!(await isDirectoryPath(entryPath))) return;
+				if (entry.isSymbolicLink()) {
+					await collectLinkedDir(entryPath, relativePath);
+					return;
+				}
+				await scanForLinkedDirs(entryPath, relativePath);
+			}),
+		);
+	}
+
+	await scanForLinkedDirs(dir, "");
 
 	return matches;
 }
