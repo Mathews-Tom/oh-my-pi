@@ -453,7 +453,12 @@ async function findGitignoreRoot(dir: string): Promise<string> {
 	let highestIgnoreDir: string | undefined;
 	while (true) {
 		if (await pathExists(path.join(current, ".git"))) return current;
-		if (await Bun.file(path.join(current, ".gitignore")).exists()) highestIgnoreDir = current;
+		if (
+			(await Bun.file(path.join(current, ".gitignore")).exists()) ||
+			(await Bun.file(path.join(current, ".ignore")).exists())
+		) {
+			highestIgnoreDir = current;
+		}
 		const parent = path.dirname(current);
 		if (parent === current) return highestIgnoreDir ?? path.resolve(dir);
 		current = parent;
@@ -590,12 +595,15 @@ async function discoverLinkedFilesFromDir(
 	extensions: string[] | undefined,
 ): Promise<Array<{ path: string }>> {
 	const matches: Array<{ path: string }> = [];
-	const visitedRealDirs = new Set<string>();
-
-	async function collectLinkedDir(currentDir: string, relativeDir: string): Promise<void> {
+	async function collectLinkedDir(
+		currentDir: string,
+		relativeDir: string,
+		activeRealDirs: ReadonlySet<string>,
+	): Promise<void> {
 		const realDir = await fs.promises.realpath(currentDir).catch(() => currentDir);
-		if (visitedRealDirs.has(realDir)) return;
-		visitedRealDirs.add(realDir);
+		if (activeRealDirs.has(realDir)) return;
+		const nextActiveRealDirs = new Set(activeRealDirs);
+		nextActiveRealDirs.add(realDir);
 
 		const entries = await readDirEntries(currentDir);
 		await Promise.all(
@@ -604,7 +612,7 @@ async function discoverLinkedFilesFromDir(
 				const entryPath = path.join(currentDir, entry.name);
 				const relativePath = path.join(relativeDir, entry.name);
 				if (await isDirectoryPath(entryPath)) {
-					await collectLinkedDir(entryPath, relativePath);
+					await collectLinkedDir(entryPath, relativePath, nextActiveRealDirs);
 					return;
 				}
 				if (matchesExtension(entry.name, extensions)) {
@@ -623,7 +631,7 @@ async function discoverLinkedFilesFromDir(
 				const relativePath = path.join(relativeDir, entry.name);
 				if (!(await isDirectoryPath(entryPath))) return;
 				if (entry.isSymbolicLink()) {
-					await collectLinkedDir(entryPath, relativePath);
+					await collectLinkedDir(entryPath, relativePath, new Set<string>());
 					return;
 				}
 				await scanForLinkedDirs(entryPath, relativePath);

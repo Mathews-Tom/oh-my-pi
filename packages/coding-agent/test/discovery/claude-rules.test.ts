@@ -338,6 +338,34 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items[0]?.content).toBe("Kept shared rule.\n");
 	});
 
+	test("respects parent .ignore files outside Git repos", async () => {
+		const sharedRulesDir = path.join(root, "shared-claude-rules");
+		await fs.rm(path.join(project, ".git"), { recursive: true, force: true });
+		await writeFile(path.join(project, ".ignore"), ".claude/rules/shared/private.md\n");
+		await writeFile(path.join(sharedRulesDir, "private.md"), "Private shared rule.\n");
+		await writeFile(path.join(sharedRulesDir, "kept.md"), "Kept shared rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRulesDir, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+
+		expect(result.items.map(rule => rule.name)).toEqual(["shared:kept"]);
+		expect(result.items[0]?.content).toBe("Kept shared rule.\n");
+	});
+
+	test("keeps distinct symlink aliases even when they share a target", async () => {
+		const sharedRulesDir = path.join(root, "shared-claude-rules");
+		await writeFile(path.join(sharedRulesDir, "api.md"), "Shared API rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules", "frontend"), { recursive: true });
+		await fs.mkdir(path.join(project, ".claude", "rules", "backend"), { recursive: true });
+		await fs.symlink(sharedRulesDir, path.join(project, ".claude", "rules", "frontend", "shared"), "dir");
+		await fs.symlink(sharedRulesDir, path.join(project, ".claude", "rules", "backend", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, { cwd: project, providers: ["claude"] });
+
+		expect(result.items.map(rule => rule.name).sort()).toEqual(["backend:shared:api", "frontend:shared:api"]);
+	});
+
 	test("does not reinclude files under ignored symlinked rule directories", async () => {
 		const sharedRulesDir = path.join(root, "shared-claude-rules");
 		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared\n!.claude/rules/shared/kept.md\n");
