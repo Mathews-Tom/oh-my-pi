@@ -485,6 +485,7 @@ async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<G
 	let current = rootDir;
 	while (true) {
 		await loadIgnoreFile(rules, path.join(current, ".gitignore"), current);
+		await loadIgnoreFile(rules, path.join(current, ".ignore"), current);
 		if (path.resolve(current) === path.resolve(targetDir)) break;
 		const next = path.join(current, path.relative(current, targetDir).split(path.sep)[0] ?? "");
 		if (next === current || !path.relative(current, targetDir)) break;
