@@ -570,16 +570,17 @@ function gitignoreRuleMatch(rule: GitignoreRule, filePath: string): GitignoreMat
 	const directoryOnly = rawPattern.endsWith("/");
 	const normalizedPattern = rawPattern.replace(/\/+$/, "");
 	const globPattern = normalizedPattern.includes("/") || anchored ? normalizedPattern : `**/${normalizedPattern}`;
-	const glob = new Bun.Glob(directoryOnly ? `${globPattern}/**` : globPattern);
+	const pathGlob = new Bun.Glob(directoryOnly ? `${globPattern}/**` : globPattern);
+	const ancestorGlob = new Bun.Glob(globPattern);
 	const parts = relativePath.split("/");
-	let matchedAncestor = directoryOnly;
+	let matchedAncestor = false;
 	for (let i = 1; i < parts.length; i++) {
-		if (glob.match(parts.slice(0, i).join("/"))) {
+		if (ancestorGlob.match(parts.slice(0, i).join("/"))) {
 			matchedAncestor = true;
 			break;
 		}
 	}
-	if (glob.match(relativePath)) return { matchedAncestor };
+	if (pathGlob.match(relativePath)) return { matchedAncestor };
 	return matchedAncestor ? { matchedAncestor: true } : undefined;
 }
 

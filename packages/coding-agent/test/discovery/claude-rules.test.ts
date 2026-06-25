@@ -69,4 +69,16 @@ describe("Claude Code rule discovery", () => {
 			path.join(project, ".claude", "rules", "local.md"),
 		);
 	});
+
+	test("keeps rules when unrelated directory-only ignores exist", async () => {
+		await writeFile(path.join(project, ".gitignore"), "node_modules/\ndist/\n");
+		await writeFile(path.join(project, ".claude", "rules", "local.md"), "Local rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("local");
+	});
 });
