@@ -50,6 +50,21 @@ function getProjectClaude(ctx: LoadContext): string {
 	return path.join(ctx.cwd, CONFIG_DIR);
 }
 
+function getProjectClaudePathCandidates(ctx: LoadContext, ...segments: string[]): string[] {
+	const paths: string[] = [];
+	let current = ctx.cwd;
+	while (true) {
+		if (current !== ctx.home) {
+			paths.push(path.join(current, CONFIG_DIR, ...segments));
+		}
+		if (current === (ctx.repoRoot ?? ctx.home)) break;
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	return paths.reverse();
+}
+
 function isMissingDirectoryError(error: unknown): boolean {
 	return hasFsCode(error, "ENOENT") || hasFsCode(error, "ENOTDIR");
 }
@@ -222,13 +237,14 @@ async function readClaudeMdExcludesFromFile(filePath: string): Promise<string[]>
 
 async function getClaudeMdExcludes(ctx: LoadContext): Promise<string[]> {
 	const userBase = getUserClaude(ctx);
-	const projectBase = getProjectClaude(ctx);
-	const [user, project, local] = await Promise.all([
+	const projectSettings = getProjectClaudePathCandidates(ctx, "settings.json");
+	const projectLocalSettings = getProjectClaudePathCandidates(ctx, "settings.local.json");
+	const projectSettingPaths = [...projectSettings, ...projectLocalSettings];
+	const [user, ...project] = await Promise.all([
 		readClaudeMdExcludesFromFile(path.join(userBase, "settings.json")),
-		readClaudeMdExcludesFromFile(path.join(projectBase, "settings.json")),
-		readClaudeMdExcludesFromFile(path.join(projectBase, "settings.local.json")),
+		...projectSettingPaths.map(filePath => readClaudeMdExcludesFromFile(filePath)),
 	]);
-	return [...user, ...project, ...local];
+	return [...user, ...project.flat()];
 }
 
 function shouldExcludeClaudeRule(filePath: string, excludes: string[], home: string): boolean {
@@ -253,16 +269,19 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const items: Rule[] = [];
 	const warnings: string[] = [];
 	const userRulesDir = path.join(getUserClaude(ctx), "rules");
-	const projectRulesDir = path.join(getProjectClaude(ctx), "rules");
+	const projectRuleDirs = getProjectClaudePathCandidates(ctx, "rules");
 	const claudeMdExcludes = await getClaudeMdExcludes(ctx);
-	const [userResult, projectResult] = await Promise.all([
+	const [userResult, ...projectResults] = await Promise.all([
 		loadClaudeRulesFromDir(ctx, userRulesDir, "user", claudeMdExcludes),
-		loadClaudeRulesFromDir(ctx, projectRulesDir, "project", claudeMdExcludes),
+		...projectRuleDirs.map(rulesDir => loadClaudeRulesFromDir(ctx, rulesDir, "project", claudeMdExcludes)),
 	]);
 
-	const projectNames = new Set(projectResult.items.map(rule => rule.name));
-	items.push(...userResult.items.filter(rule => !projectNames.has(rule.name)), ...projectResult.items);
-	warnings.push(...(userResult.warnings ?? []), ...(projectResult.warnings ?? []));
+	const projectItemsFlat = projectResults.flatMap(result => result.items);
+	const lastProjectRuleByName = new Map(projectItemsFlat.map(rule => [rule.name, rule]));
+	const projectItems = projectItemsFlat.filter(rule => lastProjectRuleByName.get(rule.name) === rule);
+	const projectNames = new Set(projectItems.map(rule => rule.name));
+	items.push(...userResult.items.filter(rule => !projectNames.has(rule.name)), ...projectItems);
+	warnings.push(...(userResult.warnings ?? []), ...projectResults.flatMap(result => result.warnings ?? []));
 
 	return { items, warnings };
 }

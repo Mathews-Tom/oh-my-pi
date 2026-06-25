@@ -70,6 +70,19 @@ describe("Claude Code rule discovery", () => {
 		);
 	});
 
+	test("loads project rules from ancestor .claude directories", async () => {
+		const nestedCwd = path.join(project, "packages", "app");
+		await fs.mkdir(nestedCwd, { recursive: true });
+		await writeFile(path.join(project, ".claude", "rules", "root.md"), "Root rule.\n");
+		await writeFile(path.join(nestedCwd, ".claude", "rules", "local.md"), "Local rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: nestedCwd,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toEqual(["root", "local"]);
+	});
 	test("keeps rules when unrelated directory-only ignores exist", async () => {
 		await writeFile(path.join(project, ".gitignore"), "node_modules/\ndist/\n");
 		await writeFile(path.join(project, ".claude", "rules", "local.md"), "Local rule.\n");
