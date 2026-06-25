@@ -599,7 +599,7 @@ async function isGitignoredPath(dir: string, relativePath: string): Promise<bool
 			for (const ancestor of match.matchedAncestors) {
 				ignoredAncestors.delete(ancestor);
 			}
-			if (match.matchedPath && ignoredAncestors.size === 0) {
+			if ((match.matchedPath || match.matchedAncestors.length > 0) && ignoredAncestors.size === 0) {
 				ignored = false;
 			}
 		} else {
