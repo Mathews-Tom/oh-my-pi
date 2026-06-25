@@ -470,6 +470,9 @@ async function findGitignoreRoot(dir: string): Promise<string> {
 	}
 }
 
+function unescapeGitignorePattern(pattern: string): string {
+	return pattern.replace(/\\([ !#\\])/g, "$1");
+}
 async function loadIgnoreFile(rules: GitignoreRule[], filePath: string, baseDir: string): Promise<void> {
 	const ignoreFile = Bun.file(filePath);
 	if (!(await ignoreFile.exists())) return;
@@ -478,7 +481,7 @@ async function loadIgnoreFile(rules: GitignoreRule[], filePath: string, baseDir:
 		const trimmed = line.trim();
 		if (!trimmed || trimmed.startsWith("#")) continue;
 		const negated = trimmed.startsWith("!");
-		const pattern = negated ? trimmed.slice(1) : trimmed;
+		const pattern = unescapeGitignorePattern(negated ? trimmed.slice(1) : trimmed);
 		if (pattern) rules.push({ baseDir, pattern, negated });
 	}
 }
