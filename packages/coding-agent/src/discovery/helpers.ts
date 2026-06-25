@@ -638,7 +638,7 @@ async function discoverLinkedFilesFromDir(
 		const entries = await readDirEntries(currentDir);
 		await Promise.all(
 			entries.map(async entry => {
-				if (entry.name.startsWith(".")) return;
+				if (entry.name.startsWith(".") || entry.name === "node_modules") return;
 				const entryPath = path.join(currentDir, entry.name);
 				const relativePath = path.join(relativeDir, entry.name);
 				if (await isDirectoryPath(entryPath)) {
@@ -656,7 +656,7 @@ async function discoverLinkedFilesFromDir(
 		const entries = await readDirEntries(currentDir);
 		await Promise.all(
 			entries.map(async entry => {
-				if (entry.name.startsWith(".")) return;
+				if (entry.name.startsWith(".") || entry.name === "node_modules") return;
 				const entryPath = path.join(currentDir, entry.name);
 				const relativePath = path.join(relativeDir, entry.name);
 				if (!(await isDirectoryPath(entryPath))) return;

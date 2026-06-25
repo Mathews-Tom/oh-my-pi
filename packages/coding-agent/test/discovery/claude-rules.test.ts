@@ -171,4 +171,19 @@ describe("Claude Code rule discovery", () => {
 
 		expect(result.items.map(rule => rule.name)).not.toContain("private");
 	});
+
+	test("skips node_modules under linked rule directories", async () => {
+		if (process.platform === "win32") return;
+		const sharedRules = path.join(root, "shared-rules-with-deps");
+		await writeFile(path.join(sharedRules, "node_modules", "pkg", "README.md"), "Dependency docs.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).not.toContain("shared:node_modules:pkg:README");
+	});
 });
