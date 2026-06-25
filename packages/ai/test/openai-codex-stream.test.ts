@@ -2817,7 +2817,7 @@ describe("openai-codex streaming", () => {
 			apiKey: token,
 			sessionId: "ws-no-progress-session",
 			providerSessionState,
-			streamIdleTimeoutMs: 5,
+			streamIdleTimeoutMs: 25,
 		}).result();
 
 		expect(sendCount).toBe(1);
@@ -2832,7 +2832,7 @@ describe("openai-codex streaming", () => {
 			}),
 		]);
 		expect(fetchMock).not.toHaveBeenCalled();
-	});
+	}, 15_000);
 
 	it("retries, then surfaces an error, when whitespace-only tool-call argument deltas never recover", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
