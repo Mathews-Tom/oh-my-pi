@@ -12,6 +12,19 @@ async function writeFile(filePath: string, content: string): Promise<void> {
 	await fs.writeFile(filePath, content);
 }
 
+async function runGit(cwd: string, args: string[]): Promise<string> {
+	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const [exitCode, stdout, stderr] = await Promise.all([
+		proc.exited,
+		new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
+		new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+	]);
+	if (exitCode !== 0) {
+		throw new Error(`git ${args.join(" ")} failed (${exitCode}): ${stderr || stdout}`);
+	}
+	return stdout.trim();
+}
+
 describe("Claude Code rule discovery", () => {
 	let root = "";
 	let home = "";
@@ -241,5 +254,37 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).toContain("keep");
 		expect(result.items.map(rule => rule.name)).not.toContain("private");
 		expect(result.items.map(rule => rule.name)).not.toContain("vendor:skip");
+	});
+
+	test("honors git excludes from a symlinked worktree checkout", async () => {
+		if (process.platform === "win32") return;
+		const repo = path.join(root, "worktree-repo");
+		const worktree = path.join(root, "worktree-checkout");
+		const sharedRules = path.join(root, "shared-rules-for-worktree");
+		await fs.rm(project, { recursive: true, force: true });
+		await fs.mkdir(repo, { recursive: true });
+		await runGit(repo, ["init"]);
+		await runGit(repo, ["config", "user.email", "test@example.com"]);
+		await runGit(repo, ["config", "user.name", "Test User"]);
+		await writeFile(path.join(repo, "tracked.txt"), "tracked\n");
+		await runGit(repo, ["add", "tracked.txt"]);
+		await runGit(repo, ["commit", "-m", "init"]);
+		await runGit(repo, ["worktree", "add", worktree, "-b", "feature"]);
+		const excludeFile = await runGit(worktree, ["rev-parse", "--git-path", "info/exclude"]);
+		await writeFile(
+			path.isAbsolute(excludeFile) ? excludeFile : path.join(worktree, excludeFile),
+			".claude/rules/shared/private.md\n",
+		);
+		await writeFile(path.join(sharedRules, "private.md"), "Private rule.\n");
+		await fs.mkdir(path.join(worktree, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(worktree, ".claude", "rules", "shared"), "dir");
+		await fs.symlink(worktree, project, "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).not.toContain("shared:private");
 	});
 });

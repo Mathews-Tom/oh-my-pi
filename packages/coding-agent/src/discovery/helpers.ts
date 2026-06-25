@@ -496,6 +496,25 @@ async function resolveGitDir(rootDir: string): Promise<string | undefined> {
 	return path.resolve(rootDir, match[1].trim());
 }
 
+async function resolveGitExcludeFile(rootDir: string): Promise<string | undefined> {
+	try {
+		const child = Bun.spawn(["git", "-C", rootDir, "rev-parse", "--git-path", "info/exclude"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [exitCode, text] = await Promise.all([
+			child.exited,
+			new Response(child.stdout as ReadableStream<Uint8Array>).text(),
+		]);
+		if (exitCode === 0) {
+			const gitPath = text.trim();
+			if (gitPath) return path.isAbsolute(gitPath) ? gitPath : path.resolve(rootDir, gitPath);
+		}
+	} catch {}
+	const gitDir = await resolveGitDir(rootDir);
+	return gitDir ? path.join(gitDir, "info", "exclude") : undefined;
+}
+
 function expandHomePath(filePath: string): string {
 	if (filePath === "~") return os.homedir();
 	if (filePath.startsWith("~/")) return path.join(os.homedir(), filePath.slice(2));
@@ -552,8 +571,8 @@ async function globalGitignorePath(): Promise<string> {
 async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<GitignoreRule[]> {
 	const rules: GitignoreRule[] = [];
 	await loadIgnoreFile(rules, await globalGitignorePath(), rootDir);
-	const gitDir = await resolveGitDir(rootDir);
-	if (gitDir) await loadIgnoreFile(rules, path.join(gitDir, "info", "exclude"), rootDir);
+	const gitExcludeFile = await resolveGitExcludeFile(rootDir);
+	if (gitExcludeFile) await loadIgnoreFile(rules, gitExcludeFile, rootDir);
 	let current = rootDir;
 	while (true) {
 		await loadIgnoreFile(rules, path.join(current, ".gitignore"), current);
