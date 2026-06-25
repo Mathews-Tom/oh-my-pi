@@ -386,7 +386,7 @@ describe("Claude Code rule discovery", () => {
 		);
 		const sharedRules = path.join(root, "shared-rules-posix-space-punct");
 		await writeFile(path.join(sharedRules, "Private Rule.md"), "Private rule.\n");
-		await writeFile(path.join(sharedRules, ".secret.md"), "Secret rule.\n");
+		await writeFile(path.join(sharedRules, "!secret.md"), "Secret rule.\n");
 		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
 		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
 		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
@@ -398,6 +398,6 @@ describe("Claude Code rule discovery", () => {
 
 		expect(result.items.map(rule => rule.name)).toContain("shared:keep");
 		expect(result.items.map(rule => rule.name)).not.toContain("shared:Private Rule");
-		expect(result.items.map(rule => rule.name)).not.toContain("shared:.secret");
+		expect(result.items.map(rule => rule.name)).not.toContain("shared:!secret");
 	});
 });

@@ -602,7 +602,7 @@ const POSIX_CHARACTER_CLASS_MAP: Record<string, string> = {
 	digit: "0-9",
 	graph: "!-~",
 	lower: "a-z",
-	punct: "\"#$%&'()*+,./:;<=>?@[\\\\]^_`{|}~!-",
+	punct: "\"#$%&'()*+,./:;<=>?@^_`{|}~!-",
 	space: " \t",
 	upper: "A-Z",
 	xdigit: "A-Fa-f0-9",
