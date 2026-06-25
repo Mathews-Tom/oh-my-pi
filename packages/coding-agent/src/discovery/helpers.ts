@@ -595,6 +595,27 @@ async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<G
 	return rules;
 }
 
+function normalizePosixCharacterClasses(pattern: string): string {
+	return pattern.replace(/\[:(alnum|alpha|digit|lower|upper|xdigit):\]/g, (_, className: string) => {
+		switch (className) {
+			case "alnum":
+				return "A-Za-z0-9";
+			case "alpha":
+				return "A-Za-z";
+			case "digit":
+				return "0-9";
+			case "lower":
+				return "a-z";
+			case "upper":
+				return "A-Z";
+			case "xdigit":
+				return "A-Fa-f0-9";
+			default:
+				return className;
+		}
+	});
+}
+
 function gitignoreRuleMatch(
 	rule: GitignoreRule,
 	filePath: string,
@@ -607,7 +628,9 @@ function gitignoreRuleMatch(
 	const rawPattern = anchored ? rule.pattern.slice(1) : rule.pattern;
 	const directoryOnly = rawPattern.endsWith("/");
 	const normalizedPattern = rawPattern.replace(/\/+$/, "");
-	const globPattern = normalizedPattern.includes("/") || anchored ? normalizedPattern : `**/${normalizedPattern}`;
+	const globPattern = normalizePosixCharacterClasses(
+		normalizedPattern.includes("/") || anchored ? normalizedPattern : `**/${normalizedPattern}`,
+	);
 	const pathGlob = new Bun.Glob(globPattern);
 	const ancestorGlob = new Bun.Glob(globPattern);
 	const parts = relativePath.split("/");
