@@ -93,6 +93,20 @@ describe("Claude Code rule discovery", () => {
 
 		expect(result.items.map(rule => rule.name)).toContain("local");
 	});
+
+	test("keeps rules when nested ignore files re-include a parent", async () => {
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/\n");
+		await writeFile(path.join(project, ".claude", ".gitignore"), "!rules/\n");
+		await writeFile(path.join(project, ".claude", "rules", "local.md"), "Local rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("local");
+	});
+
 	test("keeps linked rules ignored when a parent remains ignored", async () => {
 		if (process.platform === "win32") return;
 		await writeFile(path.join(project, ".gitignore"), "*\n!.claude/\n!.claude/rules/shared/keep.md\n");

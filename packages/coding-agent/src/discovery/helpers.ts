@@ -578,7 +578,7 @@ function gitignoreRuleMatch(rule: GitignoreRule, filePath: string): GitignoreMat
 	for (let i = 1; i < parts.length; i++) {
 		const ancestor = parts.slice(0, i).join("/");
 		if (ancestorGlob.match(ancestor)) {
-			matchedAncestors.push(ancestor);
+			matchedAncestors.push(path.resolve(rule.baseDir, ancestor));
 		}
 	}
 	const matchedPath = !directoryOnly && pathGlob.match(relativePath);
