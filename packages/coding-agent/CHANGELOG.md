@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Claude Code rule discovery so `.claude/rules/**/*.md` and `.claude/rules/**/*.mdc` files load through the standard rules capability with frontmatter metadata preserved ([#2613](https://github.com/can1357/oh-my-pi/issues/2613)).
+
 ## [16.1.19] - 2026-06-25
 
 ### Fixed
@@ -566,10 +570,6 @@
 - Secured PDF image reads by validating requested image members against the extracted member list before opening files and refusing traversal-style names
 
 ## [16.0.5] - 2026-06-17
-
-### Added
-
-- Added Claude Code rule discovery so `.claude/rules/**/*.md` and `.claude/rules/**/*.mdc` files load through the standard rules capability with frontmatter metadata preserved ([#2613](https://github.com/can1357/oh-my-pi/issues/2613)).
 
 ### Added
 
