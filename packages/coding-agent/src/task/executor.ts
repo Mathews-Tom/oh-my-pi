@@ -50,12 +50,12 @@ import {
 	type OutputValidator,
 	summarizeValidationFailure,
 } from "../tools/output-schema-validator";
-
 import { type ReportFindingDetails, toReviewFinding } from "../tools/review";
 import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
+import { Semaphore } from "./parallel";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import {
 	type AgentDefinition,
@@ -192,6 +192,51 @@ function installSubagentRetryFallbackChain(args: {
 	}
 	settings.override("retry.fallbackChains", fallbackChains);
 	return role;
+}
+
+const PROVIDER_MAX_CONCURRENCY_SETTINGS: Record<string, SettingPath> = {
+	"ollama-cloud": "providers.ollama-cloud.maxConcurrency",
+};
+
+interface ProviderSemaphoreEntry {
+	limit: number;
+	semaphore: Semaphore;
+}
+
+const providerSemaphores = new Map<string, ProviderSemaphoreEntry>();
+
+/**
+ * Resolve the configured concurrency ceiling for a provider, or `undefined`
+ * when the provider has no cap concept at all. A configured value `<= 0` means
+ * "unlimited" and maps to `Infinity` — still a tracked ceiling, so every run
+ * holds a slot and a later finite resize counts work started while unlimited.
+ */
+function getProviderConcurrencyLimit(settings: Settings, provider: string): number | undefined {
+	const settingPath = PROVIDER_MAX_CONCURRENCY_SETTINGS[provider];
+	if (!settingPath) return undefined;
+	const raw = settings.get(settingPath);
+	const limit = Number.isFinite(raw) ? Math.trunc(raw) : 0;
+	return limit > 0 ? limit : Number.POSITIVE_INFINITY;
+}
+
+function getProviderSemaphore(settings: Settings, provider: string): Semaphore | undefined {
+	const limit = getProviderConcurrencyLimit(settings, provider);
+	if (limit === undefined) return undefined;
+	// Always hand out (and acquire on) the single shared limiter, even when
+	// unlimited (Infinity). Resizing it in place — rather than replacing it —
+	// keeps every in-flight slot counted, so a runtime or mixed limit change can
+	// never push concurrency past the cap (issue #3464 review feedback).
+	const existing = providerSemaphores.get(provider);
+	if (existing) {
+		if (existing.limit !== limit) {
+			existing.limit = limit;
+			existing.semaphore.resize(limit);
+		}
+		return existing.semaphore;
+	}
+	const semaphore = new Semaphore(limit);
+	providerSemaphores.set(provider, { limit, semaphore });
+	return semaphore;
 }
 
 function renderIrcPeerRoster(selfId: string): string {
@@ -1889,6 +1934,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		let sessionOpenedAt: number | undefined;
 		let sessionCreatedAt: number | undefined;
 		let readyAt: number | undefined;
+		let providerSemaphore: Semaphore | undefined;
+		let providerSemaphoreAcquired = false;
 
 		try {
 			checkAbort();
@@ -1957,6 +2004,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
 			resolvedAt = performance.now();
+			if (model) {
+				providerSemaphore = getProviderSemaphore(settings, model.provider);
+				if (providerSemaphore) {
+					await providerSemaphore.acquire(abortSignal);
+					providerSemaphoreAcquired = true;
+				}
+			}
 
 			const effectiveCwd = worktree ?? cwd;
 			const sessionManager = sessionFile
@@ -2246,6 +2300,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					abortReasonText ??= monitor.resolveAbortReasonText();
 				}
 				if (exitCode === 0) exitCode = 1;
+			}
+			if (providerSemaphoreAcquired) {
+				providerSemaphore?.release();
+				providerSemaphoreAcquired = false;
 			}
 			sessionAbortController.abort();
 			if (unsubscribe) {

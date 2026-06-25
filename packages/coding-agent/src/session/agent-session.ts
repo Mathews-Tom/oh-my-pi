@@ -6813,7 +6813,12 @@ export class AgentSession {
 	 * the transcript can distinguish a deliberate user interrupt from an opaque
 	 * abort. Omit it for internal/lifecycle aborts.
 	 */
-	async abort(options?: { goalReason?: "interrupted" | "internal"; reason?: string }): Promise<void> {
+	async abort(options?: {
+		goalReason?: "interrupted" | "internal";
+		reason?: string;
+		/** Internal `/compact` startup keeps the manual-compaction marker alive while aborting the active turn. */
+		preserveCompaction?: boolean;
+	}): Promise<void> {
 		const userInterrupt = options?.reason === USER_INTERRUPT_LABEL;
 		if (userInterrupt) this.#advisorAutoResumeSuppressed = true;
 		// Pull advisor concerns out of the steer/follow-up queues before any await so
@@ -6828,7 +6833,17 @@ export class AgentSession {
 			this.abortRetry();
 			this.#promptGeneration++;
 			this.#scheduledHiddenNextTurnGeneration = undefined;
-			this.abortCompaction();
+			if (options?.preserveCompaction) {
+				// Manual `/compact` installed its own #compactionAbortController before
+				// this internal abort and must keep it alive (that marker is what makes
+				// isCompacting report true during startup). Any in-flight
+				// auto-compaction MUST still be cancelled, though: otherwise a
+				// background maintenance pass races the manual run and both
+				// appendCompaction/replaceMessages, double-rewriting session history.
+				this.#autoCompactionAbortController?.abort();
+			} else {
+				this.abortCompaction();
+			}
 			this.abortHandoff();
 			this.abortBash();
 			this.abortEval();
@@ -7801,12 +7816,12 @@ export class AgentSession {
 		if (compactMode?.rejectsFocus && customInstructions) {
 			throw new Error(`/compact ${compactMode.name} does not take focus instructions.`);
 		}
-		this.#disconnectFromAgent();
-		await this.abort({ goalReason: "internal" });
 		const compactionAbortController = new AbortController();
 		this.#compactionAbortController = compactionAbortController;
 
 		try {
+			this.#disconnectFromAgent();
+			await this.abort({ goalReason: "internal", preserveCompaction: true });
 			if (!this.model) {
 				throw new Error("No model selected");
 			}
@@ -10619,7 +10634,16 @@ export class AgentSession {
 	#getRetryFallbackChains(): RetryFallbackChains {
 		const configuredChains = this.settings.get("retry.fallbackChains");
 		if (!configuredChains || typeof configuredChains !== "object") return {};
-		return configuredChains as RetryFallbackChains;
+		const chains: RetryFallbackChains = { ...(configuredChains as RetryFallbackChains) };
+		const defaultChain = chains.default;
+		if (Array.isArray(defaultChain)) {
+			for (const role of Object.keys(this.settings.getModelRoles())) {
+				if (role !== "default" && chains[role] === undefined) {
+					chains[role] = defaultChain;
+				}
+			}
+		}
+		return chains;
 	}
 
 	#validateRetryFallbackChains(): void {
