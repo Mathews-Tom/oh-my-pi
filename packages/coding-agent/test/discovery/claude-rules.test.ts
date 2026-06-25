@@ -186,4 +186,23 @@ describe("Claude Code rule discovery", () => {
 
 		expect(result.items.map(rule => rule.name)).not.toContain("shared:node_modules:pkg:README");
 	});
+
+	test("honors git excludes from a symlinked project checkout", async () => {
+		if (process.platform === "win32") return;
+		const realProject = path.join(root, "real-project");
+		await fs.rm(project, { recursive: true, force: true });
+		await writeFile(path.join(realProject, ".git", "info", "exclude"), ".claude/rules/shared/private.md\n");
+		const sharedRules = path.join(root, "shared-rules-for-symlinked-project");
+		await writeFile(path.join(sharedRules, "private.md"), "Private rule.\n");
+		await fs.mkdir(path.join(realProject, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(realProject, ".claude", "rules", "shared"), "dir");
+		await fs.symlink(realProject, project, "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).not.toContain("shared:private");
+	});
 });
