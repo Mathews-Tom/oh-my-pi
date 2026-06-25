@@ -453,7 +453,8 @@ async function findGitignoreRoot(dir: string): Promise<string> {
 	let current = path.resolve(dir);
 	let highestIgnoreDir: string | undefined;
 	while (true) {
-		if (await pathExists(path.join(current, ".git"))) return current;
+		const currentStat = await fs.promises.lstat(current).catch(() => null);
+		if (!currentStat?.isSymbolicLink() && (await pathExists(path.join(current, ".git")))) return current;
 		if (
 			(await Bun.file(path.join(current, ".gitignore")).exists()) ||
 			(await Bun.file(path.join(current, ".ignore")).exists())
