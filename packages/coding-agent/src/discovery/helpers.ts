@@ -437,7 +437,8 @@ interface GitignoreRule {
 }
 
 interface GitignoreMatch {
-	matchedAncestor: boolean;
+	matchedPath: boolean;
+	matchedAncestors: string[];
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -570,18 +571,19 @@ function gitignoreRuleMatch(rule: GitignoreRule, filePath: string): GitignoreMat
 	const directoryOnly = rawPattern.endsWith("/");
 	const normalizedPattern = rawPattern.replace(/\/+$/, "");
 	const globPattern = normalizedPattern.includes("/") || anchored ? normalizedPattern : `**/${normalizedPattern}`;
-	const pathGlob = new Bun.Glob(directoryOnly ? `${globPattern}/**` : globPattern);
+	const pathGlob = new Bun.Glob(globPattern);
 	const ancestorGlob = new Bun.Glob(globPattern);
 	const parts = relativePath.split("/");
-	let matchedAncestor = false;
+	const matchedAncestors: string[] = [];
 	for (let i = 1; i < parts.length; i++) {
-		if (ancestorGlob.match(parts.slice(0, i).join("/"))) {
-			matchedAncestor = true;
-			break;
+		const ancestor = parts.slice(0, i).join("/");
+		if (ancestorGlob.match(ancestor)) {
+			matchedAncestors.push(ancestor);
 		}
 	}
-	if (pathGlob.match(relativePath)) return { matchedAncestor };
-	return matchedAncestor ? { matchedAncestor: true } : undefined;
+	const matchedPath = !directoryOnly && pathGlob.match(relativePath);
+	if (matchedPath || matchedAncestors.length > 0) return { matchedPath, matchedAncestors };
+	return undefined;
 }
 
 async function isGitignoredPath(dir: string, relativePath: string): Promise<boolean> {
@@ -589,20 +591,27 @@ async function isGitignoredPath(dir: string, relativePath: string): Promise<bool
 	const rootDir = await findGitignoreRoot(dir);
 	const rules = await loadGitignoreRules(rootDir, path.dirname(filePath));
 	let ignored = false;
-	let ignoredParent = false;
+	const ignoredAncestors = new Set<string>();
 	for (const rule of rules) {
 		const match = gitignoreRuleMatch(rule, filePath);
 		if (!match) continue;
 		if (rule.negated) {
-			if (ignoredParent && !match.matchedAncestor) continue;
-			ignored = false;
-			if (match.matchedAncestor) ignoredParent = false;
+			for (const ancestor of match.matchedAncestors) {
+				ignoredAncestors.delete(ancestor);
+			}
+			if (match.matchedPath && ignoredAncestors.size === 0) {
+				ignored = false;
+			}
 		} else {
-			ignored = true;
-			if (match.matchedAncestor) ignoredParent = true;
+			if (match.matchedPath || match.matchedAncestors.length > 0) {
+				ignored = true;
+			}
+			for (const ancestor of match.matchedAncestors) {
+				ignoredAncestors.add(ancestor);
+			}
 		}
 	}
-	return ignored;
+	return ignored || ignoredAncestors.size > 0;
 }
 
 async function discoverLinkedFilesFromDir(
