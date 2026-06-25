@@ -256,6 +256,23 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).not.toContain("vendor:skip");
 	});
 
+	test("honors project-relative claudeMdExcludes when loading rules", async () => {
+		await writeFile(
+			path.join(project, ".claude", "settings.json"),
+			JSON.stringify({ claudeMdExcludes: [".claude/rules/private.md"] }),
+		);
+		await writeFile(path.join(project, ".claude", "rules", "private.md"), "Private rule.\n");
+		await writeFile(path.join(project, ".claude", "rules", "keep.md"), "Keep rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("keep");
+		expect(result.items.map(rule => rule.name)).not.toContain("private");
+	});
+
 	test("honors git excludes from a symlinked worktree checkout", async () => {
 		if (process.platform === "win32") return;
 		const repo = path.join(root, "worktree-repo");
@@ -360,5 +377,27 @@ describe("Claude Code rule discovery", () => {
 
 		expect(result.items.map(rule => rule.name)).toContain("shared:keep");
 		expect(result.items.map(rule => rule.name)).not.toContain("shared:Private");
+	});
+	test("honors space and punctuation POSIX classes in linked rule ignores", async () => {
+		if (process.platform === "win32") return;
+		await writeFile(
+			path.join(project, ".gitignore"),
+			".claude/rules/shared/*[[:space:]]*.md\n.claude/rules/shared/[[:punct:]]*.md\n",
+		);
+		const sharedRules = path.join(root, "shared-rules-posix-space-punct");
+		await writeFile(path.join(sharedRules, "Private Rule.md"), "Private rule.\n");
+		await writeFile(path.join(sharedRules, ".secret.md"), "Secret rule.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("shared:keep");
+		expect(result.items.map(rule => rule.name)).not.toContain("shared:Private Rule");
+		expect(result.items.map(rule => rule.name)).not.toContain("shared:.secret");
 	});
 });

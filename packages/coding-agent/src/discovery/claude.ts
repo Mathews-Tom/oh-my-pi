@@ -211,31 +211,53 @@ function transformClaudeRule(rulesDir: string, content: string, filePath: string
 	return { ...rule, alwaysApply: true };
 }
 
+interface ClaudeMdExclude {
+	pattern: string;
+	baseDir: string;
+}
+
 function normalizeClaudeExcludePattern(pattern: string, home: string): string {
 	const expandedHome = pattern === "~" ? home : pattern.startsWith("~/") ? path.join(home, pattern.slice(2)) : pattern;
 	return expandedHome.split(path.sep).join("/");
 }
 
-function matchesClaudeMdExclude(filePath: string, excludes: string[], home: string): boolean {
-	const normalizedFilePath = path.resolve(filePath).split(path.sep).join("/");
-	return excludes.some(pattern => {
+function normalizePathForGlob(filePath: string): string {
+	return filePath.split(path.sep).join("/");
+}
+
+function matchesClaudeMdExclude(filePath: string, excludes: ClaudeMdExclude[], home: string): boolean {
+	const normalizedFilePath = normalizePathForGlob(path.resolve(filePath));
+	return excludes.some(({ pattern, baseDir }) => {
 		const normalizedPattern = normalizeClaudeExcludePattern(pattern, home);
-		if (!/[*?[\]{}]/.test(normalizedPattern) && path.isAbsolute(normalizedPattern)) {
-			return normalizedFilePath === path.resolve(normalizedPattern).split(path.sep).join("/");
+		const normalizedBaseDir = path.resolve(baseDir);
+		const relativeFilePath = normalizePathForGlob(path.relative(normalizedBaseDir, path.resolve(filePath)));
+		const isRelativeToBase =
+			relativeFilePath.length > 0 && relativeFilePath !== ".." && !relativeFilePath.startsWith("../");
+
+		if (!/[*?[\]{}]/.test(normalizedPattern)) {
+			if (path.isAbsolute(normalizedPattern)) {
+				return normalizedFilePath === normalizePathForGlob(path.resolve(normalizedPattern));
+			}
+			return isRelativeToBase && relativeFilePath === normalizedPattern;
 		}
-		return new Bun.Glob(normalizedPattern).match(normalizedFilePath);
+
+		const glob = new Bun.Glob(normalizedPattern);
+		if (glob.match(normalizedFilePath)) return true;
+		return isRelativeToBase && glob.match(relativeFilePath);
 	});
 }
 
-async function readClaudeMdExcludesFromFile(filePath: string): Promise<string[]> {
+async function readClaudeMdExcludesFromFile(filePath: string): Promise<ClaudeMdExclude[]> {
 	const content = await readFile(filePath);
 	if (!content) return [];
 	const data = tryParseJson<Record<string, unknown>>(content);
 	const excludes = data?.claudeMdExcludes;
-	return Array.isArray(excludes) ? excludes.filter((value): value is string => typeof value === "string") : [];
+	if (!Array.isArray(excludes)) return [];
+	const baseDir = path.dirname(path.dirname(filePath));
+	return excludes.filter((value): value is string => typeof value === "string").map(pattern => ({ pattern, baseDir }));
 }
 
-async function getClaudeMdExcludes(ctx: LoadContext): Promise<string[]> {
+async function getClaudeMdExcludes(ctx: LoadContext): Promise<ClaudeMdExclude[]> {
 	const userBase = getUserClaude(ctx);
 	const projectSettings = getProjectClaudePathCandidates(ctx, "settings.json");
 	const projectLocalSettings = getProjectClaudePathCandidates(ctx, "settings.local.json");
@@ -247,7 +269,7 @@ async function getClaudeMdExcludes(ctx: LoadContext): Promise<string[]> {
 	return [...user, ...project.flat()];
 }
 
-function shouldExcludeClaudeRule(filePath: string, excludes: string[], home: string): boolean {
+function shouldExcludeClaudeRule(filePath: string, excludes: ClaudeMdExclude[], home: string): boolean {
 	return excludes.length > 0 && matchesClaudeMdExclude(filePath, excludes, home);
 }
 
@@ -255,7 +277,7 @@ async function loadClaudeRulesFromDir(
 	ctx: LoadContext,
 	rulesDir: string,
 	level: "user" | "project",
-	excludes: string[],
+	excludes: ClaudeMdExclude[],
 ): Promise<LoadResult<Rule>> {
 	return loadFilesFromDir<Rule>(ctx, rulesDir, PROVIDER_ID, level, {
 		extensions: ["md", "mdc"],

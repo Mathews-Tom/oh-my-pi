@@ -595,25 +595,24 @@ async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<G
 	return rules;
 }
 
+const POSIX_CHARACTER_CLASS_MAP: Record<string, string> = {
+	alnum: "A-Za-z0-9",
+	alpha: "A-Za-z",
+	blank: " \t",
+	digit: "0-9",
+	graph: "!-~",
+	lower: "a-z",
+	punct: "\"#$%&'()*+,./:;<=>?@[\\\\]^_`{|}~!-",
+	space: " \t",
+	upper: "A-Z",
+	xdigit: "A-Fa-f0-9",
+};
+
 function normalizePosixCharacterClasses(pattern: string): string {
-	return pattern.replace(/\[:(alnum|alpha|digit|lower|upper|xdigit):\]/g, (_, className: string) => {
-		switch (className) {
-			case "alnum":
-				return "A-Za-z0-9";
-			case "alpha":
-				return "A-Za-z";
-			case "digit":
-				return "0-9";
-			case "lower":
-				return "a-z";
-			case "upper":
-				return "A-Z";
-			case "xdigit":
-				return "A-Fa-f0-9";
-			default:
-				return className;
-		}
-	});
+	return pattern.replace(
+		/\[:([a-z]+):\]/g,
+		(match, className: string) => POSIX_CHARACTER_CLASS_MAP[className] ?? match,
+	);
 }
 
 function gitignoreRuleMatch(
