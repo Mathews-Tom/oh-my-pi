@@ -124,8 +124,10 @@ import type {
 	ToolResultMessage,
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
+import { deterministicUuid } from "../utils/deterministic-id";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { parseStreamingJson } from "../utils/json-parse";
+import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse";
+import { connectProxiedSocket, getProxyForProvider, shouldBypassProxy } from "../utils/proxy";
 import { createRequestDebugSession, isRequestDebugEnabled, type RequestDebugResponseLog } from "../utils/request-debug";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
 import { toolWireSchema } from "../utils/schema/wire";
@@ -376,7 +378,15 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					})
 				: undefined;
 
-			h2Client = http2.connect(baseUrl);
+			const proxyUrl = shouldBypassProxy(new URL(baseUrl)) ? undefined : getProxyForProvider(model.provider);
+			if (proxyUrl) {
+				const tlsSocket = await connectProxiedSocket(proxyUrl, baseUrl);
+				h2Client = http2.connect(baseUrl, {
+					createConnection: () => tlsSocket,
+				});
+			} else {
+				h2Client = http2.connect(baseUrl);
+			}
 
 			h2Request = h2Client.request(requestHeaders);
 
@@ -548,24 +558,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}
 			});
 
-			if (state.currentTextBlock) {
-				const idx = output.content.indexOf(state.currentTextBlock);
-				stream.push({
-					type: "text_end",
-					contentIndex: idx,
-					content: state.currentTextBlock.text,
-					partial: output,
-				});
-			}
-			if (state.currentThinkingBlock) {
-				const idx = output.content.indexOf(state.currentThinkingBlock);
-				stream.push({
-					type: "thinking_end",
-					contentIndex: idx,
-					content: state.currentThinkingBlock.thinking,
-					partial: output,
-				});
-			}
+			endCurrentTextBlock(output, stream, state);
+			endCurrentThinkingBlock(output, stream, state);
 			if (state.currentToolCall) {
 				const idx = output.content.indexOf(state.currentToolCall);
 				state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall.partialJson);
@@ -1797,13 +1791,10 @@ function parseToolArgsJson(text: string): unknown {
 		return text;
 	}
 	try {
-		const normalized = trimmed
-			.replace(/\bNone\b/g, "null")
-			.replace(/\bTrue\b/g, "true")
-			.replace(/\bFalse\b/g, "false");
-		return Bun.JSON5.parse(normalized);
-	} catch {}
-	return text;
+		return parseJsonWithRepair<unknown>(trimmed);
+	} catch {
+		return text;
+	}
 }
 
 function decodeMcpArgValue(value: Uint8Array): unknown {
@@ -1972,6 +1963,38 @@ export function mergeCursorMcpToolCallArgs(
 	return merged;
 }
 
+function endCurrentTextBlock(output: AssistantMessage, stream: AssistantMessageEventStream, state: BlockState): void {
+	const block = state.currentTextBlock;
+	if (!block) return;
+	const idx = output.content.indexOf(block);
+	delete (block as { index?: number }).index;
+	stream.push({
+		type: "text_end",
+		contentIndex: idx,
+		content: block.text,
+		partial: output,
+	});
+	state.setTextBlock(null);
+}
+
+function endCurrentThinkingBlock(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	state: BlockState,
+): void {
+	const block = state.currentThinkingBlock;
+	if (!block) return;
+	const idx = output.content.indexOf(block);
+	delete (block as { index?: number }).index;
+	stream.push({
+		type: "thinking_end",
+		contentIndex: idx,
+		content: block.thinking,
+		partial: output,
+	});
+	state.setThinkingBlock(null);
+}
+
 /** Exported for tests: drives one Cursor interaction update through the streaming state machine. */
 export function processInteractionUpdate(
 	update: any,
@@ -2017,18 +2040,10 @@ export function processInteractionUpdate(
 		const idx = output.content.indexOf(state.currentThinkingBlock!);
 		stream.push({ type: "thinking_delta", contentIndex: idx, delta, partial: output });
 	} else if (updateCase === "thinkingCompleted") {
-		if (state.currentThinkingBlock) {
-			const idx = output.content.indexOf(state.currentThinkingBlock);
-			delete (state.currentThinkingBlock as any).index;
-			stream.push({
-				type: "thinking_end",
-				contentIndex: idx,
-				content: state.currentThinkingBlock.thinking,
-				partial: output,
-			});
-			state.setThinkingBlock(null);
-		}
+		endCurrentThinkingBlock(output, stream, state);
 	} else if (updateCase === "toolCallStarted") {
+		endCurrentTextBlock(output, stream, state);
+		endCurrentThinkingBlock(output, stream, state);
 		const toolCall = update.message.value.toolCall;
 		if (toolCall) {
 			const mcpCall = toolCall.mcpToolCall;
@@ -2254,19 +2269,6 @@ function extractAssistantMessageText(msg: Message): string {
 }
 
 /**
- * Derive a stable, UUID-formatted `message_id` from a content key.
- * Ensures identical historical messages hash to the same blob IDs across
- * requests, so `conversationBlobStores` does not grow unboundedly and
- * unchanged history reuses existing blob IDs.
- */
-type CursorMessageId = `${string}-${string}-${string}-${string}-${string}`;
-
-function deterministicMessageId(key: string): CursorMessageId {
-	const hex = createHash("sha256").update(key).digest("hex");
-	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
-}
-
-/**
  * Index of the last user/developer message in `messages`, or -1 if none.
  * Used to exclude the current user turn from history builders — it goes in
  * `ConversationActionSchema.userMessageAction`, not in history structures.
@@ -2389,7 +2391,7 @@ function buildConversationTurns(
 		const userMessage = createCursorUserMessage(
 			msg.content,
 			userText,
-			deterministicMessageId(`u:${turns.length}:${cursorUserContentKey(msg.content)}`),
+			deterministicUuid(`u:${turns.length}:${cursorUserContentKey(msg.content)}`),
 		);
 		const userMessageBytes = toBinary(UserMessageSchema, userMessage);
 		const userMessageBlobId = storeCursorBlob(blobStore, userMessageBytes);

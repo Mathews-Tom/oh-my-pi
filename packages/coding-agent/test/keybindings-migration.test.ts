@@ -3,9 +3,13 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings";
+import { matchesAppFollowUp } from "@oh-my-pi/pi-coding-agent/modes/utils/keybinding-matchers";
 import { setKeybindings } from "@oh-my-pi/pi-tui";
 import { YAML } from "bun";
 
+function ctrl(key: string): string {
+	return String.fromCharCode(key.toLowerCase().charCodeAt(0) & 31);
+}
 describe("KeybindingsManager.create", () => {
 	beforeEach(() => {
 		setKeybindings(KeybindingsManager.inMemory());
@@ -49,6 +53,43 @@ describe("KeybindingsManager.create", () => {
 				"tui.select.confirm": "enter",
 			});
 			expect(writtenConfig).not.toHaveProperty("selectModelTemporary");
+			expect(await Bun.file(jsonPath).exists()).toBe(true);
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	it("migrates legacy keybinding JSON with comments to YAML during create", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-keybindings-"));
+		const jsonPath = path.join(agentDir, "keybindings.json");
+		const ymlPath = path.join(agentDir, "keybindings.yml");
+
+		await Bun.write(
+			jsonPath,
+			`{
+	// Legacy config files may contain comments from hand-edited examples.
+	"fork": "ctrl+f",
+	"selectConfirm": "enter",
+	"cursorUp": "ctrl+p",
+	"app.clipboard.copyPrompt": ["alt+c", "ctrl+shift+c"]
+}
+`,
+		);
+
+		try {
+			const manager = KeybindingsManager.create(agentDir);
+			const writtenConfig = YAML.parse(await Bun.file(ymlPath).text());
+
+			expect(manager.getKeys("app.session.fork")).toEqual(["ctrl+f"]);
+			expect(manager.getKeys("tui.select.confirm")).toEqual(["enter"]);
+			expect(manager.getKeys("tui.editor.cursorUp")).toEqual(["ctrl+p"]);
+			expect(manager.getKeys("app.clipboard.copyPrompt")).toEqual(["alt+c", "ctrl+shift+c"]);
+			expect(writtenConfig).toEqual({
+				"app.clipboard.copyPrompt": ["alt+c", "ctrl+shift+c"],
+				"app.session.fork": "ctrl+f",
+				"tui.editor.cursorUp": "ctrl+p",
+				"tui.select.confirm": "enter",
+			});
 			expect(await Bun.file(jsonPath).exists()).toBe(true);
 		} finally {
 			await fs.rm(agentDir, { recursive: true, force: true });
@@ -151,11 +192,14 @@ describe("KeybindingsManager.create", () => {
 		const manager = KeybindingsManager.inMemory({
 			"app.plan.toggle": "ctrl+q",
 		});
+		setKeybindings(manager);
 
 		expect(manager.getKeys("app.plan.toggle")).toEqual(["ctrl+q"]);
 		expect(manager.getKeys("app.message.followUp")).toEqual(["ctrl+enter"]);
 		expect(manager.getDisplayString("app.message.followUp")).toBe("Ctrl+Enter");
 		expect(manager.getEffectiveConfig()["app.message.followUp"]).toBe("ctrl+enter");
+		expect(matchesAppFollowUp(ctrl("q"))).toBe(false);
+		expect(matchesAppFollowUp("\x1b[13;5u")).toBe(true);
 	});
 
 	it("keeps the Ctrl+Q follow-up default when only an unknown config key claims it (#1903)", () => {

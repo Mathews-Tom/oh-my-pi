@@ -1,12 +1,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
 import { type Component, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import { settings } from "../../../config/settings";
 import type { AgentSession } from "../../../session/agent-session";
+import type { OAuthAccountIdentity } from "../../../session/auth-storage";
+import { limitMatchesActiveAccount } from "../../../slash-commands/helpers/active-oauth-account";
 import * as git from "../../../utils/git";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
 import { sanitizeStatusText } from "../../shared";
@@ -154,6 +156,8 @@ interface ContextUsageMemo {
 }
 
 const EMPTY_MESSAGES: readonly AgentMessage[] = [];
+const STATUS_USAGE_START_DELAY_MS = 0;
+const STATUS_USAGE_REFRESH_TIMEOUT_MS = 2_000;
 
 function hasContextSegment(segments: readonly StatusLineSegmentId[]): boolean {
 	return segments.includes("context_pct") || segments.includes("context_total");
@@ -181,6 +185,7 @@ export class StatusLineComponent implements Component {
 	#cachedBranchCwd: string | undefined = undefined;
 	#gitWatcher: fs.FSWatcher | null = null;
 	#onBranchChange: (() => void) | null = null;
+	#disposed = false;
 	#autoCompactEnabled: boolean = true;
 	#hookStatuses: Map<string, string> = new Map();
 	#subagentCount: number = 0;
@@ -204,13 +209,16 @@ export class StatusLineComponent implements Component {
 	#lastTokensPerSecond: number | null = null;
 	#lastTokensPerSecondTimestamp: number | null = null;
 
-	// Anthropic usage caching (5-min TTL, OAuth/sub only)
+	// Provider usage caching (5-min TTL, OAuth/sub only)
 	#cachedUsage: {
+		tier?: string;
 		fiveHour?: { percent: number; resetMinutes?: number };
 		sevenDay?: { percent: number; resetHours?: number };
 	} | null = null;
+	#cachedUsageContextKey: string | null = null;
 	#usageFetchedAt = 0;
 	#usageInFlight = false;
+	#usageStartTimer: Timer | null = null;
 	// Context-usage memo. The status line redraws on every agent event, so the
 	// hot path must not recompute context tokens unless an input changed.
 	// `getContextUsage()` anchors on the last assistant's real prompt-token
@@ -329,6 +337,7 @@ export class StatusLineComponent implements Component {
 
 		try {
 			this.#gitWatcher = fs.watch(watchPath, () => {
+				if (this.#disposed) return;
 				this.#invalidateGitCaches();
 				if (this.#onBranchChange) {
 					this.#onBranchChange();
@@ -340,16 +349,26 @@ export class StatusLineComponent implements Component {
 	}
 
 	dispose(): void {
+		this.#disposed = true;
+		this.#onBranchChange = null;
+		this.#clearUsageStartTimer();
 		if (this.#gitWatcher) {
 			this.#gitWatcher.close();
 			this.#gitWatcher = null;
 		}
 	}
 
+	#clearUsageStartTimer(): void {
+		if (!this.#usageStartTimer) return;
+		clearTimeout(this.#usageStartTimer);
+		this.#usageStartTimer = null;
+	}
+
 	invalidate(): void {
 		this.#invalidateGitCaches();
 	}
 	#invalidateSessionCaches(): void {
+		this.#clearUsageStartTimer();
 		this.#cachedUsage = null;
 		this.#usageFetchedAt = 0;
 		this.#usageInFlight = false;
@@ -391,6 +410,7 @@ export class StatusLineComponent implements Component {
 			this.#defaultBranch = "main";
 			(async () => {
 				const resolved = await git.branch.default(getProjectDir());
+				if (this.#disposed) return;
 				if (resolved) {
 					this.#defaultBranch = resolved;
 					if (this.#onBranchChange) {
@@ -460,6 +480,7 @@ export class StatusLineComponent implements Component {
 			try {
 				// Requires `gh repo set-default` to be configured; fails gracefully if not
 				const result = await $`gh pr view --json number,url`.quiet().nothrow();
+				if (this.#disposed) return;
 				if (result.exitCode !== 0) {
 					setCachedPr(null);
 					return;
@@ -471,10 +492,11 @@ export class StatusLineComponent implements Component {
 					setCachedPr(null);
 				}
 			} catch {
+				if (this.#disposed) return;
 				setCachedPr(null);
 			} finally {
 				this.#prLookupInFlight = false;
-				if (this.#onBranchChange) {
+				if (!this.#disposed && this.#onBranchChange) {
 					this.#onBranchChange();
 				}
 			}
@@ -513,53 +535,121 @@ export class StatusLineComponent implements Component {
 		return null;
 	}
 
+	#getUsageContextKey(session: AgentSession): string {
+		const activeProvider = session.state.model?.provider ?? session.model?.provider ?? "";
+		if (!activeProvider) return "";
+		const identity = session.modelRegistry?.authStorage?.getOAuthAccountIdentity(activeProvider, session.sessionId);
+		return [activeProvider, identity?.accountId ?? "", identity?.email ?? "", identity?.projectId ?? ""].join("\0");
+	}
+
 	/**
-	 * Background-refresh the Anthropic OAuth quota report. Guarded by a 5-min
-	 * TTL on both success (cache lifetime) and error (backoff). Exposed
-	 * (non-private) so unit tests can verify the backoff invariant.
+	 * Startup redraws only arm a short-delayed task; timeout releases the render
+	 * cadence while a late successful fetch can still refresh the cached segment.
 	 */
 	refreshUsageInBackground(): void {
 		const now = Date.now();
-		if (this.#usageInFlight) return;
-		if (this.#usageFetchedAt > 0 && now - this.#usageFetchedAt < 5 * 60_000) return;
 		const session = this.session;
-		const fetcher = (session as { fetchUsageReports?: () => Promise<unknown> }).fetchUsageReports;
+		const usageContextKey = this.#getUsageContextKey(session);
+		if (this.#cachedUsageContextKey !== usageContextKey) {
+			this.#cachedUsage = null;
+			this.#usageFetchedAt = 0;
+			this.#cachedUsageContextKey = usageContextKey;
+		}
+		if (this.#usageInFlight || this.#usageStartTimer) return;
+		if (this.#usageFetchedAt > 0 && now - this.#usageFetchedAt < 5 * 60_000) return;
+		const fetcher = (session as { fetchUsageReports?: (signal?: AbortSignal) => Promise<unknown> }).fetchUsageReports;
 		if (typeof fetcher !== "function") return;
 		this.#usageInFlight = true;
-		void fetcher
-			.call(session)
+		this.#usageStartTimer = setTimeout(() => {
+			this.#usageStartTimer = null;
+			void this.#runUsageRefresh(session, fetcher);
+		}, STATUS_USAGE_START_DELAY_MS);
+	}
+
+	async #runUsageRefresh(session: AgentSession, fetcher: (signal?: AbortSignal) => Promise<unknown>): Promise<void> {
+		if (this.#disposed || this.session !== session) {
+			this.#usageInFlight = false;
+			return;
+		}
+		const signal = AbortSignal.timeout(STATUS_USAGE_REFRESH_TIMEOUT_MS);
+		let reportsPromise: Promise<unknown> | undefined;
+		try {
+			reportsPromise = fetcher.call(session, signal);
+			this.#applyUsageRefreshReports(session, await this.#raceUsageRefreshWithSignal(reportsPromise, signal));
+		} catch {
+			if (this.session !== session) return;
+			this.#usageFetchedAt = Date.now();
+			if (signal.aborted && reportsPromise) {
+				this.#observeLateUsageRefresh(session, reportsPromise);
+			}
+		} finally {
+			if (this.session === session) this.#usageInFlight = false;
+		}
+	}
+
+	#applyUsageRefreshReports(session: AgentSession, reports: unknown): void {
+		if (this.#disposed || this.session !== session) return;
+		const activeProvider = session.state.model?.provider ?? session.model?.provider;
+		const activeIdentity =
+			activeProvider && session.modelRegistry?.authStorage
+				? session.modelRegistry.authStorage.getOAuthAccountIdentity(activeProvider, session.sessionId)
+				: undefined;
+		this.#cachedUsage = this.#normalizeUsageReports(reports, activeProvider, activeIdentity);
+		this.#usageFetchedAt = Date.now();
+	}
+
+	#observeLateUsageRefresh(session: AgentSession, reportsPromise: Promise<unknown>): void {
+		void reportsPromise
 			.then(reports => {
-				if (this.session !== session) return;
-				this.#cachedUsage = this.#normalizeUsageReports(reports);
-				this.#usageFetchedAt = Date.now();
+				this.#applyUsageRefreshReports(session, reports);
 			})
 			.catch(() => {
-				if (this.session !== session) return;
-				// Backoff on error: stamp the fetch time so the 5-min TTL guard
-				// also acts as an error budget. Without this, every render
-				// kicks off another fetch (gated only by #usageInFlight),
-				// which hammers the endpoint during a network outage / 5xx.
+				if (this.#disposed || this.session !== session) return;
 				this.#usageFetchedAt = Date.now();
-			})
-			.finally(() => {
-				if (this.session === session) this.#usageInFlight = false;
 			});
 	}
 
-	#normalizeUsageReports(reports: unknown): {
+	async #raceUsageRefreshWithSignal(promise: Promise<unknown>, signal: AbortSignal): Promise<unknown> {
+		if (signal.aborted) throw signal.reason;
+		const aborted = Promise.withResolvers<never>();
+		const onAbort = () => aborted.reject(signal.reason);
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			return await Promise.race([promise, aborted.promise]);
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+	}
+
+	#normalizeUsageReports(
+		reports: unknown,
+		activeProvider?: string,
+		activeIdentity?: OAuthAccountIdentity,
+	): {
+		tier?: string;
 		fiveHour?: { percent: number; resetMinutes?: number };
 		sevenDay?: { percent: number; resetHours?: number };
 	} | null {
 		if (!Array.isArray(reports)) return null;
 		let fiveHour: { percent: number; resetMinutes?: number } | undefined;
 		let sevenDay: { percent: number; resetHours?: number } | undefined;
+		let fiveHourTier: string | undefined;
+		let sevenDayTier: string | undefined;
 		const now = Date.now();
 		for (const report of reports) {
 			if (!report || typeof report !== "object") continue;
+			const provider = (report as { provider?: unknown }).provider;
+			if (activeProvider && provider !== activeProvider) continue;
 			const limits = (report as { limits?: unknown }).limits;
 			if (!Array.isArray(limits)) continue;
 			for (const limit of limits) {
 				if (!limit || typeof limit !== "object") continue;
+				if (
+					activeIdentity &&
+					!limitMatchesActiveAccount(report as UsageReport, limit as UsageLimit, activeIdentity)
+				) {
+					continue;
+				}
 				const l = limit as {
 					scope?: { windowId?: string; tier?: string };
 					window?: { resetsAt?: number };
@@ -570,23 +660,30 @@ export class StatusLineComponent implements Component {
 				const windowId = l.scope?.windowId;
 				const tier = l.scope?.tier;
 				const resetsAt = l.window?.resetsAt;
-				if (windowId === "5h" && !tier && !fiveHour) {
+				// Accept tiered limits, but prefer untiered (backward compat with Anthropic).
+				// An untiered limit always replaces a tiered one; among same-tieredness, first wins.
+				if (windowId === "5h" && (!fiveHour || (fiveHourTier !== undefined && !tier))) {
 					fiveHour = {
 						percent: fraction * 100,
 						resetMinutes:
 							typeof resetsAt === "number" ? Math.max(0, Math.round((resetsAt - now) / 60_000)) : undefined,
 					};
-				} else if (windowId === "7d" && !tier && !sevenDay) {
+					fiveHourTier = tier || undefined;
+				}
+				if (windowId === "7d" && (!sevenDay || (sevenDayTier !== undefined && !tier))) {
 					sevenDay = {
 						percent: fraction * 100,
 						resetHours:
 							typeof resetsAt === "number" ? Math.max(0, Math.round((resetsAt - now) / 3_600_000)) : undefined,
 					};
+					sevenDayTier = tier || undefined;
 				}
 			}
 		}
 		if (!fiveHour && !sevenDay) return null;
-		return { fiveHour, sevenDay };
+		// Single compact label; prefer the five-hour tier if displayed windows ever disagree.
+		const effectiveTier = fiveHourTier ?? sevenDayTier;
+		return { tier: effectiveTier, fiveHour, sevenDay };
 	}
 
 	/**
@@ -674,10 +771,12 @@ export class StatusLineComponent implements Component {
 
 		let contextWindow = state.model?.contextWindow ?? this.session.model?.contextWindow ?? 0;
 		let contextPercent: number | null = 0;
+		let contextTokens = 0;
 		if (includeContext) {
 			const breakdown = this.getCachedContextBreakdown();
+			contextTokens = breakdown.usedTokens;
 			contextWindow = breakdown.contextWindow || contextWindow;
-			contextPercent = contextWindow > 0 ? (breakdown.usedTokens / contextWindow) * 100 : 0;
+			contextPercent = contextWindow > 0 ? (breakdown.usedTokens / contextWindow) * 100 : null;
 		}
 
 		// Collab guest: context comes from the host's state frames — the local
@@ -685,6 +784,7 @@ export class StatusLineComponent implements Component {
 		const collabState = this.#collabStatus?.stateOverride;
 		if (collabState?.contextUsage) {
 			contextWindow = collabState.contextUsage.contextWindow || contextWindow;
+			contextTokens = collabState.contextUsage.tokens ?? contextTokens;
 			contextPercent = collabState.contextUsage.percent ?? contextPercent;
 		}
 
@@ -703,6 +803,7 @@ export class StatusLineComponent implements Component {
 			collab: this.#collabStatus,
 			usageStats,
 			contextPercent,
+			contextTokens,
 			contextWindow,
 			autoCompactEnabled: this.#autoCompactEnabled,
 			subagentCount: this.#subagentCount,

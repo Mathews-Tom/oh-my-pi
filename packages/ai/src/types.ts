@@ -20,6 +20,7 @@ import type {
 } from "@oh-my-pi/pi-catalog/discovery/cursor-gen/agent_pb";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { Api, FetchImpl, KnownApi, Model, Provider, ThinkingBudgets, Usage } from "@oh-my-pi/pi-catalog/types";
+import type { Type } from "arktype";
 import type { ZodType, z } from "zod/v4";
 import type { ApiKey } from "./auth-retry";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
@@ -27,6 +28,7 @@ import type { AnthropicOptions } from "./providers/anthropic";
 import type { StopDetails } from "./providers/anthropic-wire";
 import type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses";
 import type { CursorOptions } from "./providers/cursor";
+import type { DevinOptions } from "./providers/devin";
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
@@ -57,6 +59,7 @@ export interface ApiOptionsMap {
 	"bedrock-converse-stream": BedrockOptions;
 	"openai-completions": OpenAICompletionsOptions;
 	"openai-responses": OpenAIResponsesOptions;
+	openrouter: OpenAIResponsesOptions | OpenAICompletionsOptions;
 	"openai-codex-responses": OpenAICodexResponsesOptions;
 	"azure-openai-responses": AzureOpenAIResponsesOptions;
 	"google-generative-ai": GoogleOptions;
@@ -64,6 +67,7 @@ export interface ApiOptionsMap {
 	"google-vertex": GoogleVertexOptions;
 	"ollama-chat": OllamaChatOptions;
 	"cursor-agent": CursorOptions;
+	"devin-agent": DevinOptions;
 }
 // Compile-time exhaustiveness check - this will fail if ApiOptionsMap doesn't have all KnownApi keys
 type _CheckExhaustive =
@@ -139,18 +143,25 @@ export function resolveServiceTier(
 }
 
 /**
- * True when the (possibly scoped) tier should be sent as OpenAI's
- * `service_tier` request field for the given provider. Non-OpenAI
- * providers, unsupported tiers (`"auto"`, `"default"`), and scope
- * mismatches all return false.
+ * True when the (possibly scoped) tier should be sent on the wire as the
+ * `service_tier` request field for the given provider. OpenAI / OpenAI-Codex
+ * accept `flex`/`scale`/`priority`; Fireworks Serverless realizes only its
+ * Priority serving path (`service_tier: "priority"`) on the OpenAI-compatible
+ * chat-completions endpoint. Unsupported tiers (`"auto"`, `"default"`), other
+ * providers, and scope mismatches all return false.
  */
 export function shouldSendServiceTier(
 	serviceTier: ServiceTier | null | undefined,
 	provider: Provider | undefined,
 ): boolean {
-	if (provider !== "openai" && provider !== "openai-codex") return false;
 	const resolved = resolveServiceTier(serviceTier, provider);
-	return resolved === "flex" || resolved === "scale" || resolved === "priority";
+	if (provider === "openai" || provider === "openai-codex") {
+		return resolved === "flex" || resolved === "scale" || resolved === "priority";
+	}
+	if (provider === "fireworks") {
+		return resolved === "priority";
+	}
+	return false;
 }
 
 /**
@@ -234,6 +245,13 @@ export interface StreamOptions {
 	 * For example, Anthropic uses `user_id` for abuse tracking and rate limiting.
 	 */
 	metadata?: Record<string, unknown>;
+	/**
+	 * Config options for the thinking/response loop guard.
+	 */
+	loopGuard?: {
+		enabled?: boolean;
+		checkAssistantContent?: boolean;
+	};
 	/**
 	 * Advisory token budget for a full agentic loop. Anthropic encodes this as
 	 * `output_config.task_budget` with the `task-budgets-2026-03-13` beta header.
@@ -425,7 +443,7 @@ export interface ToolCall {
 	type: "toolCall";
 	id: string;
 	name: string;
-	arguments: Record<string, any>;
+	arguments: Record<string, unknown>;
 	thoughtSignature?: string; // Google-specific: opaque signature for reusing thought context
 	intent?: string; // Harness-level intent metadata extracted from traced tool arguments
 	/**
@@ -521,7 +539,7 @@ export interface AssistantMessage {
 	ttft?: number; // Time to first token in milliseconds
 }
 
-export interface ToolResultMessage<TDetails = any> {
+export interface ToolResultMessage<TDetails = unknown> {
 	role: "toolResult";
 	toolCallId: string;
 	toolName: string;
@@ -581,20 +599,26 @@ export interface CursorExecHandlers {
 
 /**
  * Plain JSON Schema document used by extension-authored tools (legacy TypeBox
- * emits this shape). Distinguished from Zod at runtime via {@link isZodSchema}.
+ * emits this shape). Distinguished from arktype at runtime.
  */
 export type TJsonSchema = Record<string, unknown>;
 
 /**
  * Schema type accepted by the {@link Tool} interface.
  *
- * Canonical authoring uses Zod. Extension compat may supply a JSON Schema
- * object (including TypeBox static schema objects).
+ * Canonical authoring uses Zod or ArkType. Extension compat may supply a JSON
+ * Schema object (including TypeBox static schema objects).
  */
-export type TSchema = ZodType | TJsonSchema;
+export type TSchema = ZodType | Type | TJsonSchema;
 
 /** Resolve parameter types for tool execution / handlers. */
-export type Static<S> = S extends ZodType ? z.infer<S> : S extends { static: infer T } ? T : unknown;
+export type Static<S> = S extends ZodType
+	? z.infer<S>
+	: S extends Type
+		? S["infer"]
+		: S extends { static: infer T }
+			? T
+			: unknown;
 
 export interface ToolCallExample<TArgs = Record<string, unknown>> {
 	caption?: string;
@@ -641,9 +665,9 @@ export interface Tool<TParameters extends TSchema = TSchema> {
 	 * Illustrative calls/notes; the AI layer renders them into an `<examples>`
 	 * block in the model's native tool-call syntax and appends to the wire
 	 * description. Author `call`/`bad`/`good` as plain argument objects WITHOUT
-	 * `_i` — when intent tracing injects `_i` into the schema, the renderer adds
-	 * a placeholder `_i` automatically. Type each tool's `examples` against its
-	 * own schema (e.g. `readonly ToolExample<z.input<typeof schema>>[]`).
+	 * `i` — when intent tracing injects `i` into the schema, the renderer adds
+	 * a placeholder `i` automatically. Type each tool's `examples` against its
+	 * own schema (e.g. `readonly ToolExample<typeof schema["type"]>[]`).
 	 */
 	examples?: readonly ToolExample[];
 }

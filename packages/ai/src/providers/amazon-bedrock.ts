@@ -31,7 +31,7 @@ import type {
 import { normalizeToolCallId, resolveCacheRetention } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump } from "../utils/http-inspector";
-import { getStreamFirstEventTimeoutMs } from "../utils/idle-iterator";
+import { armPreResponseTimeout, getStreamFirstEventTimeoutMs } from "../utils/idle-iterator";
 import { parseStreamingJson, parseStreamingJsonThrottled } from "../utils/json-parse";
 import { toolWireSchema } from "../utils/schema/wire";
 import { invalidateAwsCredentialCache, resolveAwsCredentials } from "./aws-credentials";
@@ -78,6 +78,83 @@ const AUTHENTICATED_API_KEY_SENTINEL = "<authenticated>";
 function resolveBearerToken(options: BedrockOptions): string | undefined {
 	const apiKey = options.apiKey === AUTHENTICATED_API_KEY_SENTINEL ? undefined : options.apiKey;
 	return options.bearerToken || apiKey || $env.AWS_BEARER_TOKEN_BEDROCK;
+}
+
+function inferRegionFromBedrockArn(modelId: string): string | undefined {
+	const parts = modelId.split(":", 6);
+	if (parts[0] !== "arn" || parts[2] !== "bedrock") return undefined;
+	const region = parts[3];
+	return region || undefined;
+}
+
+/**
+ * Default AWS region for each Bedrock cross-region inference-profile geo prefix.
+ * A geo-prefixed profile (e.g. `eu.anthropic.claude-…`) is only servable from
+ * regions in its own geo, so routing one to `us-east-1` yields HTTP 400 "The
+ * provided model identifier is invalid." `global.` profiles are anchored in the
+ * us regions and intentionally absent here (they resolve fine via `us-east-1`).
+ */
+const INFERENCE_PROFILE_GEO_DEFAULT_REGION: Record<string, string> = {
+	us: "us-east-1",
+	"us-gov": "us-gov-west-1",
+	eu: "eu-west-1",
+	apac: "ap-southeast-1",
+	au: "ap-southeast-2",
+	jp: "ap-northeast-1",
+};
+
+/** Geo prefix of a cross-region inference-profile id, e.g. `eu.anthropic.…` → `eu`. */
+function inferenceProfileGeo(modelId: string): string | undefined {
+	const dot = modelId.indexOf(".");
+	if (dot <= 0) return undefined;
+	const prefix = modelId.slice(0, dot);
+	return prefix in INFERENCE_PROFILE_GEO_DEFAULT_REGION ? prefix : undefined;
+}
+
+/**
+ * Whether a concrete AWS region can serve a given inference-profile geo. The
+ * `ap-` regions overlap across `apac`/`au`/`jp` profiles, so the Australia and
+ * Japan geos pin their specific source regions rather than matching all `ap-*`.
+ */
+function regionServesGeo(region: string, geo: string): boolean {
+	switch (geo) {
+		case "us-gov":
+			return region.startsWith("us-gov-");
+		case "us":
+			return region.startsWith("us-") && !region.startsWith("us-gov-");
+		case "eu":
+			return region.startsWith("eu-");
+		case "apac":
+			return region.startsWith("ap-");
+		case "au":
+			return region === "ap-southeast-2" || region === "ap-southeast-4";
+		case "jp":
+			return region === "ap-northeast-1" || region === "ap-northeast-3";
+		default:
+			return false;
+	}
+}
+
+/**
+ * Resolve the Bedrock runtime region for a request. An explicit per-request
+ * region and an ARN-embedded region win outright. Otherwise, for a geo-prefixed
+ * cross-region inference profile (`us.`/`eu.`/`apac.`/`au.`/`jp.`/`us-gov.`), an
+ * ambient region (`AWS_REGION` / `AWS_DEFAULT_REGION`) is honored only when it
+ * can serve the profile's geo; a mismatched or absent ambient region is
+ * corrected to the geo default so an `eu.`/`apac.` profile never POSTs to a `us`
+ * endpoint (and vice versa). `global.` profiles have no geo entry, so the
+ * ambient region (or `us-east-1`) is used unchanged.
+ */
+function resolveBedrockRegion(modelId: string, options: BedrockOptions): string {
+	const explicit = options.region || inferRegionFromBedrockArn(modelId);
+	if (explicit) return explicit;
+	const ambient = $env.AWS_REGION || $env.AWS_DEFAULT_REGION;
+	const geo = inferenceProfileGeo(modelId);
+	if (geo) {
+		if (ambient && regionServesGeo(ambient, geo)) return ambient;
+		return INFERENCE_PROFILE_GEO_DEFAULT_REGION[geo];
+	}
+	return ambient || "us-east-1";
 }
 
 type Block = (TextContent | ThinkingContent | ToolCall) & {
@@ -133,6 +210,28 @@ interface WireToolChoice {
 interface WireToolConfig {
 	tools: WireToolSpec[];
 	toolChoice?: WireToolChoice;
+}
+
+/**
+ * Bedrock validates that requests carrying any `toolUse`/`toolResult` history
+ * include a `toolConfig`. For no-tool ephemeral turns (`/btw`, IRC auto-replies)
+ * we have nothing real to send, so we inject this placeholder. Its presence is
+ * tracked by a per-request flag — never the wire name — so callers who happen
+ * to register a real tool literally called `__no_tools__` are not affected.
+ */
+const NO_TOOLS_SENTINEL_NAME = "__no_tools__";
+
+const NO_TOOLS_SENTINEL: WireToolSpec = {
+	toolSpec: {
+		name: NO_TOOLS_SENTINEL_NAME,
+		description: "Placeholder required by Bedrock validation. Do not call; answer with text.",
+		inputSchema: { json: { type: "object", properties: {} } },
+	},
+};
+
+interface BedrockToolPlan {
+	toolConfig: WireToolConfig | undefined;
+	sentinelInjected: boolean;
 }
 
 interface ConverseStreamRequest {
@@ -206,14 +305,14 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 
 		const blocks = output.content as Block[];
 		let rawRequestDump: RawHttpRequestDump | undefined;
-		const region = options.region || $env.AWS_REGION || $env.AWS_DEFAULT_REGION || "us-east-1";
+		const region = resolveBedrockRegion(model.id, options);
 
 		try {
 			const cacheRetention = resolveCacheRetention(options.cacheRetention);
-			const historyHasToolBlocks = context.messages.some(
-				m => m.role === "toolResult" || (m.role === "assistant" && m.content.some(b => b.type === "toolCall")),
-			);
-			const toolConfig = convertToolConfig(context.tools, options.toolChoice, historyHasToolBlocks);
+			const convertedMessages = convertMessages(context, model, cacheRetention);
+			const toolPlan = planToolConfig(context.tools, options.toolChoice, convertedMessages);
+			const toolConfig = toolPlan.toolConfig;
+			const sentinelInjected = toolPlan.sentinelInjected;
 			let additionalModelRequestFields = buildAdditionalModelRequestFields(model, options);
 
 			// Bedrock rejects thinking + forced tool_choice ("any" or specific tool).
@@ -224,7 +323,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			}
 
 			const commandInput: ConverseStreamRequest = {
-				messages: convertMessages(context, model, cacheRetention),
+				messages: convertedMessages,
 				system: buildSystemPrompt(context.systemPrompt, model, cacheRetention),
 				inferenceConfig: {
 					maxTokens: options.maxTokens,
@@ -268,6 +367,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 						profile: options.profile,
 						region,
 						signal: options.signal,
+						fetch: options.fetch,
 					});
 				}
 				const signed = await signRequest({
@@ -290,23 +390,23 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 			// timer, otherwise a Bedrock/proxy that accepts the POST and never
 			// sends headers would hang forever.
 			const firstEventTimeoutMs = options.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs();
-			const preResponseWatchdog =
-				firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0
-					? AbortSignal.timeout(firstEventTimeoutMs)
-					: undefined;
-			const fetchSignal = preResponseWatchdog
-				? options.signal
-					? AbortSignal.any([options.signal, preResponseWatchdog])
-					: preResponseWatchdog
-				: options.signal;
-			const response = await fetchWithRetry(url, {
-				method: "POST",
-				headers: requestHeaders,
-				body,
-				signal: fetchSignal,
-				fetch: options.fetch,
-				timeout: false,
-			});
+			// Clear the pre-response timer the instant headers arrive (below): an
+			// absolute `AbortSignal.timeout` would keep aborting the actively
+			// streaming body, not just a stalled time-to-first-byte (issue #2422).
+			const watchdog = armPreResponseTimeout(options.signal, firstEventTimeoutMs);
+			let response: Response;
+			try {
+				response = await fetchWithRetry(url, {
+					method: "POST",
+					headers: requestHeaders,
+					body,
+					signal: watchdog.signal,
+					fetch: options.fetch,
+					timeout: false,
+				});
+			} finally {
+				watchdog.clear();
+			}
 
 			if (!response.ok) {
 				if (!bearerToken && (response.status === 401 || response.status === 403)) {
@@ -357,7 +457,7 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					}
 					case "contentBlockStart": {
 						if (!firstTokenTime) firstTokenTime = Date.now();
-						handleContentBlockStart(payload as ContentBlockStartEvent, blocks, output, stream);
+						handleContentBlockStart(payload as ContentBlockStartEvent, blocks, output, stream, sentinelInjected);
 						break;
 					}
 					case "contentBlockDelta": {
@@ -371,7 +471,10 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream"> = (
 					}
 					case "messageStop": {
 						const ev = payload as MessageStopEvent;
-						output.stopReason = mapStopReason(ev.stopReason);
+						// A sentinel-only request must never surface a tool-use stop:
+						// no real tool exists for the agent to dispatch.
+						output.stopReason =
+							sentinelInjected && ev.stopReason === "tool_use" ? "stop" : mapStopReason(ev.stopReason);
 						if (output.stopReason === "error") {
 							output.errorMessage = `Generation failed with stop reason: ${ev.stopReason ?? "unknown"}`;
 						}
@@ -450,9 +553,15 @@ function handleContentBlockStart(
 	blocks: Block[],
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
+	sentinelInjected: boolean,
 ): void {
 	const index = event.contentBlockIndex;
 	const start = event.start;
+
+	// Drop the sentinel call only when we injected it ourselves. A caller that
+	// registers a real tool named `__no_tools__` would otherwise lose its
+	// legitimate tool-use events on normal turns.
+	if (sentinelInjected && start?.toolUse?.name === NO_TOOLS_SENTINEL_NAME) return;
 
 	if (start?.toolUse) {
 		const block: Block = {
@@ -772,28 +881,48 @@ function convertMessages(
 	return result;
 }
 
-function convertToolConfig(
-	tools: Tool[] | undefined,
-	toolChoice: BedrockOptions["toolChoice"],
-	historyHasToolBlocks: boolean,
-): WireToolConfig | undefined {
-	if (!tools?.length) return undefined;
+function messagesHaveToolBlocks(messages: WireMessage[]): boolean {
+	for (const message of messages) {
+		for (const block of message.content) {
+			if ("toolUse" in block || "toolResult" in block) return true;
+		}
+	}
+	return false;
+}
 
-	const bedrockTools: WireToolSpec[] = tools.map(tool => ({
+function convertToolSpec(tool: Tool): WireToolSpec {
+	return {
 		toolSpec: {
 			name: tool.name,
 			description: tool.description || "",
 			inputSchema: { json: toolWireSchema(tool) },
 		},
-	}));
+	};
+}
 
-	// Bedrock rejects requests whose history contains toolUse/toolResult blocks without a
-	// toolConfig. With prior tool use we must keep the tool specs and merely omit the choice
-	// (there is no "none" choice on Converse); dropping toolConfig entirely would 400.
+function planToolConfig(
+	tools: Tool[] | undefined,
+	toolChoice: BedrockOptions["toolChoice"],
+	messages: WireMessage[],
+): BedrockToolPlan {
+	const activeTools = tools ?? [];
+	const hasTools = activeTools.length > 0;
+	const historyHasToolBlocks = messagesHaveToolBlocks(messages);
+
 	if (toolChoice === "none") {
-		return historyHasToolBlocks ? { tools: bedrockTools } : undefined;
+		if (!historyHasToolBlocks) return { toolConfig: undefined, sentinelInjected: false };
+		if (!hasTools) {
+			return {
+				toolConfig: { tools: [NO_TOOLS_SENTINEL], toolChoice: { auto: {} } },
+				sentinelInjected: true,
+			};
+		}
+		return { toolConfig: { tools: activeTools.map(convertToolSpec) }, sentinelInjected: false };
 	}
 
+	if (!hasTools) return { toolConfig: undefined, sentinelInjected: false };
+
+	const bedrockTools = activeTools.map(convertToolSpec);
 	let bedrockToolChoice: WireToolChoice | undefined;
 	switch (toolChoice) {
 		case "auto":
@@ -808,7 +937,7 @@ function convertToolConfig(
 			}
 	}
 
-	return { tools: bedrockTools, toolChoice: bedrockToolChoice };
+	return { toolConfig: { tools: bedrockTools, toolChoice: bedrockToolChoice }, sentinelInjected: false };
 }
 
 function mapStopReason(reason: string | undefined): StopReason {

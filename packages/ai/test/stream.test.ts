@@ -10,7 +10,7 @@ import type { Api, Context, ImageContent, Model, OptionsForApi, Tool, ToolResult
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { $which } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
+import { type } from "arktype";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -36,12 +36,10 @@ function hasBedrockCredentials(): boolean {
 }
 
 // Calculator tool definition (same as examples)
-const calculatorSchema = z.object({
-	a: z.number().describe("First number"),
-	b: z.number().describe("Second number"),
-	operation: z
-		.enum(["add", "subtract", "multiply", "divide"])
-		.describe("The operation to perform. One of 'add', 'subtract', 'multiply', 'divide'."),
+const calculatorSchema = type({
+	a: "number",
+	b: "number",
+	operation: "'add'|'subtract'|'multiply'|'divide'",
 });
 
 const calculatorTool: Tool<typeof calculatorSchema> = {
@@ -310,7 +308,9 @@ async function multiTurn<TApi extends Api>(model: Model<TApi>, options?: Options
 				expect(block.id).toBeTruthy();
 				expect(block.arguments).toBeTruthy();
 
-				const { a, b, operation } = block.arguments;
+				const a = Number(block.arguments.a);
+				const b = Number(block.arguments.b);
+				const operation = typeof block.arguments.operation === "string" ? block.arguments.operation : "";
 				let result: number;
 				switch (operation) {
 					case "add":
@@ -580,7 +580,12 @@ describe("Generate E2E Tests", () => {
 				contextWindow: 200_000,
 				maxTokens: 64_000,
 			});
-			const captured = Promise.withResolvers<{ url: string; authorization: string | null; body: unknown }>();
+			const captured = Promise.withResolvers<{
+				url: string;
+				authorization: string | null;
+				betaHeader: string | null;
+				body: unknown;
+			}>();
 
 			try {
 				__resetVertexTokenCache();
@@ -598,6 +603,7 @@ describe("Generate E2E Tests", () => {
 					{ messages: [{ role: "user", content: "Hello", timestamp: Date.now() }] },
 					{
 						apiKey: "<authenticated>",
+						thinkingEnabled: true,
 						fetch: async (input, init) => {
 							const url = input instanceof Request ? input.url : input.toString();
 							if (
@@ -611,6 +617,7 @@ describe("Generate E2E Tests", () => {
 							captured.resolve({
 								url,
 								authorization: headers.get("authorization"),
+								betaHeader: headers.get("anthropic-beta"),
 								body: JSON.parse(bodyText),
 							});
 							return new Response(JSON.stringify({ error: { message: "stop after capture" } }), { status: 400 });
@@ -632,6 +639,9 @@ describe("Generate E2E Tests", () => {
 					stream: true,
 				});
 				expect((request.body as Record<string, unknown>).model).toBeUndefined();
+				expect((request.body as Record<string, { type?: string }>).thinking?.type).toBe("enabled");
+				expect((request.body as Record<string, unknown>).context_management).toBeUndefined();
+				expect(request.betaHeader ?? "").not.toContain("context-management-2025-06-27");
 			} finally {
 				__resetVertexTokenCache();
 				homedirSpy.mockRestore();

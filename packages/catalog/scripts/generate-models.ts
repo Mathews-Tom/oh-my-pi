@@ -10,7 +10,8 @@ const COPILOT_PREMIUM_MULTIPLIERS: Record<string, number> = {
 };
 
 import * as path from "node:path";
-import { AuthStorage, type OAuthAccess, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import { discoverAuthStorage } from "@oh-my-pi/pi-ai/auth-broker/discover";
+import type { OAuthAccess } from "@oh-my-pi/pi-ai/auth-storage";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import { getGitLabDuoModels } from "@oh-my-pi/pi-ai/providers/gitlab-duo";
 import { $env } from "@oh-my-pi/pi-utils";
@@ -28,6 +29,7 @@ import {
 import { PROVIDER_DESCRIPTORS } from "../src/provider-models/descriptors";
 import {
 	ANTHROPIC_CURATED_FALLBACK_MODELS,
+	buildFireworksFastSeed,
 	buildXaiOAuthStaticSeed,
 	clampFireworksKimiMaxTokens,
 	clampKimiK27CodeMaxTokens,
@@ -35,6 +37,7 @@ import {
 	isKimiK27CodeModelId,
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
 	mapModelsDevToModels,
+	SAKANA_FUGU_STATIC_MODELS,
 	stripFireworksDeepSeekThinkingToggle,
 } from "../src/provider-models/openai-compat";
 import type { ModelSpec } from "../src/types";
@@ -59,6 +62,7 @@ const packageRoot = path.join(import.meta.dir, "..");
  * and never written to models.json.
  */
 const DISCOVERY_ONLY_PROVIDERS = new Set(["ollama", "vllm", "lm-studio", "litellm"]);
+const RETIRED_PROVIDERS = new Set(["wafer-pass"]);
 
 async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscoveryConfig): Promise<string | undefined> {
 	for (const envVar of catalog.envVars ?? []) {
@@ -69,10 +73,8 @@ async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscove
 	}
 
 	try {
-		const store = await SqliteAuthCredentialStore.open();
-		const authStorage = new AuthStorage(store);
+		const authStorage = await discoverAuthStorage();
 		try {
-			await authStorage.reload();
 			const storedApiKey = await authStorage.getApiKey(providerId);
 			if (storedApiKey) {
 				return storedApiKey;
@@ -88,10 +90,13 @@ async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscove
 				}
 			}
 		} finally {
-			store.close();
+			authStorage.close();
 		}
-	} catch {
-		// Ignore missing/unreadable auth storage.
+	} catch (err) {
+		console.warn(
+			`Warning: Failed to retrieve credentials for ${providerId}:`,
+			err instanceof Error ? err.message : String(err),
+		);
 	}
 
 	return undefined;
@@ -107,7 +112,8 @@ async function fetchProviderModelsFromCatalog(descriptor: CatalogProviderDescrip
 
 	try {
 		console.log(`Fetching models from ${descriptor.catalogDiscovery.label} model manager...`);
-		const manager = createModelManager(descriptor.createModelManagerOptions({ apiKey }));
+		const managerOptions = descriptor.createModelManagerOptions({ apiKey });
+		const manager = createModelManager(managerOptions);
 		const result = await manager.refresh("online");
 		// `stale: true` means the dynamic fetch failed and the manager fell back
 		// to merging the local agent.db model cache over the static catalog —
@@ -180,7 +186,7 @@ function applyGlobalModelsDevFallback(
 	const providerScopedKeys = new Set(modelsDevModels.map(model => `${model.provider}/${model.id}`));
 	const globalReferences = createGlobalModelsDevReferenceMap(modelsDevModels);
 	return models.map(model => {
-		if (providerScopedKeys.has(`${model.provider}/${model.id}`)) {
+		if (providerScopedKeys.has(`${model.provider}/${model.id}`) || model.provider === "devin") {
 			return model;
 		}
 		const reference = globalReferences.get(model.id);
@@ -336,19 +342,25 @@ const ANTIGRAVITY_ENDPOINT = ANTIGRAVITY_PRIMARY_ENDPOINT;
 
 async function getOAuthAccessFromStorage(provider: OAuthProvider): Promise<OAuthAccess | null> {
 	try {
-		const store = await SqliteAuthCredentialStore.open();
-		const authStorage = new AuthStorage(store);
+		const authStorage = await discoverAuthStorage();
 		try {
-			await authStorage.reload();
 			// `getOAuthAccess` runs the full AuthStorage refresh pipeline so an
 			// expired-but-refreshable credential gets rotated before discovery,
 			// and identity metadata (accountId/projectId/email) flows through
 			// for Codex/Antigravity downstream calls.
-			return (await authStorage.getOAuthAccess(provider)) ?? null;
+			let access = await authStorage.getOAuthAccess(provider);
+			if (!access && provider === "google-antigravity") {
+				access = await authStorage.getOAuthAccess("google-gemini-cli");
+			}
+			return access ?? null;
 		} finally {
-			store.close();
+			authStorage.close();
 		}
-	} catch {
+	} catch (err) {
+		console.warn(
+			`Warning: Failed to retrieve credentials for ${provider}:`,
+			err instanceof Error ? err.message : String(err),
+		);
 		return null;
 	}
 }
@@ -360,7 +372,8 @@ async function getOAuthAccessFromStorage(provider: OAuthProvider): Promise<OAuth
 async function fetchAntigravityModels(): Promise<ModelSpec<"google-gemini-cli">[]> {
 	const access = await getOAuthAccessFromStorage("google-antigravity");
 	if (!access) {
-		console.log("No Antigravity credentials found, will use previous models");
+		console.log("No Antigravity or Gemini CLI credentials found, will use previous models.");
+		console.log("Tip: If you are logged in under a specific profile, run with OMP_PROFILE=<name>.");
 		return [];
 	}
 	try {
@@ -404,6 +417,8 @@ function extractCodexAccountId(accessToken: string): string | null {
 async function fetchCodexDiscoveryModels(): Promise<ModelSpec<"openai-codex-responses">[]> {
 	const access = await getOAuthAccessFromStorage("openai-codex");
 	if (!access) {
+		console.log("No Codex credentials found, will use previous models.");
+		console.log("Tip: If you are logged in under a specific profile, run with OMP_PROFILE=<name>.");
 		return [];
 	}
 	try {
@@ -476,6 +491,17 @@ async function generateModels() {
 	// Mythos 5). Deduped behind upstream entries; metadata is pinned in
 	// applyAnthropicCatalogPolicy.
 	allModels.push(...ANTHROPIC_CURATED_FALLBACK_MODELS);
+	// Seed Sakana's documented Fugu models so the provider is usable when
+	// catalog generation has no live API key. If live `/v1/models` succeeds,
+	// Sakana is authoritative and stale seed IDs must stay out.
+	if (!authoritativeCatalogProviders.has("sakana")) {
+		allModels.push(...SAKANA_FUGU_STATIC_MODELS);
+	}
+	// Seed Fireworks "Fast" serving-path variants (`<id>-fast`). Fast routers are
+	// not enumerated by the serverless control-plane list, so discovery never
+	// surfaces them; the seed projects each base entry into a fast variant.
+	// Deduped behind any identical previous-snapshot entry.
+	allModels.push(...buildFireworksFastSeed());
 
 	const specialDiscoverySources = [
 		{ label: "Antigravity", fetch: fetchAntigravityModels },
@@ -515,6 +541,7 @@ async function generateModels() {
 			if (
 				!fetchedKeys.has(`${model.provider}/${model.id}`) &&
 				!DISCOVERY_ONLY_PROVIDERS.has(model.provider) &&
+				!RETIRED_PROVIDERS.has(model.provider) &&
 				!authoritativeCatalogProviders.has(model.provider) &&
 				!modelsDevSnapshotExcludedProviders.has(model.provider)
 			) {
@@ -552,7 +579,7 @@ async function generateModels() {
 	// Group by provider and sort each provider's models
 	const providers: Record<string, Record<string, ModelSpec>> = {};
 	for (const model of allModels) {
-		if (DISCOVERY_ONLY_PROVIDERS.has(model.provider)) continue;
+		if (DISCOVERY_ONLY_PROVIDERS.has(model.provider) || RETIRED_PROVIDERS.has(model.provider)) continue;
 		if (!providers[model.provider]) {
 			providers[model.provider] = {};
 		}

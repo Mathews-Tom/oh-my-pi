@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "bun:test";
+import { describe, expect, it, type Mock, vi } from "bun:test";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { InputController } from "@oh-my-pi/pi-coding-agent/modes/controllers/input-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import manualContinuePrompt from "../src/prompts/system/manual-continue.md" with { type: "text" };
@@ -20,7 +21,7 @@ type FakeEditor = {
 	onExpandTools?: () => void;
 	onToggleThinking?: () => void;
 	onExternalEditor?: () => void;
-	onDequeue?: () => void;
+	onRetry?: () => void;
 	onChange?: (text: string) => void;
 	onSubmit?: (text: string) => Promise<void>;
 	setText(text: string): void;
@@ -30,7 +31,26 @@ type FakeEditor = {
 	setCustomKeyHandler(key: string, handler: () => void): void;
 	clearCustomKeyHandlers(): void;
 	pasteText(text: string): void;
+	imageLinks?: (string | undefined)[];
+	pendingImages: ImageContent[];
+	pendingImageLinks: (string | undefined)[];
+	clearDraft(historyText?: string): void;
 };
+
+type InputListenerResult = { consume: boolean } | undefined;
+type InputListener = (data: string) => InputListenerResult;
+
+function dispatchInput(listeners: InputListener[], data: string): InputListenerResult {
+	for (const listener of listeners) {
+		const result = listener(data);
+		if (result) return result;
+	}
+	return undefined;
+}
+
+function registeredInputListeners(addInputListener: Mock<(listener: InputListener) => void>): InputListener[] {
+	return addInputListener.mock.calls.map(call => call[0]);
+}
 
 async function createContext() {
 	let editorText = "";
@@ -38,6 +58,7 @@ async function createContext() {
 		"app.display.reset": ["ctrl+l"],
 		"app.model.selectTemporary": ["ctrl+y"],
 		"app.model.select": ["alt+m"],
+		"app.retry": ["alt+r"],
 	};
 	const customHandlers = new Map<string, () => void>();
 	const setActionKeys = vi.fn();
@@ -50,12 +71,32 @@ async function createContext() {
 	const resetDisplay = vi.fn();
 	const showModelSelector = vi.fn();
 	const requestRender = vi.fn();
-	const addInputListener = vi.fn();
+	let focused: unknown;
+	const addInputListener = vi.fn((listener: InputListener) => {
+		void listener;
+	});
 	const addStartListener = vi.fn();
 	const terminalWrite = vi.fn();
 	const prompt = vi.fn(async () => {});
+	const retry = vi.fn(async () => true);
 	const abort = vi.fn(async () => {});
+	const session = {
+		isStreaming: false,
+		isCompacting: false,
+		isGeneratingHandoff: false,
+		isBashRunning: false,
+		isEvalRunning: false,
+		extensionRunner: undefined,
+		prompt,
+		queuedMessageCount: 0,
+		abort,
+		retry,
+	};
 	const updatePendingMessagesDisplay = vi.fn();
+	const handleBtwBranchKey = vi.fn(async () => true);
+	const handleBtwCopyKey = vi.fn(async () => true);
+	const canBranchBtw = vi.fn(() => false);
+	const canCopyBtw = vi.fn(() => false);
 	const editor: FakeEditor = {
 		setText(text: string) {
 			editorText = text;
@@ -70,7 +111,17 @@ async function createContext() {
 		setActionKeys,
 		setCustomKeyHandler,
 		clearCustomKeyHandlers,
+		pendingImages: [],
+		pendingImageLinks: [],
+		clearDraft(historyText?: string) {
+			if (historyText !== undefined) this.addToHistory(historyText);
+			this.setText("");
+			this.imageLinks = undefined;
+			this.pendingImages = [];
+			this.pendingImageLinks = [];
+		},
 	};
+	focused = editor;
 	const ctx = {
 		editor: editor as unknown as InteractiveModeContext["editor"],
 		ui: {
@@ -78,6 +129,7 @@ async function createContext() {
 			resetDisplay,
 			addInputListener,
 			addStartListener,
+			getFocused: vi.fn(() => focused),
 			terminal: { write: terminalWrite },
 		} as unknown as InteractiveModeContext["ui"],
 		loadingAnimation: undefined,
@@ -85,23 +137,13 @@ async function createContext() {
 		retryLoader: undefined,
 		autoCompactionEscapeHandler: undefined,
 		retryEscapeHandler: undefined,
-		session: {
-			isStreaming: false,
-			isCompacting: false,
-			isGeneratingHandoff: false,
-			isBashRunning: false,
-			isEvalRunning: false,
-			extensionRunner: undefined,
-			prompt,
-			queuedMessageCount: 0,
-			abort,
-		} as unknown as InteractiveModeContext["session"],
+		session: session as unknown as InteractiveModeContext["session"],
+		viewSession: session as unknown as InteractiveModeContext["viewSession"],
 		keybindings: {
 			getKeys(action: string) {
 				return keyMap[action] ? [...keyMap[action]] : [];
 			},
 		} as InteractiveModeContext["keybindings"],
-		pendingImages: [],
 		locallySubmittedUserSignatures: new Set<string>(),
 		isKnownSlashCommand: () => false,
 		recordLocalSubmission(this: InteractiveModeContext, text: string, imageCount = 0) {
@@ -145,7 +187,12 @@ async function createContext() {
 		showModelSelector,
 		updateEditorBorderColor: vi.fn(),
 		hasActiveBtw: vi.fn(() => false),
+		handleBtwBranchKey,
+		canBranchBtw,
+		canCopyBtw,
+		handleBtwCopyKey,
 		showError: vi.fn(),
+		showStatus: vi.fn(),
 	} as unknown as InteractiveModeContext;
 
 	return {
@@ -153,14 +200,23 @@ async function createContext() {
 		ctx,
 		editor,
 		customHandlers,
+		setFocused(target: unknown) {
+			focused = target;
+		},
 		spies: {
 			setActionKeys,
 			showModelSelector,
 			prompt,
 			updatePendingMessagesDisplay,
 			requestRender,
+			retry,
 			abort,
 			resetDisplay,
+			handleBtwBranchKey,
+			addInputListener,
+			canBranchBtw,
+			handleBtwCopyKey,
+			canCopyBtw,
 		},
 	};
 }
@@ -187,6 +243,193 @@ describe("InputController keybinding setup", () => {
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(1, { temporaryOnly: true });
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(2);
 		expect(spies.resetDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("registers retry as an editor action and retries the failed turn", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		expect(spies.setActionKeys).toHaveBeenCalledWith("app.retry", ["alt+r"]);
+		expect(editor.onRetry).toBeDefined();
+
+		editor.setText("draft that should clear after retry");
+		editor.onRetry?.();
+		await Promise.resolve();
+
+		expect(spies.retry).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
+	});
+
+	it("retries the focused view session instead of the main session", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const focusedRetry = vi.fn(async () => true);
+		(ctx as unknown as { focusedAgentId: string; viewSession: { retry: typeof focusedRetry } }).focusedAgentId =
+			"worker";
+		(ctx as unknown as { viewSession: { retry: typeof focusedRetry } }).viewSession = { retry: focusedRetry };
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onRetry?.();
+		await Promise.resolve();
+
+		expect(focusedRetry).toHaveBeenCalledTimes(1);
+		expect(spies.retry).not.toHaveBeenCalled();
+	});
+
+	it("keeps retry host-only for collab guests", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const showStatus = ctx.showStatus as unknown as Mock<(message: string) => void>;
+		(ctx as unknown as { collabGuest: { readOnly: boolean } }).collabGuest = { readOnly: true };
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("guest draft");
+		editor.onRetry?.();
+		await Promise.resolve();
+
+		expect(spies.retry).not.toHaveBeenCalled();
+		expect(showStatus).toHaveBeenCalledWith("/retry is host-only during a collab session");
+		expect(editor.getText()).toBe("guest draft");
+	});
+
+	it("keeps the draft when there is nothing to retry", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		spies.retry.mockResolvedValueOnce(false);
+		const showStatus = ctx.showStatus as unknown as Mock<(message: string) => void>;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.setText("draft that should survive");
+		editor.onRetry?.();
+		await Promise.resolve();
+
+		expect(showStatus).toHaveBeenCalledWith("Nothing to retry");
+		expect(editor.getText()).toBe("draft that should survive");
+	});
+
+	it("clears retry draft attachments only after retry starts", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const image: ImageContent = { type: "image", mimeType: "image/png", data: "abc" };
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		ctx.editor.pendingImages = [image];
+		ctx.editor.pendingImageLinks = ["local://draft.png"];
+		editor.imageLinks = ctx.editor.pendingImageLinks;
+		editor.setText("draft with image");
+		editor.onRetry?.();
+		await Promise.resolve();
+
+		expect(ctx.editor.pendingImages).toEqual([]);
+		expect(ctx.editor.pendingImageLinks).toEqual([]);
+		expect(editor.imageLinks).toBeUndefined();
+		expect(editor.getText()).toBe("");
+	});
+
+	it("routes b to branch a branchable /btw panel", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		(ctx.canBranchBtw as unknown as { mockReturnValue(value: boolean): void }).mockReturnValue(true);
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const listener = spies.addInputListener.mock.calls[1]?.[0];
+		expect(listener).toBeDefined();
+		const result = listener?.("b");
+
+		expect(result).toEqual({ consume: true });
+		expect(spies.handleBtwBranchKey).toHaveBeenCalledTimes(1);
+	});
+
+	it("lets b fall through while the editor has draft text", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		(ctx.canBranchBtw as unknown as { mockReturnValue(value: boolean): void }).mockReturnValue(true);
+		editor.setText("build a branch");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const listener = spies.addInputListener.mock.calls[1]?.[0];
+		expect(listener).toBeDefined();
+		const result = listener?.("b");
+
+		expect(result).toBeUndefined();
+		expect(spies.handleBtwBranchKey).not.toHaveBeenCalled();
+	});
+
+	it("lets b fall through when /btw is not branchable", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const listener = spies.addInputListener.mock.calls[1]?.[0];
+		expect(listener).toBeDefined();
+		const result = listener?.("b");
+
+		expect(result).toBeUndefined();
+		expect(spies.handleBtwBranchKey).not.toHaveBeenCalled();
+	});
+
+	it("lets b fall through while another input is focused", async () => {
+		const { InputController, ctx, setFocused, spies } = await createContext();
+		(ctx.canBranchBtw as unknown as { mockReturnValue(value: boolean): void }).mockReturnValue(true);
+		setFocused({ pasteText: vi.fn() });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const result = dispatchInput(registeredInputListeners(spies.addInputListener), "b");
+
+		expect(result).toBeUndefined();
+		expect(spies.handleBtwBranchKey).not.toHaveBeenCalled();
+	});
+
+	it("routes c to copy a copyable /btw panel when the editor is empty", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		(ctx.canCopyBtw as unknown as { mockReturnValue(value: boolean): void }).mockReturnValue(true);
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const result = dispatchInput(registeredInputListeners(spies.addInputListener), "c");
+
+		expect(result).toEqual({ consume: true });
+		expect(spies.handleBtwCopyKey).toHaveBeenCalledTimes(1);
+	});
+
+	it("lets c fall through while the editor has draft text", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		(ctx.canCopyBtw as unknown as { mockReturnValue(value: boolean): void }).mockReturnValue(true);
+		editor.setText("continue this draft");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const result = dispatchInput(registeredInputListeners(spies.addInputListener), "c");
+
+		expect(result).toBeUndefined();
+		expect(spies.handleBtwCopyKey).not.toHaveBeenCalled();
+	});
+
+	it("lets c fall through when /btw is not copyable", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const result = dispatchInput(registeredInputListeners(spies.addInputListener), "c");
+
+		expect(result).toBeUndefined();
+		expect(spies.handleBtwCopyKey).not.toHaveBeenCalled();
+	});
+
+	it("lets c fall through while another input is focused", async () => {
+		const { InputController, ctx, setFocused, spies } = await createContext();
+		(ctx.canCopyBtw as unknown as { mockReturnValue(value: boolean): void }).mockReturnValue(true);
+		setFocused({ pasteText: vi.fn() });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const result = dispatchInput(registeredInputListeners(spies.addInputListener), "c");
+
+		expect(result).toBeUndefined();
+		expect(spies.handleBtwCopyKey).not.toHaveBeenCalled();
 	});
 
 	it("empty Enter aborts the active stream when queued messages are pending", async () => {

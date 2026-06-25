@@ -1,10 +1,12 @@
-import { INTENT_FIELD } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { THINKING_LOOP_ERROR_MARKER } from "@oh-my-pi/pi-ai/utils/thinking-loop";
 import { type Component, Loader, TERMINAL } from "@oh-my-pi/pi-tui";
+import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { extractTextContent } from "../../commit/utils";
 import { settings } from "../../config/settings";
 import { getFileSnapshotStore } from "../../edit/file-snapshot-store";
-import { AssistantMessageComponent } from "../../modes/components/assistant-message";
+import type { AssistantMessageComponent } from "../../modes/components/assistant-message";
+import { detectCacheInvalidation } from "../../modes/components/cache-invalidation-marker";
 import {
 	ReadToolGroupComponent,
 	readArgsHaveTarget,
@@ -23,6 +25,7 @@ import type { ResolveToolDetails } from "../../tools/resolve";
 import { vocalizer } from "../../tts/vocalizer";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import { interruptHint } from "../shared";
+import { createAssistantMessageComponent } from "../utils/interactive-context-helpers";
 import { StreamingRevealController } from "./streaming-reveal";
 import { ToolArgsRevealController } from "./tool-args-reveal";
 
@@ -85,6 +88,7 @@ export class EventController {
 		this.#streamingReveal = new StreamingRevealController({
 			getSmoothStreaming: () => this.ctx.settings.get("display.smoothStreaming"),
 			getHideThinkingBlock: () => this.ctx.hideThinkingBlock,
+			getProseOnlyThinking: () => this.ctx.proseOnlyThinking,
 			requestRender: () => this.ctx.ui.requestRender(),
 		});
 		this.#toolArgsReveal = new ToolArgsRevealController({
@@ -185,7 +189,7 @@ export class EventController {
 	}
 	#updateWorkingMessageFromIntent(intent: unknown): void {
 		if (this.ctx.session.isAborting) return;
-		// Streamed JSON can deliver non-string `_i` (object, number, boolean) before
+		// Streamed JSON can deliver non-string `i` (object, number, boolean) before
 		// schema validation; `?.` only guards null/undefined, so guard the type too.
 		if (typeof intent !== "string") return;
 		const trimmed = intent.trim();
@@ -293,8 +297,15 @@ export class EventController {
 			this.#resetReadGroup();
 			this.#resolveDisplaceablePoll();
 			const wasOptimistic = this.ctx.optimisticUserMessageSignature === signature;
-			const wasLocallySubmitted = this.ctx.locallySubmittedUserSignatures.delete(signature) || wasOptimistic;
-			if (!wasOptimistic) {
+			const matchedLocalSubmission = this.ctx.locallySubmittedUserSignatures.delete(signature);
+			const replacesOptimistic =
+				this.ctx.optimisticUserMessageSignature !== undefined && !wasOptimistic && !matchedLocalSubmission;
+			const wasLocallySubmitted = matchedLocalSubmission || wasOptimistic || replacesOptimistic;
+			if (wasOptimistic) {
+				this.ctx.clearOptimisticUserMessage();
+			} else if (replacesOptimistic) {
+				this.ctx.replaceOptimisticUserMessage(event.message);
+			} else {
 				// Append synchronously: #emit dispatches to this listener fire-and-forget
 				// (see AgentSession.#emit), so any await between the user message_start and
 				// addMessageToChat lets later events (assistant message_start, tool execution
@@ -302,9 +313,6 @@ export class EventController {
 				// live-region block boundaries. addMessageToChat materializes clickable image
 				// links via the synchronous putBlobSync fallback, so no await is needed here.
 				this.ctx.addMessageToChat(event.message);
-			}
-			if (wasOptimistic) {
-				this.ctx.optimisticUserMessageSignature = undefined;
 			}
 
 			// Clear the editor only when the submission did not originate from a
@@ -325,13 +333,7 @@ export class EventController {
 			this.ctx.ui.requestRender();
 		} else if (event.message.role === "assistant") {
 			this.#lastVisibleBlockCount = 0;
-			this.ctx.streamingComponent = new AssistantMessageComponent(
-				undefined,
-				this.ctx.hideThinkingBlock,
-				() => this.ctx.ui.requestRender(),
-				this.ctx.viewSession.extensionRunner?.getAssistantThinkingRenderers(),
-				this.ctx.ui.imageBudget,
-			);
+			this.ctx.streamingComponent = createAssistantMessageComponent(this.ctx);
 			this.ctx.streamingMessage = event.message;
 			this.ctx.chatContainer.addChild(this.ctx.streamingComponent);
 			this.#streamingReveal.begin(this.ctx.streamingComponent, this.ctx.streamingMessage);
@@ -659,6 +661,16 @@ export class EventController {
 				// waiting poll cannot be displaced anymore — freeze it in place.
 				this.#resolveDisplaceablePoll();
 			}
+			// Surface a prompt-cache invalidation: if the previous turn cached a
+			// meaningful prefix and this request read none of it back, flag the turn.
+			const usage = event.message.usage;
+			if (usage.cacheRead + usage.cacheWrite + usage.input > 0) {
+				if (settings.get("display.cacheMissMarker")) {
+					const invalidation = detectCacheInvalidation(this.ctx.lastAssistantUsage, usage);
+					if (invalidation) this.ctx.streamingComponent.setCacheInvalidation(invalidation);
+				}
+				this.ctx.lastAssistantUsage = usage;
+			}
 			this.#lastAssistantComponent = this.ctx.streamingComponent;
 			this.#lastAssistantComponent.markTranscriptBlockFinalized();
 			if (settings.get("display.showTokenUsage")) {
@@ -724,6 +736,26 @@ export class EventController {
 			this.ctx.chatContainer.addChild(component);
 			this.ctx.pendingTools.set(event.toolCallId, component);
 			this.ctx.ui.requestRender();
+		} else {
+			// The tool is about to run, so its arguments are final and validated.
+			// A pending component created while args streamed (message_update) may
+			// still show a mid-reveal prefix — or, when the closing full-args
+			// `message_update` never lands (smooth-streaming off leaving the
+			// throttled `arguments` stale, an owned-dialect projector, or a
+			// superseded/aborted turn that still executes the call), a stale body
+			// the result render then freezes at its `…` placeholder. Reconcile the
+			// authoritative args here and drop any live reveal so a late tick can't
+			// re-truncate them: tool_execution_start is the one event every
+			// execution path emits with the full args immediately before the result.
+			this.#toolArgsReveal.finish(event.toolCallId);
+			const component = this.ctx.pendingTools.get(event.toolCallId);
+			if (component && typeof component.updateArgs === "function") {
+				component.updateArgs(event.args, event.toolCallId);
+				if (typeof component.setArgsComplete === "function") {
+					component.setArgsComplete(event.toolCallId);
+				}
+				this.ctx.ui.requestRender();
+			}
 		}
 	}
 
@@ -908,6 +940,17 @@ export class EventController {
 		}
 	}
 
+	/**
+	 * Trailing Esc hint for live maintenance loaders. While a subagent is
+	 * focused, Esc returns to main instead of cancelling its maintenance
+	 * (#2819), so the loader drops the hint entirely rather than advertise a
+	 * cancel that no longer happens. Includes the leading space so the focused
+	 * label carries no dangling whitespace.
+	 */
+	#maintenanceEscHint(): string {
+		return this.ctx.focusedAgentId ? "" : " (esc to cancel)";
+	}
+
 	async #handleAutoCompactionStart(
 		event: Extract<AgentSessionEvent, { type: "auto_compaction_start" }>,
 	): Promise<void> {
@@ -927,12 +970,14 @@ export class EventController {
 				? "Auto-handoff"
 				: event.action === "shake"
 					? "Auto-shake"
-					: "Auto context-full maintenance";
+					: event.action === "snapcompact"
+						? "Auto-snapcompact"
+						: "Auto context-full maintenance";
 		this.ctx.autoCompactionLoader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
 			text => theme.fg("muted", text),
-			`${reasonText}${actionLabel}… (esc to cancel)`,
+			`${reasonText}${actionLabel}…${this.#maintenanceEscHint()}`,
 			getSymbolTheme().spinnerFrames,
 		);
 		this.ctx.statusContainer.addChild(this.ctx.autoCompactionLoader);
@@ -948,13 +993,16 @@ export class EventController {
 		}
 		const isHandoffAction = event.action === "handoff";
 		const isShakeAction = event.action === "shake";
+		const isSnapcompactAction = event.action === "snapcompact";
 		if (event.aborted) {
 			this.ctx.showStatus(
 				isHandoffAction
 					? "Auto-handoff cancelled"
 					: isShakeAction
 						? "Auto-shake cancelled"
-						: "Auto context-full maintenance cancelled",
+						: isSnapcompactAction
+							? "Auto-snapcompact cancelled"
+							: "Auto context-full maintenance cancelled",
 			);
 		} else if (isShakeAction) {
 			// Shake produces no CompactionResult; rebuild on success, suppress benign skips.
@@ -969,12 +1017,14 @@ export class EventController {
 				}
 				this.ctx.showWarning(event.errorMessage);
 			} else if (!event.skipped) {
+				this.ctx.lastAssistantUsage = undefined;
 				this.ctx.rebuildChatFromMessages();
 				this.ctx.statusLine.invalidate();
 				this.ctx.updateEditorTopBorder();
 				this.ctx.showStatus("Auto-shake completed");
 			}
 		} else if (event.result) {
+			this.ctx.lastAssistantUsage = undefined;
 			this.ctx.rebuildChatFromMessages();
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();
@@ -982,6 +1032,7 @@ export class EventController {
 			this.ctx.showWarning(event.errorMessage);
 		} else if (isHandoffAction) {
 			this.ctx.chatContainer.clear();
+			this.ctx.lastAssistantUsage = undefined;
 			this.ctx.rebuildChatFromMessages();
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();
@@ -990,6 +1041,8 @@ export class EventController {
 		} else if (event.skipped) {
 			// Benign skip: no model selected, no candidate models available, or nothing
 			// to compact yet. Not a failure — suppress the warning.
+		} else if (isSnapcompactAction) {
+			this.ctx.showWarning("Auto-snapcompact maintenance failed; continuing without maintenance");
 		} else {
 			this.ctx.showWarning("Auto context-full maintenance failed; continuing without maintenance");
 		}
@@ -1000,12 +1053,19 @@ export class EventController {
 	async #handleAutoRetryStart(event: Extract<AgentSessionEvent, { type: "auto_retry_start" }>): Promise<void> {
 		this.#stopWorkingLoader();
 		this.ctx.statusContainer.clear();
+		if (event.errorMessage?.includes(THINKING_LOOP_ERROR_MARKER)) {
+			// The retry path drops the failed assistant from runtime context. Do not
+			// restore its inline Error row; just unpin the fixed-region banner so the
+			// retry UI is the visible state.
+			this.#pinnedErrorComponent = undefined;
+			this.ctx.clearPinnedError();
+		}
 		const delaySeconds = Math.round(event.delayMs / 1000);
 		this.ctx.retryLoader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("warning", spinner),
 			text => theme.fg("muted", text),
-			`Retrying (${event.attempt}/${event.maxAttempts}) in ${delaySeconds}s… (esc to cancel)`,
+			`Retrying (${event.attempt}/${event.maxAttempts}) in ${delaySeconds}s…${this.#maintenanceEscHint()}`,
 			getSymbolTheme().spinnerFrames,
 		);
 		this.ctx.statusContainer.addChild(this.ctx.retryLoader);

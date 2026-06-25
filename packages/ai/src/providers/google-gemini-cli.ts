@@ -13,6 +13,7 @@ import {
 	getGeminiCliHeaders,
 } from "@oh-my-pi/pi-catalog/wire/gemini-headers";
 import { extractHttpStatusFromError, fetchWithRetry, readSseJson } from "@oh-my-pi/pi-utils";
+import { type } from "arktype";
 import { ProviderHttpError } from "../errors";
 import type {
 	Api,
@@ -30,7 +31,7 @@ import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { extractGoogleValidationUrl, formatGoogleValidationRequiredMessage } from "../utils/google-validation";
 import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump } from "../utils/http-inspector";
-import { getStreamFirstEventTimeoutMs } from "../utils/idle-iterator";
+import { armPreResponseTimeout, getStreamFirstEventTimeoutMs } from "../utils/idle-iterator";
 // Refresh is the sole responsibility of AuthStorage (broker-aware, single-flighted);
 // the stream provider trusts the access token threaded through `options.apiKey`.
 import { normalizeSchemaForCCA } from "../utils/schema";
@@ -61,6 +62,181 @@ export type { GoogleThinkingLevel };
 /** Non-2xx response (or in-stream error chunk) from the Cloud Code Assist API. */
 export class GeminiCliApiError extends ProviderHttpError {
 	override readonly name = "GeminiCliApiError";
+}
+
+function isPlanningLeakPrefix(text: string): boolean {
+	const trimmed = text.trimStart();
+	if (!trimmed.startsWith("{")) {
+		return false;
+	}
+	const afterBrace = trimmed.slice(1).trimStart();
+	if (afterBrace === "") {
+		return trimmed.length <= 100;
+	}
+	if (afterBrace[0] !== '"') {
+		return false;
+	}
+	const nextQuoteIndex = afterBrace.indexOf('"', 1);
+	if (nextQuoteIndex === -1) {
+		const keyPrefix = afterBrace.slice(1);
+		return "thought".startsWith(keyPrefix) && trimmed.length <= 100;
+	}
+	const key = afterBrace.slice(1, nextQuoteIndex);
+	if (key !== "thought") {
+		return false;
+	}
+	const afterKey = afterBrace.slice(nextQuoteIndex + 1).trimStart();
+	if (afterKey === "") {
+		return trimmed.length <= 100;
+	}
+	if (afterKey[0] !== ":") {
+		return false;
+	}
+	return true;
+}
+
+type BufferedPlanningResult =
+	| { kind: "incomplete" }
+	| { kind: "plain"; visibleText: string }
+	| { kind: "leak"; visibleText: string };
+
+function isPlanningLeakObject(parsed: unknown, toolNames: Set<string>): boolean {
+	if (!parsed || typeof parsed !== "object") return false;
+	const record = parsed as Record<string, unknown>;
+	const hasThought = typeof record.thought === "string";
+	const isOmpTool = typeof record.call === "string" && toolNames.has(record.call);
+	const hasToolSignature =
+		"_i" in record || "paths" in record || "command" in record || ("path" in record && "content" in record);
+	return hasThought || isOmpTool || hasToolSignature;
+}
+
+function splitLeadingJsonObject(text: string): { prefixLength: number; jsonText: string; rest: string } | undefined {
+	const prefixLength = text.length - text.trimStart().length;
+	const trimmed = text.slice(prefixLength);
+	if (!trimmed.startsWith("{")) return undefined;
+
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+
+	for (let index = 0; index < trimmed.length; index += 1) {
+		const ch = trimmed[index];
+		if (inString) {
+			if (escaped) {
+				escaped = false;
+				continue;
+			}
+			if (ch === "\\") {
+				escaped = true;
+				continue;
+			}
+			if (ch === '"') inString = false;
+			continue;
+		}
+		if (ch === '"') {
+			inString = true;
+			continue;
+		}
+		if (ch === "{") {
+			depth += 1;
+			continue;
+		}
+		if (ch !== "}") continue;
+		depth -= 1;
+		if (depth !== 0) continue;
+
+		const jsonText = trimmed.slice(0, index + 1);
+		return {
+			prefixLength: prefixLength + index + 1,
+			jsonText,
+			rest: trimmed.slice(index + 1),
+		};
+	}
+
+	return undefined;
+}
+
+function splitLeadingJsonObjectIgnoringQuotes(
+	text: string,
+): { prefixLength: number; jsonText: string; rest: string } | undefined {
+	const prefixLength = text.length - text.trimStart().length;
+	const trimmed = text.slice(prefixLength);
+	if (!trimmed.startsWith("{")) return undefined;
+
+	let depth = 0;
+	for (let index = 0; index < trimmed.length; index += 1) {
+		const ch = trimmed[index];
+		if (ch === "{") {
+			depth += 1;
+		} else if (ch === "}") {
+			depth -= 1;
+			if (depth === 0) {
+				return {
+					prefixLength: prefixLength + index + 1,
+					jsonText: trimmed.slice(0, index + 1),
+					rest: trimmed.slice(index + 1),
+				};
+			}
+		}
+	}
+	return undefined;
+}
+
+function consumePlanningBuffer(text: string, toolNames: Set<string>, isFinal = false): BufferedPlanningResult {
+	if (!isPlanningLeakPrefix(text)) {
+		return { kind: "plain", visibleText: text };
+	}
+
+	// Try standard brace-balanced slicing first (respecting quotes and escapes)
+	let leading = splitLeadingJsonObject(text);
+
+	// If standard parsing fails (e.g. due to unescaped quotes), fall back to quote-ignoring brace-balanced slicing
+	if (!leading) {
+		leading = splitLeadingJsonObjectIgnoringQuotes(text);
+	}
+
+	if (!leading) {
+		if (isFinal) {
+			// At EOF, if the buffer has a leak signature but no closing brace at all, discard the whole buffer.
+			const trimmed = text.trim();
+			const hasThoughtKey = trimmed.includes('"thought"');
+			const hasToolKey = Array.from(toolNames).some(name => trimmed.includes(`"${name}"`));
+			const hasToolSignature =
+				trimmed.includes('"_i"') ||
+				trimmed.includes('"paths"') ||
+				trimmed.includes('"command"') ||
+				(trimmed.includes('"path"') && trimmed.includes('"content"'));
+			if (hasThoughtKey || hasToolKey || hasToolSignature) {
+				return { kind: "leak", visibleText: "" };
+			}
+			return { kind: "plain", visibleText: text };
+		}
+		return { kind: "incomplete" };
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(leading.jsonText);
+	} catch {
+		// Fallback to substring matching if JSON parsing fails due to unescaped quotes
+		const hasThoughtKey = leading.jsonText.includes('"thought"');
+		const hasToolKey = Array.from(toolNames).some(name => leading.jsonText.includes(`"${name}"`));
+		const hasToolSignature =
+			leading.jsonText.includes('"_i"') ||
+			leading.jsonText.includes('"paths"') ||
+			leading.jsonText.includes('"command"') ||
+			(leading.jsonText.includes('"path"') && leading.jsonText.includes('"content"'));
+		const isLeak = hasThoughtKey || hasToolKey || hasToolSignature;
+		if (isLeak) {
+			return { kind: "leak", visibleText: leading.rest };
+		}
+		// Unparseable leading object is not safe to strip; release it as normal text.
+		return { kind: "plain", visibleText: text };
+	}
+
+	return isPlanningLeakObject(parsed, toolNames)
+		? { kind: "leak", visibleText: leading.rest }
+		: { kind: "plain", visibleText: text };
 }
 
 export interface GoogleGeminiCliOptions extends StreamOptions {
@@ -185,16 +361,27 @@ function extractErrorMessage(errorText: string): string {
 	return errorText;
 }
 
-interface GeminiCliApiKeyPayload {
-	token?: unknown;
-	projectId?: unknown;
-	project_id?: unknown;
-	refreshToken?: unknown;
-	expiresAt?: unknown;
-	email?: unknown;
-	refresh?: unknown;
-	expires?: unknown;
-}
+const optionalCredentialString = type("unknown").pipe(raw => {
+	const out = type("string")(raw);
+	return out instanceof type.errors ? undefined : out;
+});
+
+const innerCredentialsSchema = type({
+	"token?": optionalCredentialString,
+	"projectId?": optionalCredentialString,
+	"project_id?": optionalCredentialString,
+	"refreshToken?": optionalCredentialString,
+	"refresh?": optionalCredentialString,
+	"email?": optionalCredentialString,
+	"expiresAt?": "unknown",
+	"expires?": "unknown",
+});
+
+const geminiCliCredentialsSchema = type("unknown").pipe(raw => {
+	const out = innerCredentialsSchema(raw);
+	return out instanceof type.errors ? {} : out;
+});
+
 interface ParsedGeminiCliCredentials {
 	accessToken: string;
 	projectId: string;
@@ -215,32 +402,25 @@ export function parseGeminiCliCredentials(apiKeyRaw: string): ParsedGeminiCliCre
 	const missingCredentialsMessage =
 		"Missing token or projectId in Google Cloud credentials. Use /login to re-authenticate.";
 
-	let parsed: GeminiCliApiKeyPayload;
+	let rawCredentials: unknown;
 	try {
-		parsed = JSON.parse(apiKeyRaw) as GeminiCliApiKeyPayload;
+		rawCredentials = JSON.parse(apiKeyRaw);
 	} catch {
 		throw new Error(invalidCredentialsMessage);
 	}
+	const parsed = geminiCliCredentialsSchema(rawCredentials);
+	if (parsed instanceof type.errors) {
+		throw new Error(invalidCredentialsMessage);
+	}
 
-	const projectId =
-		typeof parsed.projectId === "string"
-			? parsed.projectId
-			: typeof parsed.project_id === "string"
-				? parsed.project_id
-				: undefined;
-
-	if (typeof parsed.token !== "string" || typeof projectId !== "string") {
+	const projectId = parsed.projectId ?? parsed.project_id;
+	if (parsed.token === undefined || projectId === undefined) {
 		throw new Error(missingCredentialsMessage);
 	}
 
-	const refreshToken =
-		typeof parsed.refreshToken === "string"
-			? parsed.refreshToken
-			: typeof parsed.refresh === "string"
-				? parsed.refresh
-				: undefined;
+	const refreshToken = parsed.refreshToken ?? parsed.refresh;
 	const expiresAt = normalizeExpiryMs(parsed.expiresAt ?? parsed.expires);
-	const email = typeof parsed.email === "string" && parsed.email.length > 0 ? parsed.email : undefined;
+	const email = parsed.email && parsed.email.length > 0 ? parsed.email : undefined;
 
 	return {
 		accessToken: parsed.token,
@@ -457,16 +637,9 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 			// would hang forever. Floor matches the lazy wrapper's 5min default.
 			const firstEventTimeoutMs =
 				options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(undefined, 300_000);
-			const preResponseWatchdog =
-				firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0
-					? AbortSignal.timeout(firstEventTimeoutMs)
-					: undefined;
 			const callerSignal = options?.signal;
-			const fetchSignal = preResponseWatchdog
-				? callerSignal
-					? AbortSignal.any([callerSignal, preResponseWatchdog])
-					: preResponseWatchdog
-				: callerSignal;
+			const toolNames = new Set(context.tools?.map(t => t.name) ?? []);
+			const isFlashLeakModel = model.id.includes("flash");
 
 			let started = false;
 			let sawFinishReason = false;
@@ -507,6 +680,22 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				let currentBlock: TextContent | ThinkingContent | null = null;
 				const blocks = output.content;
 				const blockIndex = () => blocks.length - 1;
+
+				let isBuffering = false;
+				let textBuffer = "";
+				let bufferedTextSignature: string | undefined;
+
+				const emitVisibleText = (delta: string, thoughtSignature?: string) => {
+					if (!delta || !currentBlock || currentBlock.type !== "text") return;
+					currentBlock.text += delta;
+					currentBlock.textSignature = retainThoughtSignature(currentBlock.textSignature, thoughtSignature);
+					stream.push({
+						type: "text_delta",
+						contentIndex: blockIndex(),
+						delta,
+						partial: output,
+					});
+				};
 
 				for await (const chunk of readSseJson<CloudCodeAssistResponseChunk>(
 					activeResponse.body!,
@@ -558,17 +747,33 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 										partial: output,
 									});
 								} else {
-									currentBlock.text += part.text;
-									currentBlock.textSignature = retainThoughtSignature(
-										currentBlock.textSignature,
-										part.thoughtSignature,
-									);
-									stream.push({
-										type: "text_delta",
-										contentIndex: blockIndex(),
-										delta: part.text,
-										partial: output,
-									});
+									if (isBuffering) {
+										textBuffer += part.text;
+										bufferedTextSignature = retainThoughtSignature(
+											bufferedTextSignature,
+											part.thoughtSignature,
+										);
+									} else if (isFlashLeakModel && part.text.trimStart().startsWith("{")) {
+										isBuffering = true;
+										textBuffer = part.text;
+										bufferedTextSignature = part.thoughtSignature;
+									} else {
+										emitVisibleText(part.text, part.thoughtSignature);
+									}
+
+									if (isBuffering) {
+										const buffered = consumePlanningBuffer(textBuffer, toolNames);
+										if (buffered.kind !== "incomplete") {
+											if (buffered.kind === "leak") {
+												sawLeak = true;
+											}
+											const visibleSignature = bufferedTextSignature;
+											isBuffering = false;
+											textBuffer = "";
+											bufferedTextSignature = undefined;
+											emitVisibleText(buffered.visibleText, visibleSignature);
+										}
+									}
 								}
 							} else if (part.text === "" && part.thoughtSignature && currentBlock && !part.functionCall) {
 								if (currentBlock.type === "thinking") {
@@ -589,6 +794,8 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 									pushBlockEndEvent(currentBlock, blockIndex(), output, stream);
 									currentBlock = null;
 								}
+								isBuffering = false;
+								textBuffer = "";
 
 								const providedId = part.functionCall.id;
 								const needsNewId =
@@ -649,14 +856,28 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					}
 				}
 
+				if (isBuffering && textBuffer !== "") {
+					const buffered = consumePlanningBuffer(textBuffer, toolNames, true);
+					if (buffered.kind === "leak") {
+						sawLeak = true;
+					}
+					if (buffered.kind !== "incomplete") {
+						emitVisibleText(buffered.visibleText, bufferedTextSignature);
+					}
+					bufferedTextSignature = undefined;
+					isBuffering = false;
+					textBuffer = "";
+				}
+
 				if (currentBlock) {
 					pushBlockEndEvent(currentBlock, blockIndex(), output, stream);
 				}
 
-				return hasMeaningfulGoogleContent(output);
+				return hasMeaningfulGoogleContent(output) || sawLeak;
 			};
 
 			let receivedContent = false;
+			let sawLeak = false;
 
 			for (let i = 0; i < endpoints.length; i++) {
 				const endpoint = endpoints[i];
@@ -665,17 +886,26 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					started = false;
 					resetOutput();
 
-					const response = await fetchWithRetry(() => `${endpoint}/v1internal:streamGenerateContent?alt=sse`, {
-						method: "POST",
-						headers: requestHeaders,
-						body: requestBodyJson,
-						signal: fetchSignal,
-						maxAttempts: isLastEndpoint ? MAX_RETRIES + 1 : 1,
-						defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
-						maxDelayMs: options?.maxRetryDelayMs ?? RATE_LIMIT_BUDGET_MS,
-						fetch: options?.fetch,
-						timeout: false,
-					});
+					// Per attempt: arm a pre-response (TTFT) timer, cleared the instant
+					// headers arrive so it never aborts the actively streaming body —
+					// an absolute `AbortSignal.timeout` would (issue #2422).
+					const watchdog = armPreResponseTimeout(callerSignal, firstEventTimeoutMs);
+					let response: Response;
+					try {
+						response = await fetchWithRetry(() => `${endpoint}/v1internal:streamGenerateContent?alt=sse`, {
+							method: "POST",
+							headers: requestHeaders,
+							body: requestBodyJson,
+							signal: watchdog.signal,
+							maxAttempts: isLastEndpoint ? MAX_RETRIES + 1 : 1,
+							defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
+							maxDelayMs: options?.maxRetryDelayMs ?? RATE_LIMIT_BUDGET_MS,
+							fetch: options?.fetch,
+							timeout: false,
+						});
+					} finally {
+						watchdog.clear();
+					}
 
 					if (!response.ok) {
 						if (response.status === 429 || (response.status >= 500 && response.status < 600)) {
@@ -935,7 +1165,7 @@ function buildAntigravityRequestEnvelope(
 	const labels: Record<string, string> = {};
 	if (state?.lastExecutionId) labels.last_execution_id = state.lastExecutionId;
 	labels.last_step_index = String(step - 1);
-	if (profile) labels.model_enum = profile.modelEnum;
+	if (profile?.modelEnum !== undefined) labels.model_enum = profile.modelEnum;
 	labels.trajectory_id = trajectoryId;
 	labels.used_claude = String(isClaude);
 	labels.used_claude_conservative = String(isClaude);

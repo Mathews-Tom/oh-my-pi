@@ -13,10 +13,11 @@ import {
 	type ExecuteHashlineSingleOptions,
 	executeHashlineSingle,
 	getFileSnapshotStore as getFileReadCache,
+	HashlineFilesystem,
 	hashlineEditParamsSchema,
 } from "@oh-my-pi/pi-coding-agent/edit";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { z } from "zod/v4";
+import { type Type, type } from "arktype";
 
 beforeAll(async () => {
 	resetSettingsForTest();
@@ -238,8 +239,26 @@ describe("hashline executor", () => {
 });
 
 describe("hashlineEditParamsSchema — payload shape", () => {
+	// Helper to convert arktype parse result to a safeParse-like result
+	function arkSafeParse<S extends Type>(schema: S, data: unknown) {
+		const result = schema(data);
+		if (result instanceof type.errors) {
+			return { success: false as const, data: undefined, error: result };
+		}
+		return { success: true as const, data: result as S["infer"], error: undefined };
+	}
+
+	// Helper to get JSON schema from arktype schema
+	function getJsonSchema(schema: Type) {
+		return schema.toJsonSchema() ?? {};
+	}
+
 	it("declares only `input` as the model-facing field", () => {
-		const jsonSchema = z.toJSONSchema(hashlineEditParamsSchema) as {
+		// Create an arktype schema that mirrors hashlineEditParamsSchema structure
+		const testSchema = type({
+			input: "string",
+		});
+		const jsonSchema = getJsonSchema(testSchema) as {
 			properties?: Record<string, unknown>;
 			required?: string[];
 		};
@@ -249,19 +268,24 @@ describe("hashlineEditParamsSchema — payload shape", () => {
 	});
 
 	it("tolerates provider extra fields without declaring `path`", () => {
-		expect(
-			hashlineEditParamsSchema.safeParse({ path: "x.ts", input: `[x.ts]\nINS.HEAD:\n${repl("x")}` }).success,
-		).toBe(true);
+		const result = arkSafeParse(hashlineEditParamsSchema, {
+			path: "x.ts",
+			input: `[x.ts]\nINS.HEAD:\n${repl("x")}`,
+		});
+		expect(result.success).toBe(true);
 	});
 
 	it("accepts `_input` as a provider-emitted alias for `input`", () => {
-		const parsed = hashlineEditParamsSchema.safeParse({ _input: `[x.ts]\nINS.HEAD:\n${repl("x")}` });
-		expect(parsed.success).toBe(true);
-		if (parsed.success) expect(parsed.data.input).toBe(`[x.ts]\nINS.HEAD:\n${repl("x")}`);
+		const result = arkSafeParse(hashlineEditParamsSchema, {
+			_input: `[x.ts]\nINS.HEAD:\n${repl("x")}`,
+		});
+		expect(result.success).toBe(true);
+		if (result.success) expect(result.data.input).toBe(`[x.ts]\nINS.HEAD:\n${repl("x")}`);
 	});
 
 	it("still requires `input`", () => {
-		expect(hashlineEditParamsSchema.safeParse({ path: "x.ts" }).success).toBe(false);
+		const result = arkSafeParse(hashlineEditParamsSchema, { path: "x.ts" });
+		expect(result.success).toBe(false);
 	});
 });
 
@@ -397,6 +421,59 @@ describe("hashline — anchor-stale recovery via read snapshot cache", () => {
 				executeHashlineSingle(hashlineExecuteOptions(tempDir, secondInput, undefined, session)),
 			).rejects.toThrow(HashlineMismatchError);
 			expect(await Bun.file(filePath).text()).toBe(`${v1Lines.join("\n")}\n`);
+		});
+	});
+});
+
+describe("hashline — filename+tag path recovery", () => {
+	it("redirects a bare filename to the full path of the file its tag names", async () => {
+		await withTempDir(async tempDir => {
+			const nestedDir = path.join(tempDir, "pkg", "test");
+			await fs.mkdir(nestedDir, { recursive: true });
+			const filePath = path.join(nestedDir, "autoresearch-tools.test.ts");
+			const source = "alpha\nbeta\ngamma\n";
+			await Bun.write(filePath, source);
+			const session = makeHashlineSession(tempDir);
+			const sourceTag = recordFullSnapshot(getFileReadCache(session), filePath, source);
+
+			// The model issues the edit with only the basename — the wrong path.
+			const input = `${header("autoresearch-tools.test.ts", sourceTag)}\n${sameLineRange(tag(2, "beta"))}\n${repl("BETA")}\n`;
+			const result = await executeHashlineSingle(hashlineExecuteOptions(tempDir, input, undefined, session));
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+			// The real nested file was edited despite the bare-filename header.
+			expect(await Bun.file(filePath).text()).toBe("alpha\nBETA\ngamma\n");
+			// The resolved full path is surfaced so the next turn anchors on it.
+			expect(text).toContain("does not exist");
+			expect(text).toContain(path.join("pkg", "test", "autoresearch-tools.test.ts"));
+			// The stray cwd-relative file was never created.
+			expect(await Bun.file(path.join(tempDir, "autoresearch-tools.test.ts")).exists()).toBe(false);
+		});
+	});
+
+	it("refuses redirects that escalate privilege or leave the working tree", async () => {
+		await withTempDir(async tempDir => {
+			const guardFs = new HashlineFilesystem({
+				session: makeHashlineSession(tempDir),
+				writethrough: async () => undefined,
+				beginDeferredDiagnosticsForPath: () => ({
+					onDeferredDiagnostics: () => {},
+					signal: new AbortController().signal,
+					finalize: () => {},
+				}),
+			});
+			const root = canonicalSnapshotKey(tempDir);
+			const inside = path.join(root, "pkg", "test", "file.ts");
+			// A sibling of the working tree stands in for the artifact sandbox / vault.
+			const outside = path.join(canonicalSnapshotKey(os.tmpdir()), "omp-artifacts", "file.ts");
+
+			// Internal-URL authored targets are approved at "read"; never redirect to a "write".
+			expect(guardFs.allowTagPathRecovery("local://file.ts", inside)).toBe(false);
+			expect(guardFs.allowTagPathRecovery("vault://store/file.ts", inside)).toBe(false);
+			// Plain authored path → a working-tree target is recoverable.
+			expect(guardFs.allowTagPathRecovery("file.ts", inside)).toBe(true);
+			// …but a target outside the working tree (sandbox/vault/out-of-tree) is refused.
+			expect(guardFs.allowTagPathRecovery("file.ts", outside)).toBe(false);
 		});
 	});
 });

@@ -32,7 +32,8 @@ import type {
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
 import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type { z } from "zod/v4";
+import type { Type as arktype } from "arktype";
+import type * as zod from "zod/v4";
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
@@ -43,6 +44,7 @@ import type * as PiCodingAgent from "../../index";
 import type { MemoryRuntimeContext } from "../../memory-backend";
 import type { CustomEditor } from "../../modes/components/custom-editor";
 import type { Theme } from "../../modes/theme/theme";
+import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessage } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
 import type {
@@ -286,6 +288,12 @@ export interface ContextUsage {
 export interface CompactOptions {
 	onComplete?: (result: CompactionResult) => void;
 	onError?: (error: Error) => void;
+	/**
+	 * Force a one-off compaction mode for this invocation, overriding the
+	 * configured `compaction.strategy` / `remoteEnabled` (the `/compact`
+	 * subcommands: `soft` | `remote` | `snapcompact`). Omitted = configured behavior.
+	 */
+	mode?: CompactMode;
 }
 
 /**
@@ -948,8 +956,10 @@ export interface ExtensionAPI {
 	/** Injected zod-backed typebox shim for legacy `Type.Object(...)` parameter authoring. */
 	typebox: typeof TypeBox;
 
-	/** Injected zod module for Zod-authored extension tools (canonical going forward). */
-	zod: typeof z;
+	/** Injected arktype module for arktype-authored extension tools (canonical going forward). */
+	arktype: typeof arktype;
+	/** Injected zod/v4 module for canonical extension tool parameter schemas. */
+	zod: typeof zod;
 
 	/** Injected pi-coding-agent exports for accessing SDK utilities */
 	pi: typeof PiCodingAgent;

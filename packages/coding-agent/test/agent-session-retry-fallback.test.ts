@@ -1451,6 +1451,10 @@ describe("AgentSession retry fallback", () => {
 		expect(modelRegistry.isSelectorSuppressed("openai/gpt-4o")).toBe(true);
 		expect(modelRegistry.isSelectorSuppressed("openai/gpt-4o:low")).toBe(true);
 
+		modelRegistry.suppressSelector("openai/gpt-4o:max", future);
+		expect(modelRegistry.isSelectorSuppressed("openai/gpt-4o:xhigh")).toBe(true);
+		expect(modelRegistry.isSelectorSuppressed("openai/gpt-4o:max")).toBe(true);
+
 		await modelRegistry.refresh("offline");
 		expect(modelRegistry.isSelectorSuppressed("openai/gpt-4o")).toBe(false);
 	});
@@ -1465,7 +1469,17 @@ describe("AgentSession retry fallback", () => {
 		const requestedModels: string[] = [];
 
 		const mock = createMockModel({
-			responses: [{ throw: malformedError }, { content: ["Recovered after Gemini malformed function call"] }],
+			responses: [
+				{
+					content: [
+						{ type: "thinking", thinking: "Thinking before malformed function call..." },
+						{ type: "text", text: "Text before malformed function call..." },
+					],
+					stopReason: "error",
+					errorMessage: malformedError,
+				},
+				{ content: ["Recovered after Gemini malformed function call"] },
+			],
 		});
 		const agent = new Agent({
 			getApiKey: model => `${model.provider}-test-key`,
@@ -1512,5 +1526,64 @@ describe("AgentSession retry fallback", () => {
 			throw new Error(`Expected text content block, got ${contentBlock.type}`);
 		}
 		expect(contentBlock.text).toBe("Recovered after Gemini malformed function call");
+	});
+
+	it("auto-retries provider finish_reason errors after partial text", async () => {
+		const model = getBundledModel("openai", "gpt-4o-mini");
+		if (!model) {
+			throw new Error("Expected bundled OpenAI test model to exist");
+		}
+
+		const errorMessage = "Provider returned error finish_reason";
+		const mock = createMockModel({
+			responses: [
+				{ content: ["partial output before gateway error"], stopReason: "error", errorMessage },
+				{ content: ["Recovered after provider finish_reason error"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) => mock.stream(requestedModel, context, options),
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 1,
+			"retry.modelFallback": false,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+
+		await session.prompt("recover from provider finish_reason error");
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(2);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0].errorMessage).toBe(errorMessage);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(session.agent.state.messages).toHaveLength(2);
+		const assistantMsg = session.agent.state.messages[1];
+		if (assistantMsg.role !== "assistant") {
+			throw new Error(`Expected assistant message, got ${assistantMsg.role}`);
+		}
+		const contentBlock = assistantMsg.content[0];
+		if (contentBlock.type !== "text") {
+			throw new Error(`Expected text content block, got ${contentBlock.type}`);
+		}
+		expect(contentBlock.text).toBe("Recovered after provider finish_reason error");
 	});
 });

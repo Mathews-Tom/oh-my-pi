@@ -46,11 +46,12 @@ import type {
 import { resolveServiceTier } from "../types";
 import { isRecord, normalizeSystemPrompts, normalizeToolCallId, resolveCacheRetention } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
+import { withEmptyCompletionRetry } from "../utils/empty-completion-retry";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { isFoundryEnabled } from "../utils/foundry";
 import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } from "../utils/http-inspector";
 import { getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
-import { parseStreamingJsonThrottled } from "../utils/json-parse";
+import { parseJsonWithRepair, parseStreamingJsonThrottled } from "../utils/json-parse";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { isCopilotTransientModelError } from "../utils/retry";
 import { COMBINATOR_KEYS, NO_STRICT, toolWireSchema } from "../utils/schema";
@@ -119,10 +120,11 @@ export function buildBetaHeader(baseBetas: readonly string[], extraBetas: readon
 }
 
 const midConversationSystemBeta = "mid-conversation-system-2026-04-07";
+const contextManagementBeta = "context-management-2025-06-27";
 const claudeCodeUtilityBetaDefaults = [
 	"oauth-2025-04-20",
 	"interleaved-thinking-2025-05-14",
-	"context-management-2025-06-27",
+	contextManagementBeta,
 	"prompt-caching-scope-2026-01-05",
 	"structured-outputs-2025-12-15",
 ] as const;
@@ -130,7 +132,7 @@ const claudeCodeAgentBetaDefaults = [
 	"claude-code-20250219",
 	"oauth-2025-04-20",
 	"interleaved-thinking-2025-05-14",
-	"context-management-2025-06-27",
+	contextManagementBeta,
 	"prompt-caching-scope-2026-01-05",
 	midConversationSystemBeta,
 	"advanced-tool-use-2025-11-20",
@@ -191,10 +193,18 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 	const oauthToken = options.isOAuth ?? isAnthropicOAuthToken(options.apiKey);
 	const extraBetas = options.extraBetas ?? [];
 	const stream = options.stream ?? false;
-	// `enforcedHeaderKeys` strips User-Agent out of modelHeaders so a spread can't
-	// produce case-duplicate keys; re-add the caller's value explicitly per branch
-	// (OAuth replaces non-claude-cli values, the other branches forward verbatim).
+	// `enforcedHeaderKeys` strips User-Agent / X-Api-Key / Authorization out of
+	// modelHeaders so a case-insensitive spread can't produce duplicate keys; each
+	// branch re-adds the caller's value explicitly. User-Agent and X-Api-Key are
+	// always honored (with branch-specific defaults filling in when absent), while
+	// Authorization is honored for every non-OAuth, non-Cloudflare-gateway branch —
+	// OAuth requests MUST carry `Authorization: Bearer <oauth-token>` (the OAuth
+	// credential itself) and Cloudflare AI Gateway authenticates via
+	// `cf-aig-authorization`, so user-supplied auth there would just leak. Both of
+	// those cases drop + log the caller value (#3391).
 	const incomingUserAgent = getHeaderCaseInsensitive(options.modelHeaders, "User-Agent");
+	const incomingAuthorization = getHeaderCaseInsensitive(options.modelHeaders, "Authorization");
+	const incomingApiKey = getHeaderCaseInsensitive(options.modelHeaders, "X-Api-Key");
 	// Claude Code betas (oauth-2025-04-20, claude-code-20250219, …) are part of
 	// the OAuth fingerprint; API-key requests default to extras only, matching
 	// the streaming path (buildAnthropicClientOptions passes [] for non-OAuth).
@@ -203,14 +213,21 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 		extraBetas,
 	);
 	const acceptHeader = oauthToken ? "application/json" : stream ? "text/event-stream" : "application/json";
+	const isCloudflare = options.isCloudflareAiGateway ?? false;
+	const honorAuthorization = !oauthToken && !isCloudflare;
+	const honorApiKey = !isCloudflare;
 	const modelHeaders: Record<string, string> = {};
 	const filteredEnforcedKeys: string[] = [];
 	for (const [key, value] of Object.entries(options.modelHeaders ?? {})) {
 		const lowerKey = key.toLowerCase();
 		if (enforcedHeaderKeys.has(lowerKey)) {
-			// User-Agent is filtered only to dedup the spread; every branch re-adds
-			// the caller's value explicitly, so it is not "ignored".
-			if (lowerKey !== "user-agent") filteredEnforcedKeys.push(key);
+			// user-agent is always re-applied explicitly. authorization / x-api-key
+			// are silently re-applied in honoring branches and dropped + logged
+			// where the branch enforces its own credential.
+			if (lowerKey === "user-agent") continue;
+			if (lowerKey === "authorization" && honorAuthorization) continue;
+			if (lowerKey === "x-api-key" && honorApiKey) continue;
+			filteredEnforcedKeys.push(key);
 			continue;
 		}
 		modelHeaders[key] = value;
@@ -224,7 +241,7 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 		});
 	}
 
-	if (options.isCloudflareAiGateway) {
+	if (isCloudflare) {
 		return {
 			...modelHeaders,
 			Accept: acceptHeader,
@@ -249,15 +266,17 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 			...(options.claudeCodeSessionId ? { "X-Claude-Code-Session-Id": options.claudeCodeSessionId } : {}),
 			"x-client-request-id": nodeCrypto.randomUUID(),
 			"User-Agent": userAgent,
+			...(incomingApiKey ? { "X-Api-Key": incomingApiKey } : {}),
 		};
 	} else if (!isOfficialAnthropicApiUrl(options.baseUrl)) {
 		return {
 			...modelHeaders,
 			Accept: acceptHeader,
-			Authorization: `Bearer ${options.apiKey}`,
+			Authorization: incomingAuthorization ?? `Bearer ${options.apiKey}`,
 			...sharedHeaders,
 			...(incomingUserAgent ? { "User-Agent": incomingUserAgent } : {}),
 			...(betaHeader ? { "anthropic-beta": betaHeader } : {}),
+			...(incomingApiKey ? { "X-Api-Key": incomingApiKey } : {}),
 		};
 	} else {
 		return {
@@ -266,7 +285,8 @@ export function buildAnthropicHeaders(options: AnthropicHeaderOptions): Record<s
 			...sharedHeaders,
 			...(incomingUserAgent ? { "User-Agent": incomingUserAgent } : {}),
 			...(betaHeader ? { "anthropic-beta": betaHeader } : {}),
-			"X-Api-Key": options.apiKey,
+			...(incomingAuthorization ? { Authorization: incomingAuthorization } : {}),
+			"X-Api-Key": incomingApiKey ?? options.apiKey,
 		};
 	}
 }
@@ -1003,7 +1023,8 @@ function convertContentBlocks(
 	return blocks;
 }
 
-export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
+export type AnthropicOutputEffort = "low" | "medium" | "high" | "xhigh" | "max";
+export type AnthropicEffort = AnthropicOutputEffort | "adaptive";
 export type AnthropicThinkingDisplay = "summarized" | "omitted";
 
 export interface AnthropicOptions extends StreamOptions {
@@ -1026,11 +1047,13 @@ export interface AnthropicOptions extends StreamOptions {
 	requestModelId?: string;
 	/**
 	 * Effort level for adaptive thinking.
-	 * Controls how much thinking Claude allocates:
+	 * Controls how much Claude allocates, or uses "adaptive" for MiniMax's
+	 * binary adaptive-thinking tag:
 	 * - "max": Always thinks with no constraints
 	 * - "high": Always thinks, deep reasoning (default)
 	 * - "medium": Moderate thinking, may skip for simple queries
 	 * - "low": Minimal thinking, skips for simple tasks
+	 * - "adaptive": Sends `thinking.type: "adaptive"` without `output_config.effort`
 	 * Ignored for older models.
 	 */
 	effort?: AnthropicEffort;
@@ -1481,6 +1504,10 @@ function isProviderRetryableStreamEnvelopeError(error: unknown): boolean {
 	return /stream event order|before message_start/i.test(error.message);
 }
 
+function isAnthropicTransientTransportMessage(message: string): boolean {
+	return message.includes("tls: bad record mac") || message.includes("type=server_error");
+}
+
 export function isProviderRetryableError(error: unknown, provider?: string): boolean {
 	if (!(error instanceof Error)) return false;
 	if (provider === "github-copilot" && isCopilotTransientModelError(error)) return true;
@@ -1497,7 +1524,8 @@ export function isProviderRetryableError(error: unknown, provider?: string): boo
 	const msg = error.message.toLowerCase();
 	if (
 		isUnexpectedSocketCloseMessage(msg) ||
-		/rate.?limit|too many requests|overloaded|service.?unavailable|internal_error|stream error.*received from peer|1302|timed?\s*out while waiting for the first event|timeout waiting for first/i.test(
+		isAnthropicTransientTransportMessage(msg) ||
+		/rate.?limit|too many requests|overloaded|service.?unavailable|internal_error|server_error|bad record mac|stream error.*received from peer|1302|timed?\s*out while waiting for the first event|timeout waiting for first/i.test(
 			msg,
 		) ||
 		isTransientStreamParseError(error) ||
@@ -1572,7 +1600,7 @@ export function applyAnthropicUsageExtras(usage: Usage, source: AnthropicUsageLi
 	}
 }
 
-export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
+const streamAnthropicOnce = (
 	model: Model<"anthropic-messages">,
 	context: Context,
 	options?: AnthropicOptions,
@@ -1650,13 +1678,16 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				// `output_config.effort` ships on thinking-on requests AND on the
 				// thinking-off adaptive pin (adaptive-only models get effort:"low" so
 				// the toggle cannot 400); the beta must accompany the field in both.
+				// MiniMax uses `thinking.type:"adaptive"` itself as the control surface,
+				// so the sentinel "adaptive" value intentionally sends no output_config.
 				const sendsAdaptiveEffortPin =
 					options?.thinkingEnabled === false &&
 					model.thinking?.mode === "anthropic-adaptive" &&
-					!model.compat.disableAdaptiveThinking;
+					!model.compat.disableAdaptiveThinking &&
+					!usesAdaptiveThinkingTagOnly(model);
 				if (
 					model.reasoning &&
-					(options?.thinkingEnabled || sendsAdaptiveEffortPin) &&
+					((options?.thinkingEnabled && options.effort !== "adaptive") || sendsAdaptiveEffortPin) &&
 					!extraBetas.includes(effortBeta)
 				) {
 					extraBetas.push(effortBeta);
@@ -1667,6 +1698,22 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					// need the beta alongside the role (OAuth agent requests already
 					// carry it in the Claude Code list).
 					extraBetas.push(midConversationSystemBeta);
+				}
+				// `context_management.clear_thinking_20251015` requires this beta. OAuth
+				// requests carry it in `claudeCodeAgentBetaDefaults`; API-key requests
+				// need it added explicitly so the field is honored instead of rejected
+				// (#3288). Skip transports where this package cannot deliver the beta
+				// in the form their adapter accepts: Copilot strips Anthropic betas,
+				// and Vertex rawPredict needs betas in the body (`anthropic_beta`),
+				// not as an `anthropic-beta` HTTP header.
+				if (
+					model.reasoning &&
+					options?.thinkingEnabled &&
+					model.provider !== "github-copilot" &&
+					model.provider !== "google-vertex" &&
+					!extraBetas.includes(contextManagementBeta)
+				) {
+					extraBetas.push(contextManagementBeta);
 				}
 
 				const created = createClient(model, {
@@ -1746,14 +1793,25 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					const finalJson =
 						block.partialJson.length > 0 ? block.partialJson : JSON.stringify(block.arguments ?? {});
 					try {
-						block.arguments = JSON.parse(finalJson) as ToolCall["arguments"];
+						block.arguments = parseJsonWithRepair(finalJson) as ToolCall["arguments"];
 					} catch (parseError) {
 						// Non-fatal: keep the best-effort arguments recovered by the throttled streaming
 						// parser instead of failing the turn on malformed/truncated tool-argument JSON.
 						reportAnthropicEnvelopeAnomaly(
 							`tool_use ${block.id} arguments are not valid JSON: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
 						);
-						block.arguments = (block.arguments ?? {}) as ToolCall["arguments"];
+						const recoveredKeys = Object.keys(block.arguments ?? {});
+						if (recoveredKeys.length === 0) {
+							const maxLen = 512;
+							const truncatedJson =
+								finalJson.length <= maxLen
+									? finalJson
+									: `${finalJson.slice(0, maxLen)}… [truncated ${finalJson.length - maxLen} chars]`;
+							block.arguments = {
+								__parseError: parseError instanceof Error ? parseError.message : String(parseError),
+								__rawJson: truncatedJson,
+							};
+						}
 					}
 					delete (block as { partialJson?: string }).partialJson;
 					delete (block as { lastParseLen?: number }).lastParseLen;
@@ -2292,6 +2350,16 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 	return stream;
 };
 
+/**
+ * Public entry: wrap the single-attempt streamer with bounded empty-completion
+ * retries (a benign terminal stop carrying no content/usage would otherwise
+ * stall the agent loop). The inner attempt keeps its own provider-failure retry
+ * loop; this layer only re-issues a fresh request on an empty success. Shared
+ * with the OpenAI-completions provider via `withEmptyCompletionRetry`.
+ */
+export const streamAnthropic: StreamFunction<"anthropic-messages"> = (model, context, options) =>
+	withEmptyCompletionRetry(model, context, options, streamAnthropicOnce);
+
 export type AnthropicSystemBlock = {
 	type: "text";
 	text: string;
@@ -2497,12 +2565,15 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		};
 	}
 
+	// Suppress the client-level `X-Api-Key` whenever an `Authorization` header
+	// already sits in `defaultHeaders` for a non-official, non-OAuth endpoint —
+	// either our auto-built `Bearer <apiKey>` or a caller-supplied custom auth
+	// scheme via `model.headers` (#3391). Adding a bonus `X-Api-Key` would force
+	// the proxy to deal with two competing credentials when the user explicitly
+	// asked for one.
 	const authorizationHeader = getHeaderCaseInsensitive(defaultHeaders, "Authorization");
 	const shouldSuppressClientApiKey =
-		!oauthToken &&
-		!model.compat.officialEndpoint &&
-		typeof authorizationHeader === "string" &&
-		/^Bearer\s+/i.test(authorizationHeader);
+		!oauthToken && !model.compat.officialEndpoint && typeof authorizationHeader === "string";
 
 	return {
 		isOAuthToken: oauthToken,
@@ -2783,11 +2854,22 @@ function enforceCacheControlLimit(params: MessageCreateParamsStreaming, maxBreak
 	}
 }
 
+function usesAdaptiveThinkingTagOnly(model: Model<"anthropic-messages">): boolean {
+	const thinking = model.thinking;
+	if (thinking?.mode !== "anthropic-adaptive") return false;
+	const effortMap = thinking.effortMap;
+	if (!effortMap) return false;
+	for (const effort of thinking.efforts) {
+		if (effortMap[effort] !== "adaptive") return false;
+	}
+	return thinking.efforts.length > 0;
+}
+
 function resolveAnthropicAdaptiveEffort(
 	model: Model<"anthropic-messages">,
 	options: AnthropicOptions,
 ): AnthropicEffort | undefined {
-	if (options.effort) return options.effort;
+	if (options.effort) return usesAdaptiveThinkingTagOnly(model) ? "adaptive" : options.effort;
 	const requestedEffort = options.reasoning;
 	if (!requestedEffort) return undefined;
 	return mapEffortToAnthropicAdaptiveEffort(model, requestedEffort);
@@ -2854,7 +2936,7 @@ function buildParams(
 
 	// Pre-compute thinking + output_config effort.
 	let thinking: MessageCreateParamsStreaming["thinking"] | undefined;
-	let outputConfigEffort: AnthropicEffort | undefined;
+	let outputConfigEffort: AnthropicOutputEffort | undefined;
 	if (model.reasoning) {
 		if (options?.thinkingEnabled) {
 			const mode = model.thinking?.mode;
@@ -2872,18 +2954,22 @@ function buildParams(
 					adaptive.display = options.thinkingDisplay ?? "summarized";
 				}
 				thinking = adaptive;
-				if (effort) outputConfigEffort = effort;
+				if (effort && effort !== "adaptive") outputConfigEffort = effort;
 			} else {
 				thinking = {
 					type: "enabled",
 					budget_tokens: options.thinkingBudgetTokens || 1024,
 					display: options.thinkingDisplay ?? "summarized",
 				};
-				if (mode === "anthropic-budget-effort" && effort) outputConfigEffort = effort;
+				if (mode === "anthropic-budget-effort" && effort && effort !== "adaptive") outputConfigEffort = effort;
 			}
 		} else if (options?.thinkingEnabled === false) {
 			const compat = model.compat;
-			if (model.thinking?.mode === "anthropic-adaptive" && !compat.disableAdaptiveThinking) {
+			if (
+				model.thinking?.mode === "anthropic-adaptive" &&
+				!compat.disableAdaptiveThinking &&
+				!usesAdaptiveThinkingTagOnly(model)
+			) {
 				// Adaptive-only Claude models (Opus 4.6+, Sonnet 4.6+, Fable/Mythos 5) reject
 				// `thinking.type: "disabled"` — adaptive thinking cannot be switched off.
 				// Omit the thinking field (the API defaults to adaptive) and pin the
@@ -2896,11 +2982,28 @@ function buildParams(
 		}
 	}
 
-	// Pre-compute context_management (depends on thinking).
-	const contextManagement =
-		isOAuthToken && thinking?.type === "adaptive"
-			? { edits: [{ type: "clear_thinking_20251015" as const, keep: "all" as const }] }
-			: undefined;
+	// Pre-compute context_management. Send keep: "all" for every enabled or
+	// adaptive thinking request (OAuth + API-key) — not just OAuth. Without
+	// this directive Anthropic-compatible backends (Z.AI, Kimi, DeepSeek, …)
+	// strip the replayed thinking blocks `replayUnsignedThinking` puts back
+	// on the wire, so the model loses the prior reasoning chain across turns
+	// and the KV cache misses every turn (#3288). Narrowing this guard back
+	// to `isOAuthToken` regresses every API-key thinking provider. Skip
+	// injected clients because this code cannot add the required
+	// `context-management-2025-06-27` beta to caller-owned SDK clients. Skip
+	// Copilot because its proxy strips Anthropic betas and demotes thinking
+	// blocks to text upstream, so `keep: "all"` is a no-op that risks proxy
+	// rejection of an unrecognized field. Skip Vertex rawPredict because that
+	// adapter requires betas in the JSON body (`anthropic_beta`) instead of the
+	// Anthropic HTTP beta header this code can add.
+	const shouldKeepThinkingContext =
+		!options?.client &&
+		model.provider !== "github-copilot" &&
+		model.provider !== "google-vertex" &&
+		(thinking?.type === "adaptive" || thinking?.type === "enabled");
+	const contextManagement = shouldKeepThinkingContext
+		? { edits: [{ type: "clear_thinking_20251015" as const, keep: "all" as const }] }
+		: undefined;
 
 	// Pre-compute output_config.
 	const outputConfigEntries: AnthropicOutputConfig = {};
@@ -3265,8 +3368,9 @@ export function convertAnthropicMessages(
 /**
  * JSON Schema whitelist for Anthropic tool `input_schema` nodes.
  *
- * Mirrors the Anthropic Python SDK's `lib/_parse/_transform.py::transform_schema`:
- * we keep only structural/metadata keywords Anthropic's validator honors, and demote
+ * Tracks the Anthropic Python SDK's `lib/_parse/_transform.py::transform_schema`,
+ * with live Messages API guardrails for keywords the SDK preserves but the API rejects.
+ * We keep only structural/metadata keywords Anthropic's validator honors, and demote
  * anything else into the node's `description` as `\n\n{key: value, ...}` so the model
  * still sees the constraint as a natural-language hint.
  *
@@ -3281,7 +3385,6 @@ const ANTHROPIC_TOOL_SCHEMA_UNIVERSAL_KEEP = new Set([
 	"definitions",
 	"type",
 	"anyOf",
-	"oneOf",
 	"allOf",
 	"enum",
 	"const",
@@ -3377,13 +3480,16 @@ function anthropicPerTypeKeep(scalarType: string | undefined): Set<string> | und
  * Applies the full whitelist semantics from the Anthropic Python SDK's
  * `lib/_parse/_transform.py::transform_schema`:
  *
- * 1. Universal keys (`$ref`, `$defs`, `type`, `anyOf`/`oneOf`/`allOf`, `enum`, `const`,
- *    `description`, `title`, `default`, `nullable`) are preserved on every node.
+ * 1. Universal keys (`$ref`, `$defs`, `type`, `anyOf`, `allOf`, `enum`, `const`,
+ *    `description`, `title`, `default`, `nullable`) are preserved on every node, with
+ *    one position-dependent exception: the combinator keys. Root `anyOf`/`allOf` are
+ *    spilled (recent Anthropic Messages validators reject combinators at the tool
+ *    `input_schema` root) but kept when nested; `oneOf` is spilled at every position
+ *    (it is not in the documented supported subset).
  * 2. Per-type keys are kept additively (object → `properties`/`required`/`additionalProperties`,
  *    array → `items`/`prefixItems` plus `minItems` only when 0 or 1, string → `format`
  *    only when in the supported value set).
  * 3. Everything else is demoted into the node's `description` as `\n\n{key: value, ...}`
- *    so the model still sees the constraint as a natural-language hint.
  *
  * Object nodes default to `additionalProperties: false`, but explicit open-map
  * declarations (`additionalProperties: true` or a schema literal — Zod's
@@ -3394,6 +3500,7 @@ function anthropicPerTypeKeep(scalarType: string | undefined): Set<string> | und
 function normalizeAnthropicToolSchemaNode(
 	schema: unknown,
 	cache: WeakMap<Record<string, unknown>, Record<string, unknown>>,
+	isRoot = false,
 ): unknown {
 	if (Array.isArray(schema)) return schema.map(entry => normalizeAnthropicToolSchemaNode(entry, cache));
 	if (!isRecord(schema)) return schema;
@@ -3411,7 +3518,8 @@ function normalizeAnthropicToolSchemaNode(
 	for (const key in schema) {
 		if (!Object.hasOwn(schema, key)) continue;
 		const value = schema[key];
-		if (ANTHROPIC_TOOL_SCHEMA_UNIVERSAL_KEEP.has(key) || perTypeKeep?.has(key)) {
+		const isRootCombinator = isRoot && COMBINATOR_KEYS.includes(key as (typeof COMBINATOR_KEYS)[number]);
+		if (!isRootCombinator && (ANTHROPIC_TOOL_SCHEMA_UNIVERSAL_KEEP.has(key) || perTypeKeep?.has(key))) {
 			result[key] = value;
 		} else {
 			spill.push([key, value]);
@@ -3486,7 +3594,7 @@ function normalizeAnthropicToolSchemaNode(
 }
 
 export function normalizeAnthropicToolSchema(schema: unknown): unknown {
-	return normalizeAnthropicToolSchemaNode(schema, new WeakMap());
+	return normalizeAnthropicToolSchemaNode(schema, new WeakMap(), true);
 }
 
 type AnthropicToolSchemaPlan = {

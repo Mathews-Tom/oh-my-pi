@@ -6,7 +6,7 @@ import { formatHashlineHeader, stripHashlinePrefixes } from "@oh-my-pi/hashline"
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { isEnoent, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
+import { type } from "arktype";
 
 import { canonicalSnapshotKey, getFileSnapshotStore } from "../edit/file-snapshot-store";
 import { normalizeToLF } from "../edit/normalize";
@@ -20,8 +20,15 @@ import writeDescription from "../prompts/tools/write.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { fileHyperlink, framedBlock, renderStatusLine } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
+import {
+	type ArchiveMemberContent,
+	archiveFormatFromPath,
+	parseArchivePathCandidates,
+	readArchiveEntries,
+	writeArchive,
+} from "../utils/zip";
+import { routeWriteThroughBridge } from "./acp-bridge";
 import { truncateForPrompt } from "./approval";
-import { parseArchivePathCandidates } from "./archive-reader";
 import { assertEditableFile } from "./auto-generated-guard";
 import {
 	type ConflictEntry,
@@ -65,18 +72,12 @@ import { toolResult } from "./tool-result";
 const LOOSE_HASHLINE_HEADER_RE = /^\s*\[[^#\r\n]+#[^ \t\r\n]*\]\s*$/;
 const EXECUTABLE_NOTICE = "[Notice: Made executable via chmod +x]";
 
-let fflateModulePromise: Promise<typeof import("fflate")> | undefined;
-async function loadFflate(): Promise<typeof import("fflate")> {
-	if (!fflateModulePromise) fflateModulePromise = import("fflate");
-	return fflateModulePromise;
-}
-
-const writeSchema = z.object({
-	path: z.string().describe("file path"),
-	content: z.string().describe("file content"),
+const writeSchema = type({
+	path: type("string").describe("file path"),
+	content: type("string").describe("file content"),
 });
 
-export type WriteToolInput = z.infer<typeof writeSchema>;
+export type WriteToolInput = typeof writeSchema.infer;
 
 /** Details returned by the write tool for TUI rendering */
 export interface WriteToolDetails {
@@ -141,15 +142,6 @@ function maybeWriteSnapshotHeader(session: ToolSession, absolutePath: string, co
 	const normalized = normalizeToLF(content);
 	const tag = getFileSnapshotStore(session).record(canonicalSnapshotKey(absolutePath), normalized);
 	return formatHashlineHeader(formatPathRelativeToCwd(absolutePath, session.cwd), tag);
-}
-
-function shouldRouteWriteThroughBridge(session: ToolSession, requestedPath: string, absolutePath: string): boolean {
-	if (isInternalUrlPath(requestedPath)) return false;
-
-	const state = session.getPlanModeState?.();
-	if (!state?.enabled || !isInternalUrlPath(state.planFilePath)) return true;
-
-	return absolutePath !== resolvePlanPath(session, state.planFilePath);
 }
 
 /**
@@ -293,8 +285,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	readonly parameters = writeSchema;
 	readonly strict = true;
 	readonly concurrency = "exclusive";
-	readonly loadMode = "discoverable";
-	readonly summary = "Write content to a file (creates or overwrites)";
+	readonly loadMode = "essential";
 
 	/** Stream matchers should see the real file content, not its JSON-escaped argument encoding. */
 	matcherDigest(args: unknown): string | undefined {
@@ -369,9 +360,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const finalPath = resolvedArchivePath.exists
 			? await fs.realpath(resolvedArchivePath.absolutePath).catch(() => resolvedArchivePath.absolutePath)
 			: resolvedArchivePath.absolutePath;
-		const lowerPath = finalPath.toLowerCase();
-		const isZip = lowerPath.endsWith(".zip");
-		const isGzip = lowerPath.endsWith(".tar.gz") || lowerPath.endsWith(".tgz");
+		// A realpath swap can land on a name without an archive extension; a
+		// whole-archive rewrite then defaults to an uncompressed tar, matching the
+		// previous `isZip`/`isGzip`/else fallthrough.
+		const format = archiveFormatFromPath(finalPath) ?? "tar";
 		// Rewrites are whole-archive: write to a temp file and rename so a
 		// crash/disk-full mid-write can't destroy the original archive.
 		const tmpPath = `${finalPath}.tmp-${process.pid}`;
@@ -381,66 +373,25 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			await fs.mkdir(parentDir, { recursive: true });
 		}
 
-		if (isZip) {
-			const zipEntries: Record<string, Uint8Array> = {};
-
-			if (resolvedArchivePath.exists) {
-				try {
-					const bytes = await Bun.file(resolvedArchivePath.absolutePath).bytes();
-					const { unzipSync } = await loadFflate();
-					const existing = unzipSync(new Uint8Array(bytes));
-					for (const [entryPath, data] of Object.entries(existing)) {
-						zipEntries[entryPath.replace(/\\/g, "/")] = data;
-					}
-				} catch (error) {
-					throw new ToolError(error instanceof Error ? error.message : String(error));
-				}
-			}
-
-			zipEntries[resolvedArchivePath.archiveSubPath] = new TextEncoder().encode(content);
-
+		const entries = new Map<string, ArchiveMemberContent>();
+		if (resolvedArchivePath.exists) {
 			try {
-				const { zipSync } = await loadFflate();
-				const zipBuffer = zipSync(zipEntries);
-				await Bun.write(tmpPath, zipBuffer);
-				await fs.rename(tmpPath, finalPath);
+				const existing = await readArchiveEntries({ bytes: await Bun.file(finalPath).bytes(), format });
+				for (const [entryPath, data] of existing) {
+					entries.set(entryPath, data);
+				}
 			} catch (error) {
-				await fs.rm(tmpPath, { force: true }).catch(() => {});
 				throw new ToolError(error instanceof Error ? error.message : String(error));
 			}
-		} else {
-			const archiveEntries: Record<string, string | File> = {};
-			if (resolvedArchivePath.exists) {
-				let archive: Bun.Archive;
-				try {
-					archive = new Bun.Archive(await Bun.file(resolvedArchivePath.absolutePath).bytes());
-				} catch (error) {
-					throw new ToolError(error instanceof Error ? error.message : String(error));
-				}
+		}
+		entries.set(resolvedArchivePath.archiveSubPath, content);
 
-				let files: Map<string, File>;
-				try {
-					files = await archive.files();
-				} catch (error) {
-					throw new ToolError(error instanceof Error ? error.message : String(error));
-				}
-
-				for (const [entryPath, file] of files) {
-					archiveEntries[entryPath.replace(/\\/g, "/")] = file;
-				}
-			}
-
-			archiveEntries[resolvedArchivePath.archiveSubPath] = content;
-
-			try {
-				// `Bun.Archive.write` never infers compression from the extension;
-				// request gzip explicitly so `.tar.gz`/`.tgz` stay compressed.
-				await Bun.Archive.write(tmpPath, archiveEntries, isGzip ? { compress: "gzip" } : undefined);
-				await fs.rename(tmpPath, finalPath);
-			} catch (error) {
-				await fs.rm(tmpPath, { force: true }).catch(() => {});
-				throw new ToolError(error instanceof Error ? error.message : String(error));
-			}
+		try {
+			await writeArchive(tmpPath, format, entries);
+			await fs.rename(tmpPath, finalPath);
+		} catch (error) {
+			await fs.rm(tmpPath, { force: true }).catch(() => {});
+			throw new ToolError(error instanceof Error ? error.message : String(error));
 		}
 
 		invalidateFsScanAfterWrite(resolvedArchivePath.absolutePath);
@@ -812,11 +763,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		};
 	}
 
-	#routeWriteThroughBridge(absolutePath: string, content: string): Promise<void> | undefined {
-		const bridge = this.session.getClientBridge?.();
-		if (!bridge?.capabilities.writeTextFile || !bridge.writeTextFile) return undefined;
-		return bridge.writeTextFile({ path: absolutePath, content });
-	}
 	async execute(
 		_toolCallId: string,
 		{ path: rawPath, content }: WriteParams,
@@ -923,17 +869,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			// Try ACP bridge first for editor-visible filesystem paths. Internal
 			// artifacts such as local:// plans are owned by OMP, not the editor.
-			const bridgePromise = shouldRouteWriteThroughBridge(this.session, path, absolutePath)
-				? this.#routeWriteThroughBridge(absolutePath, cleanContent)
-				: undefined;
-			if (bridgePromise !== undefined) {
-				try {
-					await bridgePromise;
-				} catch (error) {
-					throw new ToolError(error instanceof Error ? error.message : String(error));
-				}
-				invalidateFsScanAfterWrite(absolutePath);
-				this.session.bumpFileMutationVersion?.(absolutePath);
+			if (await routeWriteThroughBridge(this.session, path, absolutePath, cleanContent)) {
 				const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, cleanContent);
 				const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
 				const header = maybeWriteSnapshotHeader(this.session, absolutePath, cleanContent);
@@ -1108,14 +1044,12 @@ export const writeToolRenderer = {
 		const lang = getLanguageFromPath(rawPath) ?? "text";
 		const langIcon = uiTheme.fg("muted", uiTheme.getLangIcon(lang));
 		const pathDisplay = filePath ? uiTheme.fg("accent", filePath) : uiTheme.fg("toolOutput", "…");
-		// Static pending icon, never the animated glyph: the header is the head
-		// row of the framed block, and native-scrollback commits are prefix-only
-		// — an animating head row would pin the commit boundary at the top and
-		// keep a tall expanded preview from scroll-appending mid-stream. The
-		// liveness cue rides the trailing "(streaming)" line instead.
+		// No status icon on the head row: it's the head of the framed block, and
+		// native-scrollback commits are prefix-only — an animated glyph would pin
+		// the commit boundary at the top, and the pending hourglass just adds
+		// noise. The liveness cue rides the trailing "(streaming)" line instead.
 		const header = renderStatusLine(
 			{
-				icon: "pending",
 				title: "Write",
 				description: `${langIcon} ${pathDisplay}`,
 			},

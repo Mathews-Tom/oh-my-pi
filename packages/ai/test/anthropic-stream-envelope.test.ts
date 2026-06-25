@@ -260,6 +260,34 @@ function createMalformedToolUseEvents(): MockAnthropicEvent[] {
 	];
 }
 
+function createGenuinelyMalformedToolUseEvents(): MockAnthropicEvent[] {
+	return [
+		{
+			type: "message_start",
+			message: {
+				id: "msg_tool_broken",
+				usage: {
+					input_tokens: 12,
+					output_tokens: 0,
+					cache_read_input_tokens: 0,
+					cache_creation_input_tokens: 0,
+				},
+			},
+		},
+		{
+			type: "content_block_start",
+			index: 0,
+			content_block: { type: "tool_use", id: "tool_broken", name: "lookup_weather", input: {} },
+		},
+		{
+			type: "content_block_delta",
+			index: 0,
+			delta: { type: "input_json_delta", partial_json: '{"city": Par' },
+		},
+		{ type: "content_block_stop", index: 0 },
+	];
+}
+
 function createUnterminatedToolUseSplicedReconnectEvents(): MockAnthropicEvent[] {
 	return [
 		{
@@ -547,6 +575,36 @@ describe("anthropic stream envelope handling", () => {
 		expect(result.content).toEqual([{ type: "text", text: "59" }]);
 		expect(capturedParams?.tools?.map(tool => tool.name)).toEqual(["web_search"]);
 		expect(capturedOptions?.headers).toEqual({ "X-Umans-Websearch-Provider": "exa" });
+	});
+
+	it("does not send context_management through injected clients", async () => {
+		type CapturedPayload = {
+			thinking?: { type?: string };
+			context_management?: unknown;
+		};
+		let capturedParams: CapturedPayload | undefined;
+		const client: AnthropicMessagesClientLike = {
+			messages: {
+				create(params) {
+					capturedParams = params as CapturedPayload;
+					return createMockRequest(createTextSuccessEvents("done"));
+				},
+			},
+		};
+
+		const stream = streamAnthropic(model, context, {
+			client,
+			thinkingEnabled: true,
+		});
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const result = await stream.result();
+
+		expect(result.content).toEqual([{ type: "text", text: "done" }]);
+		expect(capturedParams?.thinking?.type).toBe("enabled");
+		expect(capturedParams?.context_management).toBeUndefined();
 	});
 	it("unwraps thinking blocks that Anthropic streams with literal thinking tags", async () => {
 		const wrappedThinking =
@@ -1019,6 +1077,32 @@ describe("anthropic stream envelope handling", () => {
 		// Best-effort arguments recovered by the throttled streaming parser are retained.
 		expect(toolCall.arguments).toEqual({ city: "Par" });
 		expect("partialJson" in toolCall).toBe(false);
+	});
+
+	it("records __parseError and pre-truncated __rawJson when partialParse fails on malformed JSON", async () => {
+		let attempt = 0;
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
+			attempt += 1;
+			return createMockRequest(createGenuinelyMalformedToolUseEvents()) as never;
+		});
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const result = await stream.result();
+
+		expect(attempt).toBe(1);
+
+		const toolCall = result.content[0];
+		expect(toolCall?.type).toBe("toolCall");
+		if (toolCall?.type !== "toolCall") {
+			throw new Error("Expected toolCall content");
+		}
+		expect(toolCall.arguments.__parseError).toBeDefined();
+		expect(toolCall.arguments.__rawJson).toBeDefined();
+		expect(toolCall.arguments.__rawJson).toContain('{"city": Par');
 	});
 
 	it("finalizes a tool call left open by a spliced reconnect instead of erroring", async () => {

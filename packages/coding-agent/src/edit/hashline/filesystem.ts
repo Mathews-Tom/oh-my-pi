@@ -16,12 +16,15 @@
  * (batch request, diagnostics) lives on the instance and isn't safe to
  * share across concurrent edit tools.
  */
+import * as path from "node:path";
 import { Filesystem, NotFoundError, type WriteResult } from "@oh-my-pi/hashline";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import type { FileDiagnosticsResult, WritethroughCallback, WritethroughDeferredHandle } from "../../lsp";
 import type { ToolSession } from "../../tools";
+import { routeWriteThroughBridge } from "../../tools/acp-bridge";
 import { assertEditableFileContent } from "../../tools/auto-generated-guard";
 import { invalidateFsScanAfterWrite } from "../../tools/fs-cache-invalidation";
+import { isInternalUrlPath } from "../../tools/path-utils";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
 import { canonicalSnapshotKey } from "../file-snapshot-store";
 import { readEditFileText, serializeEditFileText } from "../read-file";
@@ -85,6 +88,18 @@ export class HashlineFilesystem extends Filesystem {
 		return canonicalSnapshotKey(this.resolveAbsolute(relativePath));
 	}
 
+	allowTagPathRecovery(authoredPath: string, resolvedPath: string): boolean {
+		// Internal-URL authored targets (`local://`, `vault://`, …) are approved
+		// at the lower "read" privilege; never let one redirect onto a "write".
+		if (isInternalUrlPath(authoredPath)) return false;
+		// Recovery only fixes a mistyped working-tree path: confine the resolved
+		// target to the working tree (realpath-normalized). A plain-path "write"
+		// approval must not redirect into the artifact sandbox, the secret vault,
+		// or any out-of-tree file the user never named.
+		const root = canonicalSnapshotKey(this.session.cwd);
+		return resolvedPath === root || resolvedPath.startsWith(`${root}${path.sep}`);
+	}
+
 	async readText(relativePath: string): Promise<string> {
 		const absolutePath = this.resolveAbsolute(relativePath);
 		let content: string;
@@ -110,6 +125,13 @@ export class HashlineFilesystem extends Filesystem {
 		await this.preflightWrite(relativePath);
 		const absolutePath = this.resolveAbsolute(relativePath);
 		const finalContent = await serializeEditFileText(absolutePath, relativePath, content);
+
+		// Route through ACP bridge when available; skips internal artifacts.
+		if (await routeWriteThroughBridge(this.session, relativePath, absolutePath, finalContent)) {
+			this.#diagnosticsByPath.set(relativePath, undefined);
+			return { text: finalContent };
+		}
+
 		const diagnostics = await this.#writethrough(
 			absolutePath,
 			finalContent,

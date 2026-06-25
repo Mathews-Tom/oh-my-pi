@@ -4,6 +4,7 @@ import * as path from "node:path";
 import * as url from "node:url";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { getActiveRules } from "../capability/rule";
+import type { Skill } from "../extensibility/skills";
 import { InternalUrlRouter, type LocalProtocolOptions, parseInternalUrl } from "../internal-urls";
 import { ToolError } from "./tool-errors";
 
@@ -1013,6 +1014,8 @@ export interface ToolScopeOptions {
 	signal?: AbortSignal;
 	/** Calling session's `local://` root mapping — pins resolutions to the calling session. */
 	localProtocolOptions?: LocalProtocolOptions;
+	/** Calling session's loaded skills — lets skill:// resolve without process-global state. */
+	skills?: readonly Skill[];
 }
 
 export interface ToolScopeResolution {
@@ -1069,6 +1072,7 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 			settings: opts.settings,
 			signal: opts.signal,
 			localProtocolOptions: opts.localProtocolOptions,
+			skills: opts.skills,
 		});
 		if (!resource.sourcePath) {
 			throw new ToolError(`Cannot ${internalUrlAction} internal URL without a backing file: ${rawPath}`);

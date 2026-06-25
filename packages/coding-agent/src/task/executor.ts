@@ -41,7 +41,8 @@ import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../session/messages";
 import { SessionManager } from "../session/session-manager";
 import { truncateTail } from "../session/streaming-output";
-import type { ContextFileEntry } from "../tools";
+import type { ContextFileEntry, ToolSession } from "../tools";
+import { resolveEvalBackends } from "../tools/eval-backends";
 import { isIrcEnabled } from "../tools/irc";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import {
@@ -196,7 +197,7 @@ function installSubagentRetryFallbackChain(args: {
 function renderIrcPeerRoster(selfId: string): string {
 	const peers = AgentRegistry.global()
 		.list()
-		.filter(ref => ref.id !== selfId && ref.status !== "aborted");
+		.filter(ref => ref.id !== selfId && ref.status !== "aborted" && ref.kind !== "advisor");
 	if (peers.length === 0) return "- (no other agents)";
 	const lines = peers.map(
 		peer =>
@@ -302,6 +303,16 @@ export interface ExecutorOptions {
 	enableLsp?: boolean;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
+	/**
+	 * Epochs (ms, `Date.now()`) bracketing the concurrency-semaphore wait:
+	 * `invokedAt` is stamped at the spawn boundary before `acquire()`,
+	 * `acquiredAt` immediately after. {@link runSubprocess} reports true queue
+	 * wait (`acquiredAt - invokedAt`) and pre-run setup (`startTime - acquiredAt`)
+	 * separately in the launch-timing debug log. Undefined for callers that
+	 * bypass the semaphore path.
+	 */
+	invokedAt?: number;
+	acquiredAt?: number;
 	sessionFile?: string | null;
 	persistArtifacts?: boolean;
 	artifactsDir?: string;
@@ -516,6 +527,7 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 	const { yieldItems, reportFindings, doneAborted, signalAborted, outputSchema } = args;
 	let abortedViaYield = false;
 	const hasYield = Array.isArray(yieldItems) && yieldItems.length > 0;
+	const hadFailureBeforeYield = exitCode !== 0 && stderr.trim().length > 0;
 
 	if (hasYield) {
 		const lastYield = yieldItems[yieldItems.length - 1];
@@ -553,12 +565,16 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 						const errorMessage = err instanceof Error ? err.message : String(err);
 						rawOutput = `{"error":"Failed to serialize yield data: ${errorMessage}"}`;
 					}
-					exitCode = 0;
-					stderr = overridden
-						? SUBAGENT_WARNING_SCHEMA_OVERRIDDEN
-						: schemaError
-							? `invalid output schema: ${schemaError}`
-							: "";
+					if (!hadFailureBeforeYield) {
+						exitCode = 0;
+						stderr = overridden
+							? SUBAGENT_WARNING_SCHEMA_OVERRIDDEN
+							: schemaError
+								? `invalid output schema: ${schemaError}`
+								: "";
+					} else if (!stderr) {
+						stderr = "Subagent failed after yielding a result.";
+					}
 				}
 			}
 		}
@@ -1693,6 +1709,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		onProgress,
 	} = options;
 	const startTime = Date.now();
+	// Set by the session's onFirstChatDispatch hook the first time the agent
+	// loop dispatches a chat request to the provider — the launch-complete boundary.
+	let firstChatDispatchAt: number | undefined;
 
 	// Check if already aborted
 	if (signal?.aborted) {
@@ -1772,10 +1791,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		toolNames = [...toolNames, "irc"];
 	}
 	if (toolNames?.includes("exec")) {
-		const allowEvalPy = settings.get("eval.py") ?? true;
-		const allowEvalJs = settings.get("eval.js") ?? true;
+		const backends = resolveEvalBackends({ settings } as ToolSession);
 		const expanded = toolNames.filter(name => name !== "exec");
-		if (allowEvalPy || allowEvalJs) expanded.push("eval");
+		if (backends.python || backends.js || backends.ruby || backends.julia) expanded.push("eval");
 		expanded.push("bash");
 		toolNames = Array.from(new Set(expanded));
 	}
@@ -1863,6 +1881,14 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				abortSignal.removeEventListener("abort", onAbort);
 			}
 		};
+		// Launch-latency phase marks (performance.now()); read by the debug log
+		// emitted before this closure returns. Left undefined when setup throws
+		// before reaching the phase, which itself localizes the cost.
+		const perfStart = performance.now();
+		let resolvedAt: number | undefined;
+		let sessionOpenedAt: number | undefined;
+		let sessionCreatedAt: number | undefined;
+		let readyAt: number | undefined;
 
 		try {
 			checkAbort();
@@ -1930,6 +1956,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const effectiveThinkingLevel = explicitThinkingLevel
 				? resolvedThinkingLevel
 				: (thinkingLevel ?? resolvedThinkingLevel);
+			resolvedAt = performance.now();
 
 			const effectiveCwd = worktree ?? cwd;
 			const sessionManager = sessionFile
@@ -1943,6 +1970,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			if (options.parentArtifactManager) {
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
 			}
+			sessionOpenedAt = performance.now();
 
 			const mcpProxyTools = options.mcpManager ? createMCPProxyTools(options.mcpManager) : [];
 			const enableMCP = !options.mcpManager;
@@ -2038,6 +2066,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				localProtocolOptions: options.localProtocolOptions,
 				telemetry: subagentTelemetry,
 				parentEvalSessionId: options.parentEvalSessionId,
+				onFirstChatDispatch: () => {
+					firstChatDispatchAt ??= performance.now();
+				},
 			});
 
 			const sessionPromise = createAgentSession(buildSubagentSessionOptions(sessionManager));
@@ -2051,6 +2082,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				void sessionPromise.then(created => created.session.dispose()).catch(() => {});
 				throw err;
 			}
+			sessionCreatedAt = performance.now();
 
 			monitor.setActiveSession(session);
 			installRegistryStatusSync(session);
@@ -2196,6 +2228,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 			}
 
+			readyAt = performance.now();
 			const outcome = await driveSessionToYield(session, monitor, task);
 			exitCode = outcome.exitCode;
 			error = outcome.error;
@@ -2260,6 +2293,35 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			}
 		}
 
+		// Launch-latency breakdown (subagent invocation → first chat dispatch).
+		// Phase deltas are performance.now() spans; the semaphore brackets use the
+		// Date.now epochs captured by the spawn site (invokedAt before acquire,
+		// acquiredAt after) so queue wait and pre-run setup are reported apart.
+		const span = (from: number | undefined, to: number | undefined): number | undefined =>
+			from !== undefined && to !== undefined ? Math.round(to - from) : undefined;
+		const queueMs =
+			options.invokedAt !== undefined && options.acquiredAt !== undefined
+				? Math.round(options.acquiredAt - options.invokedAt)
+				: undefined;
+		const preRunMs = options.acquiredAt !== undefined ? Math.round(startTime - options.acquiredAt) : undefined;
+		const setupToFirstChatMs = span(perfStart, firstChatDispatchAt);
+		const invokeToFirstChatMs =
+			options.invokedAt !== undefined && setupToFirstChatMs !== undefined
+				? Math.round(startTime - options.invokedAt) + setupToFirstChatMs
+				: undefined;
+		logger.debug("subagent launch timing", {
+			id,
+			agent: agent.name,
+			queueMs,
+			preRunMs,
+			resolveMs: span(perfStart, resolvedAt),
+			sessionOpenMs: span(resolvedAt, sessionOpenedAt),
+			createSessionMs: span(sessionOpenedAt, sessionCreatedAt),
+			readyMs: span(sessionCreatedAt, readyAt),
+			promptToFirstChatMs: span(readyAt, firstChatDispatchAt),
+			setupToFirstChatMs,
+			invokeToFirstChatMs,
+		});
 		return {
 			exitCode,
 			error,

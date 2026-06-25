@@ -47,6 +47,14 @@ omp config reset steeringMode   # restore a key to its schema default
 omp config path                 # print the active agent directory
 ```
 
+For users who want the full first-run animation on normal launches, set `startup.showSplash`:
+
+```bash
+omp config set startup.showSplash true
+```
+
+This only controls the startup splash animation. It does not rerun setup or change setup state, and `startup.quiet: true` still suppresses all startup chrome including the splash.
+
 ### Subcommands
 
 | Command | Effect |
@@ -190,7 +198,7 @@ tools:
     bash: prompt
 
 compaction:
-  strategy: context-full
+  strategy: snapcompact
   thresholdPercent: 80
 
 theme:
@@ -321,7 +329,7 @@ See [Advisor and WATCHDOG.md](./advisor-watchdog.md) for runtime behavior, `WATC
 | `advisor.enabled` | boolean | `false` | Enable the advisor runtime when `modelRoles.advisor` resolves to an available model. |
 | `advisor.subagents` | boolean | `false` | Also enable advisor runtimes for spawned task/eval subagents. |
 | `advisor.syncBacklog` | enum | `off` | Bounded advisor catch-up delay: `off`, `1`, `3`, or `5`. The primary waits up to 30 seconds only while advisor backlog is at or above the threshold. |
-| `advisor.immuneTurns` | number | `1` | After a `concern`/`blocker` interrupts, route further concerns/blockers as non-interrupting asides for this many completed primary turns. |
+| `advisor.immuneTurns` | number | `3` | After a `concern`/`blocker` interrupts, route further concerns/blockers as non-interrupting asides for this many completed primary turns. |
 
 ### Thinking
 
@@ -484,7 +492,6 @@ read:
 | `read.summarize.enabled` | boolean | `true` | Structural summaries for code reads. |
 | `read.summarize.prose` | boolean | `false` | Summarize prose files too. |
 | `read.toolResultPreview` | boolean | `false` | Inline preview of tool results. |
-| `readHashLines` | boolean | `true` | Show hashline tags in read output. |
 | `readLineNumbers` | boolean | `false` | Show plain line numbers. |
 
 ### Context, compaction, and memory
@@ -495,7 +502,7 @@ contextPromotion:
 
 compaction:
   enabled: true
-  strategy: context-full     # context-full, handoff, shake, snapcompact, off
+  strategy: snapcompact     # context-full, handoff, shake, snapcompact, off
   thresholdPercent: -1       # -1 = default reserve-based behavior
   thresholdTokens: -1        # fixed token limit when > 0
   remoteEnabled: true
@@ -508,7 +515,7 @@ memory:
 |---|---|---|---|
 | `contextPromotion.enabled` | boolean | `true` | Promote relevant earlier context. |
 | `compaction.enabled` | boolean | `true` | Automatic conversation compaction. |
-| `compaction.strategy` | enum | `context-full` | `context-full`, `handoff`, `shake`, `snapcompact`, `off`. |
+| `compaction.strategy` | enum | `snapcompact` | `context-full`, `handoff`, `shake`, `snapcompact`, `off`. |
 | `compaction.thresholdPercent` | number | `-1` | Percent-of-context trigger; `-1` = reserve-based default. |
 | `compaction.thresholdTokens` | number | `-1` | Fixed token trigger when `> 0`. |
 | `compaction.reserveTokens` | number | `16384` | Tokens reserved for the next turn. |
@@ -607,7 +614,7 @@ searxng:
 
 | Key | Type | Default | Values / notes |
 |---|---|---|---|
-| `providers.webSearch` | enum | `auto` | `auto` plus the configured search providers (`tavily`, `perplexity`, `brave`, `jina`, `kimi`, `anthropic`, `gemini`, `codex`, `zai`, `exa`, `parallel`, `kagi`, `synthetic`, `searxng`). |
+| `providers.webSearch` | enum | `auto` | `auto` plus the configured search providers (`perplexity`, `gemini`, `anthropic`, `codex`, `zai`, `exa`, `jina`, `kagi`, `tavily`, `brave`, `kimi`, `parallel`, `synthetic`, `searxng`). |
 | `providers.image` | enum | `auto` | `auto`, `openai`, `antigravity`, `xai`, `gemini`, `openrouter`. |
 | `providers.fetch` | enum | `auto` | `auto`, `native`, `trafilatura`, `lynx`, `parallel`, `jina`. |
 | `providers.tinyModel` | enum | `online` | `online` or a local model (`lfm2-350m`, `qwen3-0.6b`, `gemma-270m`, `qwen2.5-0.5b`, `lfm2-700m`). |
