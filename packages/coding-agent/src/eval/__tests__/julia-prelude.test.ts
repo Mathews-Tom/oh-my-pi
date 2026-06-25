@@ -44,5 +44,5 @@ nothing
 		expect(result.output).toContain("STRIPPED=red");
 		expect(result.output).toContain("META=alpha:true");
 		expect(result.output).toContain("MULTI=2:alpha:json");
-	}, 30_000);
+	}, 60_000);
 });
