@@ -328,4 +328,20 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).toContain("vendor:keep");
 		expect(result.items.map(rule => rule.name)).not.toContain("vendor:drop");
 	});
+	test("keeps root .ignore precedence over nested .gitignore for linked rules", async () => {
+		if (process.platform === "win32") return;
+		await writeFile(path.join(project, ".ignore"), ".claude/rules/shared/private.md\n");
+		await writeFile(path.join(project, ".claude", "rules", ".gitignore"), "!shared/private.md\n");
+		const sharedRules = path.join(root, "shared-rules-ignore-precedence");
+		await writeFile(path.join(sharedRules, "private.md"), "Private rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).not.toContain("shared:private");
+	});
 });

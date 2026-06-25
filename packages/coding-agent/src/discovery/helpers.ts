@@ -576,14 +576,21 @@ async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<G
 	await loadIgnoreFile(rules, await globalGitignorePath(), rootDir);
 	const gitExcludeFile = await resolveGitExcludeFile(rootDir);
 	if (gitExcludeFile) await loadIgnoreFile(rules, gitExcludeFile, rootDir);
+	const directories: string[] = [];
 	let current = rootDir;
 	while (true) {
-		await loadIgnoreFile(rules, path.join(current, ".gitignore"), current);
-		await loadIgnoreFile(rules, path.join(current, ".ignore"), current);
+		directories.push(current);
 		if (path.resolve(current) === path.resolve(targetDir)) break;
-		const next = path.join(current, path.relative(current, targetDir).split(path.sep)[0] ?? "");
+		const nextSegment = path.relative(current, targetDir).split(path.sep)[0] ?? "";
+		const next = path.join(current, nextSegment);
 		if (next === current || !path.relative(current, targetDir)) break;
 		current = next;
+	}
+	for (const dir of directories) {
+		await loadIgnoreFile(rules, path.join(dir, ".gitignore"), dir);
+	}
+	for (const dir of directories) {
+		await loadIgnoreFile(rules, path.join(dir, ".ignore"), dir);
 	}
 	return rules;
 }
