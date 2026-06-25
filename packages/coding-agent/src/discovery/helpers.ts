@@ -588,7 +588,11 @@ async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<G
 	return rules;
 }
 
-function gitignoreRuleMatch(rule: GitignoreRule, filePath: string): GitignoreMatch | undefined {
+function gitignoreRuleMatch(
+	rule: GitignoreRule,
+	filePath: string,
+	options?: { treatAsDirectory?: boolean },
+): GitignoreMatch | undefined {
 	const relativePath = normalizedRelativePath(rule.baseDir, filePath);
 	if (!relativePath || relativePath.startsWith("../")) return undefined;
 
@@ -607,19 +611,22 @@ function gitignoreRuleMatch(rule: GitignoreRule, filePath: string): GitignoreMat
 			matchedAncestors.push(path.resolve(rule.baseDir, ancestor));
 		}
 	}
-	const matchedPath = !directoryOnly && pathGlob.match(relativePath);
+	const matchedPath = (options?.treatAsDirectory ? true : !directoryOnly) && pathGlob.match(relativePath);
 	if (matchedPath || matchedAncestors.length > 0) return { matchedPath, matchedAncestors };
 	return undefined;
 }
-
-async function isGitignoredPath(dir: string, relativePath: string): Promise<boolean> {
+async function getGitignoreState(
+	dir: string,
+	relativePath: string,
+	options?: { treatAsDirectory?: boolean },
+): Promise<{ ignoredPath: boolean; ignoredAncestors: Set<string> }> {
 	const filePath = path.join(dir, relativePath);
 	const rootDir = await findGitignoreRoot(dir);
 	const rules = await loadGitignoreRules(rootDir, path.dirname(filePath));
 	let ignoredPath = false;
 	const ignoredAncestors = new Set<string>();
 	for (const rule of rules) {
-		const match = gitignoreRuleMatch(rule, filePath);
+		const match = gitignoreRuleMatch(rule, filePath, options);
 		if (!match) continue;
 		if (rule.negated) {
 			for (const ancestor of match.matchedAncestors) {
@@ -637,11 +644,19 @@ async function isGitignoredPath(dir: string, relativePath: string): Promise<bool
 			}
 		}
 	}
+	return { ignoredPath, ignoredAncestors };
+}
+
+async function isGitignoredPath(dir: string, relativePath: string): Promise<boolean> {
+	const { ignoredPath, ignoredAncestors } = await getGitignoreState(dir, relativePath);
 	return ignoredPath || ignoredAncestors.size > 0;
 }
 
 async function isGitignoredDirectoryPath(dir: string, relativePath: string): Promise<boolean> {
-	return isGitignoredPath(dir, path.join(relativePath, "__omp_ignore_probe__"));
+	const { ignoredPath, ignoredAncestors } = await getGitignoreState(dir, relativePath, {
+		treatAsDirectory: true,
+	});
+	return ignoredPath || ignoredAncestors.size > 0;
 }
 
 async function discoverLinkedFilesFromDir(
