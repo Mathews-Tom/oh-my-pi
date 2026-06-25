@@ -138,4 +138,20 @@ describe("Claude Code rule discovery", () => {
 
 		expect(result.items.map(rule => rule.name)).not.toContain("shared:private");
 	});
+
+	test("skips ignored linked rule directories", async () => {
+		if (process.platform === "win32") return;
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/vendor/\n");
+		const vendorRules = path.join(root, "vendor-rules");
+		await writeFile(path.join(vendorRules, "private.md"), "Private rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(vendorRules, path.join(project, ".claude", "rules", "vendor"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).not.toContain("vendor:private");
+	});
 });

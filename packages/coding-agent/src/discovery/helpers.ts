@@ -614,6 +614,10 @@ async function isGitignoredPath(dir: string, relativePath: string): Promise<bool
 	return ignoredPath || ignoredAncestors.size > 0;
 }
 
+async function isGitignoredDirectoryPath(dir: string, relativePath: string): Promise<boolean> {
+	return isGitignoredPath(dir, path.join(relativePath, "__omp_ignore_probe__"));
+}
+
 async function discoverLinkedFilesFromDir(
 	dir: string,
 	extensions: string[] | undefined,
@@ -624,6 +628,7 @@ async function discoverLinkedFilesFromDir(
 		relativeDir: string,
 		activeRealDirs: ReadonlySet<string>,
 	): Promise<void> {
+		if (relativeDir && (await isGitignoredDirectoryPath(dir, relativeDir))) return;
 		const realDir = await fs.promises.realpath(currentDir).catch(() => currentDir);
 		if (activeRealDirs.has(realDir)) return;
 		const nextActiveRealDirs = new Set(activeRealDirs);
@@ -654,6 +659,7 @@ async function discoverLinkedFilesFromDir(
 				const entryPath = path.join(currentDir, entry.name);
 				const relativePath = path.join(relativeDir, entry.name);
 				if (!(await isDirectoryPath(entryPath))) return;
+				if (await isGitignoredDirectoryPath(dir, relativePath)) return;
 				if (entry.isSymbolicLink()) {
 					await collectLinkedDir(entryPath, relativePath, new Set<string>());
 					return;
