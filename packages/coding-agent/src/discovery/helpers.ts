@@ -590,7 +590,7 @@ async function isGitignoredPath(dir: string, relativePath: string): Promise<bool
 	const filePath = path.join(dir, relativePath);
 	const rootDir = await findGitignoreRoot(dir);
 	const rules = await loadGitignoreRules(rootDir, path.dirname(filePath));
-	let ignored = false;
+	let ignoredPath = false;
 	const ignoredAncestors = new Set<string>();
 	for (const rule of rules) {
 		const match = gitignoreRuleMatch(rule, filePath);
@@ -599,19 +599,19 @@ async function isGitignoredPath(dir: string, relativePath: string): Promise<bool
 			for (const ancestor of match.matchedAncestors) {
 				ignoredAncestors.delete(ancestor);
 			}
-			if ((match.matchedPath || match.matchedAncestors.length > 0) && ignoredAncestors.size === 0) {
-				ignored = false;
+			if (match.matchedPath && ignoredAncestors.size === 0) {
+				ignoredPath = false;
 			}
 		} else {
-			if (match.matchedPath || match.matchedAncestors.length > 0) {
-				ignored = true;
+			if (match.matchedPath) {
+				ignoredPath = true;
 			}
 			for (const ancestor of match.matchedAncestors) {
 				ignoredAncestors.add(ancestor);
 			}
 		}
 	}
-	return ignored || ignoredAncestors.size > 0;
+	return ignoredPath || ignoredAncestors.size > 0;
 }
 
 async function discoverLinkedFilesFromDir(
