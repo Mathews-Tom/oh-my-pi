@@ -196,26 +196,68 @@ function transformClaudeRule(rulesDir: string, content: string, filePath: string
 	return { ...rule, alwaysApply: true };
 }
 
+function normalizeClaudeExcludePattern(pattern: string, home: string): string {
+	const expandedHome = pattern === "~" ? home : pattern.startsWith("~/") ? path.join(home, pattern.slice(2)) : pattern;
+	return expandedHome.split(path.sep).join("/");
+}
+
+function matchesClaudeMdExclude(filePath: string, excludes: string[], home: string): boolean {
+	const normalizedFilePath = path.resolve(filePath).split(path.sep).join("/");
+	return excludes.some(pattern => {
+		const normalizedPattern = normalizeClaudeExcludePattern(pattern, home);
+		if (!/[*?[\]{}]/.test(normalizedPattern) && path.isAbsolute(normalizedPattern)) {
+			return normalizedFilePath === path.resolve(normalizedPattern).split(path.sep).join("/");
+		}
+		return new Bun.Glob(normalizedPattern).match(normalizedFilePath);
+	});
+}
+
+async function readClaudeMdExcludesFromFile(filePath: string): Promise<string[]> {
+	const content = await readFile(filePath);
+	if (!content) return [];
+	const data = tryParseJson<Record<string, unknown>>(content);
+	const excludes = data?.claudeMdExcludes;
+	return Array.isArray(excludes) ? excludes.filter((value): value is string => typeof value === "string") : [];
+}
+
+async function getClaudeMdExcludes(ctx: LoadContext): Promise<string[]> {
+	const userBase = getUserClaude(ctx);
+	const projectBase = getProjectClaude(ctx);
+	const [user, project, local] = await Promise.all([
+		readClaudeMdExcludesFromFile(path.join(userBase, "settings.json")),
+		readClaudeMdExcludesFromFile(path.join(projectBase, "settings.json")),
+		readClaudeMdExcludesFromFile(path.join(projectBase, "settings.local.json")),
+	]);
+	return [...user, ...project, ...local];
+}
+
+function shouldExcludeClaudeRule(filePath: string, excludes: string[], home: string): boolean {
+	return excludes.length > 0 && matchesClaudeMdExclude(filePath, excludes, home);
+}
+
+async function loadClaudeRulesFromDir(
+	ctx: LoadContext,
+	rulesDir: string,
+	level: "user" | "project",
+	excludes: string[],
+): Promise<LoadResult<Rule>> {
+	return loadFilesFromDir<Rule>(ctx, rulesDir, PROVIDER_ID, level, {
+		extensions: ["md", "mdc"],
+		recursive: true,
+		followSymlinkDirectories: true,
+		excludePath: filePath => shouldExcludeClaudeRule(filePath, excludes, ctx.home),
+		transform: (_name, content, filePath, source) => transformClaudeRule(rulesDir, content, filePath, source),
+	});
+}
 async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const items: Rule[] = [];
 	const warnings: string[] = [];
 	const userRulesDir = path.join(getUserClaude(ctx), "rules");
 	const projectRulesDir = path.join(getProjectClaude(ctx), "rules");
-
+	const claudeMdExcludes = await getClaudeMdExcludes(ctx);
 	const [userResult, projectResult] = await Promise.all([
-		loadFilesFromDir<Rule>(ctx, userRulesDir, PROVIDER_ID, "user", {
-			extensions: ["md", "mdc"],
-			recursive: true,
-			followSymlinkDirectories: true,
-			transform: (_name, content, filePath, source) => transformClaudeRule(userRulesDir, content, filePath, source),
-		}),
-		loadFilesFromDir<Rule>(ctx, projectRulesDir, PROVIDER_ID, "project", {
-			extensions: ["md", "mdc"],
-			recursive: true,
-			followSymlinkDirectories: true,
-			transform: (_name, content, filePath, source) =>
-				transformClaudeRule(projectRulesDir, content, filePath, source),
-		}),
+		loadClaudeRulesFromDir(ctx, userRulesDir, "user", claudeMdExcludes),
+		loadClaudeRulesFromDir(ctx, projectRulesDir, "project", claudeMdExcludes),
 	]);
 
 	const projectNames = new Set(projectResult.items.map(rule => rule.name));

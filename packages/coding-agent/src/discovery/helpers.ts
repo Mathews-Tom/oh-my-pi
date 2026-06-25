@@ -696,12 +696,14 @@ export async function loadFilesFromDir<T>(
 		recursive?: boolean;
 		/** Also traverse symlinked directories; native glob intentionally skips them. */
 		followSymlinkDirectories?: boolean;
+		/** Skip files whose absolute path matches a caller-defined exclusion. */
+		excludePath?: (path: string) => boolean | Promise<boolean>;
 	},
 ): Promise<LoadResult<T>> {
 	const items: T[] = [];
 	const warnings: string[] = [];
 	// Build glob pattern based on extensions and recursion
-	const { extensions, recursive = false, followSymlinkDirectories = false } = options;
+	const { extensions, recursive = false, followSymlinkDirectories = false, excludePath } = options;
 
 	let pattern: string;
 	if (extensions && extensions.length > 0) {
@@ -743,6 +745,13 @@ export async function loadFilesFromDir<T>(
 			seen.add(match.path);
 			matches.push(match);
 		}
+	}
+
+	if (excludePath) {
+		const filteredMatches = await Promise.all(
+			matches.map(async match => ((await excludePath(path.join(dir, match.path))) ? null : match)),
+		);
+		matches = filteredMatches.filter((match): match is { path: string } => match !== null);
 	}
 
 	// Read all matching files in parallel

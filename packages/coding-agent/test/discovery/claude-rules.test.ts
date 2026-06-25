@@ -205,4 +205,28 @@ describe("Claude Code rule discovery", () => {
 
 		expect(result.items.map(rule => rule.name)).not.toContain("shared:private");
 	});
+
+	test("honors merged claudeMdExcludes when loading rules", async () => {
+		const privateRule = path.join(project, ".claude", "rules", "private.md");
+		await writeFile(
+			path.join(project, ".claude", "settings.json"),
+			JSON.stringify({ claudeMdExcludes: [privateRule] }),
+		);
+		await writeFile(
+			path.join(project, ".claude", "settings.local.json"),
+			JSON.stringify({ claudeMdExcludes: ["**/.claude/rules/vendor/**"] }),
+		);
+		await writeFile(privateRule, "Private rule.\n");
+		await writeFile(path.join(project, ".claude", "rules", "keep.md"), "Keep rule.\n");
+		await writeFile(path.join(project, ".claude", "rules", "vendor", "skip.md"), "Skip rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("keep");
+		expect(result.items.map(rule => rule.name)).not.toContain("private");
+		expect(result.items.map(rule => rule.name)).not.toContain("vendor:skip");
+	});
 });
