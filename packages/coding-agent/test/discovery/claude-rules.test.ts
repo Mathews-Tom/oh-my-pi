@@ -305,6 +305,36 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).not.toContain("shared:private");
 	});
 
+	test("honors repo-local excludesFile from a symlinked worktree checkout", async () => {
+		if (process.platform === "win32") return;
+		const repo = path.join(root, "local-excludes-repo");
+		const worktree = path.join(root, "local-excludes-worktree");
+		const sharedRules = path.join(root, "shared-rules-local-excludes");
+		const excludesFile = path.join(worktree, ".gitignore-local");
+		await fs.rm(project, { recursive: true, force: true });
+		await fs.mkdir(repo, { recursive: true });
+		await runGit(repo, ["init"]);
+		await runGit(repo, ["config", "user.email", "test@example.com"]);
+		await runGit(repo, ["config", "user.name", "Test User"]);
+		await writeFile(path.join(repo, "tracked.txt"), "tracked\n");
+		await runGit(repo, ["add", "tracked.txt"]);
+		await runGit(repo, ["commit", "-m", "init"]);
+		await runGit(repo, ["worktree", "add", worktree, "-b", "feature"]);
+		await runGit(worktree, ["config", "core.excludesFile", excludesFile]);
+		await writeFile(excludesFile, ".claude/rules/shared/private.md\n");
+		await writeFile(path.join(sharedRules, "private.md"), "Private rule.\n");
+		await fs.mkdir(path.join(worktree, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(worktree, ".claude", "rules", "shared"), "dir");
+		await fs.symlink(worktree, project, "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).not.toContain("shared:private");
+	});
+
 	test("honors escaped gitignore patterns for linked rules", async () => {
 		if (process.platform === "win32") return;
 		await writeFile(
@@ -403,6 +433,24 @@ describe("Claude Code rule discovery", () => {
 		if (process.platform === "win32") return;
 		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/[[:upper:]]*.md\n");
 		const sharedRules = path.join(root, "shared-rules-posix-classes");
+		await writeFile(path.join(sharedRules, "Private.md"), "Private rule.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("shared:keep");
+		expect(result.items.map(rule => rule.name)).not.toContain("shared:Private");
+	});
+
+	test("honors POSIX print classes in linked rule ignores", async () => {
+		if (process.platform === "win32") return;
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/[[:print:]]rivate.md\n");
+		const sharedRules = path.join(root, "shared-rules-posix-print");
 		await writeFile(path.join(sharedRules, "Private.md"), "Private rule.\n");
 		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
 		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });

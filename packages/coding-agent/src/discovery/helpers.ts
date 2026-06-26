@@ -562,9 +562,9 @@ async function configuredGlobalGitignorePath(): Promise<string | undefined> {
 	}
 	return undefined;
 }
-async function globalGitignorePath(): Promise<string> {
+async function gitignorePath(rootDir: string): Promise<string> {
 	try {
-		const child = Bun.spawn(["git", "config", "--global", "--path", "core.excludesFile"], {
+		const child = Bun.spawn(["git", "-C", rootDir, "config", "--path", "core.excludesFile"], {
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -574,7 +574,10 @@ async function globalGitignorePath(): Promise<string> {
 		]);
 		if (exitCode === 0) {
 			const configured = text.trim();
-			if (configured) return configured;
+			if (configured) {
+				const expanded = expandHomePath(configured);
+				return path.isAbsolute(expanded) ? expanded : path.resolve(rootDir, expanded);
+			}
 		}
 	} catch {}
 	const configured = await configuredGlobalGitignorePath();
@@ -585,7 +588,7 @@ async function globalGitignorePath(): Promise<string> {
 
 async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<GitignoreRule[]> {
 	const rules: GitignoreRule[] = [];
-	await loadIgnoreFile(rules, await globalGitignorePath(), rootDir);
+	await loadIgnoreFile(rules, await gitignorePath(rootDir), rootDir);
 	const gitExcludeFile = await resolveGitExcludeFile(rootDir);
 	if (gitExcludeFile) await loadIgnoreFile(rules, gitExcludeFile, rootDir);
 	const directories: string[] = [];
@@ -614,9 +617,11 @@ const POSIX_CHARACTER_CLASS_MAP: Record<string, string> = {
 	digit: "0-9",
 	graph: "!-~",
 	lower: "a-z",
+	print: " -~",
 	punct: "][\\\\!\"#$%&'()*+,./:;<=>?@\\[^_`{|}~-",
 	space: " \t",
 	upper: "A-Z",
+	cntrl: "\u0000-\u001F\u007F",
 	xdigit: "A-Fa-f0-9",
 };
 
