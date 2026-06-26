@@ -328,6 +328,26 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).not.toContain("shared:!secret");
 	});
 
+	test("treats gitignore braces as literals for linked rules", async () => {
+		if (process.platform === "win32") return;
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/{private,secret}.md\n");
+		const sharedRules = path.join(root, "shared-rules-brace-literals");
+		await writeFile(path.join(sharedRules, "{private,secret}.md"), "Literal brace rule.\n");
+		await writeFile(path.join(sharedRules, "private.md"), "Private rule.\n");
+		await writeFile(path.join(sharedRules, "secret.md"), "Secret rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("shared:private");
+		expect(result.items.map(rule => rule.name)).toContain("shared:secret");
+		expect(result.items.map(rule => rule.name)).not.toContain("shared:{private,secret}");
+	});
+
 	test("keeps re-included files under otherwise ignored linked directories", async () => {
 		if (process.platform === "win32") return;
 		await writeFile(path.join(project, ".gitignore"), ".claude/rules/vendor/*\n!.claude/rules/vendor/keep.md\n");

@@ -615,6 +615,39 @@ function normalizePosixCharacterClasses(pattern: string): string {
 	);
 }
 
+function escapeGitignoreLiteralBraces(pattern: string): string {
+	let escaped = "";
+	let inCharacterClass = false;
+	for (let i = 0; i < pattern.length; i++) {
+		const ch = pattern[i];
+		if (ch === "\\" && i + 1 < pattern.length) {
+			escaped += ch + pattern[i + 1];
+			i++;
+			continue;
+		}
+		if (ch === "[" && !inCharacterClass) {
+			inCharacterClass = true;
+			escaped += ch;
+			continue;
+		}
+		if (ch === "]" && inCharacterClass) {
+			inCharacterClass = false;
+			escaped += ch;
+			continue;
+		}
+		if (!inCharacterClass && ch === "{") {
+			escaped += "[{]";
+			continue;
+		}
+		if (!inCharacterClass && ch === "}") {
+			escaped += "[}]";
+			continue;
+		}
+		escaped += ch;
+	}
+	return escaped;
+}
+
 function gitignoreRuleMatch(
 	rule: GitignoreRule,
 	filePath: string,
@@ -627,8 +660,10 @@ function gitignoreRuleMatch(
 	const rawPattern = anchored ? rule.pattern.slice(1) : rule.pattern;
 	const directoryOnly = rawPattern.endsWith("/");
 	const normalizedPattern = rawPattern.replace(/\/+$/, "");
-	const globPattern = normalizePosixCharacterClasses(
-		normalizedPattern.includes("/") || anchored ? normalizedPattern : `**/${normalizedPattern}`,
+	const globPattern = escapeGitignoreLiteralBraces(
+		normalizePosixCharacterClasses(
+			normalizedPattern.includes("/") || anchored ? normalizedPattern : `**/${normalizedPattern}`,
+		),
 	);
 	const pathGlob = new Bun.Glob(globPattern);
 	const ancestorGlob = new Bun.Glob(globPattern);
