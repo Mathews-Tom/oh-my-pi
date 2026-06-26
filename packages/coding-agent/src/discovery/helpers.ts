@@ -473,15 +473,27 @@ async function findGitignoreRoot(dir: string): Promise<string> {
 function unescapeGitignorePattern(pattern: string): string {
 	return pattern.replace(/\\([ !#\\])/g, "$1");
 }
+
+function trimGitignoreTrailingSpaces(pattern: string): string {
+	let end = pattern.length;
+	while (end > 0 && pattern[end - 1] === " ") {
+		let backslashCount = 0;
+		for (let i = end - 2; i >= 0 && pattern[i] === "\\"; i--) {
+			backslashCount++;
+		}
+		if (backslashCount % 2 === 1) break;
+		end--;
+	}
+	return pattern.slice(0, end);
+}
 async function loadIgnoreFile(rules: GitignoreRule[], filePath: string, baseDir: string): Promise<void> {
 	const ignoreFile = Bun.file(filePath);
 	if (!(await ignoreFile.exists())) return;
 	const lines = (await ignoreFile.text()).split(/\r?\n/);
 	for (const line of lines) {
-		const trimmed = line.trim();
-		if (!trimmed || trimmed.startsWith("#")) continue;
-		const negated = trimmed.startsWith("!");
-		const pattern = unescapeGitignorePattern(negated ? trimmed.slice(1) : trimmed);
+		if (line.trim().length === 0 || line.startsWith("#")) continue;
+		const negated = line.startsWith("!");
+		const pattern = unescapeGitignorePattern(trimGitignoreTrailingSpaces(negated ? line.slice(1) : line));
 		if (pattern) rules.push({ baseDir, pattern, negated });
 	}
 }
