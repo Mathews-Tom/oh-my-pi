@@ -44,6 +44,7 @@ import compactionSummaryPrompt from "./prompts/compaction-summary.md" with { typ
 import compactionTurnPrefixPrompt from "./prompts/compaction-turn-prefix.md" with { type: "text" };
 import compactionUpdateSummaryPrompt from "./prompts/compaction-update-summary.md" with { type: "text" };
 import handoffDocumentPrompt from "./prompts/handoff-document.md" with { type: "text" };
+import snapcompactArchiveContextPrompt from "./prompts/snapcompact-archive-context.md" with { type: "text" };
 
 import {
 	computeFileLists,
@@ -658,6 +659,27 @@ export interface SummaryOptions {
 	fetch?: FetchImpl;
 }
 
+function formatPreviousSnapcompactArchive(archiveText: string): string {
+	return prompt.render(snapcompactArchiveContextPrompt, { archiveText });
+}
+
+function mergePreviousSummaryWithSnapcompactArchive(
+	previousSummary: string | undefined,
+	archiveText: string | undefined,
+): string | undefined {
+	if (!archiveText) return previousSummary;
+	const archiveSummary = formatPreviousSnapcompactArchive(archiveText);
+	return previousSummary ? `${previousSummary}\n\n${archiveSummary}` : archiveSummary;
+}
+
+function createSnapcompactArchiveMigrationMessage(archiveText: string): Message {
+	return {
+		role: "user",
+		content: [{ type: "text", text: formatPreviousSnapcompactArchive(archiveText) }],
+		timestamp: Date.now(),
+	};
+}
+
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model,
@@ -1101,10 +1123,27 @@ export async function compact(
 		fetch: options?.fetch,
 	};
 
+	const previousSnapcompactArchive = snapcompact.getPreservedArchive(previousPreserveData);
+	const previousSnapcompactArchiveText = previousSnapcompactArchive
+		? snapcompact.archiveSourceText(previousSnapcompactArchive)
+		: undefined;
+	const previousSummaryForCompaction = mergePreviousSummaryWithSnapcompactArchive(
+		previousSummary,
+		previousSnapcompactArchiveText,
+	);
+	const snapcompactArchiveMigrationMessage = previousSnapcompactArchiveText
+		? createSnapcompactArchiveMigrationMessage(previousSnapcompactArchiveText)
+		: undefined;
+
 	let preserveData = withOpenAiRemoteCompactionPreserveData(previousPreserveData, undefined);
 	if (settings.remoteEnabled !== false && shouldUseOpenAiRemoteCompaction(model)) {
 		const previousRemoteCompaction = getPreservedOpenAiRemoteCompactionData(previousPreserveData);
-		const remoteMessages = [...messagesToSummarize, ...turnPrefixMessages, ...recentMessages];
+		const remoteMessages: AgentMessage[] = [
+			...(snapcompactArchiveMigrationMessage ? [snapcompactArchiveMigrationMessage] : []),
+			...messagesToSummarize,
+			...turnPrefixMessages,
+			...recentMessages,
+		];
 		const previousReplacementHistory =
 			previousRemoteCompaction?.provider === model.provider
 				? previousRemoteCompaction.replacementHistory
@@ -1150,7 +1189,7 @@ export async function compact(
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
 		// Generate both summaries in parallel
 		const [historyResult, turnPrefixResult] = await Promise.all([
-			messagesToSummarize.length > 0
+			messagesToSummarize.length > 0 || previousSummaryForCompaction
 				? generateSummary(
 						messagesToSummarize,
 						model,
@@ -1158,7 +1197,7 @@ export async function compact(
 						apiKey,
 						signal,
 						customInstructions,
-						previousSummary,
+						previousSummaryForCompaction,
 						summaryOptions,
 					)
 				: Promise.resolve("No prior history."),
@@ -1175,12 +1214,12 @@ export async function compact(
 			apiKey,
 			signal,
 			customInstructions,
-			previousSummary,
+			previousSummaryForCompaction,
 			summaryOptions,
 		);
-	} else if (previousSummary) {
+	} else if (previousSummaryForCompaction) {
 		// No new messages to summarize, preserve previous summary
-		summary = previousSummary;
+		summary = previousSummaryForCompaction;
 	} else {
 		// No messages and no previous summary
 		summary = "No prior history.";
@@ -1214,13 +1253,21 @@ export async function compact(
 		throw new Error("First kept entry has no ID - session may need migration");
 	}
 
+	// This LLM-summary path migrated any prior snapcompact frames into the summary
+	// text above; strip the now-stale frame archive from preserveData so it cannot
+	// re-attach to the rebuilt context. Only the legacy-frame case needs stripping —
+	// when there was no previous archive, preserveData carries no frames to drop.
+	const finalPreserveData = previousSnapcompactArchive
+		? snapcompact.stripPreservedArchive(preserveData)
+		: preserveData;
+
 	return {
 		summary,
 		shortSummary,
 		firstKeptEntryId,
 		tokensBefore,
 		details: { readFiles, modifiedFiles } as CompactionDetails,
-		preserveData,
+		preserveData: finalPreserveData,
 	};
 }
 
