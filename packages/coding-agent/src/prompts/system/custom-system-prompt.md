@@ -45,10 +45,10 @@ If a skill applies, you MUST read `skill://<name>` before proceeding.
 {{/each}}
 {{/if}}
 {{#if rules.length}}
-Rules are local constraints. You MUST read `rule://<name>` when working in that domain.
+Rules are local constraints. You MUST read the advertised `rule://...` URL when working in that domain.
 <rules>
 {{#list rules join="\n"}}
-<rule name="{{name}}">
+<rule name="{{name}}" url="rule://{{urlName}}">
 {{description}}
 {{#if globs.length}}
 {{#list globs join="\n"}}<glob>{{this}}</glob>{{/list}}

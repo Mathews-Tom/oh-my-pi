@@ -266,4 +266,26 @@ describe("SYSTEM.md prompt assembly", () => {
 		const matches = promptText.match(new RegExp(escapeRegExp(sharedContent), "g")) ?? [];
 		expect(matches).toHaveLength(1);
 	});
+
+	it("renders url-safe rule references for rulebook entries", async () => {
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: tempDir,
+			customPrompt: "Base prompt",
+			contextFiles: [],
+			skills: [],
+			rules: [
+				{
+					name: "C%2523",
+					description: "Literal percent rule",
+					path: "/tmp/C%23.md",
+					globs: ["**/*.cs"],
+				},
+			],
+			toolNames: [],
+		});
+
+		const promptText = systemPrompt.join("\n\n");
+		expect(promptText).toContain('<rule name="C%2523" url="rule://C%252523">');
+		expect(promptText).toContain("Literal percent rule");
+	});
 });
