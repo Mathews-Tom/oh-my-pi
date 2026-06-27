@@ -88,6 +88,18 @@ describe("splitInternalUrlSel", () => {
 		expect(splitInternalUrlSel("rule://C%2523:raw")).toEqual({ path: "rule://C%2523", sel: "raw" });
 	});
 
+	it("keeps encoded rule URLs when selector peeling matches a decoded rule name", () => {
+		setActiveRules([
+			{
+				name: "C#",
+				path: "/tmp/C#.md",
+				content: "decoded",
+				_source: { provider: "test", providerName: "test", path: "/tmp/C#.md", level: "project" },
+			},
+		]);
+		expect(splitInternalUrlSel("rule://C%23:raw")).toEqual({ path: "rule://C%23", sel: "raw" });
+	});
+
 	it("stops at the scheme separator `://`", () => {
 		expect(splitInternalUrlSel("agent://1-50")).toEqual({ path: "agent://1-50" });
 	});

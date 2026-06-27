@@ -346,22 +346,30 @@ export function splitInternalUrlSel(rawPath: string): { path: string; sel?: stri
 		try {
 			const parsed = parseInternalUrl(rawPath);
 			const activeRuleNames = new Set(getActiveRules().map(rule => rule.name));
-			const candidates = [parsed.rawEncodedHost, parsed.rawHost, parsed.hostname].filter(
-				(name, index, names): name is string => Boolean(name) && names.indexOf(name) === index,
+			const candidates = [
+				{ matchName: parsed.rawEncodedHost, emitName: parsed.rawEncodedHost },
+				{ matchName: parsed.rawHost, emitName: parsed.rawEncodedHost ?? parsed.rawHost },
+				{ matchName: parsed.hostname, emitName: parsed.rawEncodedHost ?? parsed.hostname },
+			].filter(
+				(candidate, index, all): candidate is { matchName: string; emitName: string } =>
+					Boolean(candidate.matchName) &&
+					all.findIndex(other => other.matchName === candidate.matchName) === index,
 			);
 			for (const initialCandidate of candidates) {
-				if (activeRuleNames.has(initialCandidate)) return { path: rawPath };
+				if (activeRuleNames.has(initialCandidate.matchName)) return { path: rawPath };
 				const chunks: string[] = [];
-				let candidate = initialCandidate;
+				let candidateMatch = initialCandidate.matchName;
+				let candidateEmit = initialCandidate.emitName;
 				while (true) {
-					const colon = candidate.lastIndexOf(":");
+					const colon = candidateMatch.lastIndexOf(":");
 					if (colon < 0) break;
-					const tail = candidate.slice(colon + 1);
+					const tail = candidateMatch.slice(colon + 1);
 					if (!INTERNAL_URL_SELECTOR_PART_RE.test(tail)) break;
 					chunks.unshift(tail);
-					candidate = candidate.slice(0, colon);
-					if (activeRuleNames.has(candidate)) {
-						return { path: `${scheme}://${candidate}`, sel: chunks.join(":") };
+					candidateMatch = candidateMatch.slice(0, colon);
+					candidateEmit = candidateEmit.slice(0, candidateEmit.lastIndexOf(":"));
+					if (activeRuleNames.has(candidateMatch)) {
+						return { path: `${scheme}://${candidateEmit}`, sel: chunks.join(":") };
 					}
 				}
 			}
