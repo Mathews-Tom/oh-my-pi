@@ -198,7 +198,10 @@ function scopedClaudeRuleDescription(globs: string[]): string {
 function claudeRuleNameFromPath(rulesDir: string, filePath: string): string {
 	const relativePath = path.relative(rulesDir, filePath);
 	const withoutExtension = relativePath.replace(/\.(md|mdc)$/, "");
-	return withoutExtension.split(path.sep).join(":");
+	return withoutExtension
+		.split(path.sep)
+		.map(segment => encodeURIComponent(segment))
+		.join(":");
 }
 
 function transformClaudeRule(rulesDir: string, content: string, filePath: string, source: SourceMeta): Rule {

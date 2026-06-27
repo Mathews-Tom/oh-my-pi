@@ -4,9 +4,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as capabilityFs from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
-import { type Rule, ruleCapability } from "@oh-my-pi/pi-coding-agent/capability/rule";
+import {
+	type Rule,
+	resetActiveRulesForTests,
+	ruleCapability,
+	setActiveRules,
+} from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { loadCapability } from "@oh-my-pi/pi-coding-agent/discovery";
+import { RuleProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/rule-protocol";
 
 async function writeFile(filePath: string, content: string): Promise<void> {
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
@@ -47,6 +53,7 @@ describe("Claude Code rule discovery", () => {
 	beforeEach(async () => {
 		clearFsCache();
 		resetSettingsForTest();
+		resetActiveRulesForTests();
 		originalHome = process.env.HOME;
 		originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
 		root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-claude-rules-"));
@@ -61,6 +68,7 @@ describe("Claude Code rule discovery", () => {
 	afterEach(async () => {
 		clearFsCache();
 		resetSettingsForTest();
+		resetActiveRulesForTests();
 		vi.restoreAllMocks();
 		if (originalHome === undefined) {
 			delete process.env.HOME;
@@ -107,6 +115,22 @@ describe("Claude Code rule discovery", () => {
 		});
 
 		expect(result.items.map(rule => rule.name)).toEqual(["root", "local"]);
+	});
+
+	test("percent-encodes reserved characters in Claude rule names for rule URLs", async () => {
+		await writeFile(path.join(project, ".claude", "rules", "C#.md"), '---\npaths:\n  - "**/*.cs"\n---\nC# rule.\n');
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.find(rule => rule.path.endsWith("C#.md"))?.name).toBe("C%23");
+		setActiveRules(result.items);
+		const resource = await new RuleProtocolHandler().resolve(
+			Object.assign(new URL("rule://C%23"), { rawHost: "C#" }),
+		);
+		expect(resource.content.trim()).toBe("C# rule.");
 	});
 	test("keeps rules when unrelated directory-only ignores exist", async () => {
 		await writeFile(path.join(project, ".gitignore"), "node_modules/\ndist/\n");

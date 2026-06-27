@@ -7,6 +7,21 @@
 import { getActiveRules } from "../capability/rule";
 import type { InternalResource, InternalUrl, ProtocolHandler, UrlCompletion } from "./types";
 
+function decodeRuleName(name: string): string {
+	try {
+		return decodeURIComponent(name);
+	} catch {
+		return name;
+	}
+}
+
+function encodeRuleUrlHost(name: string): string {
+	return name
+		.split(":")
+		.map(segment => encodeURIComponent(decodeRuleName(segment)))
+		.join(":");
+}
+
 export class RuleProtocolHandler implements ProtocolHandler {
 	readonly scheme = "rule";
 	readonly immutable = true;
@@ -19,7 +34,7 @@ export class RuleProtocolHandler implements ProtocolHandler {
 			throw new Error("rule:// URL requires a rule name: rule://<name>");
 		}
 
-		const rule = rules.find(r => r.name === ruleName);
+		const rule = rules.find(r => r.name === ruleName || decodeRuleName(r.name) === ruleName);
 		if (!rule) {
 			const available = rules.map(r => r.name);
 			const availableStr = available.length > 0 ? available.join(", ") : "none";
@@ -38,7 +53,8 @@ export class RuleProtocolHandler implements ProtocolHandler {
 
 	async complete(): Promise<UrlCompletion[]> {
 		return getActiveRules().map(rule => ({
-			value: rule.name,
+			value: encodeRuleUrlHost(rule.name),
+			...(decodeRuleName(rule.name) !== rule.name ? { label: decodeRuleName(rule.name) } : {}),
 			...(rule.description ? { description: rule.description } : {}),
 		}));
 	}
