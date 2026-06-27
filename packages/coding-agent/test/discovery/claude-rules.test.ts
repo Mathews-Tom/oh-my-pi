@@ -446,6 +446,25 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).not.toContain("shared:!secret");
 	});
 
+	test("honors core.ignoreCase for linked gitignore matches", async () => {
+		if (process.platform === "win32") return;
+		await fs.rm(path.join(project, ".git"), { recursive: true, force: true });
+		await runGit(project, ["init"]);
+		await runGit(project, ["config", "core.ignoreCase", "true"]);
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/private.md\n");
+		const sharedRules = path.join(root, "shared-rules-ignore-case");
+		await writeFile(path.join(sharedRules, "Private.md"), "Private rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).not.toContain("shared:Private");
+	});
+
 	test("treats leading-space bang lines as literal ignore patterns", async () => {
 		if (process.platform === "win32") return;
 		await writeFile(path.join(project, ".gitignore"), "*.md\n !.claude/rules/shared/private.md\n");

@@ -436,6 +436,7 @@ interface GitignoreRule {
 	baseDir: string;
 	pattern: string;
 	negated: boolean;
+	ignoreCase: boolean;
 }
 
 interface GitignoreMatch {
@@ -488,7 +489,12 @@ function trimGitignoreTrailingSpaces(pattern: string): string {
 	}
 	return pattern.slice(0, end);
 }
-async function loadIgnoreFile(rules: GitignoreRule[], filePath: string, baseDir: string): Promise<void> {
+async function loadIgnoreFile(
+	rules: GitignoreRule[],
+	filePath: string,
+	baseDir: string,
+	ignoreCase: boolean,
+): Promise<void> {
 	const ignoreFile = Bun.file(filePath);
 	if (!(await ignoreFile.exists())) return;
 	const lines = (await ignoreFile.text()).split(/\r?\n/);
@@ -496,7 +502,7 @@ async function loadIgnoreFile(rules: GitignoreRule[], filePath: string, baseDir:
 		if (line.trim().length === 0 || line.startsWith("#")) continue;
 		const negated = line.startsWith("!");
 		const pattern = unescapeGitignorePattern(trimGitignoreTrailingSpaces(negated ? line.slice(1) : line));
-		if (pattern) rules.push({ baseDir, pattern, negated });
+		if (pattern) rules.push({ baseDir, pattern, negated, ignoreCase });
 	}
 }
 
@@ -587,12 +593,31 @@ async function gitignorePath(rootDir: string): Promise<string | null> {
 	return path.join(configHome, "git", "ignore");
 }
 
+async function resolveGitIgnoreCase(rootDir: string): Promise<boolean> {
+	try {
+		const child = Bun.spawn(["git", "-C", rootDir, "config", "--bool", "core.ignoreCase"], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [exitCode, text] = await Promise.all([
+			child.exited,
+			new Response(child.stdout as ReadableStream<Uint8Array>).text(),
+		]);
+		if (exitCode !== 0) return false;
+		const normalized = text.trim().toLowerCase();
+		return normalized === "true" || normalized === "yes" || normalized === "on" || normalized === "1";
+	} catch {
+		return false;
+	}
+}
+
 async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<GitignoreRule[]> {
 	const rules: GitignoreRule[] = [];
+	const ignoreCase = await resolveGitIgnoreCase(rootDir);
 	const globalIgnore = await gitignorePath(rootDir);
-	if (globalIgnore) await loadIgnoreFile(rules, globalIgnore, rootDir);
+	if (globalIgnore) await loadIgnoreFile(rules, globalIgnore, rootDir, ignoreCase);
 	const gitExcludeFile = await resolveGitExcludeFile(rootDir);
-	if (gitExcludeFile) await loadIgnoreFile(rules, gitExcludeFile, rootDir);
+	if (gitExcludeFile) await loadIgnoreFile(rules, gitExcludeFile, rootDir, ignoreCase);
 	const directories: string[] = [];
 	let current = rootDir;
 	while (true) {
@@ -604,10 +629,10 @@ async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<G
 		current = next;
 	}
 	for (const dir of directories) {
-		await loadIgnoreFile(rules, path.join(dir, ".gitignore"), dir);
+		await loadIgnoreFile(rules, path.join(dir, ".gitignore"), dir, ignoreCase);
 	}
 	for (const dir of directories) {
-		await loadIgnoreFile(rules, path.join(dir, ".ignore"), dir);
+		await loadIgnoreFile(rules, path.join(dir, ".ignore"), dir, ignoreCase);
 	}
 	return rules;
 }
@@ -679,14 +704,16 @@ function gitignoreRuleMatch(
 	const rawPattern = anchored ? rule.pattern.slice(1) : rule.pattern;
 	const directoryOnly = rawPattern.endsWith("/");
 	const normalizedPattern = rawPattern.replace(/\/+$/, "");
-	const globPattern = escapeGitignoreLiteralBraces(
+	const basePattern = escapeGitignoreLiteralBraces(
 		normalizePosixCharacterClasses(
 			normalizedPattern.includes("/") || anchored ? normalizedPattern : `**/${normalizedPattern}`,
 		),
 	);
+	const globPattern = rule.ignoreCase ? basePattern.toLowerCase() : basePattern;
+	const candidatePath = rule.ignoreCase ? relativePath.toLowerCase() : relativePath;
 	const pathGlob = new Bun.Glob(globPattern);
 	const ancestorGlob = new Bun.Glob(globPattern);
-	const parts = relativePath.split("/");
+	const parts = candidatePath.split("/");
 	const matchedAncestors: string[] = [];
 	for (let i = 1; i < parts.length; i++) {
 		const ancestor = parts.slice(0, i).join("/");
@@ -694,7 +721,7 @@ function gitignoreRuleMatch(
 			matchedAncestors.push(path.resolve(rule.baseDir, ancestor));
 		}
 	}
-	const matchedPath = (options?.treatAsDirectory ? true : !directoryOnly) && pathGlob.match(relativePath);
+	const matchedPath = (options?.treatAsDirectory ? true : !directoryOnly) && pathGlob.match(candidatePath);
 	if (matchedPath || matchedAncestors.length > 0) return { matchedPath, matchedAncestors };
 	return undefined;
 }
