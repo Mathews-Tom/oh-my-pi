@@ -2,9 +2,58 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Demote cross-vendor reasoning to plain text when the target does not natively support it
+- Refine cross-model reasoning preservation to prevent leaking inert context into structured fields
+
+- Rendered demoted cross-model reasoning blocks in the target model's canonical thinking dialect
+- Improved reliability of AI model responses by implementing automatic retry logic for detected thinking-loop stalls
+- Changed cross-provider/cross-model thinking demotion to render the prior turn's reasoning in the target model's canonical inline thinking dialect (a ```` ```thinking ```` fence for Gemini, `<think>`/`<thinking>` tags for others) instead of bare prose, with a neutral `<think>` fallback for control-token dialects (Harmony, Gemma) so chat-template tokens never leak into history. Replaying it as a native `thought` block was ruled out: end-to-end testing against Gemini 3 confirmed an unsigned `thought` part is schema-accepted but silently discarded — neither recalled nor influencing generation.
+
+## [16.2.0] - 2026-06-27
+
+### Breaking Changes
+
+- Removed the `@oh-my-pi/pi-ai/utils/json-parse` module. The JSON repair and parsing helpers (`repairJson`, `parseJsonWithRepair`, `parseStreamingJson`, `parseStreamingJsonThrottled`) have been moved to `@oh-my-pi/pi-utils` to be shared across utilities.
+
 ### Added
 
+- Added the GitLab Duo Agent provider (`gitlab-duo-agent`) and built-in implementation, renaming the existing AI Gateway proxy provider to "GitLab Duo Non-Agentic" (`gitlab-duo`).
+- Added GitLab Duo Workflow provider support, featuring OAuth login via the official VS Code OAuth application, automatic project discovery, and automatic session-time namespace Duo settings enablement.
+- Added runaway detection for Gemini models to interrupt streams stuck in excessive planning steps.
+- Added a per-provider in-flight request limiter for LLM streams, shared across local OMP processes and configurable via `maxInFlightRequests`.
+- Added a `credits` field to `UsageResetCredits` to display when banked rate-limit resets expire, with support for OpenAI Codex usage details.
+
+### Changed
+
+- Optimized GitLab Duo Agent and Workflow providers to use an inline custom "ambient" flow with MCP-only agent privileges, registering MCP tools under their bare names.
+- Improved GitLab Duo Agent context management and auto-compaction by lowering the soft overflow threshold to 1 MB and stripping redundant bytes (such as tool-call UUIDs and escaped JSON) from the goal transcript.
+- Enhanced GitLab Duo Agent prompt engineering to render replayed tool calls as past-tense records, reducing model confusion and preventing the model from mimicking historical markers.
+- Added caching for discovered GitLab Duo Agent root namespaces per account to avoid redundant discovery requests.
+
+### Fixed
+
+- Fixed various GitLab Duo Agent and Workflow stability issues, including infinite tool-call loops, connection hangs on half-open WebSockets, and unhandled step-limit or generic server-side failures.
+- Improved GitLab Duo Workflow routing, namespace resolution, and project-path handling, ensuring correct numeric ID resolution and support for self-managed GitLab relative install base paths.
+- Fixed GitLab Duo Workflow checkpoint streaming to correctly map reasoning entries to thinking blocks, preserve tool boundaries, and accurately report token usage.
+- Fixed `AuthStorage.login` to only synthesize manual-code paste prompts for paste-code providers, preventing terminal-blocking races on loopback OAuth flows.
+- Fixed llama.cpp compatibility by downgrading named forced `tool_choice` objects to the string `"required"` in the chat-completions encoder.
+- Fixed `omp usage` omitting Ollama and Ollama Cloud accounts by registering placeholder usage providers.
+- Fixed Gemini reasoning-runaway detection to expose a dedicated thought-summary header guard to interrupt streams stuck in planning loops.
+
+### Removed
+
+- Removed legacy GitLab Duo Workflow `chat` and `software_development` flow paths and the non-MCP action bridge in favor of the inline custom `ambient` flow.
+
+## [16.1.23] - 2026-06-26
+
+### Added
+
+- Added a third streaming thinking-loop detection heuristic to catch "progress-lexicon stalls" where models endlessly reshuffle motivational filler without introducing new vocabulary or concrete technical references
 - Added branded wordmark and logo animation to authentication flow
+- Added a third streaming thinking-loop detection shape — a *progress-lexicon stall* — alongside verbatim tail repetition and near-duplicate (trigram) segments. It catches reasoning-summarizer loops that reshuffle the same motivational filler ("just doing it, pushing ahead, maintaining momentum") into fresh word order every paragraph: word-trigrams never cluster, but a run of substantial segments that recycle the recent vocabulary and introduce no *new* concrete reference (path / identifier / code-span) trips the guard. Summarizer title/heading lines (`**Bold Title**`, `## Heading`) are stripped before analysis so their ever-changing wording cannot mask the stall by inflating novelty. Calibrated against 537k real non-Gemini reasoning blocks (zero false positives at novelty floor 0.2 / run length 8; the real loop sustains runs of 10+).
+- Added CoreWeave Serverless Inference provider login support via `COREWEAVE_API_KEY` and `WANDB_API_KEY` fallback.
 
 ### Changed
 

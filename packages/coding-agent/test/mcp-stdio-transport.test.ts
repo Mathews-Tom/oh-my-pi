@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-
 import { resolveStdioSpawnCommand, StdioTransport, writeFrame } from "@oh-my-pi/pi-coding-agent/mcp/transports/stdio";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 describe("resolveStdioSpawnCommand", () => {
 	it("resolves bare Windows commands through PATHEXT and wraps .cmd shims with cmd.exe", async () => {
@@ -35,7 +35,7 @@ describe("resolveStdioSpawnCommand", () => {
 			expect(result.windowsHide).toBe(true);
 			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -65,8 +65,8 @@ describe("resolveStdioSpawnCommand", () => {
 			expect(result.windowsHide).toBe(true);
 			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(projectDir, { recursive: true, force: true });
-			await fs.rm(globalDir, { recursive: true, force: true });
+			await removeWithRetries(projectDir);
+			await removeWithRetries(globalDir);
 		}
 	});
 
@@ -109,14 +109,15 @@ describe("resolveStdioSpawnCommand", () => {
 						PATHEXT: ".cmd",
 					},
 					platform: "win32",
+					hostHasInheritableConsole: true,
 				},
 			);
 
 			expect(result.cmd).toEqual(["node", entry, "serve", "--mcp"]);
-			expect(result.windowsHide).toBe(true);
+			expect(result.windowsHide).toBe(false);
 			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -159,7 +160,7 @@ describe("resolveStdioSpawnCommand", () => {
 			expect(result.windowsHide).toBe(true);
 			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -192,7 +193,7 @@ describe("resolveStdioSpawnCommand", () => {
 			expect(result.windowsHide).toBe(true);
 			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -225,7 +226,7 @@ describe("resolveStdioSpawnCommand", () => {
 			expect(result.windowsHide).toBe(true);
 			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -266,7 +267,7 @@ describe("resolveStdioSpawnCommand", () => {
 			expect(result.windowsHide).toBe(true);
 			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -339,18 +340,14 @@ describe("resolveStdioSpawnCommand", () => {
 		expect(result.detached).toBe(true);
 	});
 
-	it("never detaches Windows stdio launches so nested cmd.exe wrappers keep stdout routed back to the parent pipe (#3544)", async () => {
-		// The reporter's failing shape is `cmd.exe` → `node wrapper` →
-		// `cmd.exe /C npx.cmd -y mcp-remote`. Detaching the direct hidden
-		// `cmd.exe` strips its inherited console; the nested console
-		// grandchildren (`node`, `npx.cmd`, `mcp-remote`) then allocate a
-		// brand-new visible conhost whose stdout no longer routes back through
-		// our pipe — the proxy reports the bridge is up while OMP times out on
-		// the MCP `initialize` response. `windowsHide` only hides the direct
-		// child's window (#3536); the only fix that keeps the grandchild
-		// attached to the same console session is `detached: false`. Pin every
-		// Windows return shape here so the contract cannot regress for the
-		// direct-`cmd.exe` launcher the reporter used.
+	it("keeps console-attached Windows cmd.exe wrapper chains out of CREATE_NO_WINDOW (#3567)", async () => {
+		// The #3544 shape is `cmd.exe` → `node wrapper` → another console
+		// launcher (`cmd.exe /C npx.cmd`, PowerShell, similar). If the OMP host
+		// already owns a terminal console, `windowsHide: true` maps to
+		// CREATE_NO_WINDOW and strips that inheritable console from the direct
+		// hidden wrapper. Grandchildren then allocate fresh visible conhost
+		// windows during startup or reconnect loops (#3567). Keep the tree
+		// attached to OMP's console instead.
 		const result = await resolveStdioSpawnCommand(
 			{ type: "stdio", command: "cmd.exe", args: ["/C", "node .codex\\mcp-wrapper.js"] },
 			{
@@ -361,11 +358,12 @@ describe("resolveStdioSpawnCommand", () => {
 					PATHEXT: ".COM;.EXE;.BAT;.CMD",
 				},
 				platform: "win32",
+				hostHasInheritableConsole: true,
 			},
 		);
 
 		expect(result.detached).toBe(false);
-		expect(result.windowsHide).toBe(true);
+		expect(result.windowsHide).toBe(false);
 	});
 });
 

@@ -18,6 +18,7 @@ import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../
 import type { Skill, SkillFrontmatter } from "../capability/skill";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import { parseThinkingLevel } from "../thinking";
+import { normalizeToolNames } from "../tools/builtin-names";
 
 import { buildPluginDirRoot } from "./plugin-dir-roots";
 
@@ -249,7 +250,8 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		return null;
 	}
 
-	let tools = parseArrayOrCSV(frontmatter.tools)?.map(tool => tool.toLowerCase());
+	let tools = parseArrayOrCSV(frontmatter.tools);
+	if (tools) tools = normalizeToolNames(tools);
 
 	// Subagents with explicit tool lists always need yield
 	if (tools && !tools.includes("yield")) {
@@ -562,7 +564,7 @@ async function configuredGlobalGitignorePath(): Promise<string | undefined> {
 	}
 	return undefined;
 }
-async function gitignorePath(rootDir: string): Promise<string> {
+async function gitignorePath(rootDir: string): Promise<string | null> {
 	try {
 		const child = Bun.spawn(["git", "-C", rootDir, "config", "--path", "core.excludesFile"], {
 			stdout: "pipe",
@@ -574,10 +576,9 @@ async function gitignorePath(rootDir: string): Promise<string> {
 		]);
 		if (exitCode === 0) {
 			const configured = text.trim();
-			if (configured) {
-				const expanded = expandHomePath(configured);
-				return path.isAbsolute(expanded) ? expanded : path.resolve(rootDir, expanded);
-			}
+			if (!configured) return null;
+			const expanded = expandHomePath(configured);
+			return path.isAbsolute(expanded) ? expanded : path.resolve(rootDir, expanded);
 		}
 	} catch {}
 	const configured = await configuredGlobalGitignorePath();
@@ -588,7 +589,8 @@ async function gitignorePath(rootDir: string): Promise<string> {
 
 async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<GitignoreRule[]> {
 	const rules: GitignoreRule[] = [];
-	await loadIgnoreFile(rules, await gitignorePath(rootDir), rootDir);
+	const globalIgnore = await gitignorePath(rootDir);
+	if (globalIgnore) await loadIgnoreFile(rules, globalIgnore, rootDir);
 	const gitExcludeFile = await resolveGitExcludeFile(rootDir);
 	if (gitExcludeFile) await loadIgnoreFile(rules, gitExcludeFile, rootDir);
 	const directories: string[] = [];

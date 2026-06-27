@@ -37,6 +37,15 @@ export type StreamFn = (
  */
 export type AsideMessage = AgentMessage | (() => AgentMessage | null);
 
+export interface AgentTurnEndContext {
+	/** Assistant/user message that just completed this turn boundary. */
+	message: AgentMessage;
+	/** Tool results produced by this turn, already paired with `message` in the live context. */
+	toolResults: ToolResultMessage[];
+	/** True when the current tool-loop batch is continuing without yielding to post-turn steering. */
+	willContinue: boolean;
+}
+
 /**
  * A soft tool requirement: the host wants `toolName` called before the loop
  * runs other tools or yields, but WITHOUT paying the forced-`toolChoice` cost
@@ -328,6 +337,17 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	getServiceTier?: (model: Model) => ServiceTier | undefined;
 
 	/**
+	 * Per-call working-directory resolver, read once per LLM call. When set, its
+	 * return value overrides the static {@link SimpleStreamOptions.cwd} for the
+	 * request (falling back to that static `cwd` when it returns `undefined`).
+	 * Lets the host reflect a session move (`/move`, which updates the working
+	 * directory without reconstructing the loop config) into provider options —
+	 * e.g. GitLab Duo Agent namespace/project discovery keys off this cwd's git
+	 * remote, so a stale value would strand discovery on the original repo.
+	 */
+	getCwd?: () => string | undefined;
+
+	/**
 	 * Called after a tool call has been validated and is about to execute.
 	 *
 	 * Return `{ block: true }` to prevent execution. The loop emits an error tool
@@ -346,11 +366,11 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	) => Promise<BeforeToolCallResult | undefined> | BeforeToolCallResult | undefined;
 	/**
 	 * Called after a turn ends and before the loop polls steering/asides for the
-	 * next iteration. Use this for awaited per-turn bookkeeping that must be
-	 * visible before the next model request (e.g. synchronizing an advisor's
-	 * backlog so advice produced during the wait is injected as an aside).
+	 * next iteration. `context` carries the just-finished turn; `context.willContinue`
+	 * is true when the current tool-loop batch is continuing without yielding to
+	 * post-turn steering.
 	 */
-	onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<void> | void;
+	onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
 
 	/**
 	 * Called once an assistant message is finalized from the model stream, before

@@ -3,7 +3,8 @@ import { isKimiModelId } from "@oh-my-pi/pi-catalog/identity";
 import { resolveWireModelId } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type { ResolvedOpenAICompat } from "@oh-my-pi/pi-catalog/types";
-import { $env, extractHttpStatusFromError } from "@oh-my-pi/pi-utils";
+import { $env, extractHttpStatusFromError, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
+import { renderDemotedThinking } from "../dialect/demotion";
 import { getKimiCommonHeaders } from "../registry/oauth/kimi";
 import { getEnvApiKey } from "../stream";
 import type {
@@ -36,7 +37,6 @@ import {
 	iterateWithIdleTimeout,
 	iterateWithTerminalGrace,
 } from "../utils/idle-iterator";
-import { parseStreamingJson, parseStreamingJsonThrottled } from "../utils/json-parse";
 import { OpenAIHttpError, postOpenAIStream } from "../utils/openai-http";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { callWithCopilotModelRetry } from "../utils/retry";
@@ -1439,6 +1439,13 @@ function buildParams(
 	if (options?.toolChoice && initialCompat.supportsToolChoice) {
 		params.tool_choice = mapToOpenAICompletionsToolChoice(options.toolChoice);
 	}
+	if (
+		typeof params.tool_choice === "object" &&
+		params.tool_choice !== null &&
+		!initialCompat.supportsNamedToolChoice
+	) {
+		params.tool_choice = "required";
+	}
 	if (isForcedToolChoice(params.tool_choice) && !initialCompat.supportsForcedToolChoice) {
 		// Some thinking-required OpenAI-compatible models reject forced
 		// `tool_choice` while still accepting tools with the default auto
@@ -1769,13 +1776,14 @@ export function convertMessages(
 			const nonEmptyThinkingBlocks = thinkingBlocks.filter(b => b.thinking && b.thinking.trim().length > 0);
 			if (nonEmptyThinkingBlocks.length > 0) {
 				if (compat.requiresThinkingAsText) {
-					// Convert thinking blocks to plain text (no tags to avoid model mimicking them)
-					const thinkingText = nonEmptyThinkingBlocks.map(b => b.thinking).join("\n\n");
+					const thinkingText = nonEmptyThinkingBlocks
+						.map(b => renderDemotedThinking(model.id, b.thinking))
+						.join("");
 					// `content` is a plain string at this point (set above) or null —
-					// never an array. Prepend the thinking text to the string form.
+					// never an array. Prepend the demoted thinking to the string form.
 					assistantMsg.content =
 						typeof assistantMsg.content === "string" && assistantMsg.content.length > 0
-							? `${thinkingText}\n\n${assistantMsg.content}`
+							? `${thinkingText}${assistantMsg.content}`
 							: thinkingText;
 				} else if (compat.requiresReasoningContentForToolCalls) {
 					// Use the streamed signature when the backend accepts whichever

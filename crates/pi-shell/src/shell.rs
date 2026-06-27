@@ -533,6 +533,8 @@ async fn create_session(config: &ShellConfig) -> Result<ShellSessionCore> {
 		shell.register_builtin("ls", crate::coreutils::ls_builtin());
 		shell.register_builtin("find", crate::coreutils::find_builtin());
 		shell.register_builtin("grep", crate::coreutils::grep_builtin());
+		shell.register_builtin("rg", crate::coreutils::rg_builtin());
+		shell.register_builtin("fd", crate::fd::fd_builtin());
 		shell.register_builtin("cat", crate::coreutils::cat_builtin());
 		shell.register_builtin("uniq", crate::coreutils::uniq_builtin());
 		if !uutils_env_disabled(config, "PI_DISABLE_UUTILS_DESTRUCTIVE") {
@@ -2319,6 +2321,245 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&tmp);
 	}
 
+	/// `rg` is not an alias for `grep`: it recurses by default, respects
+	/// ripgrep's ignore/hidden/binary filters, and keeps `-h` as help.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn rg_builtin_uses_ripgrep_defaults() {
+		let tmp = std::env::temp_dir().join(format!("pi-rg-defaults-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(tmp.join("sub")).expect("sub dir");
+		std::fs::create_dir_all(tmp.join(".git")).expect("git dir");
+		std::fs::write(tmp.join("data.txt"), "alpha\nneedle\n").expect("data");
+		std::fs::write(tmp.join("sub/nested.txt"), "needle\n").expect("nested");
+		std::fs::write(tmp.join(".hidden.txt"), "needle\n").expect("hidden");
+		std::fs::write(tmp.join("ignored.log"), "needle\n").expect("ignored");
+		std::fs::write(tmp.join(".gitignore"), "ignored.log\n").expect("gitignore");
+		std::fs::write(tmp.join("binary.bin"), b"needle\0hidden\n").expect("binary");
+		let tmp_str = tmp.to_str().expect("utf8");
+
+		let config = ShellConfig { session_env: None, snapshot_path: None, minimizer: None };
+		let mut session = create_session(&config).await.expect("create_session");
+		session.shell.set_working_dir(tmp_str).expect("cwd");
+		let mut params = session.shell.default_exec_params();
+		params.set_fd(OpenFiles::STDIN_FD, null_file().expect("null"));
+		params.set_fd(OpenFiles::STDOUT_FD, null_file().expect("null"));
+		params.set_fd(OpenFiles::STDERR_FD, null_file().expect("null"));
+		let si = SourceInfo::from("pi-natives:test");
+		let read = |name: &str| std::fs::read_to_string(tmp.join(name)).unwrap_or_default();
+
+		let exec = session
+			.shell
+			.run_string("rg needle > rg.txt", &si, &params)
+			.await
+			.expect("rg");
+		assert_eq!(exit_code(&exec), 0, "rg recursive search should match");
+		let out = read("rg.txt");
+		assert!(out.contains("data.txt:needle"), "rg missed visible file: {out:?}");
+		assert!(out.contains("sub/nested.txt:needle"), "rg missed nested file: {out:?}");
+		assert!(!out.contains(".hidden.txt"), "rg searched hidden file by default: {out:?}");
+		assert!(!out.contains("ignored.log"), "rg ignored .gitignore by default: {out:?}");
+		assert!(!out.contains("binary.bin"), "rg printed binary file by default: {out:?}");
+
+		let single = session
+			.shell
+			.run_string("rg -nH needle data.txt > single.txt", &si, &params)
+			.await
+			.expect("rg single");
+		assert_eq!(exit_code(&single), 0, "rg explicit file should match");
+		assert_eq!(read("single.txt"), "data.txt:2:needle\n");
+
+		let explicit_binary = session
+			.shell
+			.run_string("rg needle binary.bin > explicit-binary.txt", &si, &params)
+			.await
+			.expect("rg explicit binary");
+		assert_eq!(exit_code(&explicit_binary), 0, "explicit binary file should be searched");
+		assert_eq!(read("explicit-binary.txt"), "needle\n");
+
+		let help = session
+			.shell
+			.run_string("rg -h > help.txt", &si, &params)
+			.await
+			.expect("rg help");
+		assert_eq!(exit_code(&help), 0, "rg -h should be help, not no-filename");
+		assert!(
+			read("help.txt").contains("ripgrep recursively searches"),
+			"help text should describe ripgrep"
+		);
+
+		let _ = std::fs::remove_dir_all(&tmp);
+	}
+
+	/// `fd` recurses from the shell working directory, respects hidden and
+	/// ignore filters (including `.fdignore`), preserves explicit search-path
+	/// prefixes, and renders help to stdout with a success status.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn fd_builtin_uses_fd_defaults() {
+		let tmp = std::env::temp_dir().join(format!("pi-fd-defaults-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(tmp.join("sub")).expect("sub dir");
+		std::fs::create_dir_all(tmp.join(".git/info")).expect("git info dir");
+		std::fs::write(tmp.join("needle.txt"), "visible\n").expect("visible");
+		std::fs::write(tmp.join("sub/needle.rs"), "nested\n").expect("nested");
+		std::fs::write(tmp.join(".hidden-needle.txt"), "hidden\n").expect("hidden");
+		std::fs::write(tmp.join("ignored-needle.log"), "ignored\n").expect("ignored");
+		std::fs::write(tmp.join("excluded-needle.vcs"), "excluded\n").expect("excluded");
+		std::fs::write(tmp.join("fdignored-needle.tmp"), "fdignored\n").expect("fdignored");
+		std::fs::write(tmp.join(".gitignore"), "ignored-needle.log\n").expect("gitignore");
+		std::fs::write(tmp.join(".git/info/exclude"), "excluded-needle.vcs\n").expect("exclude");
+		std::fs::write(tmp.join(".fdignore"), "fdignored-needle.tmp\n").expect("fdignore");
+		let tmp_str = tmp.to_str().expect("utf8");
+
+		let config = ShellConfig { session_env: None, snapshot_path: None, minimizer: None };
+		let mut session = create_session(&config).await.expect("create_session");
+		session.shell.set_working_dir(tmp_str).expect("cwd");
+		let mut params = session.shell.default_exec_params();
+		params.set_fd(OpenFiles::STDIN_FD, null_file().expect("null"));
+		params.set_fd(OpenFiles::STDOUT_FD, null_file().expect("null"));
+		params.set_fd(OpenFiles::STDERR_FD, null_file().expect("null"));
+		let si = SourceInfo::from("pi-natives:test");
+		let read = |name: &str| std::fs::read_to_string(tmp.join(name)).unwrap_or_default();
+
+		let exec = session
+			.shell
+			.run_string("fd needle > fd.txt", &si, &params)
+			.await
+			.expect("fd");
+		assert_eq!(exit_code(&exec), 0, "fd should match visible files");
+		let out = read("fd.txt");
+		assert!(out.contains("needle.txt"), "fd missed visible file: {out:?}");
+		assert!(out.contains("sub/needle.rs"), "fd missed nested file: {out:?}");
+		assert!(!out.contains(".hidden-needle.txt"), "fd searched hidden file: {out:?}");
+		assert!(!out.contains("ignored-needle.log"), "fd ignored .gitignore: {out:?}");
+		assert!(!out.contains("fdignored-needle.tmp"), "fd ignored .fdignore: {out:?}");
+		assert!(!out.contains("excluded-needle.vcs"), "fd ignored .git/info/exclude: {out:?}");
+
+		session
+			.shell
+			.run_string("fd -u needle > unrestricted.txt", &si, &params)
+			.await
+			.expect("fd -u");
+		let unrestricted = read("unrestricted.txt");
+		assert!(unrestricted.contains(".hidden-needle.txt"), "-u should include hidden files");
+		assert!(unrestricted.contains("ignored-needle.log"), "-u should include gitignored files");
+		assert!(unrestricted.contains("fdignored-needle.tmp"), "-u should include fdignored files");
+
+		session
+			.shell
+			.run_string("fd --no-ignore-vcs needle > no-ignore-vcs.txt", &si, &params)
+			.await
+			.expect("fd --no-ignore-vcs");
+		let no_ignore_vcs = read("no-ignore-vcs.txt");
+		assert!(
+			no_ignore_vcs.contains("ignored-needle.log"),
+			"--no-ignore-vcs should include .gitignore matches"
+		);
+		assert!(
+			no_ignore_vcs.contains("excluded-needle.vcs"),
+			"--no-ignore-vcs should include .git/info/exclude matches"
+		);
+		assert!(
+			!no_ignore_vcs.contains("fdignored-needle.tmp"),
+			"--no-ignore-vcs must still respect .fdignore"
+		);
+
+		session
+			.shell
+			.run_string("fd --glob '*.rs' sub > glob.txt", &si, &params)
+			.await
+			.expect("fd glob");
+		assert_eq!(read("glob.txt"), "sub/needle.rs\n");
+
+		let no_match = session
+			.shell
+			.run_string("fd definitely-absent > no-match.txt", &si, &params)
+			.await
+			.expect("fd no match");
+		assert_eq!(exit_code(&no_match), 0, "ordinary fd no-match should still succeed");
+		assert_eq!(read("no-match.txt"), "");
+
+		let quiet_miss = session
+			.shell
+			.run_string("fd -q definitely-absent > quiet-miss.txt", &si, &params)
+			.await
+			.expect("fd quiet miss");
+		assert_eq!(exit_code(&quiet_miss), 1, "quiet fd no-match should fail");
+		assert_eq!(read("quiet-miss.txt"), "");
+
+		let quiet_hit = session
+			.shell
+			.run_string("fd -q needle > quiet-hit.txt", &si, &params)
+			.await
+			.expect("fd quiet hit");
+		assert_eq!(exit_code(&quiet_hit), 0, "quiet fd match should succeed");
+		assert_eq!(read("quiet-hit.txt"), "");
+
+		let help = session
+			.shell
+			.run_string("fd --help > help.txt 2> help.err", &si, &params)
+			.await
+			.expect("fd help");
+		assert_eq!(exit_code(&help), 0, "fd help should succeed");
+		assert!(read("help.txt").contains("A program to find entries in your filesystem"));
+		assert_eq!(read("help.err"), "");
+
+		let _ = std::fs::remove_dir_all(&tmp);
+	}
+
+	/// Plain `rg PATTERN` uses the shell working directory when the host wired
+	/// stdin to null, but a real pipeline remains stdin input. Pattern stdin
+	/// (`-f -`) must not consume the implicit search path decision.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn rg_builtin_defaults_to_cwd_unless_stdin_is_pipeline() {
+		let tmp = std::env::temp_dir().join(format!("pi-rg-stdin-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&tmp);
+		std::fs::create_dir_all(&tmp).expect("temp dir");
+		std::fs::write(tmp.join("data.txt"), "from-cwd\nfrom-pattern\n").expect("data");
+		let tmp_str = tmp.to_str().expect("utf8");
+
+		let config = ShellConfig { session_env: None, snapshot_path: None, minimizer: None };
+		let mut session = create_session(&config).await.expect("create_session");
+		session.shell.set_working_dir(tmp_str).expect("cwd");
+		let mut params = session.shell.default_exec_params();
+		params.set_fd(OpenFiles::STDIN_FD, null_file().expect("null"));
+		params.set_fd(OpenFiles::STDOUT_FD, null_file().expect("null"));
+		params.set_fd(OpenFiles::STDERR_FD, null_file().expect("null"));
+		let si = SourceInfo::from("pi-natives:test");
+		let read = |name: &str| std::fs::read_to_string(tmp.join(name)).unwrap_or_default();
+
+		session
+			.shell
+			.run_string("rg from-cwd > cwd.txt", &si, &params)
+			.await
+			.expect("rg cwd");
+		assert_eq!(read("cwd.txt"), "data.txt:from-cwd\n");
+
+		session
+			.shell
+			.run_string("printf 'from-pipe\\n' | rg from-pipe > pipe.txt", &si, &params)
+			.await
+			.expect("rg pipe");
+		assert_eq!(read("pipe.txt"), "from-pipe\n");
+
+		session
+			.shell
+			.run_string("printf 'from-pattern\\n' | rg -f - > pattern.txt", &si, &params)
+			.await
+			.expect("rg pattern stdin");
+		assert_eq!(read("pattern.txt"), "data.txt:from-pattern\n");
+
+		session
+			.shell
+			.run_string("printf 'not-a-path\\n' | rg --files > files.txt", &si, &params)
+			.await
+			.expect("rg files");
+		let files = read("files.txt");
+		assert!(files.contains("data.txt"), "--files should list cwd files: {files:?}");
+		assert!(!files.contains("not-a-path"), "--files must not read piped stdin: {files:?}");
+
+		let _ = std::fs::remove_dir_all(&tmp);
+	}
+
 	/// `grep -q` must suppress all stdout and drive the exit status (0 on match,
 	/// 1 otherwise) so shell conditionals work; `-x` must anchor whole lines.
 	/// Mirrors busybox applet probing: `grep -qx "$applet" <(strings bin)`.
@@ -2591,6 +2832,7 @@ mod tests {
 		.await
 		.expect("create_session");
 		assert!(default.shell.builtin_mut("head").is_some(), "head registered by default");
+		assert!(default.shell.builtin_mut("rg").is_some(), "rg registered by default");
 		assert!(default.shell.builtin_mut("rm").is_some(), "rm registered by default");
 		assert!(default.shell.builtin_mut("mv").is_some(), "mv registered by default");
 
@@ -2598,6 +2840,7 @@ mod tests {
 			.await
 			.expect("create_session");
 		assert!(all_off.shell.builtin_mut("head").is_none(), "kill-switch drops head");
+		assert!(all_off.shell.builtin_mut("rg").is_none(), "kill-switch drops rg");
 		assert!(all_off.shell.builtin_mut("rm").is_none(), "kill-switch drops rm");
 
 		let mut rm_off = create_session(&session_with(&[("PI_DISABLE_RM_BUILTIN", "1")]))

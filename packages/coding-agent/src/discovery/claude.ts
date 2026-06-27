@@ -4,6 +4,7 @@
  * Loads configuration from .claude directories.
  * Priority: 80 (tool-specific, below builtin but above shared standards)
  */
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { hasFsCode, tryParseJson } from "@oh-my-pi/pi-utils";
 import { registerProvider } from "../capability";
@@ -247,26 +248,62 @@ function matchesClaudeMdExclude(filePath: string, excludes: ClaudeMdExclude[], h
 	});
 }
 
-async function readClaudeMdExcludesFromFile(filePath: string): Promise<ClaudeMdExclude[]> {
+async function readClaudeMdExcludesFromFile(filePath: string, baseDir: string): Promise<ClaudeMdExclude[]> {
 	const content = await readFile(filePath);
 	if (!content) return [];
 	const data = tryParseJson<Record<string, unknown>>(content);
 	const excludes = data?.claudeMdExcludes;
 	if (!Array.isArray(excludes)) return [];
-	const baseDir = path.dirname(path.dirname(filePath));
 	return excludes.filter((value): value is string => typeof value === "string").map(pattern => ({ pattern, baseDir }));
+}
+
+function getManagedClaudeSettingsDir(): string {
+	switch (process.platform) {
+		case "darwin":
+			return "/Library/Application Support/ClaudeCode";
+		case "win32":
+			return path.join(process.env.ProgramFiles || "C:\\Program Files", "ClaudeCode");
+		default:
+			return "/etc/claude-code";
+	}
+}
+
+async function listManagedClaudeSettingsFiles(): Promise<string[]> {
+	const managedDir = getManagedClaudeSettingsDir();
+	const files = [path.join(managedDir, "managed-settings.json")];
+	const dropInDir = path.join(managedDir, "managed-settings.d");
+	try {
+		const entries = await fs.readdir(dropInDir, { withFileTypes: true });
+		files.push(
+			...entries
+				.filter(
+					entry =>
+						!entry.name.startsWith(".") &&
+						entry.name.endsWith(".json") &&
+						(entry.isFile() || entry.isSymbolicLink()),
+				)
+				.map(entry => path.join(dropInDir, entry.name))
+				.sort((left, right) => left.localeCompare(right)),
+		);
+	} catch {}
+	return files;
 }
 
 async function getClaudeMdExcludes(ctx: LoadContext): Promise<ClaudeMdExclude[]> {
 	const userBase = getUserClaude(ctx);
+	const managedBase = getManagedClaudeSettingsDir();
+	const managedSettings = await listManagedClaudeSettingsFiles();
 	const projectSettings = getProjectClaudePathCandidates(ctx, "settings.json");
 	const projectLocalSettings = getProjectClaudePathCandidates(ctx, "settings.local.json");
 	const projectSettingPaths = [...projectSettings, ...projectLocalSettings];
-	const [user, ...project] = await Promise.all([
-		readClaudeMdExcludesFromFile(path.join(userBase, "settings.json")),
-		...projectSettingPaths.map(filePath => readClaudeMdExcludesFromFile(filePath)),
+	const [managed, user, ...project] = await Promise.all([
+		Promise.all(managedSettings.map(filePath => readClaudeMdExcludesFromFile(filePath, managedBase))),
+		readClaudeMdExcludesFromFile(path.join(userBase, "settings.json"), userBase),
+		...projectSettingPaths.map(filePath =>
+			readClaudeMdExcludesFromFile(filePath, path.dirname(path.dirname(filePath))),
+		),
 	]);
-	return [...user, ...project.flat()];
+	return [...managed.flat(), ...user, ...project.flat()];
 }
 
 function shouldExcludeClaudeRule(filePath: string, excludes: ClaudeMdExclude[], home: string): boolean {

@@ -15,8 +15,11 @@ import {
 	isRetryableError,
 	isUnexpectedSocketCloseMessage,
 	logger,
+	parseJsonWithRepair,
+	parseStreamingJsonThrottled,
 	readSseEvents,
 } from "@oh-my-pi/pi-utils";
+import { renderDemotedThinking } from "../dialect/demotion";
 import { isUsageLimitError } from "../rate-limit-utils";
 import { getEnvApiKey, OUTPUT_FALLBACK_BUFFER } from "../stream";
 import type {
@@ -51,7 +54,6 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 import { isFoundryEnabled } from "../utils/foundry";
 import { finalizeErrorMessage, type RawHttpRequestDump, rewriteCopilotError } from "../utils/http-inspector";
 import { getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs, iterateWithIdleTimeout } from "../utils/idle-iterator";
-import { parseJsonWithRepair, parseStreamingJsonThrottled } from "../utils/json-parse";
 import { notifyProviderResponse } from "../utils/provider-response";
 import { isCopilotTransientModelError } from "../utils/retry";
 import { COMBINATOR_KEYS, NO_STRICT, toolWireSchema } from "../utils/schema";
@@ -3237,7 +3239,7 @@ export function convertAnthropicMessages(
 							if (block.thinking.trim().length === 0) continue;
 							blocks.push({
 								type: "text",
-								text: block.thinking.toWellFormed(),
+								text: renderDemotedThinking(model.id, block.thinking),
 							});
 							continue;
 						}
@@ -3259,7 +3261,7 @@ export function convertAnthropicMessages(
 						} else {
 							blocks.push({
 								type: "text",
-								text: block.thinking.toWellFormed(),
+								text: renderDemotedThinking(model.id, block.thinking),
 							});
 						}
 					} else {

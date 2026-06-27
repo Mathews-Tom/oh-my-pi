@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as capabilityFs from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { type Rule, ruleCapability } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -23,6 +24,17 @@ async function runGit(cwd: string, args: string[]): Promise<string> {
 		throw new Error(`git ${args.join(" ")} failed (${exitCode}): ${stderr || stdout}`);
 	}
 	return stdout.trim();
+}
+
+function managedSettingsPath(): string {
+	switch (process.platform) {
+		case "darwin":
+			return "/Library/Application Support/ClaudeCode/managed-settings.json";
+		case "win32":
+			return path.join(process.env.ProgramFiles || "C:\\Program Files", "ClaudeCode", "managed-settings.json");
+		default:
+			return "/etc/claude-code/managed-settings.json";
+	}
 }
 
 describe("Claude Code rule discovery", () => {
@@ -256,6 +268,28 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).not.toContain("vendor:skip");
 	});
 
+	test("honors managed-policy claudeMdExcludes when loading rules", async () => {
+		const managedRule = path.join(project, ".claude", "rules", "managed-private.md");
+		await writeFile(managedRule, "Managed private rule.\n");
+		await writeFile(path.join(project, ".claude", "rules", "keep.md"), "Keep rule.\n");
+		const originalReadFile = capabilityFs.readFile;
+		const managedPath = managedSettingsPath();
+		vi.spyOn(capabilityFs, "readFile").mockImplementation(filePath => {
+			if (filePath === managedPath) {
+				return Promise.resolve(JSON.stringify({ claudeMdExcludes: [managedRule] }));
+			}
+			return originalReadFile(filePath);
+		});
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("keep");
+		expect(result.items.map(rule => rule.name)).not.toContain("managed-private");
+	});
+
 	test("honors project-relative claudeMdExcludes when loading rules", async () => {
 		await writeFile(
 			path.join(project, ".claude", "settings.json"),
@@ -333,6 +367,36 @@ describe("Claude Code rule discovery", () => {
 		});
 
 		expect(result.items.map(rule => rule.name)).not.toContain("shared:private");
+	});
+
+	test("treats empty core.excludesFile as disabling the global ignore file", async () => {
+		if (process.platform === "win32") return;
+		const repo = path.join(root, "empty-excludes-repo");
+		const worktree = path.join(root, "empty-excludes-worktree");
+		const sharedRules = path.join(root, "shared-rules-empty-excludes");
+		await fs.rm(project, { recursive: true, force: true });
+		await fs.mkdir(repo, { recursive: true });
+		await runGit(repo, ["init"]);
+		await runGit(repo, ["config", "user.email", "test@example.com"]);
+		await runGit(repo, ["config", "user.name", "Test User"]);
+		await writeFile(path.join(repo, "tracked.txt"), "tracked\n");
+		await runGit(repo, ["add", "tracked.txt"]);
+		await runGit(repo, ["commit", "-m", "init"]);
+		await runGit(repo, ["worktree", "add", worktree, "-b", "feature"]);
+		await writeFile(path.join(home, ".gitconfig"), "[core]\n\texcludesFile = ~/.config/git/ignore\n");
+		await writeFile(path.join(home, ".config", "git", "ignore"), "*.md\n");
+		await runGit(worktree, ["config", "core.excludesFile", ""]);
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(worktree, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(worktree, ".claude", "rules", "shared"), "dir");
+		await fs.symlink(worktree, project, "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("shared:keep");
 	});
 
 	test("honors escaped gitignore patterns for linked rules", async () => {

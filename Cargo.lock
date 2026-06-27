@@ -2902,7 +2902,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "16.1.22"
+version = "16.2.1"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -2972,7 +2972,7 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "16.1.22"
+version = "16.2.1"
 dependencies = [
  "async-trait",
  "libc",
@@ -2984,7 +2984,7 @@ dependencies = [
 
 [[package]]
 name = "pi-natives"
-version = "16.1.22"
+version = "16.2.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "16.1.22"
+version = "16.2.1"
 dependencies = [
  "anyhow",
  "brush-builtins",
@@ -3040,6 +3040,8 @@ dependencies = [
  "brush-parser 0.3.0",
  "bytes",
  "clap",
+ "globset",
+ "ignore",
  "libc",
  "os_pipe",
  "pi-uutils-ctx",
