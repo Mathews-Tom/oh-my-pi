@@ -15,10 +15,10 @@ function decodeRuleName(name: string): string {
 	}
 }
 
-function encodeRuleUrlHost(name: string): string {
+export function encodeRuleUrlHost(name: string): string {
 	return name
 		.split(":")
-		.map(segment => encodeURIComponent(decodeRuleName(segment)))
+		.map(segment => encodeURIComponent(segment))
 		.join(":");
 }
 
@@ -34,7 +34,7 @@ export class RuleProtocolHandler implements ProtocolHandler {
 			throw new Error("rule:// URL requires a rule name: rule://<name>");
 		}
 
-		const exactNames = [url.rawEncodedHost, url.rawHost, url.hostname].filter(
+		const exactNames = [url.rawHost, url.rawEncodedHost, url.hostname].filter(
 			(name, index, names): name is string => Boolean(name) && names.indexOf(name) === index,
 		);
 		let rule = exactNames
@@ -62,10 +62,14 @@ export class RuleProtocolHandler implements ProtocolHandler {
 	}
 
 	async complete(): Promise<UrlCompletion[]> {
-		return getActiveRules().map(rule => ({
-			value: encodeRuleUrlHost(rule.name),
-			...(decodeRuleName(rule.name) !== rule.name ? { label: decodeRuleName(rule.name) } : {}),
-			...(rule.description ? { description: rule.description } : {}),
-		}));
+		return getActiveRules().map(rule => {
+			const value = encodeRuleUrlHost(rule.name);
+			const label = rule._source.provider === "claude" ? decodeRuleName(rule.name) : rule.name;
+			return {
+				value,
+				...(label !== value ? { label } : {}),
+				...(rule.description ? { description: rule.description } : {}),
+			};
+		});
 	}
 }

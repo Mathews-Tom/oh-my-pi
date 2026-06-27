@@ -134,7 +134,7 @@ describe("Claude Code rule discovery", () => {
 		expect(resource.content.trim()).toBe("C# rule.");
 	});
 
-	test("prefers exact encoded rule names over decoded collisions", async () => {
+	test("keeps Claude completion values unique across encoded collisions", async () => {
 		await writeFile(path.join(project, ".claude", "rules", "C#.md"), "Decoded C# rule.\n");
 		await writeFile(path.join(project, ".claude", "rules", "C%23.md"), "Literal percent rule.\n");
 
@@ -146,7 +146,10 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.find(rule => rule.path.endsWith("C#.md"))?.name).toBe("C%23");
 		expect(result.items.find(rule => rule.path.endsWith("C%23.md"))?.name).toBe("C%2523");
 		setActiveRules(result.items);
-		const resource = await new RuleProtocolHandler().resolve(parseInternalUrl("rule://C%2523"));
+		const completions = await new RuleProtocolHandler().complete();
+		expect(completions.map(completion => completion.value)).toEqual(["C%2523", "C%252523"]);
+		expect(completions.map(completion => completion.label ?? null)).toEqual(["C#", "C%23"]);
+		const resource = await new RuleProtocolHandler().resolve(parseInternalUrl("rule://C%252523"));
 		expect(resource.content.trim()).toBe("Literal percent rule.");
 	});
 	test("keeps rules when unrelated directory-only ignores exist", async () => {

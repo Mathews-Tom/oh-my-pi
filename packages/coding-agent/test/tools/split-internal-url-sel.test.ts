@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { resetActiveRulesForTests, setActiveRules } from "@oh-my-pi/pi-coding-agent/capability/rule";
+import { RuleProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/rule-protocol";
 import { pathTargetsSsh, peelWriteUrlSelector, splitInternalUrlSel } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 
 describe("splitInternalUrlSel", () => {
@@ -70,22 +71,25 @@ describe("splitInternalUrlSel", () => {
 		expect(splitInternalUrlSel("rule://frontend:raw:1-10")).toEqual({ path: "rule://frontend:raw", sel: "1-10" });
 	});
 
-	it("peels selectors from exact encoded rule names before decoded collisions", () => {
+	it("keeps completion values and selector peeling unique for encoded rule names", async () => {
 		setActiveRules([
 			{
 				name: "C%23",
 				path: "/tmp/C#.md",
 				content: "decoded",
-				_source: { provider: "test", providerName: "test", path: "/tmp/C#.md", level: "project" },
+				_source: { provider: "claude", providerName: "claude", path: "/tmp/C#.md", level: "project" },
 			},
 			{
 				name: "C%2523",
 				path: "/tmp/C%23.md",
 				content: "literal-percent",
-				_source: { provider: "test", providerName: "test", path: "/tmp/C%23.md", level: "project" },
+				_source: { provider: "claude", providerName: "claude", path: "/tmp/C%23.md", level: "project" },
 			},
 		]);
-		expect(splitInternalUrlSel("rule://C%2523:raw")).toEqual({ path: "rule://C%2523", sel: "raw" });
+		const completions = await new RuleProtocolHandler().complete();
+		expect(completions.map(completion => completion.value)).toEqual(["C%2523", "C%252523"]);
+		expect(completions.map(completion => completion.label ?? null)).toEqual(["C#", "C%23"]);
+		expect(splitInternalUrlSel("rule://C%252523:raw")).toEqual({ path: "rule://C%252523", sel: "raw" });
 	});
 
 	it("keeps encoded rule URLs when selector peeling matches a decoded rule name", () => {
@@ -98,6 +102,26 @@ describe("splitInternalUrlSel", () => {
 			},
 		]);
 		expect(splitInternalUrlSel("rule://C%23:raw")).toEqual({ path: "rule://C%23", sel: "raw" });
+	});
+
+	it("keeps completion values unique for raw rule names containing percent encodings", async () => {
+		setActiveRules([
+			{
+				name: "C#",
+				path: "/tmp/C#.md",
+				content: "decoded",
+				_source: { provider: "test", providerName: "test", path: "/tmp/C#.md", level: "project" },
+			},
+			{
+				name: "C%23",
+				path: "/tmp/C%23.md",
+				content: "literal-percent",
+				_source: { provider: "test", providerName: "test", path: "/tmp/C%23.md", level: "project" },
+			},
+		]);
+		const completions = await new RuleProtocolHandler().complete();
+		expect(completions.map(completion => completion.value)).toEqual(["C%23", "C%2523"]);
+		expect(completions.map(completion => completion.label ?? null)).toEqual(["C#", "C%23"]);
 	});
 
 	it("stops at the scheme separator `://`", () => {

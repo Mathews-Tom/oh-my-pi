@@ -6,6 +6,7 @@ import { isEnoent } from "@oh-my-pi/pi-utils";
 import { getActiveRules } from "../capability/rule";
 import type { Skill } from "../extensibility/skills";
 import { InternalUrlRouter, type LocalProtocolOptions, parseInternalUrl } from "../internal-urls";
+import { encodeRuleUrlHost } from "../internal-urls/rule-protocol";
 import { ToolError } from "./tool-errors";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
@@ -346,20 +347,13 @@ export function splitInternalUrlSel(rawPath: string): { path: string; sel?: stri
 		try {
 			const parsed = parseInternalUrl(rawPath);
 			const activeRuleNames = new Set(getActiveRules().map(rule => rule.name));
-			const candidates = [
-				{ matchName: parsed.rawEncodedHost, emitName: parsed.rawEncodedHost },
-				{ matchName: parsed.rawHost, emitName: parsed.rawEncodedHost ?? parsed.rawHost },
-				{ matchName: parsed.hostname, emitName: parsed.rawEncodedHost ?? parsed.hostname },
-			].filter(
-				(candidate, index, all): candidate is { matchName: string; emitName: string } =>
-					Boolean(candidate.matchName) &&
-					all.findIndex(other => other.matchName === candidate.matchName) === index,
+			const candidates = [parsed.rawEncodedHost, parsed.rawHost, parsed.hostname].filter(
+				(name, index, names): name is string => Boolean(name) && names.indexOf(name) === index,
 			);
 			for (const initialCandidate of candidates) {
-				if (activeRuleNames.has(initialCandidate.matchName)) return { path: rawPath };
+				if (activeRuleNames.has(initialCandidate)) return { path: rawPath };
 				const chunks: string[] = [];
-				let candidateMatch = initialCandidate.matchName;
-				let candidateEmit = initialCandidate.emitName;
+				let candidateMatch = initialCandidate;
 				while (true) {
 					const colon = candidateMatch.lastIndexOf(":");
 					if (colon < 0) break;
@@ -367,9 +361,8 @@ export function splitInternalUrlSel(rawPath: string): { path: string; sel?: stri
 					if (!INTERNAL_URL_SELECTOR_PART_RE.test(tail)) break;
 					chunks.unshift(tail);
 					candidateMatch = candidateMatch.slice(0, colon);
-					candidateEmit = candidateEmit.slice(0, candidateEmit.lastIndexOf(":"));
 					if (activeRuleNames.has(candidateMatch)) {
-						return { path: `${scheme}://${candidateEmit}`, sel: chunks.join(":") };
+						return { path: `${scheme}://${encodeRuleUrlHost(candidateMatch)}`, sel: chunks.join(":") };
 					}
 				}
 			}
