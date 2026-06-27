@@ -67,6 +67,10 @@ export interface InternalUrl extends URL {
 	 */
 	rawHost: string;
 	/**
+	 * Raw host segment extracted from input before percent-decoding, preserving case.
+	 */
+	rawEncodedHost?: string;
+	/**
 	 * Raw pathname extracted from input, preserving traversal markers before URL normalization.
 	 */
 	rawPathname?: string;

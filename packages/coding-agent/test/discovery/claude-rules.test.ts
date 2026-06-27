@@ -12,6 +12,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { loadCapability } from "@oh-my-pi/pi-coding-agent/discovery";
+import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import { RuleProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/rule-protocol";
 
 async function writeFile(filePath: string, content: string): Promise<void> {
@@ -131,6 +132,22 @@ describe("Claude Code rule discovery", () => {
 			Object.assign(new URL("rule://C%23"), { rawHost: "C#" }),
 		);
 		expect(resource.content.trim()).toBe("C# rule.");
+	});
+
+	test("prefers exact encoded rule names over decoded collisions", async () => {
+		await writeFile(path.join(project, ".claude", "rules", "C#.md"), "Decoded C# rule.\n");
+		await writeFile(path.join(project, ".claude", "rules", "C%23.md"), "Literal percent rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.find(rule => rule.path.endsWith("C#.md"))?.name).toBe("C%23");
+		expect(result.items.find(rule => rule.path.endsWith("C%23.md"))?.name).toBe("C%2523");
+		setActiveRules(result.items);
+		const resource = await new RuleProtocolHandler().resolve(parseInternalUrl("rule://C%2523"));
+		expect(resource.content.trim()).toBe("Literal percent rule.");
 	});
 	test("keeps rules when unrelated directory-only ignores exist", async () => {
 		await writeFile(path.join(project, ".gitignore"), "node_modules/\ndist/\n");
@@ -507,6 +524,27 @@ describe("Claude Code rule discovery", () => {
 		if (process.platform === "win32") return;
 		await writeFile(path.join(project, ".gitignore"), ".claude/rules/vendor/*\n!.claude/rules/vendor/keep.md\n");
 		const sharedRules = path.join(root, "shared-rules-content-ignored");
+		await writeFile(path.join(sharedRules, "drop.md"), "Drop rule.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "vendor"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("vendor:keep");
+		expect(result.items.map(rule => rule.name)).not.toContain("vendor:drop");
+	});
+
+	test("keeps linked allow-list files when parents are re-included later", async () => {
+		if (process.platform === "win32") return;
+		await writeFile(
+			path.join(project, ".gitignore"),
+			"*\n!.claude/rules/vendor/keep.md\n!.claude/\n!.claude/rules/\n!.claude/rules/vendor/\n",
+		);
+		const sharedRules = path.join(root, "shared-rules-allow-list-order");
 		await writeFile(path.join(sharedRules, "drop.md"), "Drop rule.\n");
 		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
 		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });

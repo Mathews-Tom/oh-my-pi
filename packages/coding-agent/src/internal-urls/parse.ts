@@ -58,7 +58,8 @@ export function parseInternalUrl(input: string): InternalUrl {
 		} as unknown as URL;
 	}
 
-	let rawHost = hostMatch ? hostMatch[2] : parsed.hostname;
+	const rawEncodedHost = hostMatch ? hostMatch[2] : parsed.hostname;
+	let rawHost = rawEncodedHost;
 	try {
 		rawHost = decodeURIComponent(rawHost);
 	} catch {
@@ -66,6 +67,7 @@ export function parseInternalUrl(input: string): InternalUrl {
 	}
 
 	const result = parsed as InternalUrl;
+	result.rawEncodedHost = rawEncodedHost;
 	result.rawHost = rawHost;
 	result.rawPathname = pathMatch?.[1] ?? parsed.pathname;
 	return result;

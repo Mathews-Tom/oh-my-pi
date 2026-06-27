@@ -34,7 +34,17 @@ export class RuleProtocolHandler implements ProtocolHandler {
 			throw new Error("rule:// URL requires a rule name: rule://<name>");
 		}
 
-		const rule = rules.find(r => r.name === ruleName || decodeRuleName(r.name) === ruleName);
+		const exactNames = [url.rawEncodedHost, url.rawHost, url.hostname].filter(
+			(name, index, names): name is string => Boolean(name) && names.indexOf(name) === index,
+		);
+		let rule = exactNames
+			.map(name => rules.find(r => r.name === name))
+			.find((candidate): candidate is (typeof rules)[number] => Boolean(candidate));
+		if (!rule) {
+			rule = exactNames
+				.map(name => rules.find(r => decodeRuleName(r.name) === decodeRuleName(name)))
+				.find((candidate): candidate is (typeof rules)[number] => Boolean(candidate));
+		}
 		if (!rule) {
 			const available = rules.map(r => r.name);
 			const availableStr = available.length > 0 ? available.join(", ") : "none";

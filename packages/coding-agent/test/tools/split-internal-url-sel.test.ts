@@ -70,6 +70,24 @@ describe("splitInternalUrlSel", () => {
 		expect(splitInternalUrlSel("rule://frontend:raw:1-10")).toEqual({ path: "rule://frontend:raw", sel: "1-10" });
 	});
 
+	it("peels selectors from exact encoded rule names before decoded collisions", () => {
+		setActiveRules([
+			{
+				name: "C%23",
+				path: "/tmp/C#.md",
+				content: "decoded",
+				_source: { provider: "test", providerName: "test", path: "/tmp/C#.md", level: "project" },
+			},
+			{
+				name: "C%2523",
+				path: "/tmp/C%23.md",
+				content: "literal-percent",
+				_source: { provider: "test", providerName: "test", path: "/tmp/C%23.md", level: "project" },
+			},
+		]);
+		expect(splitInternalUrlSel("rule://C%2523:raw")).toEqual({ path: "rule://C%2523", sel: "raw" });
+	});
+
 	it("stops at the scheme separator `://`", () => {
 		expect(splitInternalUrlSel("agent://1-50")).toEqual({ path: "agent://1-50" });
 	});

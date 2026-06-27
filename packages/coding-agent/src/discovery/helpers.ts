@@ -742,7 +742,7 @@ async function getGitignoreState(
 			for (const ancestor of match.matchedAncestors) {
 				ignoredAncestors.delete(ancestor);
 			}
-			if (match.matchedPath && ignoredAncestors.size === 0) {
+			if (match.matchedPath) {
 				ignoredPath = false;
 			}
 		} else {

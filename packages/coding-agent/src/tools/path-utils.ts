@@ -345,12 +345,14 @@ export function splitInternalUrlSel(rawPath: string): { path: string; sel?: stri
 	if (scheme === "rule") {
 		try {
 			const parsed = parseInternalUrl(rawPath);
-			const ruleName = parsed.rawHost || parsed.hostname;
-			if (ruleName) {
-				const activeRuleNames = new Set(getActiveRules().map(rule => rule.name));
-				if (activeRuleNames.has(ruleName)) return { path: rawPath };
+			const activeRuleNames = new Set(getActiveRules().map(rule => rule.name));
+			const candidates = [parsed.rawEncodedHost, parsed.rawHost, parsed.hostname].filter(
+				(name, index, names): name is string => Boolean(name) && names.indexOf(name) === index,
+			);
+			for (const initialCandidate of candidates) {
+				if (activeRuleNames.has(initialCandidate)) return { path: rawPath };
 				const chunks: string[] = [];
-				let candidate = ruleName;
+				let candidate = initialCandidate;
 				while (true) {
 					const colon = candidate.lastIndexOf(":");
 					if (colon < 0) break;
