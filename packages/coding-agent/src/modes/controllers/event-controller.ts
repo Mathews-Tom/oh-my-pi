@@ -1,5 +1,6 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { THINKING_LOOP_ERROR_MARKER } from "@oh-my-pi/pi-ai/utils/thinking-loop";
+import * as AIError from "@oh-my-pi/pi-ai/error";
+import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { type Component, Loader, TERMINAL } from "@oh-my-pi/pi-tui";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { extractTextContent } from "../../commit/utils";
@@ -609,9 +610,9 @@ export class EventController {
 				// reveal (write/edit/bash previews grow smoothly when a slow provider
 				// delivers large batches); once it closes, the final args render
 				// as-is — mirroring how assistant text snaps at message_end.
-				const partialJson = "partialJson" in content ? content.partialJson : undefined;
 				let renderArgs: Record<string, unknown>;
-				if (typeof partialJson === "string") {
+				const partialJson = getStreamingPartialJson(content);
+				if (partialJson) {
 					renderArgs = this.#toolArgsReveal.setTarget(
 						content.id,
 						partialJson,
@@ -697,7 +698,7 @@ export class EventController {
 			this.#toolArgsReveal.flushAll();
 			let errorMessage: string | undefined;
 			const aborted = this.ctx.streamingMessage.stopReason === "aborted";
-			const silentlyAborted = aborted && isSilentAbort(this.ctx.streamingMessage.errorMessage);
+			const silentlyAborted = aborted && isSilentAbort(this.ctx.streamingMessage);
 			const ttsrSilenced = aborted && this.ctx.viewSession.isTtsrAbortPending;
 			if (aborted && !silentlyAborted && !ttsrSilenced) {
 				// Resolve the operator-facing label: a user-interrupt (Esc) abort
@@ -707,7 +708,7 @@ export class EventController {
 				// AgentSession.#handleAgentEvent already stamped SILENT_ABORT_MARKER for
 				// the plan-compact transition before this controller ran, so reaching
 				// this branch implies the abort was NOT a silent internal transition.
-				errorMessage = resolveAbortLabel(this.ctx.streamingMessage.errorMessage, this.ctx.viewSession.retryAttempt);
+				errorMessage = resolveAbortLabel(this.ctx.streamingMessage, this.ctx.viewSession.retryAttempt);
 				this.ctx.streamingMessage.errorMessage = errorMessage;
 			}
 			if (silentlyAborted || ttsrSilenced) {
@@ -759,11 +760,7 @@ export class EventController {
 			// above the editor so it survives transcript scroll. Cleared at the next
 			// turn's agent_start. Suppress the transcript's inline `Error: …` line for
 			// the same message while pinned so the error isn't rendered twice.
-			if (
-				event.message.stopReason === "error" &&
-				event.message.errorMessage &&
-				!isSilentAbort(event.message.errorMessage)
-			) {
+			if (event.message.stopReason === "error" && event.message.errorMessage && !isSilentAbort(event.message)) {
 				this.#lastAssistantComponent?.setErrorPinned(true);
 				this.#pinnedErrorComponent = this.#lastAssistantComponent;
 				this.ctx.showPinnedError(event.message.errorMessage);
@@ -1157,7 +1154,7 @@ export class EventController {
 	async #handleAutoRetryStart(event: Extract<AgentSessionEvent, { type: "auto_retry_start" }>): Promise<void> {
 		this.#stopWorkingLoader();
 		this.ctx.statusContainer.clear();
-		if (event.errorMessage?.includes(THINKING_LOOP_ERROR_MARKER)) {
+		if (AIError.is(event.errorId, AIError.Flag.ThinkingLoop)) {
 			// The retry path drops the failed assistant from runtime context. Do not
 			// restore its inline Error row; just unpin the fixed-region banner so the
 			// retry UI is the visible state.

@@ -4,6 +4,8 @@
  * Allows extensions to register streaming functions for custom API types
  * (e.g., "vertex-claude-api") that are not built into stream.ts.
  */
+
+import * as AIError from "./error";
 import type {
 	Api,
 	AssistantMessageEventStream,
@@ -60,7 +62,7 @@ const customApiRegistry = new Map<string, RegisteredCustomApi>();
 
 function assertCustomApiName(api: string): void {
 	if (BUILTIN_APIS.has(api as KnownApi)) {
-		throw new Error(`Cannot register custom API "${api}": built-in API names are reserved.`);
+		throw new AIError.ConfigurationError(`Cannot register custom API "${api}": built-in API names are reserved.`);
 	}
 }
 

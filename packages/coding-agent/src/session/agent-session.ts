@@ -36,6 +36,7 @@ import {
 	type CompactionSummaryMessage,
 	countTokens,
 	resolveTelemetry,
+	type StreamFn,
 	ThinkingLevel,
 	type ToolChoiceDirective,
 } from "@oh-my-pi/pi-agent-core";
@@ -80,6 +81,7 @@ import type { ProtectedToolMatcher } from "@oh-my-pi/pi-agent-core/compaction/to
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
+	Context,
 	ImageContent,
 	Message,
 	MessageAttribution,
@@ -102,18 +104,13 @@ import {
 	clearAnthropicFastModeFallback,
 	deriveClaudeDeviceId,
 	Effort,
-	isContextOverflow,
-	isUsageLimitError,
 	parseRateLimitReason,
 	resolveServiceTier,
 	streamSimple,
 } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import {
-	GeminiHeaderRunDetector,
-	isGeminiThinkingModel,
-	THINKING_LOOP_ERROR_MARKER,
-} from "@oh-my-pi/pi-ai/utils/thinking-loop";
+import { GeminiHeaderRunDetector, isGeminiThinkingModel } from "@oh-my-pi/pi-ai/utils/thinking-loop";
 import { isFireworksFastModelId, toFireworksBaseModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
@@ -125,7 +122,6 @@ import {
 	getInstallId,
 	isBunTestRuntime,
 	isEnoent,
-	isUnexpectedSocketCloseMessage,
 	logger,
 	prompt,
 	relativePathWithinRoot,
@@ -307,7 +303,6 @@ import {
 	type BashExecutionMessage,
 	type CustomMessage,
 	convertToLlm,
-	GENERIC_ABORT_SENTINEL,
 	type PythonExecutionMessage,
 	readQueueChipText,
 	SILENT_ABORT_MARKER,
@@ -370,7 +365,14 @@ export type AgentSessionEvent =
 			/** True when compaction was skipped for a benign reason (no model, no candidates, nothing to compact). */
 			skipped?: boolean;
 	  }
-	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
+	| {
+			type: "auto_retry_start";
+			attempt: number;
+			maxAttempts: number;
+			delayMs: number;
+			errorMessage: string;
+			errorId?: number;
+	  }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| { type: "retry_fallback_applied"; from: string; to: string; role: string }
 	| { type: "retry_fallback_succeeded"; model: string; role: string }
@@ -513,6 +515,21 @@ export interface AgentSessionConfig {
 	builtInToolNames?: Iterable<string>;
 	/** Current session pre-LLM message transform pipeline */
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
+	/**
+	 * Per-request transform applied after `convertToLlm` and before the
+	 * provider call. Used for snapcompact, secret obfuscation, and image
+	 * clamping. When supplied via {@link createAgentSession}, the advisor agent
+	 * inherits this so its requests undergo the same shaping as the main turn.
+	 */
+	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	/**
+	 * Stream wrapper passed to the advisor agent so its requests apply the
+	 * session's `providers.openrouterVariant`, `providers.antigravityEndpoint`,
+	 * `providers.maxInFlightRequests`, and `model.loopGuard.*` settings —
+	 * keeping OpenRouter sticky-routing / response caching consistent with the
+	 * main agent. Defaults to plain `streamSimple` when omitted.
+	 */
+	advisorStreamFn?: StreamFn;
 	/** Provider payload hook used by the active session request path */
 	onPayload?: SimpleStreamOptions["onPayload"];
 	/** Provider response hook used by the active session request path */
@@ -1334,6 +1351,8 @@ export class AgentSession {
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	#onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	#onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
+	#transformProviderContext: ((context: Context, model: Model) => Context | Promise<Context>) | undefined;
+	#advisorStreamFn: StreamFn | undefined;
 	#convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	#rebuildSystemPrompt:
 		| ((toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>)
@@ -1388,6 +1407,7 @@ export class AgentSession {
 	 *  `message_end` + `stopReason: "aborted"`; callers clear it in `finally` so
 	 *  it cannot leak into later unrelated aborts. */
 	#planInternalAbortPending = false;
+	#pendingAbortErrorId?: number;
 
 	#postPromptTasks = new Set<Promise<unknown>>();
 	#postPromptTasksPromise: Promise<void> | undefined = undefined;
@@ -1658,6 +1678,8 @@ export class AgentSession {
 		this.#builtInToolNames = new Set(config.builtInToolNames ?? []);
 		this.#requestedToolNames = config.requestedToolNames;
 		this.#transformContext = config.transformContext ?? (messages => messages);
+		this.#transformProviderContext = config.transformProviderContext;
+		this.#advisorStreamFn = config.advisorStreamFn;
 		this.#onPayload = config.onPayload;
 		this.rawSseDebugBuffer = config.rawSseDebugBuffer ?? new RawSseDebugBuffer();
 		// Avoid wrapping in an `async` closure when no user callback is configured: the
@@ -2004,6 +2026,25 @@ export class AgentSession {
 					conversationId: undefined,
 				}
 			: undefined;
+		// Mirror the provider-shaping options the SDK installs on the main agent
+		// so the advisor's requests cache, route, and obfuscate identically:
+		//
+		// - `streamFn`/`advisorStreamFn` carries the session's OpenRouter sticky
+		//   variant, antigravity endpoint mode, in-flight cap, and loop guard.
+		// - `onPayload`/`onResponse`/`onSseEvent` keep extension hooks plus the
+		//   per-session `RawSseDebugBuffer` recording advisor traffic too.
+		// - `providerSessionState` shares Codex websockets / Anthropic fast-mode
+		//   fallback state with the main agent so both turns reuse the same
+		//   transport caches.
+		// - `promptCacheKey` pins OpenAI Responses (and any provider that reads
+		//   `prompt_cache_key`) to the advisor session id so consecutive advisor
+		//   turns land on the same cache shard.
+		// - `transformProviderContext` applies snapcompact, secret obfuscation,
+		//   and image clamping to advisor requests like the main turn.
+		//
+		// Without this parity, OpenRouter advisor calls bypassed the variant
+		// suffix and prompt-cache key and produced inconsistent cache hits
+		// (see can1357/oh-my-pi#3639).
 		const advisorAgent = new Agent({
 			initialState: {
 				systemPrompt,
@@ -2013,7 +2054,14 @@ export class AgentSession {
 			},
 			appendOnlyContext,
 			sessionId: advisorSessionId,
+			promptCacheKey: advisorSessionId,
+			providerSessionState: this.#providerSessionState,
 			getApiKey: requestModel => this.#modelRegistry.resolver(requestModel, advisorSessionId),
+			streamFn: this.#advisorStreamFn,
+			onPayload: this.#onPayload,
+			onResponse: this.#onResponse,
+			onSseEvent: this.#onSseEvent,
+			transformProviderContext: this.#transformProviderContext,
 			intentTracing: false,
 			telemetry: advisorTelemetry,
 			serviceTier: advisorServiceTier,
@@ -2027,6 +2075,19 @@ export class AgentSession {
 			reset: () => {
 				advisorAgent.reset();
 				appendOnlyContext.log.clear();
+			},
+			rollbackTo: count => {
+				// Drop the failed user batch + synthetic assistant-error turn
+				// `Agent.#runLoop` appended for a turn ending in `stopReason: "error"`.
+				// The append-only context auto-resyncs on the next prompt's
+				// `syncMessages` shrink path, but reset the sync cursor so the log
+				// can't carry the dropped tail forward if no further turn ever runs.
+				const messages = advisorAgent.state.messages;
+				if (count < messages.length) {
+					messages.length = count;
+				}
+				appendOnlyContext.resetSyncCursor();
+				advisorAgent.state.error = undefined;
 			},
 			state: advisorAgent.state,
 		};
@@ -2769,11 +2830,17 @@ export class AgentSession {
 		if (
 			event.type === "message_end" &&
 			event.message.role === "assistant" &&
-			event.message.stopReason === "aborted" &&
-			this.#planInternalAbortPending
+			event.message.stopReason === "aborted"
 		) {
-			(event.message as AssistantMessage).errorMessage = SILENT_ABORT_MARKER;
-			this.#planInternalAbortPending = false;
+			const message = event.message as AssistantMessage;
+			if (this.#planInternalAbortPending) {
+				message.errorMessage = SILENT_ABORT_MARKER;
+				message.errorId = AIError.create(AIError.Flag.SilentAbort);
+				this.#planInternalAbortPending = false;
+			} else if (this.#pendingAbortErrorId) {
+				message.errorId = this.#pendingAbortErrorId;
+				this.#pendingAbortErrorId = undefined;
+			}
 		}
 
 		const messageEndPersistence =
@@ -3086,7 +3153,7 @@ export class AgentSession {
 			if (
 				msg.stopReason === "error" &&
 				msg.provider === "github-copilot" &&
-				msg.errorMessage?.includes("GitHub Copilot authentication failed")
+				AIError.is(AIError.classifyMessage(msg), AIError.Flag.AuthFailed)
 			) {
 				await this.#modelRegistry.authStorage.remove("github-copilot");
 			}
@@ -3700,8 +3767,32 @@ export class AgentSession {
 
 		context.toolName = toolCall.name;
 		context.streamKey = toolCall.id ? `toolcall:${toolCall.id}` : `tool:${toolCall.name}:${contentIndex}`;
-		context.filePaths = this.#extractTtsrFilePathsFromArgs(toolCall.arguments);
+		context.filePaths = this.#extractTtsrToolFilePaths(toolCall);
 		return context;
+	}
+
+	/**
+	 * Resolve the file paths a tool call would touch for TTSR path-glob matching.
+	 *
+	 * Prefer the tool's own `matcherPaths` hook — it understands the wire format
+	 * (hashline `[path#TAG]` section headers, apply_patch envelope markers) and
+	 * surfaces paths the generic top-level argument scan never sees. Fall back
+	 * to {@link #extractTtsrFilePathsFromArgs} for tools that pass paths as
+	 * `path`/`paths` arguments and for tool calls whose payload has not yet
+	 * streamed a header.
+	 */
+	#extractTtsrToolFilePaths(toolCall: ToolCall): string[] | undefined {
+		const args = toolCall.arguments ?? {};
+		const tools = this.agent.state.tools;
+		const tool =
+			tools.find(t => t.name === toolCall.name) ??
+			tools.find(t => t.customWireName !== undefined && t.customWireName === toolCall.name);
+		const toolPaths = tool?.matcherPaths?.(args);
+		if (toolPaths && toolPaths.length > 0) {
+			const normalized = toolPaths.flatMap(p => this.#normalizeTtsrPathCandidates(p));
+			if (normalized.length > 0) return Array.from(new Set(normalized));
+		}
+		return this.#extractTtsrFilePathsFromArgs(args);
 	}
 
 	/**
@@ -3717,6 +3808,14 @@ export class AgentSession {
 		if (!manager) {
 			return [];
 		}
+		const entries = this.#resolveTtsrMatcherEntries(toolCall);
+		if (entries) {
+			const matches: Rule[] = [];
+			for (const entry of entries) {
+				matches.push(...manager.checkSnapshot(entry.digest, this.#perFileTtsrContext(matchContext, entry.path)));
+			}
+			return matches;
+		}
 		const digest = this.#resolveTtsrMatcherDigest(toolCall);
 		if (digest !== undefined) {
 			return manager.checkSnapshot(digest, matchContext);
@@ -3726,14 +3825,44 @@ export class AgentSession {
 
 	/** Reconstruct the tool's normalized source snapshot via its `matcherDigest`, if any. */
 	#resolveTtsrMatcherDigest(toolCall: ToolCall | undefined): string | undefined {
-		if (!toolCall) {
-			return undefined;
-		}
+		const tool = this.#resolveTtsrTool(toolCall);
+		return tool?.matcherDigest?.(toolCall?.arguments ?? {});
+	}
+
+	/**
+	 * Per-file split of a streamed call (one entry per touched file paired with
+	 * the digest of only that file's added lines). Lets {@link #checkTtsrStream}
+	 * and {@link #checkTtsrAstStream} evaluate each file in isolation so a
+	 * path-scoped rule like `tool:edit(*.ts)` never fires on text that belongs
+	 * to a sibling Markdown hunk in a multi-file payload.
+	 */
+	#resolveTtsrMatcherEntries(toolCall: ToolCall | undefined): readonly { path: string; digest: string }[] | undefined {
+		const tool = this.#resolveTtsrTool(toolCall);
+		const entries = tool?.matcherEntries?.(toolCall?.arguments ?? {});
+		return entries && entries.length > 0 ? entries : undefined;
+	}
+
+	#resolveTtsrTool(toolCall: ToolCall | undefined) {
+		if (!toolCall) return undefined;
 		const tools = this.agent.state.tools;
-		const tool =
+		return (
 			tools.find(t => t.name === toolCall.name) ??
-			tools.find(t => t.customWireName !== undefined && t.customWireName === toolCall.name);
-		return tool?.matcherDigest?.(toolCall.arguments ?? {});
+			tools.find(t => t.customWireName !== undefined && t.customWireName === toolCall.name)
+		);
+	}
+
+	/**
+	 * Replace `matchContext`'s `filePaths` + `streamKey` so a per-file entry
+	 * gets its own glob-eligible path and its own TTSR buffer/repeat tracking
+	 * (each file's stream is independent inside the same tool call).
+	 */
+	#perFileTtsrContext(base: TtsrMatchContext, filePath: string): TtsrMatchContext {
+		const filePaths = this.#normalizeTtsrPathCandidates(filePath);
+		return {
+			...base,
+			filePaths: filePaths.length > 0 ? filePaths : [filePath],
+			streamKey: base.streamKey ? `${base.streamKey}#${filePath}` : undefined,
+		};
 	}
 
 	/**
@@ -3747,6 +3876,16 @@ export class AgentSession {
 		const manager = this.#ttsrManager;
 		if (!manager) {
 			return [];
+		}
+		const entries = this.#resolveTtsrMatcherEntries(toolCall);
+		if (entries) {
+			const matches: Rule[] = [];
+			for (const entry of entries) {
+				matches.push(
+					...(await manager.checkAstSnapshot(entry.digest, this.#perFileTtsrContext(matchContext, entry.path))),
+				);
+			}
+			return matches;
 		}
 		const digest = this.#resolveTtsrMatcherDigest(toolCall);
 		if (digest === undefined) {
@@ -4477,6 +4616,7 @@ export class AgentSession {
 				maxAttempts: event.maxAttempts,
 				delayMs: event.delayMs,
 				errorMessage: event.errorMessage,
+				errorId: event.errorId,
 			});
 		} else if (event.type === "auto_retry_end") {
 			await this.#extensionRunner.emit({
@@ -7251,6 +7391,7 @@ export class AgentSession {
 		preserveCompaction?: boolean;
 	}): Promise<void> {
 		const userInterrupt = options?.reason === USER_INTERRUPT_LABEL;
+		this.#pendingAbortErrorId = userInterrupt ? AIError.create(AIError.Flag.UserInterrupt) : undefined;
 		if (userInterrupt) this.#advisorAutoResumeSuppressed = true;
 		// Pull advisor concerns out of the steer/follow-up queues before any await so
 		// the post-abort stranded-message drain can't auto-resume the run on them.
@@ -8957,7 +9098,7 @@ export class AgentSession {
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
 		const errorIsFromBeforeCompaction =
 			compactionEntry !== null && assistantMessage.timestamp < new Date(compactionEntry.timestamp).getTime();
-		if (sameModel && !errorIsFromBeforeCompaction && isContextOverflow(assistantMessage, contextWindow)) {
+		if (sameModel && !errorIsFromBeforeCompaction && AIError.isContextOverflow(assistantMessage, contextWindow)) {
 			// Remove the error message from agent state (it IS saved to session for history,
 			// but we don't want it in context for the retry)
 			const messages = this.agent.state.messages;
@@ -10759,11 +10900,12 @@ export class AgentSession {
 							}
 
 							const message = error instanceof Error ? error.message : String(error);
+							const id = AIError.classify(error, candidate.api);
 							if (this.#isCompactionAuthFailure(error)) {
 								lastError = this.#buildCompactionAuthError();
 								break;
 							}
-							if (this.#isCompactionSummarizationTimeoutMessage(message)) {
+							if (AIError.is(id, AIError.Flag.Timeout)) {
 								logger.warn(
 									hasMoreCandidates
 										? "Auto-compaction summarization timed out, trying next model"
@@ -10782,8 +10924,8 @@ export class AgentSession {
 								retrySettings.enabled &&
 								attempt < retrySettings.maxRetries &&
 								(retryAfterMs !== undefined ||
-									this.#isTransientErrorMessage(message) ||
-									isUsageLimitError(message));
+									AIError.is(id, AIError.Flag.Transient) ||
+									AIError.is(id, AIError.Flag.UsageLimit));
 							if (!shouldRetry) {
 								lastError = error;
 								break;
@@ -11183,6 +11325,31 @@ export class AgentSession {
 	// =========================================================================
 
 	/**
+	 * Classify retry decisions against the active session model. Test stream
+	 * shims and provider adapters can emit generic assistant metadata, but retry
+	 * policy belongs to the model that was actually requested for this turn.
+	 */
+	#classifyRetryMessage(message: AssistantMessage): number {
+		const activeModel = this.model;
+		if (!activeModel || message.api === activeModel.api) {
+			return AIError.classifyMessage(message);
+		}
+
+		const id = AIError.classifyMessage({
+			api: activeModel.api,
+			errorId: message.errorId,
+			errorMessage: message.errorMessage,
+			errorStatus: message.errorStatus,
+		});
+		message.errorId = id;
+		return id;
+	}
+
+	#isGenericAbortSentinel(message: AssistantMessage): boolean {
+		return message.errorMessage === "Request was aborted" || message.errorMessage === "Request was aborted.";
+	}
+
+	/**
 	 * Retry an empty, reason-less provider abort: a turn that ended `aborted`
 	 * with no content and the generic sentinel (bare `abort()`), but only while
 	 * the session is neither aborting nor tearing down. A user/lifecycle abort
@@ -11194,14 +11361,22 @@ export class AgentSession {
 	 * `prompt()`) or silently undo the guard's intended abort.
 	 */
 	#isRetryableReasonlessAbort(message: AssistantMessage): boolean {
-		return (
-			message.stopReason === "aborted" &&
-			message.content.length === 0 &&
-			message.errorMessage === GENERIC_ABORT_SENTINEL &&
-			!this.#abortInProgress &&
-			!this.#isDisposed &&
-			!this.#streamingEditAbortTriggered
-		);
+		if (
+			message.stopReason !== "aborted" ||
+			message.content.length !== 0 ||
+			this.#abortInProgress ||
+			this.#isDisposed ||
+			this.#streamingEditAbortTriggered
+		) {
+			return false;
+		}
+
+		const id = this.#classifyRetryMessage(message);
+		if (AIError.is(id, AIError.Flag.Abort)) return true;
+		if (!this.#isGenericAbortSentinel(message)) return false;
+
+		message.errorId = AIError.create(AIError.Flag.Abort);
+		return true;
 	}
 
 	/**
@@ -11210,21 +11385,15 @@ export class AgentSession {
 	 * Usage-limit errors are retryable because the retry handler performs credential switching.
 	 */
 	#isRetryableError(message: AssistantMessage): boolean {
-		if (message.stopReason !== "error" || !message.errorMessage) return false;
+		if (message.stopReason !== "error") return false;
 
+		const id = this.#classifyRetryMessage(message);
 		// Context overflow is handled by compaction, not retry
 		const contextWindow = this.model?.contextWindow ?? 0;
-		if (isContextOverflow(message, contextWindow)) return false;
+		if (AIError.isContextOverflow(message, contextWindow)) return false;
 
 		if (this.#isClassifierRefusal(message)) return true;
-		if (this.#isProviderErrorFinishReasonBeforeToolUse(message)) return true;
-		if (this.#isMalformedFunctionCallError(message)) return true;
-		if (this.#hasReplayUnsafeToolOutput(message)) return false;
-		if (message.errorMessage.includes(THINKING_LOOP_ERROR_MARKER)) return true;
-		if (this.#isStaleOpenAIResponsesReplayError(message)) return true;
-
-		const err = message.errorMessage;
-		return this.#isTransientErrorMessage(err) || isUsageLimitError(err);
+		return AIError.retriable(id, { replayUnsafe: this.#hasReplayUnsafeToolOutput(message) });
 	}
 	/**
 	 * Retried turns remove the failed assistant message from active context.
@@ -11236,71 +11405,10 @@ export class AgentSession {
 		return message.content.some(block => block.type === "toolCall");
 	}
 
-	#isStaleOpenAIResponsesReplayError(message: AssistantMessage): boolean {
-		const currentApi = this.model?.api;
-		if (
-			message.api !== "openai-responses" &&
-			message.api !== "openai-codex-responses" &&
-			currentApi !== "openai-responses" &&
-			currentApi !== "openai-codex-responses"
-		) {
-			return false;
-		}
-
-		const errorMessage = message.errorMessage;
-		if (!errorMessage) return false;
-
-		return (
-			/\bItem with id ['"][^'"]+['"] not found\.?/i.test(errorMessage) ||
-			(/previous[ _]?response/i.test(errorMessage) &&
-				/not[ _]?found|invalid|expired|stale|zero[ _-]?data[ _-]?retention/i.test(errorMessage))
-		);
-	}
-
 	#isClassifierRefusal(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error") return false;
 		const stopType = message.stopDetails?.type;
 		return stopType === "refusal" || stopType === "sensitive";
-	}
-
-	#isProviderErrorFinishReasonBeforeToolUse(message: AssistantMessage): boolean {
-		if (!message.errorMessage) return false;
-		if (message.content.some(block => block.type === "toolCall")) return false;
-		return /\bProvider (?:returned error finish_reason|finish_reason:\s*error)\b/i.test(message.errorMessage);
-	}
-
-	#isMalformedFunctionCallError(message: AssistantMessage): boolean {
-		if (!message.errorMessage) return false;
-		return /\bmalformed.?function.?call\b/i.test(message.errorMessage);
-	}
-
-	#isTransientErrorMessage(errorMessage: string): boolean {
-		return (
-			this.#isTransientEnvelopeErrorMessage(errorMessage) || this.#isTransientTransportErrorMessage(errorMessage)
-		);
-	}
-
-	#isTransientEnvelopeErrorMessage(errorMessage: string): boolean {
-		// Match Anthropic stream-envelope failures that indicate a broken stream before any content starts.
-		return /anthropic stream envelope error:/i.test(errorMessage) && /before message_start/i.test(errorMessage);
-	}
-
-	#isCompactionSummarizationTimeoutMessage(errorMessage: string): boolean {
-		return /\b(?:operation\s+)?timed?\s*out\b|\btimeout\b|\bstream stall\b/i.test(errorMessage);
-	}
-
-	#isTransientTransportErrorMessage(errorMessage: string): boolean {
-		// Match: overloaded_error, provider returned error, rate limit, 429, 500, 502, 503, 504,
-		// service unavailable, provider-suggested retry, network/connection/socket errors, fetch failed,
-		// gateway upstream failures, terminated, retry delay exceeded, Bun HTTP/2 stream resets
-		// (RST_STREAM / REFUSED_STREAM / ENHANCE_YOUR_CALM, surfaced verbatim from
-		// src/http/h2_client/dispatch.zig)
-		return (
-			isUnexpectedSocketCloseMessage(errorMessage) ||
-			/overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|retry your request|network.?error|connection.?error|connection.?refused|other side closed|fetch failed|upstream.?connect|upstream.?request.?failed|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay|stream stall|no error details in response|HTTP2(?:StreamReset|RefusedStream|EnhanceYourCalm)|malformed.?function.?call/i.test(
-				errorMessage,
-			)
-		);
 	}
 
 	#getRetryFallbackChains(): RetryFallbackChains {
@@ -11535,20 +11643,15 @@ export class AgentSession {
 	#isFireworksFastFallbackEligible(message: AssistantMessage): boolean {
 		const model = this.#activeFireworksFastModel();
 		if (!model) return false;
-		if (message.stopReason !== "error" || !message.errorMessage) return false;
+		if (message.stopReason !== "error") return false;
 		if (message.content.some(block => block.type === "toolCall")) return false;
 		// A content refusal/sensitivity stop is the model's decision, not a route
 		// failure — switching to the base model would just re-trigger it.
 		if (this.#isClassifierRefusal(message)) return false;
-		if (isContextOverflow(message, model.contextWindow ?? 0)) return false;
-		const err = message.errorMessage;
-		if (isUsageLimitError(err)) return false;
-		if (
-			/\b(?:401|403|unauthorized|forbidden|authentication|auth[_ ]?unavailable|no auth available|(?:invalid|no)[_ ]?api[_ ]?key)\b/i.test(
-				err,
-			)
-		)
-			return false;
+		const id = this.#classifyRetryMessage(message);
+		if (AIError.isContextOverflow(message, model.contextWindow ?? 0)) return false;
+		if (AIError.is(id, AIError.Flag.UsageLimit)) return false;
+		if (AIError.is(id, AIError.Flag.AuthFailed)) return false;
 		return this.#modelRegistry.find("fireworks", toFireworksBaseModelId(model.id)) !== undefined;
 	}
 
@@ -11714,7 +11817,8 @@ export class AgentSession {
 		}
 
 		const errorMessage = message.errorMessage || "Unknown error";
-		const staleOpenAIResponsesReplayError = this.#isStaleOpenAIResponsesReplayError(message);
+		const id = this.#classifyRetryMessage(message);
+		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
 		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
 		let delayMs = staleOpenAIResponsesReplayError
 			? 0
@@ -11729,7 +11833,7 @@ export class AgentSession {
 			this.#resetCurrentResponsesProviderSession("stale replay error");
 		}
 
-		if (this.model && !staleOpenAIResponsesReplayError && isUsageLimitError(errorMessage)) {
+		if (this.model && !staleOpenAIResponsesReplayError && AIError.is(id, AIError.Flag.UsageLimit)) {
 			const retryAfterMs = parsedRetryAfterMs ?? calculateRateLimitBackoffMs(parseRateLimitReason(errorMessage));
 			const outcome = await this.#modelRegistry.authStorage.markUsageLimitReached(
 				this.model.provider,
@@ -11836,6 +11940,7 @@ export class AgentSession {
 			maxAttempts: retrySettings.maxRetries,
 			delayMs,
 			errorMessage,
+			errorId: message.errorId,
 		});
 
 		// Remove the failed assistant message from active context before retrying.
@@ -13745,6 +13850,17 @@ export class AgentSession {
 	 */
 	isAdvisorActive(): boolean {
 		return this.#advisorAgent !== undefined;
+	}
+
+	/**
+	 * The live advisor `Agent`, or `undefined` when no advisor runtime is
+	 * attached. Surfaced for diagnostics (`/dump advisor` already serializes
+	 * its transcript via {@link formatAdvisorHistoryAsText}) and so callers can
+	 * verify the advisor inherits the session's provider-shaping options
+	 * (`streamFn`, `promptCacheKey`, `providerSessionState`, ...).
+	 */
+	getAdvisorAgent(): Agent | undefined {
+		return this.#advisorAgent;
 	}
 
 	/**

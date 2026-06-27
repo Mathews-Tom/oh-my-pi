@@ -4,12 +4,30 @@
 
 ### Changed
 
-- Demote cross-vendor reasoning to plain text when the target does not natively support it
-- Refine cross-model reasoning preservation to prevent leaking inert context into structured fields
+- Default reasoning context to `all_turns` for all Codex requests
 
-- Rendered demoted cross-model reasoning blocks in the target model's canonical thinking dialect
-- Improved reliability of AI model responses by implementing automatic retry logic for detected thinking-loop stalls
-- Changed cross-provider/cross-model thinking demotion to render the prior turn's reasoning in the target model's canonical inline thinking dialect (a ```` ```thinking ```` fence for Gemini, `<think>`/`<thinking>` tags for others) instead of bare prose, with a neutral `<think>` fallback for control-token dialects (Harmony, Gemma) so chat-template tokens never leak into history. Replaying it as a native `thought` block was ruled out: end-to-end testing against Gemini 3 confirmed an unsigned `thought` part is schema-accepted but silently discarded — neither recalled nor influencing generation.
+## [16.2.2] - 2026-06-27
+
+### Added
+
+- Added a comprehensive, public-facing error module exported via the "./error" path, featuring structured error classification, provider-specific HTTP error classes (e.g., Anthropic, OpenAI, Gemini), OAuth/Auth-specific errors, rate-limit utilities, and retryability predicates.
+
+### Changed
+
+- Updated OpenAI Codex defaults to increase default text verbosity to medium, enable detailed reasoning summaries by default, and include all turns in the reasoning context by default.
+- Updated the OpenAI Codex WebSocket transport to resolve its configuration (via PI_CODEX_WEBSOCKET_* environment variables) once at startup rather than re-parsing on every request.
+- Enhanced cross-model reasoning recovery and preservation to render demoted reasoning in the target model's canonical inline thinking dialect (such as Gemini's thinking fence or standard think tags) to prevent leaking inert context or control tokens into history.
+- Broadened the leaked-thinking stream healer to recover reasoning emitted in any dialect's canonical idiom (including Gemini, Gemma, Harmony, and scratchpads) and route them to thinking events instead of raw markup.
+- Implemented automatic retry logic for detected thinking-loop stalls to improve response reliability.
+- Hardened stateful delta chaining to ignore transient streaming bookkeeping symbols during structural equality checks, preventing unnecessary full-transcript replays.
+
+### Fixed
+
+- Fixed preservation of OpenAI Responses assistant message phase values across auth-gateway parsing, streaming, and history replay, ensuring GPT-5.4/GPT-5.5 intermediate updates and final answers retain their original phase labels.
+
+### Removed
+
+- Removed Pi dialect support and related serialization/parsing logic.
 
 ## [16.2.0] - 2026-06-27
 

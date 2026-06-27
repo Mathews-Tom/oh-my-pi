@@ -1183,6 +1183,23 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	textVerbosity: {
+		type: "enum",
+		values: ["low", "medium", "high"] as const,
+		default: "high",
+		ui: {
+			tab: "model",
+			group: "Sampling",
+			label: "Text Verbosity",
+			description: "OpenAI Responses and Codex response verbosity (low, medium, or high)",
+			options: [
+				{ value: "low", label: "Low", description: "Prefer concise responses" },
+				{ value: "medium", label: "Medium", description: "Balance brevity and detail" },
+				{ value: "high", label: "High", description: "Prefer detailed responses (default)" },
+			],
+		},
+	},
+
 	serviceTier: {
 		type: "enum",
 		values: SERVICE_TIER_SETTING_VALUES,
@@ -2007,7 +2024,6 @@ export const SETTINGS_SCHEMA = {
 			"anthropic",
 			"deepseek",
 			"harmony",
-			"pi",
 			"qwen3",
 			"gemini",
 			"gemma",
@@ -2034,7 +2050,6 @@ export const SETTINGS_SCHEMA = {
 				{ value: "anthropic", label: "Anthropic", description: "Use Anthropic-style in-band tool calls." },
 				{ value: "deepseek", label: "DeepSeek", description: "Use DeepSeek-style in-band tool calls." },
 				{ value: "harmony", label: "Harmony", description: "Use Harmony-style in-band tool calls." },
-				{ value: "pi", label: "Pi", description: "Use the Pi owned dialect (compact sigil-delimited tool calls)." },
 				{ value: "qwen3", label: "Qwen3", description: "Use the Qwen3 owned dialect." },
 				{ value: "gemini", label: "Gemini", description: "Use the Gemini owned dialect." },
 				{ value: "gemma", label: "Gemma", description: "Use the Gemma owned dialect." },

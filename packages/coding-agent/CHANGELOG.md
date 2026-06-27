@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [16.2.2] - 2026-06-27
+
 ### Added
 
 - Added Claude Code rule discovery so `.claude/rules/**/*.md` and `.claude/rules/**/*.mdc` files load through the standard rules capability with frontmatter metadata preserved ([#2613](https://github.com/can1357/oh-my-pi/issues/2613)).
@@ -10,20 +12,24 @@
 
 - Added `grep -q`/`--quiet`/`--silent` and `-x`/`--line-regexp` to the in-process `grep` builtin used by the bash tool. `-q` suppresses all stdout and exits 0 on the first match (short-circuiting, with match status taking precedence over read errors per GNU); `-x` anchors each pattern to whole lines. Unblocks shell conditionals such as `grep -qx "$applet" <(strings bin)`.
 - Added new `tiny` model role for consolidated online task handling
+- Added a new `tiny` model role for consolidated online task handling.
+- Added a `textVerbosity` setting to control OpenAI and Codex response detail.
 
 ### Changed
 
-- Simplified status line subagent display by removing running state and hub hint indicators
-
-- Updated online title, memory, and classification tasks to prioritize the `tiny` model role
+- Simplified the status line subagent display by removing running state and hub hint indicators.
+- Updated online title, memory, and classification tasks to prioritize the new `tiny` model role.
 
 ### Fixed
 
-- Prevented auto-generated session titles from accidentally re-shouting user all-caps text
-- Fixed auto-generated session titles re-shouting emphatic ALL-CAPS from the user's message. `reconcileTitleCasing` (`packages/coding-agent/src/tiny/text.ts`) restored any source token with interior/repeated uppercase, so shouting like "unify ALL ERROR HANDLING" turned the model's clean sentence case ("Unify error handling…") back into "Unify ERROR HANDLING…". Casing is now restored only from mixed-case identifiers the user typed deliberately (`TinyVMM`, `iOS`, `IDs`); pure all-caps is left to the model's own output.
-- Fixed Tavily web search with recency filters to retry once without `time_range` when Tavily returns HTTP 200 with no renderable content. ([#3633](https://github.com/can1357/oh-my-pi/issues/3633))
-- Fixed TUI thought stream stalling and `ui.loop-blocked` warnings during subagent-heavy runs by replacing the mid-run compaction persistence check's O(n²) branch rebuild + per-pair `JSON.stringify` content compare with a one-shot persistence-key snapshot. Content equality is preserved as the rare collision tiebreaker. ([#3629](https://github.com/can1357/oh-my-pi/issues/3629))
-- Fixed marketplace-installed plugins appearing in both the npm plugin list and the OMP extension-package status provider. ([#3628](https://github.com/can1357/oh-my-pi/issues/3628))
+- Improved reliability of auto-retry logic for aborted requests by standardizing error classification across model adapters and ensuring stale session states are reset.
+- Enhanced MCP authentication error detection, header-based server discovery, and 401/403 authorization failure detection during Smithery commands and HTTP RPCs.
+- Fixed auto-generated session titles incorrectly preserving user all-caps text, ensuring proper sentence casing while still respecting intentional mixed-case identifiers.
+- Fixed Tavily web search with recency filters to automatically retry without a time range if Tavily returns an empty HTTP 200 response.
+- Fixed TUI thought stream stalling and `ui.loop-blocked` warnings during subagent-heavy runs by optimizing the mid-run compaction persistence check.
+- Fixed marketplace-installed plugins incorrectly appearing in both the npm plugin list and the extension-package status provider.
+- Fixed inconsistent OpenRouter prompt-cache hits on `/advisor` turns by ensuring advisor agents inherit the same provider-shaping options, hooks, and settings as the main agent.
+- Fixed path-scoped TTSR (Targeted Tool Safety Rules) evaluation for `hashline` and `apply_patch` edit streams, ensuring rules are correctly applied to file paths parsed from section headers and envelope markers without leaking across file scopes.
 
 ## [16.2.1] - 2026-06-27
 

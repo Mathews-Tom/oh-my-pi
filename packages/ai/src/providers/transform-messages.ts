@@ -483,8 +483,7 @@ export function transformMessages<TApi extends Api>(
 					let normalizedToolCall: ToolCall = toolCall;
 
 					if (!isSameModel && toolCall.thoughtSignature) {
-						normalizedToolCall = { ...toolCall };
-						delete (normalizedToolCall as { thoughtSignature?: string }).thoughtSignature;
+						normalizedToolCall = { ...toolCall, thoughtSignature: undefined };
 					}
 
 					if (isAnthropicTarget) {
