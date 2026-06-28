@@ -629,13 +629,18 @@ async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<G
 		current = next;
 	}
 	// Git does not follow symbolic links when reading .gitignore/.ignore files
-	// (https://git-scm.com/docs/gitignore#_notes). A per-directory ignore file at or
-	// below a symlinked directory is only reachable through that symlink, so skip it
-	// to match native ignore semantics for linked rule directories.
+	// (https://git-scm.com/docs/gitignore#_notes). A per-directory ignore file below a
+	// symlinked directory is only reachable through that symlink, so stop the walk
+	// there to match native ignore semantics for linked rule directories. The ignore
+	// root itself may legitimately be reached through a symlinked checkout path
+	// (e.g. /tmp/link -> /real/repo); its own ignore files are still authoritative.
 	const realDirectories: string[] = [];
-	for (const dir of directories) {
-		const stat = await fs.promises.lstat(dir).catch(() => null);
-		if (stat?.isSymbolicLink()) break;
+	for (let i = 0; i < directories.length; i++) {
+		const dir = directories[i];
+		if (i > 0) {
+			const stat = await fs.promises.lstat(dir).catch(() => null);
+			if (stat?.isSymbolicLink()) break;
+		}
 		realDirectories.push(dir);
 	}
 	for (const dir of realDirectories) {

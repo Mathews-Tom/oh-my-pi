@@ -678,4 +678,28 @@ describe("Claude Code rule discovery", () => {
 		expect(names).not.toContain("shared:foou");
 		expect(names).toContain("shared:fooA-Z");
 	});
+	test("honors root .gitignore when the project root is reached through a symlink", async () => {
+		if (process.platform === "win32") return;
+		// Opening a checkout via a symlinked path (e.g. /tmp/link -> /real/repo) must still
+		// honor the repo-root .gitignore for linked rules.
+		const realProject = path.join(root, "real-project");
+		await fs.mkdir(path.join(realProject, ".git"), { recursive: true });
+		await writeFile(path.join(realProject, ".gitignore"), ".claude/rules/shared/private.md\n");
+		const sharedRules = path.join(root, "shared-rules-root-symlink");
+		await writeFile(path.join(sharedRules, "private.md"), "Private rule.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(realProject, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(realProject, ".claude", "rules", "shared"), "dir");
+		const linkedProject = path.join(root, "linked-project");
+		await fs.symlink(realProject, linkedProject, "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: linkedProject,
+			providers: ["claude"],
+		});
+
+		const names = result.items.map(rule => rule.name);
+		expect(names).toContain("shared:keep");
+		expect(names).not.toContain("shared:private");
+	});
 });
