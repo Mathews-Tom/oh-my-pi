@@ -957,6 +957,22 @@ export async function loadFilesFromDir<T>(
 		// rule directories with many files.
 		const dirStat = await fs.promises.lstat(dir).catch(() => null);
 		if (dirStat?.isSymbolicLink()) {
+			// The native scanner canonicalizes a symlinked search root and applies the
+			// target checkout's own .gitignore, which git does not follow for a symlinked
+			// rules directory. Re-scan without ignore handling so target-side ignores
+			// cannot drop root-level rules, then apply only the project logical filter.
+			try {
+				const unfiltered = await glob({
+					pattern,
+					path: dir,
+					gitignore: false,
+					hidden: false,
+					fileType: FileType.File,
+				});
+				matches = unfiltered.matches;
+			} catch {
+				// Keep the gitignore-filtered matches if the rescan fails.
+			}
 			const filteredNativeMatches = await Promise.all(
 				matches.map(async match => ((await isGitignoredPath(dir, match.path, ignoreCache)) ? null : match)),
 			);
