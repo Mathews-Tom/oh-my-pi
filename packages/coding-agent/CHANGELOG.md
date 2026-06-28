@@ -2,11 +2,11 @@
 
 ## [Unreleased]
 
-## [16.2.3] - 2026-06-28
-
 ### Added
 
 - Added Claude Code rule discovery so `.claude/rules/**/*.md` and `.claude/rules/**/*.mdc` files load through the standard rules capability with frontmatter metadata preserved ([#2613](https://github.com/can1357/oh-my-pi/issues/2613)).
+
+## [16.2.3] - 2026-06-28
 
 ### Added
 
