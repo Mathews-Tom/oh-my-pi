@@ -641,4 +641,41 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).not.toContain("shared:]secret");
 		expect(result.items.map(rule => rule.name)).not.toContain(String.raw`shared:\secret`);
 	});
+	test("does not follow .gitignore reached through a symlinked rule directory", async () => {
+		if (process.platform === "win32") return;
+		// Git does not follow symlinks when reading .gitignore files, so a target-side
+		// ignore file inside the linked checkout must not suppress linked rules.
+		const sharedRules = path.join(root, "shared-rules-symlinked-gitignore");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await writeFile(path.join(sharedRules, ".gitignore"), "*.md\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("shared:keep");
+	});
+	test("treats single-bracket POSIX-like classes as literal in linked rule ignores", async () => {
+		if (process.platform === "win32") return;
+		// `[:upper:]` (single brackets) is not a POSIX class: git treats it as a bracket
+		// expression of the literal characters `:uper`, so it must not become an A-Z range.
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/foo[:upper:].md\n");
+		const sharedRules = path.join(root, "shared-rules-single-bracket");
+		await writeFile(path.join(sharedRules, "foou.md"), "Matches the literal class.\n");
+		await writeFile(path.join(sharedRules, "fooA-Z.md"), "Must stay loaded.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const names = result.items.map(rule => rule.name);
+		expect(names).not.toContain("shared:foou");
+		expect(names).toContain("shared:fooA-Z");
+	});
 });

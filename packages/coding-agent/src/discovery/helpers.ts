@@ -628,10 +628,20 @@ async function loadGitignoreRules(rootDir: string, targetDir: string): Promise<G
 		if (next === current || !path.relative(current, targetDir)) break;
 		current = next;
 	}
+	// Git does not follow symbolic links when reading .gitignore/.ignore files
+	// (https://git-scm.com/docs/gitignore#_notes). A per-directory ignore file at or
+	// below a symlinked directory is only reachable through that symlink, so skip it
+	// to match native ignore semantics for linked rule directories.
+	const realDirectories: string[] = [];
 	for (const dir of directories) {
+		const stat = await fs.promises.lstat(dir).catch(() => null);
+		if (stat?.isSymbolicLink()) break;
+		realDirectories.push(dir);
+	}
+	for (const dir of realDirectories) {
 		await loadIgnoreFile(rules, path.join(dir, ".gitignore"), dir, ignoreCase);
 	}
-	for (const dir of directories) {
+	for (const dir of realDirectories) {
 		await loadIgnoreFile(rules, path.join(dir, ".ignore"), dir, ignoreCase);
 	}
 	return rules;
@@ -653,10 +663,42 @@ const POSIX_CHARACTER_CLASS_MAP: Record<string, string> = {
 };
 
 function normalizePosixCharacterClasses(pattern: string): string {
-	return pattern.replace(
-		/\[:([a-z]+):\]/g,
-		(match, className: string) => POSIX_CHARACTER_CLASS_MAP[className] ?? match,
-	);
+	// POSIX bracket classes are only meaningful inside a bracket expression, e.g.
+	// `[[:upper:]]`. A bare `[:upper:]` is an ordinary bracket expression matching one
+	// of the literal characters `:uper`, so it must be left untranslated to match
+	// git/fnmatch semantics.
+	let result = "";
+	let inBracket = false;
+	for (let i = 0; i < pattern.length; i++) {
+		const ch = pattern[i];
+		if (ch === "\\" && i + 1 < pattern.length) {
+			result += ch + pattern[i + 1];
+			i++;
+			continue;
+		}
+		if (!inBracket) {
+			if (ch === "[") inBracket = true;
+			result += ch;
+			continue;
+		}
+		if (ch === "[" && pattern[i + 1] === ":") {
+			const end = pattern.indexOf(":]", i + 2);
+			if (end !== -1) {
+				const className = pattern.slice(i + 2, end);
+				const replacement = POSIX_CHARACTER_CLASS_MAP[className];
+				if (replacement !== undefined) {
+					result += replacement;
+					i = end + 1;
+					continue;
+				}
+			}
+			result += ch;
+			continue;
+		}
+		if (ch === "]") inBracket = false;
+		result += ch;
+	}
+	return result;
 }
 
 function escapeGitignoreLiteralBraces(pattern: string): string {
