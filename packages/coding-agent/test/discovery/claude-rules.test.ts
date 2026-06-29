@@ -118,6 +118,31 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).toEqual(["root", "local"]);
 	});
 
+	test("honors the repo .gitignore for ancestor rules when cwd is nested below a symlinked checkout", async () => {
+		if (process.platform === "win32") return;
+		// cwd is nested below a symlinked checkout (link -> realRepo) and the rule dir is an
+		// ancestor `.claude/rules` that is NOT under cwd. The symlink boundary must be the
+		// repo root (link), not the nested cwd, so the repo `.gitignore` still suppresses
+		// `secret.md` instead of the walk skipping past the checkout symlink and missing it.
+		const realRepo = path.join(root, "real-repo");
+		await fs.mkdir(path.join(realRepo, ".git"), { recursive: true });
+		await writeFile(path.join(realRepo, ".gitignore"), ".claude/rules/secret.md\n");
+		await writeFile(path.join(realRepo, ".claude", "rules", "secret.md"), "Secret rule.\n");
+		await writeFile(path.join(realRepo, ".claude", "rules", "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(realRepo, "packages", "app"), { recursive: true });
+		const link = path.join(root, "link");
+		await fs.symlink(realRepo, link, "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: path.join(link, "packages", "app"),
+			providers: ["claude"],
+		});
+
+		const names = result.items.map(rule => rule.name);
+		expect(names).toContain("keep");
+		expect(names).not.toContain("secret");
+	});
+
 	test("percent-encodes reserved characters in Claude rule names for rule URLs", async () => {
 		await writeFile(path.join(project, ".claude", "rules", "C#.md"), '---\npaths:\n  - "**/*.cs"\n---\nC# rule.\n');
 

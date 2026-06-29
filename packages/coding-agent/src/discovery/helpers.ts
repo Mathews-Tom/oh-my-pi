@@ -1031,6 +1031,23 @@ async function discoverLinkedFilesFromDir(
 	return matches;
 }
 
+// The workspace boundary for symlink-aware ignore handling of `dir`: the deepest
+// directory shared by `dir` and the cwd/home anchor. When `dir` is an ancestor rule
+// directory — or cwd is nested below a symlinked checkout — `dir` is not under cwd, so
+// using cwd directly would walk past the checkout root and mistake the checkout symlink
+// for a symlinked rules ancestor. The common ancestor is the project/repo root that
+// contains `dir`, keeping a checkout-level symlink authoritative.
+function workspaceBoundaryFor(dir: string, anchor: string): string {
+	const dirParts = path.resolve(dir).split(path.sep);
+	const anchorParts = path.resolve(anchor).split(path.sep);
+	const common: string[] = [];
+	for (let i = 0; i < Math.min(dirParts.length, anchorParts.length); i++) {
+		if (dirParts[i] !== anchorParts[i]) break;
+		common.push(dirParts[i]);
+	}
+	return common.join(path.sep) || path.sep;
+}
+
 // True when `dir` itself or any ancestor up to (but excluding) `base` is a symlink.
 // The native glob canonicalizes a symlinked search root and applies the target's own
 // ignores; that happens whether the link is the rules dir itself or a parent (e.g. a
@@ -1108,7 +1125,7 @@ export async function loadFilesFromDir<T>(
 		// symlinked `.claude` — is a symlink does the walker resolve into the target and
 		// bypass project-local logical ignores, so re-filter native matches only in that
 		// case, avoiding a per-file git subprocess fan-out for ordinary rule directories.
-		const base = level === "user" ? ctx.home : ctx.cwd;
+		const base = workspaceBoundaryFor(dir, level === "user" ? ctx.home : ctx.cwd);
 		if (await pathHasSymlinkedAncestor(dir, base)) {
 			// The native scanner canonicalizes a symlinked search root and applies the
 			// target checkout's own .gitignore, which git does not follow for a symlinked
