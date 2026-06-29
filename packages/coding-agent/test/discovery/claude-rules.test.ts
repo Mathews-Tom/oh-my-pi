@@ -663,6 +663,27 @@ describe("Claude Code rule discovery", () => {
 		expect(names).not.toContain("shared:-secret");
 		expect(names).not.toContain("shared:~secret");
 	});
+	test("matches every POSIX space character in linked rule ignores", async () => {
+		if (process.platform === "win32") return;
+		// Git's [[:space:]] also matches newline/CR/VT/FF in filenames, not just space/tab.
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/*[[:space:]]*.md\n");
+		const sharedRules = path.join(root, "shared-rules-posix-space-control");
+		await writeFile(path.join(sharedRules, "tab\tname.md"), "Tab rule.\n");
+		await writeFile(path.join(sharedRules, "line\nbreak.md"), "Newline rule.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const paths = result.items.map(rule => rule.path);
+		expect(paths.some(rulePath => rulePath.endsWith("keep.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("break.md"))).toBe(false);
+		expect(paths.some(rulePath => rulePath.endsWith("name.md"))).toBe(false);
+	});
 	test("does not follow .gitignore reached through a symlinked rule directory", async () => {
 		if (process.platform === "win32") return;
 		// Git does not follow symlinks when reading .gitignore files, so a target-side

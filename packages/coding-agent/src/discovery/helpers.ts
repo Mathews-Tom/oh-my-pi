@@ -694,7 +694,9 @@ const POSIX_CHARACTER_CLASS_MAP: Record<string, string> = {
 	lower: "a-z",
 	print: " -~",
 	punct: "][\\\\!\"#$%&'()*+,./:;<=>?@\\[^_`{|}~-",
-	space: " \t",
+	// POSIX space = space, tab, newline, vertical tab, form feed, carriage return; Git's
+	// [[:space:]] matches all of them in filenames, so emit the full set (not just space/tab).
+	space: " \t\n\u000b\f\r",
 	upper: "A-Z",
 	cntrl: "\u0000-\u001F\u007F",
 	xdigit: "A-Fa-f0-9",
