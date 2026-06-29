@@ -481,10 +481,11 @@ async function findGitignoreRoot(dir: string): Promise<string> {
 	}
 }
 
-// Bun.Glob metacharacters: a gitignore `\X` of one of these must STAY escaped so
-// Bun.Glob keeps it literal. Git lets a backslash escape ANY character, so every
-// other `\X` is a plain literal — drop the backslash (e.g. `foo\bar.md` is the
-// logical file `foobar.md`, and leaving `\b` in the glob would match nothing).
+// Bun.Glob metacharacters: outside a bracket expression a gitignore `\X` of one of
+// these must STAY escaped so Bun.Glob keeps it literal. Git lets a backslash escape
+// ANY character, so every other `\X` outside brackets is a plain literal — drop the
+// backslash (e.g. `foo\bar.md` is the logical file `foobar.md`, and leaving `\b` in
+// the glob would match nothing).
 const GLOB_METACHARACTERS: Record<string, true> = {
 	"\\": true,
 	"*": true,
@@ -502,13 +503,23 @@ const GLOB_METACHARACTERS: Record<string, true> = {
 };
 function unescapeGitignorePattern(pattern: string): string {
 	let result = "";
+	let inBracket = false;
 	for (let i = 0; i < pattern.length; i++) {
 		const ch = pattern[i];
 		if (ch === "\\" && i + 1 < pattern.length) {
 			const next = pattern[i + 1] as string;
-			result += GLOB_METACHARACTERS[next] ? `\\${next}` : next;
+			// Inside a `[...]` class, backslash escapes carry bracket-local meaning
+			// (e.g. `[a\-z]` is the literals a, -, z — not the range a-z), so keep them
+			// verbatim for Bun.Glob's class parser. Outside brackets, keep the escape
+			// only for glob metacharacters; otherwise drop it.
+			result += inBracket || GLOB_METACHARACTERS[next] ? `\\${next}` : next;
 			i++;
 			continue;
+		}
+		if (ch === "[" && !inBracket) {
+			inBracket = true;
+		} else if (ch === "]" && inBracket) {
+			inBracket = false;
 		}
 		result += ch;
 	}

@@ -511,6 +511,32 @@ describe("Claude Code rule discovery", () => {
 		expect(names).not.toContain("shared:foobar");
 	});
 
+	test("preserves bracket-local escapes in gitignore patterns for linked rules", async () => {
+		if (process.platform === "win32") return;
+		// Inside a `[...]` class, `\-` is a literal hyphen, so `[a\-z]` matches the
+		// literals a, -, z — not the range a-z. Dropping the backslash would form the
+		// range `[a-z]` and wrongly suppress unrelated rules like `bsecret.md`.
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/[a\\-z]secret.md\n");
+		const sharedRules = path.join(root, "shared-rules-bracket-escape");
+		await writeFile(path.join(sharedRules, "asecret.md"), "A rule.\n");
+		await writeFile(path.join(sharedRules, "-secret.md"), "Hyphen rule.\n");
+		await writeFile(path.join(sharedRules, "bsecret.md"), "B rule.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const names = result.items.map(rule => rule.name);
+		expect(names).toContain("shared:keep");
+		expect(names).toContain("shared:bsecret");
+		expect(names).not.toContain("shared:asecret");
+		expect(names).not.toContain("shared:-secret");
+	});
+
 	test("honors core.ignoreCase for linked gitignore matches", async () => {
 		if (process.platform === "win32") return;
 		await fs.rm(path.join(project, ".git"), { recursive: true, force: true });
