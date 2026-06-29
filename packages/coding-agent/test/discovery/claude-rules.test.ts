@@ -986,6 +986,25 @@ describe("Claude Code rule discovery", () => {
 
 		expect(result.items.map(rule => rule.name)).toContain("keep");
 	});
+	test("ignores target-side .gitignore when the whole .claude dir is symlinked in a no-Git workspace", async () => {
+		if (process.platform === "win32") return;
+		// `.claude` itself is the symlink (rules live under the target) and the project has
+		// no `.git` or project ignore file. The ignore-root walk must skip the symlinked
+		// ancestor instead of adopting the target checkout's `.gitignore` (*.md) as the
+		// root, which would drop linked rules git would keep.
+		await fs.rm(path.join(project, ".git"), { recursive: true, force: true });
+		const sharedClaude = path.join(root, "shared-claude-no-git");
+		await writeFile(path.join(sharedClaude, "rules", "keep.md"), "Keep rule.\n");
+		await writeFile(path.join(sharedClaude, "rules", ".gitignore"), "*.md\n");
+		await fs.symlink(sharedClaude, path.join(project, ".claude"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("keep");
+	});
 	test("does not follow a symlinked .gitignore file for linked rules", async () => {
 		if (process.platform === "win32") return;
 		// Git never follows a symlinked working-tree .gitignore (it reports the link as

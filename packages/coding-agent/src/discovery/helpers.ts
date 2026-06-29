@@ -464,17 +464,29 @@ function normalizedRelativePath(from: string, to: string): string {
 	return path.relative(from, to).split(path.sep).join("/");
 }
 
-async function findGitignoreRoot(dir: string): Promise<string> {
+async function findGitignoreRoot(dir: string, base?: string): Promise<string> {
 	const startDir = path.resolve(dir);
-	const startStat = await fs.promises.lstat(startDir).catch(() => null);
-	// A symlinked start dir (e.g. a linked `.claude/rules` root) resolves into the target
-	// checkout. Git never follows symlinks for `.git`/ignore files, so the target's
-	// metadata must neither anchor the gitignore root nor filter the project-logical rules
-	// reached through the link. Walk the symlink's own parent chain so only the project
-	// namespace is inspected, and fall back to that parent rather than the link itself when
-	// no real root or ignore file is found (computeGitignoreRules then stops at the symlink
-	// as a descendant and never loads its target-side ignore files).
-	const walkStart = startStat?.isSymbolicLink() === true ? path.dirname(startDir) : startDir;
+	// Where to begin the upward search. A symlinked rules dir — or, when the workspace
+	// `base` is known, any symlinked ancestor strictly below it (e.g. a symlinked
+	// `.claude`) — resolves into a target checkout whose .git/ignore files git never
+	// follows. Start at the project-side parent of the highest such symlink so the
+	// target's metadata neither anchors the gitignore root nor records target-side ignore
+	// files. A symlink AT or above the base (a checkout reached through a symlinked path)
+	// stays authoritative, so it is left in the search. Without a `base`, only the start
+	// dir itself is checked, preserving the original single-component behavior.
+	let walkStart = startDir;
+	const boundary = base !== undefined ? path.resolve(base) : undefined;
+	let probe = startDir;
+	while (true) {
+		const probeStat = await fs.promises.lstat(probe).catch(() => null);
+		if (probeStat?.isSymbolicLink() === true) {
+			walkStart = path.dirname(probe);
+		}
+		if (boundary === undefined) break;
+		const probeParent = path.dirname(probe);
+		if (probeParent === probe || probeParent === boundary) break;
+		probe = probeParent;
+	}
 	let current = walkStart;
 	let highestIgnoreDir: string | undefined;
 	while (true) {
@@ -906,9 +918,10 @@ async function getGitignoreState(
 	relativePath: string,
 	options?: { treatAsDirectory?: boolean },
 	cache?: GitignoreRulesCache,
+	base?: string,
 ): Promise<{ ignoredPath: boolean; ignoredAncestors: Set<string> }> {
 	const filePath = path.join(dir, relativePath);
-	const rootDir = await findGitignoreRoot(dir);
+	const rootDir = await findGitignoreRoot(dir, base);
 	const rules = await loadGitignoreRules(rootDir, path.dirname(filePath), cache);
 	let ignoredPath = false;
 	const ignoredAncestors = new Set<string>();
@@ -934,8 +947,13 @@ async function getGitignoreState(
 	return { ignoredPath, ignoredAncestors };
 }
 
-async function isGitignoredPath(dir: string, relativePath: string, cache?: GitignoreRulesCache): Promise<boolean> {
-	const { ignoredPath, ignoredAncestors } = await getGitignoreState(dir, relativePath, undefined, cache);
+async function isGitignoredPath(
+	dir: string,
+	relativePath: string,
+	cache?: GitignoreRulesCache,
+	base?: string,
+): Promise<boolean> {
+	const { ignoredPath, ignoredAncestors } = await getGitignoreState(dir, relativePath, undefined, cache, base);
 	return ignoredPath || ignoredAncestors.size > 0;
 }
 
@@ -943,12 +961,14 @@ async function isGitignoredDirectoryPath(
 	dir: string,
 	relativePath: string,
 	cache?: GitignoreRulesCache,
+	base?: string,
 ): Promise<boolean> {
 	const { ignoredPath, ignoredAncestors } = await getGitignoreState(
 		dir,
 		relativePath,
 		{ treatAsDirectory: true },
 		cache,
+		base,
 	);
 	return ignoredPath || ignoredAncestors.size > 0;
 }
@@ -957,6 +977,7 @@ async function discoverLinkedFilesFromDir(
 	dir: string,
 	extensions: string[] | undefined,
 	cache?: GitignoreRulesCache,
+	base?: string,
 ): Promise<Array<{ path: string }>> {
 	const matches: Array<{ path: string }> = [];
 	async function collectLinkedDir(
@@ -964,7 +985,7 @@ async function discoverLinkedFilesFromDir(
 		relativeDir: string,
 		activeRealDirs: ReadonlySet<string>,
 	): Promise<void> {
-		if (relativeDir && (await isGitignoredDirectoryPath(dir, relativeDir, cache))) return;
+		if (relativeDir && (await isGitignoredDirectoryPath(dir, relativeDir, cache, base))) return;
 		const realDir = await fs.promises.realpath(currentDir).catch(() => currentDir);
 		if (activeRealDirs.has(realDir)) return;
 		const nextActiveRealDirs = new Set(activeRealDirs);
@@ -995,7 +1016,7 @@ async function discoverLinkedFilesFromDir(
 				const entryPath = path.join(currentDir, entry.name);
 				const relativePath = path.join(relativeDir, entry.name);
 				if (!(await isDirectoryPath(entryPath))) return;
-				if (await isGitignoredDirectoryPath(dir, relativePath, cache)) return;
+				if (await isGitignoredDirectoryPath(dir, relativePath, cache, base)) return;
 				if (entry.isSymbolicLink()) {
 					await collectLinkedDir(entryPath, relativePath, new Set<string>());
 					return;
@@ -1106,13 +1127,13 @@ export async function loadFilesFromDir<T>(
 				// Keep the gitignore-filtered matches if the rescan fails.
 			}
 			const filteredNativeMatches = await Promise.all(
-				matches.map(async match => ((await isGitignoredPath(dir, match.path, ignoreCache)) ? null : match)),
+				matches.map(async match => ((await isGitignoredPath(dir, match.path, ignoreCache, base)) ? null : match)),
 			);
 			matches = filteredNativeMatches.filter((match): match is { path: string } => match !== null);
 		}
 		const linkedMatches = await Promise.all(
-			(await discoverLinkedFilesFromDir(dir, extensions, ignoreCache)).map(async match =>
-				(await isGitignoredPath(dir, match.path, ignoreCache)) ? null : match,
+			(await discoverLinkedFilesFromDir(dir, extensions, ignoreCache, base)).map(async match =>
+				(await isGitignoredPath(dir, match.path, ignoreCache, base)) ? null : match,
 			),
 		);
 		const seen = new Set(matches.map(match => match.path));
