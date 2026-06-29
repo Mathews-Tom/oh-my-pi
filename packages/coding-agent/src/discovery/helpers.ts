@@ -453,12 +453,20 @@ function normalizedRelativePath(from: string, to: string): string {
 }
 
 async function findGitignoreRoot(dir: string): Promise<string> {
-	let current = path.resolve(dir);
-	const startDir = current;
+	const startDir = path.resolve(dir);
+	const startStat = await fs.promises.lstat(startDir).catch(() => null);
+	// A symlinked start dir (e.g. a linked `.claude/rules` root) resolves into the target
+	// checkout. Git never follows symlinks for `.git`/ignore files, so the target's
+	// metadata must neither anchor the gitignore root nor filter the project-logical rules
+	// reached through the link. Walk the symlink's own parent chain so only the project
+	// namespace is inspected, and fall back to that parent rather than the link itself when
+	// no real root or ignore file is found (computeGitignoreRules then stops at the symlink
+	// as a descendant and never loads its target-side ignore files).
+	const walkStart = startStat?.isSymbolicLink() === true ? path.dirname(startDir) : startDir;
+	let current = walkStart;
 	let highestIgnoreDir: string | undefined;
 	while (true) {
-		const currentStat = await fs.promises.lstat(current).catch(() => null);
-		if (!(currentStat?.isSymbolicLink() && current === startDir) && (await pathExists(path.join(current, ".git")))) {
+		if (await pathExists(path.join(current, ".git"))) {
 			return current;
 		}
 		if (
@@ -468,7 +476,7 @@ async function findGitignoreRoot(dir: string): Promise<string> {
 			highestIgnoreDir = current;
 		}
 		const parent = path.dirname(current);
-		if (parent === current) return highestIgnoreDir ?? path.resolve(dir);
+		if (parent === current) return highestIgnoreDir ?? walkStart;
 		current = parent;
 	}
 }
