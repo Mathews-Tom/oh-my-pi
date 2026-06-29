@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
-import { isEnoent } from "@oh-my-pi/pi-utils";
+import { isEnoent, stripWindowsExtendedLengthPathPrefix } from "@oh-my-pi/pi-utils";
 import { getActiveRules } from "../capability/rule";
 import type { Skill } from "../extensibility/skills";
 import { InternalUrlRouter, type LocalProtocolOptions, parseInternalUrl } from "../internal-urls";
@@ -149,7 +149,9 @@ export function expandTilde(filePath: string, home?: string): string {
 }
 
 export function expandPath(filePath: string): string {
-	const normalized = stripFileUrl(normalizeUnicodeSpaces(normalizeAtPrefix(filePath)));
+	const normalized = stripWindowsExtendedLengthPathPrefix(
+		stripFileUrl(normalizeUnicodeSpaces(normalizeAtPrefix(filePath))),
+	);
 	return expandTilde(normalized);
 }
 
