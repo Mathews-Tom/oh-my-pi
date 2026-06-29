@@ -709,9 +709,8 @@ function normalizePosixCharacterClasses(pattern: string): string {
 	// git/fnmatch semantics.
 	let result = "";
 	let inBracket = false;
-	// `!`/`^` are negation operators only as the first character inside a bracket. Track
-	// that slot so a class expansion landing there (e.g. `[[:graph:]]` -> `!-~`) can be
-	// escaped, otherwise Bun.Glob reads it as a negated class instead of a literal range.
+	// Track the bracket negation slot: `!`/`^` negate only as the first character, and
+	// `]` is literal only there, so a class expansion's leading char may need escaping.
 	let atBracketStart = false;
 	for (let i = 0; i < pattern.length; i++) {
 		const ch = pattern[i];
@@ -735,7 +734,12 @@ function normalizePosixCharacterClasses(pattern: string): string {
 				const className = pattern.slice(i + 2, end);
 				const replacement = POSIX_CHARACTER_CLASS_MAP[className];
 				if (replacement !== undefined) {
-					const needsEscape = atBracketStart && (replacement[0] === "!" || replacement[0] === "^");
+					// Position-sensitive bracket metacharacters: `!`/`^` negate only at the bracket
+					// start, while `]` is a literal only at the start (elsewhere it closes the class).
+					// Escape a class expansion's leading char when its slot would make it special so
+					// Bun.Glob keeps it literal (e.g. `[[:graph:]]` -> `!-~`, `[a[:punct:]]` -> `]...`).
+					const firstChar = replacement[0];
+					const needsEscape = atBracketStart ? firstChar === "!" || firstChar === "^" : firstChar === "]";
 					result += needsEscape ? `\\${replacement}` : replacement;
 					atBracketStart = false;
 					i = end + 1;

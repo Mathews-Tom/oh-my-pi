@@ -684,6 +684,31 @@ describe("Claude Code rule discovery", () => {
 		expect(paths.some(rulePath => rulePath.endsWith("break.md"))).toBe(false);
 		expect(paths.some(rulePath => rulePath.endsWith("name.md"))).toBe(false);
 	});
+	test("preserves a punct class inside a mixed bracket expression in linked rule ignores", async () => {
+		if (process.platform === "win32") return;
+		// The [:punct:] expansion's leading ] is literal only at the bracket start; after another
+		// token (e.g. [a[:punct:]]) it must be escaped or Bun.Glob ends the class early and keeps
+		// rules git ignores.
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/[a[:punct:]]secret.md\n");
+		const sharedRules = path.join(root, "shared-rules-posix-punct-mixed");
+		await writeFile(path.join(sharedRules, "asecret.md"), "A secret.\n");
+		await writeFile(path.join(sharedRules, "!secret.md"), "Bang secret.\n");
+		await writeFile(path.join(sharedRules, "]secret.md"), "Bracket secret.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const paths = result.items.map(rule => rule.path);
+		expect(paths.some(rulePath => rulePath.endsWith("keep.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("asecret.md"))).toBe(false);
+		expect(paths.some(rulePath => rulePath.endsWith("!secret.md"))).toBe(false);
+		expect(paths.some(rulePath => rulePath.endsWith("]secret.md"))).toBe(false);
+	});
 	test("does not follow .gitignore reached through a symlinked rule directory", async () => {
 		if (process.platform === "win32") return;
 		// Git does not follow symlinks when reading .gitignore files, so a target-side
