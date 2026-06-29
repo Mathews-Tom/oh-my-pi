@@ -641,6 +641,28 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).not.toContain("shared:]secret");
 		expect(result.items.map(rule => rule.name)).not.toContain(String.raw`shared:\secret`);
 	});
+	test("honors the POSIX graph class in linked rule ignores", async () => {
+		if (process.platform === "win32") return;
+		// `[[:graph:]]` is the `!`-to-`~` range. Mapped naively to `[!-~]`, Bun.Glob reads the
+		// leading `!` as negation and would keep names git ignores (e.g. `-secret.md`).
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/[[:graph:]]secret.md\n");
+		const sharedRules = path.join(root, "shared-rules-posix-graph");
+		await writeFile(path.join(sharedRules, "-secret.md"), "Dash secret rule.\n");
+		await writeFile(path.join(sharedRules, "~secret.md"), "Tilde secret rule.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const names = result.items.map(rule => rule.name);
+		expect(names).toContain("shared:keep");
+		expect(names).not.toContain("shared:-secret");
+		expect(names).not.toContain("shared:~secret");
+	});
 	test("does not follow .gitignore reached through a symlinked rule directory", async () => {
 		if (process.platform === "win32") return;
 		// Git does not follow symlinks when reading .gitignore files, so a target-side

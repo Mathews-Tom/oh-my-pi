@@ -707,15 +707,23 @@ function normalizePosixCharacterClasses(pattern: string): string {
 	// git/fnmatch semantics.
 	let result = "";
 	let inBracket = false;
+	// `!`/`^` are negation operators only as the first character inside a bracket. Track
+	// that slot so a class expansion landing there (e.g. `[[:graph:]]` -> `!-~`) can be
+	// escaped, otherwise Bun.Glob reads it as a negated class instead of a literal range.
+	let atBracketStart = false;
 	for (let i = 0; i < pattern.length; i++) {
 		const ch = pattern[i];
 		if (ch === "\\" && i + 1 < pattern.length) {
 			result += ch + pattern[i + 1];
 			i++;
+			if (inBracket) atBracketStart = false;
 			continue;
 		}
 		if (!inBracket) {
-			if (ch === "[") inBracket = true;
+			if (ch === "[") {
+				inBracket = true;
+				atBracketStart = true;
+			}
 			result += ch;
 			continue;
 		}
@@ -725,16 +733,20 @@ function normalizePosixCharacterClasses(pattern: string): string {
 				const className = pattern.slice(i + 2, end);
 				const replacement = POSIX_CHARACTER_CLASS_MAP[className];
 				if (replacement !== undefined) {
-					result += replacement;
+					const needsEscape = atBracketStart && (replacement[0] === "!" || replacement[0] === "^");
+					result += needsEscape ? `\\${replacement}` : replacement;
+					atBracketStart = false;
 					i = end + 1;
 					continue;
 				}
 			}
 			result += ch;
+			atBracketStart = false;
 			continue;
 		}
 		if (ch === "]") inBracket = false;
 		result += ch;
+		atBracketStart = false;
 	}
 	return result;
 }
