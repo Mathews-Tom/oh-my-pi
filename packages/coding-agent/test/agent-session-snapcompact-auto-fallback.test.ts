@@ -39,13 +39,19 @@ async function createHarness(tempDir: TempDir, authStorage: AuthStorage, options
 	const firstKeptEntryId = sessionManager.getBranch()[0]?.id;
 	if (!firstKeptEntryId) throw new Error("Expected seeded branch entry");
 
+	const settings = Settings.isolated({
+		"compaction.strategy": "snapcompact",
+		// Force a 1-token recent window so the post-turn cut always splits off the
+		// last turn and summarizes the seeded (CJK) history. With the default
+		// 20k window the cut keeps both tiny messages, leaving nothing for
+		// snapcompact's renderability preflight to scan.
+		"compaction.keepRecentTokens": 1,
+		modelRoles: { vision: "aimlapi/claude-sonnet-4-5-20250929" },
+	});
 	const session = new AgentSession({
 		agent,
 		sessionManager,
-		settings: Settings.isolated({
-			"compaction.strategy": "snapcompact",
-			modelRoles: { vision: "aimlapi/claude-sonnet-4-5-20250929" },
-		}),
+		settings,
 		modelRegistry,
 	});
 	vi.spyOn(compactionModule, "compact").mockResolvedValue({
@@ -66,13 +72,16 @@ async function createHarness(tempDir: TempDir, authStorage: AuthStorage, options
 	});
 
 	const triggerThreshold = () => {
-		// Size the synthetic usage to the active model's context window so the turn trips the
-		// compaction threshold (window - 15% reserve) without exceeding the window. Exceeding it
-		// routes through overflow recovery, which strips the triggering turn before snapcompact
-		// can evaluate the transcript; 95% clears the threshold for both narrow- and wide-context
-		// models while staying inside the window.
-		const contextWindow = activeModel.contextWindow ?? 200000;
-		const inputTokens = Math.floor(contextWindow * 0.95);
+		// Prompt tokens above the auto-compaction threshold but below the model's
+		// context window: post-turn maintenance must run a threshold compaction,
+		// NOT the overflow recovery path (which drops the just-ended turn before
+		// snapcompact's renderability preflight can scan it, leaving nothing to
+		// summarize). Derived from the live window so the fixture survives model
+		// metadata changes (claude-sonnet-4-5's 200k window is narrower than the
+		// vision-role qwen's, so a fixed count would overflow one of them).
+		const contextWindow = activeModel.contextWindow ?? 0;
+		const thresholdTokens = compactionModule.resolveThresholdTokens(contextWindow, settings.getGroup("compaction"));
+		const promptTokens = contextWindow > 0 ? Math.floor((thresholdTokens + contextWindow) / 2) : 246_000;
 		const assistantMsg = {
 			role: "assistant" as const,
 			content: [{ type: "text" as const, text: "Done." }],
@@ -81,11 +90,11 @@ async function createHarness(tempDir: TempDir, authStorage: AuthStorage, options
 			model: activeModel.id,
 			stopReason: "stop" as const,
 			usage: {
-				input: inputTokens,
-				output: 1000,
+				input: promptTokens,
+				output: 0,
 				cacheRead: 0,
 				cacheWrite: 0,
-				totalTokens: inputTokens + 1000,
+				totalTokens: promptTokens,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			timestamp: Date.now(),
