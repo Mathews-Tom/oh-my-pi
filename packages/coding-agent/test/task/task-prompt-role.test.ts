@@ -22,7 +22,7 @@ describe("task tool description: role parameter", () => {
 	it("documents `role` in the batch parameter list", () => {
 		const out = render(true);
 		expect(out).toContain("`role`:");
-		expect(out).toMatch(/specialist identity/i);
+		expect(out).toMatch(/`role`:[^\n]*specialist/i);
 	});
 
 	it("documents `role` in the flat (single-spawn) parameter list", () => {
@@ -34,6 +34,6 @@ describe("task tool description: role parameter", () => {
 		const out = render(true);
 		// Stable invariant — tailoring tied to `role` on one directive line —
 		// rather than the exact copy-edited wording/capitalization.
-		expect(out).toMatch(/tailor[^\n]*role/i);
+		expect(out).toMatch(/`role`[^\n]*tailor/i);
 	});
 });

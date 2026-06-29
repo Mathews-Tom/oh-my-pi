@@ -5,7 +5,7 @@ Execution blocks your turn: the call only returns once the work is completely fi
 # Delegation Strategy
 - **Maximize parallelism:** Break work into the widest possible {{#if batchEnabled}}array of `tasks[]`{{else}}set of parallel `task` calls{{/if}}. NEVER serialize work that can run concurrently. Tasks touching different files or independent refactors should run in parallel; agents resolve their own file collisions live.
 - **Sequence only when necessary:** The only reason to run A before B is if B strictly requires A's output to function (e.g., a core API contract or schema migration). {{#if ircEnabled}}If the missing piece is small, run them in parallel and have B ask A via `irc`!{{/if}}
-- **Tailor every spawn:** Assign each subagent a specific `role` (e.g. "Security Reviewer", "DB Migrator") rather than cloning a generic worker. Tailored specialists are the default, not the exception.
+- **Role matching:** Assign each subagent a specific `role` (e.g. "Security Reviewer", "DB Migrator"). Do not spawn generic workers.
 - **No overhead:** Each assignment MUST instruct its agent to skip formatters, linters, and project-wide test suites. You will run those once at the end.
 - **Do your own thinking:** NEVER assign reasoning, architecture, or design to `quick_task` or `explore`. They are for mechanical lookups only. Keep hard decisions in your own context or use `task`, `plan`, or `oracle`.
 - **One-pass agents:** Prefer agents that investigate **and** edit in a single pass; only spin a read-only discovery step (e.g. `explore`) when the affected files are genuinely unknown.
@@ -18,7 +18,7 @@ Execution blocks your turn: the call only returns once the work is completely fi
   - `assignment`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
   - `id`: A stable CamelCase identifier (≤32 chars). Generated automatically if omitted.
   - `description`: A UI label only; the subagent NEVER sees it.
-  - `role`: specialist identity this subagent embodies (e.g. "Auth-flow security reviewer"). Tailor per spawn; do not clone a generic worker.
+  - `role`: The specialist this subagent embodies. Tailor per spawn; do not clone a generic worker.
 {{#if isolationEnabled}}
   - `isolated`: Run in a dedicated worktree and return patches. Isolated agents are destroyed upon completion and cannot be addressed afterward.
 {{/if}}
@@ -26,7 +26,7 @@ Execution blocks your turn: the call only returns once the work is completely fi
 - `assignment`: Complete, self-contained instructions. One-liners or missing acceptance criteria are PROHIBITED.
 - `id`: A stable CamelCase identifier (≤32 chars). Generated automatically if omitted.
 - `description`: A UI label only; the subagent NEVER sees it.
-- `role`: specialist identity this subagent embodies (e.g. "Auth-flow security reviewer"). Tailor per spawn; do not clone a generic worker.
+- `role`: The specialist this subagent embodies. Tailor per spawn; do not clone a generic worker.
 {{#if isolationEnabled}}
 - `isolated`: Run in a dedicated worktree and return patches. Isolated agents are destroyed upon completion and cannot be addressed afterward.
 {{/if}}
