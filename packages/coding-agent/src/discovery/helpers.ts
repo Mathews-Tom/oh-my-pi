@@ -195,9 +195,15 @@ export function buildRuleFromMarkdown(
 	const { frontmatter, body } = parseFrontmatter(content, { source: filePath });
 	const { condition, astCondition, scope } = parseRuleConditionAndScope(frontmatter as RuleFrontmatter);
 
-	const globs = options?.scopeFromPathsOnly
-		? parseRuleGlobs(frontmatter.paths)
-		: (parseRuleGlobs(frontmatter.globs) ?? parseRuleGlobs(frontmatter.paths));
+	// `scopeFromPathsOnly` makes Claude rules path-scope off `paths:` only, ignoring
+	// Cursor-style `globs:`. But a TTSR rule (condition/astCondition) uses `globs` as
+	// its global path filter (TtsrManager.addRule), so keep `globs:` whenever the rule
+	// is conditional — otherwise the condition would fire for unrelated files.
+	const isTtsrRule = (condition?.length ?? 0) > 0 || (astCondition?.length ?? 0) > 0;
+	const globs =
+		options?.scopeFromPathsOnly && !isTtsrRule
+			? parseRuleGlobs(frontmatter.paths)
+			: (parseRuleGlobs(frontmatter.globs) ?? parseRuleGlobs(frontmatter.paths));
 
 	const resolvedName = options?.ruleName ?? name.replace(options?.stripNamePattern ?? /\.(md|mdc)$/, "");
 	const rawMode = frontmatter.interruptMode;

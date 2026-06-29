@@ -177,6 +177,24 @@ describe("Claude Code rule discovery", () => {
 		expect(pathsScoped?.alwaysApply).not.toBe(true);
 		expect(pathsScoped?.globs).toEqual(["**/*.ts"]);
 	});
+	test("preserves globs on conditional (TTSR) Claude rules so the condition stays path-scoped", async () => {
+		// A Claude rule that combines OMP TTSR metadata (`condition:`) with a `globs:`
+		// path filter must keep its globs — TtsrManager uses rule.globs as the global
+		// path filter, so dropping it would fire the condition for unrelated files.
+		await writeFile(
+			path.join(project, ".claude", "rules", "ttsr-globs.md"),
+			'---\ncondition: TODO\nglobs:\n  - "**/*.ts"\n---\nTTSR rule.\n',
+		);
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const ttsr = result.items.find(rule => rule.name === "ttsr-globs");
+		expect(ttsr?.condition).toEqual(["TODO"]);
+		expect(ttsr?.globs).toEqual(["**/*.ts"]);
+	});
 	test("keeps rules when unrelated directory-only ignores exist", async () => {
 		await writeFile(path.join(project, ".gitignore"), "node_modules/\ndist/\n");
 		await writeFile(path.join(project, ".claude", "rules", "local.md"), "Local rule.\n");
