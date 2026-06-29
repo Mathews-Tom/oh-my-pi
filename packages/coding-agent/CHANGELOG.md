@@ -36,8 +36,6 @@
 
 ### Added
 
-- Added mouse support for scrolling and interaction in the debug log and raw SSE stream viewers.
-- Added the `statusLine.compactThinkingLevel` setting to render the model segment's thinking level as a single leading glyph instead of a separate text suffix.
 - Added support for multiple configurable advisors via WATCHDOG.yml/WATCHDOG.yaml files, allowing per-advisor models, tool subsets, and instructions.
 - Added /advisor configure, a full-screen, mouse-driven TUI to easily manage the advisor roster, configure models, toggle tool permissions, and edit instructions.
 - Added full unified edit diffs to advisor transcripts, allowing advisors to see changes directly without re-reading files.
@@ -87,8 +85,6 @@
 
 ### Added
 
-- Added `grep -q`/`--quiet`/`--silent` and `-x`/`--line-regexp` to the in-process `grep` builtin used by the bash tool. `-q` suppresses all stdout and exits 0 on the first match (short-circuiting, with match status taking precedence over read errors per GNU); `-x` anchors each pattern to whole lines. Unblocks shell conditionals such as `grep -qx "$applet" <(strings bin)`.
-- Added new `tiny` model role for consolidated online task handling
 - Added a new `tiny` model role for consolidated online task handling.
 - Added a `textVerbosity` setting to control OpenAI and Codex response detail.
 
