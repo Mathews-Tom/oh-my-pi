@@ -186,12 +186,18 @@ export function buildRuleFromMarkdown(
 	options?: {
 		ruleName?: string;
 		stripNamePattern?: RegExp;
+		// When set, path-scope only off the `paths:` field and ignore Cursor-style
+		// `globs:`. Claude Code treats only `paths:` as path-specific; a rule without
+		// `paths:` loads unconditionally, so a `globs:`-only rule must not be scoped.
+		scopeFromPathsOnly?: boolean;
 	},
 ): Rule {
 	const { frontmatter, body } = parseFrontmatter(content, { source: filePath });
 	const { condition, astCondition, scope } = parseRuleConditionAndScope(frontmatter as RuleFrontmatter);
 
-	const globs = parseRuleGlobs(frontmatter.globs) ?? parseRuleGlobs(frontmatter.paths);
+	const globs = options?.scopeFromPathsOnly
+		? parseRuleGlobs(frontmatter.paths)
+		: (parseRuleGlobs(frontmatter.globs) ?? parseRuleGlobs(frontmatter.paths));
 
 	const resolvedName = options?.ruleName ?? name.replace(options?.stripNamePattern ?? /\.(md|mdc)$/, "");
 	const rawMode = frontmatter.interruptMode;

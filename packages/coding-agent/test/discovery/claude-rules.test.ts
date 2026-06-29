@@ -152,6 +152,31 @@ describe("Claude Code rule discovery", () => {
 		const resource = await new RuleProtocolHandler().resolve(parseInternalUrl("rule://C%252523"));
 		expect(resource.content.trim()).toBe("Literal percent rule.");
 	});
+	test("treats Claude rules with globs but no paths as always-on launch rules", async () => {
+		// Claude Code path-specificity comes only from `paths:`; a Cursor-style
+		// `globs:` key must NOT scope a Claude rule, so a globs-only rule loads
+		// unconditionally while a `paths:` rule stays path-scoped.
+		await writeFile(
+			path.join(project, ".claude", "rules", "globs-only.md"),
+			'---\nglobs:\n  - "**/*.ts"\n---\nGlobs-only rule.\n',
+		);
+		await writeFile(
+			path.join(project, ".claude", "rules", "paths-scoped.md"),
+			'---\npaths:\n  - "**/*.ts"\n---\nPaths rule.\n',
+		);
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const globsOnly = result.items.find(rule => rule.name === "globs-only");
+		const pathsScoped = result.items.find(rule => rule.name === "paths-scoped");
+		expect(globsOnly?.alwaysApply).toBe(true);
+		expect(globsOnly?.globs).toBeUndefined();
+		expect(pathsScoped?.alwaysApply).not.toBe(true);
+		expect(pathsScoped?.globs).toEqual(["**/*.ts"]);
+	});
 	test("keeps rules when unrelated directory-only ignores exist", async () => {
 		await writeFile(path.join(project, ".gitignore"), "node_modules/\ndist/\n");
 		await writeFile(path.join(project, ".claude", "rules", "local.md"), "Local rule.\n");

@@ -206,7 +206,7 @@ function claudeRuleNameFromPath(rulesDir: string, filePath: string): string {
 
 function transformClaudeRule(rulesDir: string, content: string, filePath: string, source: SourceMeta): Rule {
 	const ruleName = claudeRuleNameFromPath(rulesDir, filePath);
-	const rule = buildRuleFromMarkdown(ruleName, content, filePath, source, { ruleName });
+	const rule = buildRuleFromMarkdown(ruleName, content, filePath, source, { ruleName, scopeFromPathsOnly: true });
 	if (rule.alwaysApply === true) return rule;
 	if (rule.globs && rule.globs.length > 0) {
 		return rule.description ? rule : { ...rule, description: scopedClaudeRuleDescription(rule.globs) };
