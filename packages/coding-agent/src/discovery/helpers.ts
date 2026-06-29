@@ -481,8 +481,38 @@ async function findGitignoreRoot(dir: string): Promise<string> {
 	}
 }
 
+// Bun.Glob metacharacters: a gitignore `\X` of one of these must STAY escaped so
+// Bun.Glob keeps it literal. Git lets a backslash escape ANY character, so every
+// other `\X` is a plain literal — drop the backslash (e.g. `foo\bar.md` is the
+// logical file `foobar.md`, and leaving `\b` in the glob would match nothing).
+const GLOB_METACHARACTERS: Record<string, true> = {
+	"\\": true,
+	"*": true,
+	"?": true,
+	"[": true,
+	"]": true,
+	"{": true,
+	"}": true,
+	"(": true,
+	")": true,
+	"!": true,
+	"+": true,
+	"@": true,
+	"|": true,
+};
 function unescapeGitignorePattern(pattern: string): string {
-	return pattern.replace(/\\([ !#\\])/g, "$1");
+	let result = "";
+	for (let i = 0; i < pattern.length; i++) {
+		const ch = pattern[i];
+		if (ch === "\\" && i + 1 < pattern.length) {
+			const next = pattern[i + 1] as string;
+			result += GLOB_METACHARACTERS[next] ? `\\${next}` : next;
+			i++;
+			continue;
+		}
+		result += ch;
+	}
+	return result;
 }
 
 function trimGitignoreTrailingSpaces(pattern: string): string {

@@ -489,6 +489,28 @@ describe("Claude Code rule discovery", () => {
 		expect(names).toContain("shared:!secret");
 	});
 
+	test("unescapes arbitrary backslash escapes in gitignore patterns for linked rules", async () => {
+		if (process.platform === "win32") return;
+		// Git lets a backslash escape ANY character, so `foo\bar.md` is the logical
+		// file `foobar.md`. Leaving `\b` in the Bun.Glob pattern would match nothing
+		// and wrongly keep a rule Git/native discovery suppresses.
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/foo\\bar.md\n");
+		const sharedRules = path.join(root, "shared-rules-arbitrary-escape");
+		await writeFile(path.join(sharedRules, "foobar.md"), "Escaped rule.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const names = result.items.map(rule => rule.name);
+		expect(names).toContain("shared:keep");
+		expect(names).not.toContain("shared:foobar");
+	});
+
 	test("honors core.ignoreCase for linked gitignore matches", async () => {
 		if (process.platform === "win32") return;
 		await fs.rm(path.join(project, ".git"), { recursive: true, force: true });
