@@ -297,6 +297,29 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).not.toContain("private");
 	});
 
+	test("honors project ignores when the whole .claude directory is symlinked", async () => {
+		if (process.platform === "win32") return;
+		// `.claude` itself is the symlink (not just `.claude/rules`), so lstat on the
+		// rules dir resolves the parent link and reports a real directory. A symlink in
+		// any ancestor must still trigger the project-logical re-filter; otherwise the
+		// native glob walks the target and the project `.gitignore` entry for
+		// `.claude/rules/private.md` is bypassed.
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/private.md\n");
+		const sharedClaude = path.join(root, "shared-claude-dir");
+		await writeFile(path.join(sharedClaude, "rules", "private.md"), "Private rule.\n");
+		await writeFile(path.join(sharedClaude, "rules", "keep.md"), "Keep rule.\n");
+		await fs.symlink(sharedClaude, path.join(project, ".claude"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const names = result.items.map(rule => rule.name);
+		expect(names).toContain("keep");
+		expect(names).not.toContain("private");
+	});
+
 	test("skips node_modules under linked rule directories", async () => {
 		if (process.platform === "win32") return;
 		const sharedRules = path.join(root, "shared-rules-with-deps");

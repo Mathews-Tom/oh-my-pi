@@ -998,12 +998,31 @@ async function discoverLinkedFilesFromDir(
 	return matches;
 }
 
+// True when `dir` itself or any ancestor up to (but excluding) `base` is a symlink.
+// The native glob canonicalizes a symlinked search root and applies the target's own
+// ignores; that happens whether the link is the rules dir itself or a parent (e.g. a
+// symlinked `.claude`), so both must trigger the unignored rescan + project-logical
+// re-filter. `base` (cwd/home) bounds the walk so system links above the workspace
+// (e.g. a symlinked /tmp) never count.
+async function pathHasSymlinkedAncestor(dir: string, base: string): Promise<boolean> {
+	const boundary = path.resolve(base);
+	let current = path.resolve(dir);
+	while (current !== boundary) {
+		const stat = await fs.promises.lstat(current).catch(() => null);
+		if (stat?.isSymbolicLink()) return true;
+		const parent = path.dirname(current);
+		if (parent === current) break; // reached filesystem root without hitting base
+		current = parent;
+	}
+	return false;
+}
+
 /**
  * Load files from a directory matching extensions.
  * Uses native glob for fast filesystem scanning with gitignore support.
  */
 export async function loadFilesFromDir<T>(
-	_ctx: LoadContext,
+	ctx: LoadContext,
 	dir: string,
 	provider: string,
 	level: "user" | "project",
@@ -1051,13 +1070,13 @@ export async function loadFilesFromDir<T>(
 
 	if (followSymlinkDirectories && recursive) {
 		const ignoreCache: GitignoreRulesCache = new Map();
-		// The native glob already honors ignore rules for a real directory. Only when
-		// the rules directory itself is a symlink does the walker resolve into the
-		// target and bypass project-local logical ignores, so re-filter native matches
-		// only in that case — avoiding a per-file git subprocess fan-out for ordinary
-		// rule directories with many files.
-		const dirStat = await fs.promises.lstat(dir).catch(() => null);
-		if (dirStat?.isSymbolicLink()) {
+		// The native glob already honors ignore rules for a real directory. Only when the
+		// rules directory — or any ancestor between it and the workspace base, e.g. a
+		// symlinked `.claude` — is a symlink does the walker resolve into the target and
+		// bypass project-local logical ignores, so re-filter native matches only in that
+		// case, avoiding a per-file git subprocess fan-out for ordinary rule directories.
+		const base = level === "user" ? ctx.home : ctx.cwd;
+		if (await pathHasSymlinkedAncestor(dir, base)) {
 			// The native scanner canonicalizes a symlinked search root and applies the
 			// target checkout's own .gitignore, which git does not follow for a symlinked
 			// rules directory. Re-scan without ignore handling so target-side ignores
