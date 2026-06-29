@@ -152,6 +152,26 @@ describe("Claude Code rule discovery", () => {
 		const resource = await new RuleProtocolHandler().resolve(parseInternalUrl("rule://C%252523"));
 		expect(resource.content.trim()).toBe("Literal percent rule.");
 	});
+	test("scopes a relative project claudeMdExclude to its base, sparing user rules", async () => {
+		await writeFile(
+			path.join(project, ".claude", "settings.json"),
+			JSON.stringify({ claudeMdExcludes: ["**/private.md"] }),
+		);
+		await writeFile(path.join(home, ".claude", "rules", "private.md"), "User private rule.\n");
+		await writeFile(path.join(home, ".claude", "rules", "keep.md"), "User keep rule.\n");
+		await writeFile(path.join(project, ".claude", "rules", "private.md"), "Project private rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const paths = result.items.map(rule => rule.path);
+		// The relative project exclude must drop the project rule but not the user rule.
+		expect(paths).toContain(path.join(home, ".claude", "rules", "private.md"));
+		expect(paths).toContain(path.join(home, ".claude", "rules", "keep.md"));
+		expect(paths).not.toContain(path.join(project, ".claude", "rules", "private.md"));
+	});
 	test("keeps rules when unrelated directory-only ignores exist", async () => {
 		await writeFile(path.join(project, ".gitignore"), "node_modules/\ndist/\n");
 		await writeFile(path.join(project, ".claude", "rules", "local.md"), "Local rule.\n");

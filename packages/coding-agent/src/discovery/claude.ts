@@ -246,7 +246,11 @@ function matchesClaudeMdExclude(filePath: string, excludes: ClaudeMdExclude[], h
 		}
 
 		const glob = new Bun.Glob(normalizedPattern);
-		if (glob.match(normalizedFilePath)) return true;
+		// Mirror the literal branch above: an absolute (or `~/`-expanded) pattern matches the
+		// absolute path, while a relative pattern is scoped to its settings baseDir. Without this
+		// a relative project exclude (e.g. `**/private.md`) would match the absolute path and could
+		// suppress unrelated user rules under ~/.claude, since the merged list is reused there too.
+		if (path.isAbsolute(normalizedPattern)) return glob.match(normalizedFilePath);
 		return isRelativeToBase && glob.match(relativeFilePath);
 	});
 }
