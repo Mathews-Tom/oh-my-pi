@@ -739,4 +739,25 @@ describe("Claude Code rule discovery", () => {
 
 		expect(result.items.map(rule => rule.name)).toContain("keep");
 	});
+	test("does not follow a symlinked .gitignore file for linked rules", async () => {
+		if (process.platform === "win32") return;
+		// Git never follows a symlinked working-tree .gitignore (it reports the link as
+		// inaccessible), so a rule the symlink target would ignore must stay visible.
+		await writeFile(path.join(project, "shared-ignore"), ".claude/rules/shared/private.md\n");
+		await fs.symlink("shared-ignore", path.join(project, ".gitignore"));
+		const sharedRules = path.join(root, "shared-rules-symlinked-ignore-file");
+		await writeFile(path.join(sharedRules, "private.md"), "Private rule.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const names = result.items.map(rule => rule.name);
+		expect(names).toContain("shared:private");
+		expect(names).toContain("shared:keep");
+	});
 });

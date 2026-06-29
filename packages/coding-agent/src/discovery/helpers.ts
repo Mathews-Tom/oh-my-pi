@@ -502,7 +502,16 @@ async function loadIgnoreFile(
 	filePath: string,
 	baseDir: string,
 	ignoreCase: boolean,
+	skipSymlink = false,
 ): Promise<void> {
+	// Git never follows a symlinked working-tree .gitignore/.ignore file
+	// (https://git-scm.com/docs/gitignore#_notes); skip it so a linked rule tree filtered
+	// by a symlinked ignore file keeps the rules git would leave visible. Configured
+	// ignore sources (core.excludesFile, .git/info/exclude) are read by path and remain
+	// followed.
+	if (skipSymlink && (await fs.promises.lstat(filePath).catch(() => null))?.isSymbolicLink()) {
+		return;
+	}
 	const ignoreFile = Bun.file(filePath);
 	if (!(await ignoreFile.exists())) return;
 	const lines = (await ignoreFile.text()).split(/\r?\n/);
@@ -668,10 +677,10 @@ async function computeGitignoreRules(rootDir: string, targetDir: string): Promis
 		realDirectories.push(dir);
 	}
 	for (const dir of realDirectories) {
-		await loadIgnoreFile(rules, path.join(dir, ".gitignore"), dir, ignoreCase);
+		await loadIgnoreFile(rules, path.join(dir, ".gitignore"), dir, ignoreCase, true);
 	}
 	for (const dir of realDirectories) {
-		await loadIgnoreFile(rules, path.join(dir, ".ignore"), dir, ignoreCase);
+		await loadIgnoreFile(rules, path.join(dir, ".ignore"), dir, ignoreCase, true);
 	}
 	return rules;
 }
