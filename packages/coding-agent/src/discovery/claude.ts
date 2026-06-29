@@ -182,13 +182,12 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 // Rules
 // =============================================================================
 
-function hasTtsrMetadata(rule: Rule): boolean {
-	return Boolean(
-		(rule.condition && rule.condition.length > 0) ||
-			(rule.astCondition && rule.astCondition.length > 0) ||
-			rule.scope ||
-			rule.interruptMode,
-	);
+// Only a condition/astCondition makes a rule an actual TTSR rule (TtsrManager.addRule
+// rejects rules without one). Modifier-only metadata (scope/interruptMode) must not
+// suppress the default launch behavior, or such a rule is neither launched nor
+// registered as TTSR and silently disappears.
+function isConditionalTtsrRule(rule: Rule): boolean {
+	return Boolean((rule.condition && rule.condition.length > 0) || (rule.astCondition && rule.astCondition.length > 0));
 }
 
 function scopedClaudeRuleDescription(globs: string[]): string {
@@ -211,7 +210,7 @@ function transformClaudeRule(rulesDir: string, content: string, filePath: string
 	if (rule.globs && rule.globs.length > 0) {
 		return rule.description ? rule : { ...rule, description: scopedClaudeRuleDescription(rule.globs) };
 	}
-	if (rule.alwaysApply === false || hasTtsrMetadata(rule)) return rule;
+	if (rule.alwaysApply === false || isConditionalTtsrRule(rule)) return rule;
 	return { ...rule, alwaysApply: true };
 }
 

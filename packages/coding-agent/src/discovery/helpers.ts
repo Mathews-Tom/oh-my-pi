@@ -516,6 +516,9 @@ const GLOB_METACHARACTERS: Record<string, true> = {
 function unescapeGitignorePattern(pattern: string): string {
 	let result = "";
 	let inBracket = false;
+	// `]` closes a class only when not in the leading slot; right after `[` it is a
+	// literal member (e.g. `[]...]`), so the class keeps parsing past it.
+	let atBracketStart = false;
 	for (let i = 0; i < pattern.length; i++) {
 		const ch = pattern[i];
 		if (ch === "\\" && i + 1 < pattern.length) {
@@ -526,14 +529,20 @@ function unescapeGitignorePattern(pattern: string): string {
 			// only for glob metacharacters; otherwise drop it.
 			result += inBracket || GLOB_METACHARACTERS[next] ? `\\${next}` : next;
 			i++;
+			if (inBracket) atBracketStart = false;
 			continue;
 		}
-		if (ch === "[" && !inBracket) {
-			inBracket = true;
-		} else if (ch === "]" && inBracket) {
-			inBracket = false;
+		if (!inBracket) {
+			if (ch === "[") {
+				inBracket = true;
+				atBracketStart = true;
+			}
+			result += ch;
+			continue;
 		}
+		if (ch === "]" && !atBracketStart) inBracket = false;
 		result += ch;
+		atBracketStart = false;
 	}
 	return result;
 }
@@ -803,7 +812,10 @@ function normalizePosixCharacterClasses(pattern: string): string {
 			atBracketStart = false;
 			continue;
 		}
-		if (ch === "]") inBracket = false;
+		// A `]` is the class close only when it is NOT in the leading slot; right after
+		// `[` it is a literal member (e.g. `[]...]`), so the class — and any later
+		// `[:posix:]` token — keeps parsing.
+		if (ch === "]" && !atBracketStart) inBracket = false;
 		result += ch;
 		atBracketStart = false;
 	}

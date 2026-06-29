@@ -195,6 +195,23 @@ describe("Claude Code rule discovery", () => {
 		expect(ttsr?.condition).toEqual(["TODO"]);
 		expect(ttsr?.globs).toEqual(["**/*.ts"]);
 	});
+	test("treats modifier-only Claude rules (no condition/paths) as launch rules", async () => {
+		// scope/interruptMode without a condition does not make a rule TTSR (TtsrManager
+		// rejects it) and it is not path-scoped, so it must still launch at startup
+		// rather than silently disappear.
+		await writeFile(
+			path.join(project, ".claude", "rules", "modifier-only.md"),
+			"---\ninterruptMode: never\n---\nModifier-only rule.\n",
+		);
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const modifierOnly = result.items.find(rule => rule.name === "modifier-only");
+		expect(modifierOnly?.alwaysApply).toBe(true);
+	});
 	test("keeps rules when unrelated directory-only ignores exist", async () => {
 		await writeFile(path.join(project, ".gitignore"), "node_modules/\ndist/\n");
 		await writeFile(path.join(project, ".claude", "rules", "local.md"), "Local rule.\n");
@@ -845,6 +862,31 @@ describe("Claude Code rule discovery", () => {
 		expect(paths.some(rulePath => rulePath.endsWith("asecret.md"))).toBe(false);
 		expect(paths.some(rulePath => rulePath.endsWith("!secret.md"))).toBe(false);
 		expect(paths.some(rulePath => rulePath.endsWith("]secret.md"))).toBe(false);
+	});
+	test("keeps a leading ] literal before a POSIX class in linked rule ignores", async () => {
+		if (process.platform === "win32") return;
+		// In `[][:upper:]]`, the first `]` is a literal class member and `[:upper:]` is a
+		// POSIX class. Closing the class on the leading `]` would drop the expansion, so
+		// Bun.Glob would match neither `]secret.md` nor an uppercase name git ignores.
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/[][:upper:]]secret.md\n");
+		const sharedRules = path.join(root, "shared-rules-posix-leading-bracket");
+		await writeFile(path.join(sharedRules, "]secret.md"), "Bracket secret.\n");
+		await writeFile(path.join(sharedRules, "Asecret.md"), "Upper secret.\n");
+		await writeFile(path.join(sharedRules, "bsecret.md"), "Lower keep.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const paths = result.items.map(rule => rule.path);
+		expect(paths.some(rulePath => rulePath.endsWith("keep.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("bsecret.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("]secret.md"))).toBe(false);
+		expect(paths.some(rulePath => rulePath.endsWith("Asecret.md"))).toBe(false);
 	});
 	test("does not follow .gitignore reached through a symlinked rule directory", async () => {
 		if (process.platform === "win32") return;
