@@ -2,9 +2,11 @@
 
 ## [Unreleased]
 
+## [16.2.6] - 2026-06-29
+
 ### Fixed
 
-- Tolerated a stray `.` before the trailing `:` in hunk headers (e.g. `SWAP 2.=3.:`, `INS.POST 2.:`, `DEL 2.=3.`), recovering from GLM 5.2's tendency to insert an extra dot between the line number/range and the colon. The parser now skips the spurious dot so these headers parse correctly instead of failing with "payload line has no preceding hunk header."
+- Fixed a parser error ("payload line has no preceding hunk header") caused by stray dots before the trailing colon in hunk headers, improving compatibility with GLM 5.2 outputs.
 
 ## [16.2.0] - 2026-06-27
 
