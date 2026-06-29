@@ -66,6 +66,13 @@ async function createHarness(tempDir: TempDir, authStorage: AuthStorage, options
 	});
 
 	const triggerThreshold = () => {
+		// Size the synthetic usage to the active model's context window so the turn trips the
+		// compaction threshold (window - 15% reserve) without exceeding the window. Exceeding it
+		// routes through overflow recovery, which strips the triggering turn before snapcompact
+		// can evaluate the transcript; 95% clears the threshold for both narrow- and wide-context
+		// models while staying inside the window.
+		const contextWindow = activeModel.contextWindow ?? 200000;
+		const inputTokens = Math.floor(contextWindow * 0.95);
 		const assistantMsg = {
 			role: "assistant" as const,
 			content: [{ type: "text" as const, text: "Done." }],
@@ -74,11 +81,11 @@ async function createHarness(tempDir: TempDir, authStorage: AuthStorage, options
 			model: activeModel.id,
 			stopReason: "stop" as const,
 			usage: {
-				input: 245000,
+				input: inputTokens,
 				output: 1000,
 				cacheRead: 0,
 				cacheWrite: 0,
-				totalTokens: 246000,
+				totalTokens: inputTokens + 1000,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			timestamp: Date.now(),
