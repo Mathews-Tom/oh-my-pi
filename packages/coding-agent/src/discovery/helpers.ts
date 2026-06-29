@@ -790,6 +790,17 @@ function escapeGitignoreLiteralBraces(pattern: string): string {
 	return escaped;
 }
 
+// A leading `!` in a gitignore pattern is the negation prefix, consumed at parse
+// time into `GitignoreRule.negated`. Any `!` that survives into the glob is a
+// literal path character — an anchored `/!name`, an escaped `\!name`, or a
+// slash-bearing `!dir/x` — but `Bun.Glob` treats a leading `!` as negation and
+// would then match every unrelated path. Escape it so the glob stays literal. A
+// `!` after a `**/` prefix (or anywhere but the start) is already literal to
+// `Bun.Glob` and is left untouched.
+function escapeGlobLeadingBang(pattern: string): string {
+	return pattern.startsWith("!") ? `\\${pattern}` : pattern;
+}
+
 function gitignoreRuleMatch(
 	rule: GitignoreRule,
 	filePath: string,
@@ -802,9 +813,11 @@ function gitignoreRuleMatch(
 	const rawPattern = anchored ? rule.pattern.slice(1) : rule.pattern;
 	const directoryOnly = rawPattern.endsWith("/");
 	const normalizedPattern = rawPattern.replace(/\/+$/, "");
-	const basePattern = escapeGitignoreLiteralBraces(
-		normalizePosixCharacterClasses(
-			normalizedPattern.includes("/") || anchored ? normalizedPattern : `**/${normalizedPattern}`,
+	const basePattern = escapeGlobLeadingBang(
+		escapeGitignoreLiteralBraces(
+			normalizePosixCharacterClasses(
+				normalizedPattern.includes("/") || anchored ? normalizedPattern : `**/${normalizedPattern}`,
+			),
 		),
 	);
 	const globPattern = rule.ignoreCase ? basePattern.toLowerCase() : basePattern;

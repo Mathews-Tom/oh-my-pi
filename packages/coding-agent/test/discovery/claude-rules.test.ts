@@ -466,6 +466,29 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).not.toContain("shared:!secret");
 	});
 
+	test("treats an anchored literal bang gitignore pattern as root-only for linked rules", async () => {
+		if (process.platform === "win32") return;
+		// `/!secret.md` is an anchored ignore of the literal root file `!secret.md`.
+		// The leading `!` is negation only as a bare line prefix; after the `/` anchor
+		// it is a literal path character. If Bun.Glob reads it as negation the pattern
+		// becomes "match anything but secret.md" and drops every unrelated linked rule.
+		await writeFile(path.join(project, ".gitignore"), "/!secret.md\n");
+		const sharedRules = path.join(root, "shared-rules-anchored-bang");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await writeFile(path.join(sharedRules, "!secret.md"), "Secret rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const names = result.items.map(rule => rule.name);
+		expect(names).toContain("shared:keep");
+		expect(names).toContain("shared:!secret");
+	});
+
 	test("honors core.ignoreCase for linked gitignore matches", async () => {
 		if (process.platform === "win32") return;
 		await fs.rm(path.join(project, ".git"), { recursive: true, force: true });
