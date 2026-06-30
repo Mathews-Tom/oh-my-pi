@@ -6,6 +6,36 @@
 
 - Added Claude Code rule discovery so `.claude/rules/**/*.md` and `.claude/rules/**/*.mdc` files load through the standard rules capability with frontmatter metadata preserved ([#2613](https://github.com/can1357/oh-my-pi/issues/2613)).
 
+## [16.2.9] - 2026-06-30
+
+### Breaking Changes
+
+- Renamed the built-in quick_task subagent to sonic; update any task spawns or configurations referencing quick_task by name.
+
+### Added
+
+- Added the llama3.2:3b local model option for memory and auto-thinking tasks, utilizing a quantized ONNX model.
+- Added a built-in Tester subagent designed to write high-signal tests for behavior, invariants, and edge cases while avoiding redundant or low-value tests.
+- Added a Speech-to-Text submit trigger setting to auto-submit dictation on release, on complete sentences, or via a spoken submit command.
+- Added a loop-guard mechanism that detects thinking/response loops and injects a system notice during auto-retries to guide the model to break the pattern and take a concrete next step.
+
+### Changed
+
+- Renamed the Speech-to-Text (STT) setting label from "TTS Submit Trigger" to "Speech-to-Text Submit Trigger".
+
+### Fixed
+
+- Fixed an issue where mid-run compaction was incorrectly skipped when a persisted assistant display variant shared a persistence key but differed in content from the live message.
+- Fixed duplicate placeholder cards being created when streamed tool blocks started with an empty ID.
+- Fixed omp debug --profile failing on Bun by treating the optional --allow-natives-syntax flag as best-effort when v8.setFlagsFromString is unavailable.
+- Fixed release binaries missing the compiled tiny-model Transformers.js version pin, preventing runtime resolution issues on certain platforms like Homebrew Darwin arm64.
+- Fixed MCP OAuth flows silently falling back to a random redirect port when the preferred port (default 3000) was busy, which caused authentication failures with strict providers. The flow now fails fast with a configuration error when a static client ID is pinned, while dynamic registration flows continue to use fallback ports.
+- Fixed /mcp reauth and /mcp add commands ignoring the Escape key during OAuth authentication, allowing users to cancel the flow immediately instead of waiting for the timeout.
+
+### Removed
+
+- Removed the built-in oracle subagent.
+
 ## [16.2.8] - 2026-06-30
 
 ### Added

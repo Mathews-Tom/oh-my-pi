@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [16.2.9] - 2026-06-30
+
+### Added
+
+- Added `OAuthCallbackFlowOptions.allowPortFallback` to allow disabling random-port fallback, enabling strict port enforcement and early configuration errors for OAuth flows with static redirect URIs.
+
+### Changed
+
+- Improved `OAuthCallbackFlow` port conflict error messages to include the busy port, configured redirect URI, and actionable remediation steps.
+
+### Fixed
+
+- Fixed an issue where malformed tool-call JSON from local Ollama or llama.cpp models was incorrectly retried as generic 500 errors, now surfacing a clear recovery message.
+- Fixed a race condition in OAuth callback flows where abort signals triggered before the callback listener was registered were ignored.
+
 ## [16.2.7] - 2026-06-30
 
 ### Added
