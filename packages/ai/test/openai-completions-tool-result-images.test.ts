@@ -203,7 +203,7 @@ describe("openai-completions convertMessages", () => {
 		expect(assistantParam?.content).toBe("");
 	});
 
-	it("uses generated tool_call_id values when assistant/tool IDs are empty", () => {
+	it("drops an assistant turn whose only tool call has an empty id, with its orphan result", () => {
 		const baseModel = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
 		const model: Model<"openai-completions"> = {
 			...baseModel,
@@ -238,18 +238,14 @@ describe("openai-completions convertMessages", () => {
 			],
 		};
 
+		// A toolCall with an empty id is malformed: sanitizeMalformedToolCalls (run
+		// first inside transformMessages) drops the block, the now-empty assistant
+		// turn, and the orphan toolResult that pointed at the empty id. Every wire
+		// provider 400s on such a call, so replaying it would wedge the session.
 		const messages = convertMessages(model, context, compat);
-		const assistantParam = messages.find(message => message.role === "assistant") as
-			| { role: "assistant"; tool_calls?: Array<{ id: string }> }
-			| undefined;
-		expect(assistantParam).toBeDefined();
-		expect(assistantParam?.tool_calls).toBeDefined();
-		const generatedId = assistantParam!.tool_calls![0].id;
-		expect(generatedId.length).toBeGreaterThan(0);
-
-		const toolParam = messages.find(message => message.role === "tool") as { tool_call_id: string } | undefined;
-		expect(toolParam).toBeDefined();
-		expect(toolParam?.tool_call_id).toBe(generatedId);
+		expect(messages.find(message => message.role === "assistant")).toBeUndefined();
+		expect(messages.find(message => message.role === "tool")).toBeUndefined();
+		expect(messages.filter(message => message.role === "user")).toHaveLength(1);
 	});
 
 	it("serializes string tool arguments into valid JSON objects", () => {
