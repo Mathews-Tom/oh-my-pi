@@ -842,7 +842,9 @@ function escapeGitignoreLiteralBraces(pattern: string): string {
 	// (git/fnmatch semantics, e.g. `[]{}]` is the class of `]`, `{`, `}`). Closing
 	// the class on that leading `]` would expose later `{`/`}` to brace escaping and
 	// break the glob, letting symlinked rules git suppresses leak into the prompt.
+	// At most one leading `!`/`^` negation prefix keeps the leading slot open.
 	let atClassStart = false;
+	let negationSeen = false;
 	for (let i = 0; i < pattern.length; i++) {
 		const ch = pattern[i];
 		if (ch === "\\" && i + 1 < pattern.length) {
@@ -863,6 +865,7 @@ function escapeGitignoreLiteralBraces(pattern: string): string {
 			if (ch === "[") {
 				inCharacterClass = true;
 				atClassStart = true;
+				negationSeen = false;
 			}
 			escaped += ch;
 			continue;
@@ -872,9 +875,12 @@ function escapeGitignoreLiteralBraces(pattern: string): string {
 			escaped += ch;
 			continue;
 		}
-		// `!`/`^` right after `[` is the negation prefix; the leading slot (where `]`
-		// stays literal) extends across it.
-		if (atClassStart && (ch === "!" || ch === "^")) {
+		// Only the first `!`/`^` right after `[` is the negation prefix; it keeps the
+		// leading slot (where `]` stays literal) open across exactly one such char. A
+		// second `!`/`^` is an ordinary member, so the slot closes and a following `]`
+		// ends the class (git/fnmatch, e.g. `[!!]` is the class "not `!`").
+		if (atClassStart && !negationSeen && (ch === "!" || ch === "^")) {
+			negationSeen = true;
 			escaped += ch;
 			continue;
 		}

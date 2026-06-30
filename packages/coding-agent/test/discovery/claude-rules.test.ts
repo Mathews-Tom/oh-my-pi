@@ -939,6 +939,34 @@ describe("Claude Code rule discovery", () => {
 		expect(paths.some(rulePath => rulePath.endsWith("{secret.md"))).toBe(false);
 		expect(paths.some(rulePath => rulePath.endsWith("}secret.md"))).toBe(false);
 	});
+	test("closes a bracket class after one negation prefix in a linked rule ignore", async () => {
+		if (process.platform === "win32") return;
+		// In `[!!]`, the first `!` is the negation prefix and the second `!` is an ordinary
+		// member, so the class is "any char except `!`" and the following `]` closes it. The
+		// trailing `{private,secret}` are then literal braces. Keeping the leading slot open
+		// past the first `!` would leave the class unclosed, so Bun.Glob would brace-expand
+		// `{private,secret}` — dropping `aprivate.md`/`asecret.md` git keeps and keeping the
+		// literal braced rule git suppresses.
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/[!!]{private,secret}.md\n");
+		const sharedRules = path.join(root, "shared-rules-negation-prefix-braces");
+		await writeFile(path.join(sharedRules, "a{private,secret}.md"), "Literal braced secret.\n");
+		await writeFile(path.join(sharedRules, "aprivate.md"), "Private keep.\n");
+		await writeFile(path.join(sharedRules, "asecret.md"), "Secret keep.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const paths = result.items.map(rule => rule.path);
+		expect(paths.some(rulePath => rulePath.endsWith("keep.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("aprivate.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("asecret.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("a{private,secret}.md"))).toBe(false);
+	});
 	test("does not follow .gitignore reached through a symlinked rule directory", async () => {
 		if (process.platform === "win32") return;
 		// Git does not follow symlinks when reading .gitignore files, so a target-side
