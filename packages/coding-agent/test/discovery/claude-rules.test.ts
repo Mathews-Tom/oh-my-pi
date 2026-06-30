@@ -913,6 +913,32 @@ describe("Claude Code rule discovery", () => {
 		expect(paths.some(rulePath => rulePath.endsWith("]secret.md"))).toBe(false);
 		expect(paths.some(rulePath => rulePath.endsWith("Asecret.md"))).toBe(false);
 	});
+	test("keeps a leading ] literal before braces in a linked rule ignore class", async () => {
+		if (process.platform === "win32") return;
+		// In `[]{}]`, the first `]` is a literal class member, so the class matches `]`,
+		// `{`, `}`. Closing the class on that leading `]` exposes the later `{`/`}` to brace
+		// escaping, so Bun.Glob would match none of those names git ignores and leak the
+		// symlinked rules into the prompt.
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/[]{}]secret.md\n");
+		const sharedRules = path.join(root, "shared-rules-leading-bracket-braces");
+		await writeFile(path.join(sharedRules, "]secret.md"), "Bracket secret.\n");
+		await writeFile(path.join(sharedRules, "{secret.md"), "Brace-open secret.\n");
+		await writeFile(path.join(sharedRules, "}secret.md"), "Brace-close secret.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const paths = result.items.map(rule => rule.path);
+		expect(paths.some(rulePath => rulePath.endsWith("keep.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("]secret.md"))).toBe(false);
+		expect(paths.some(rulePath => rulePath.endsWith("{secret.md"))).toBe(false);
+		expect(paths.some(rulePath => rulePath.endsWith("}secret.md"))).toBe(false);
+	});
 	test("does not follow .gitignore reached through a symlinked rule directory", async () => {
 		if (process.platform === "win32") return;
 		// Git does not follow symlinks when reading .gitignore files, so a target-side
