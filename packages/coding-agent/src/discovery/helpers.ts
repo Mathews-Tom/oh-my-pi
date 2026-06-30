@@ -528,9 +528,11 @@ const GLOB_METACHARACTERS: Record<string, true> = {
 function unescapeGitignorePattern(pattern: string): string {
 	let result = "";
 	let inBracket = false;
-	// `]` closes a class only when not in the leading slot; right after `[` it is a
-	// literal member (e.g. `[]...]`), so the class keeps parsing past it.
+	// `]` closes a class only when not in the leading slot; right after `[`, or right
+	// after a `[!`/`[^` negation prefix, it is a literal member (e.g. `[]...]`,
+	// `[!]...]`), so the class keeps parsing past it.
 	let atBracketStart = false;
+	let negationSeen = false;
 	for (let i = 0; i < pattern.length; i++) {
 		const ch = pattern[i];
 		if (ch === "\\" && i + 1 < pattern.length) {
@@ -548,11 +550,23 @@ function unescapeGitignorePattern(pattern: string): string {
 			if (ch === "[") {
 				inBracket = true;
 				atBracketStart = true;
+				negationSeen = false;
 			}
 			result += ch;
 			continue;
 		}
-		if (ch === "]" && !atBracketStart) inBracket = false;
+		if (ch === "]" && !atBracketStart) {
+			inBracket = false;
+			result += ch;
+			continue;
+		}
+		// Only the first `!`/`^` right after `[` is the negation prefix; it keeps the
+		// leading slot (where `]` stays literal) open across exactly one such char.
+		if (atBracketStart && !negationSeen && (ch === "!" || ch === "^")) {
+			negationSeen = true;
+			result += ch;
+			continue;
+		}
 		result += ch;
 		atBracketStart = false;
 	}
@@ -783,9 +797,12 @@ function normalizePosixCharacterClasses(pattern: string): string {
 	// git/fnmatch semantics.
 	let result = "";
 	let inBracket = false;
-	// Track the bracket negation slot: `!`/`^` negate only as the first character, and
-	// `]` is literal only there, so a class expansion's leading char may need escaping.
+	// Track the bracket leading slot: `]` is a literal member right after `[`, or right
+	// after a `[!`/`[^` negation prefix (`atBracketStart`), while `!`/`^` negate only as
+	// the very first character before any negation prefix (`atBracketStart && !negationSeen`).
+	// A class expansion's leading char may need escaping depending on which slot it lands in.
 	let atBracketStart = false;
+	let negationSeen = false;
 	for (let i = 0; i < pattern.length; i++) {
 		const ch = pattern[i];
 		if (ch === "\\" && i + 1 < pattern.length) {
@@ -798,6 +815,7 @@ function normalizePosixCharacterClasses(pattern: string): string {
 			if (ch === "[") {
 				inBracket = true;
 				atBracketStart = true;
+				negationSeen = false;
 			}
 			result += ch;
 			continue;
@@ -808,12 +826,16 @@ function normalizePosixCharacterClasses(pattern: string): string {
 				const className = pattern.slice(i + 2, end);
 				const replacement = POSIX_CHARACTER_CLASS_MAP[className];
 				if (replacement !== undefined) {
-					// Position-sensitive bracket metacharacters: `!`/`^` negate only at the bracket
-					// start, while `]` is a literal only at the start (elsewhere it closes the class).
-					// Escape a class expansion's leading char when its slot would make it special so
-					// Bun.Glob keeps it literal (e.g. `[[:graph:]]` -> `!-~`, `[a[:punct:]]` -> `]...`).
+					// Position-sensitive bracket metacharacters: `]` is a literal only in the leading
+					// slot (elsewhere it closes the class), while `!`/`^` negate only before any
+					// negation prefix. Escape a class expansion's leading char when its slot would
+					// make it special so Bun.Glob keeps it literal (e.g. `[[:graph:]]` -> `\!-~`,
+					// `[a[:punct:]]` -> `\]...`, but `[![:punct:]]` keeps a leading `]` literal).
 					const firstChar = replacement[0];
-					const needsEscape = atBracketStart ? firstChar === "!" || firstChar === "^" : firstChar === "]";
+					const needsEscape =
+						firstChar === "]"
+							? !atBracketStart
+							: (firstChar === "!" || firstChar === "^") && atBracketStart && !negationSeen;
 					result += needsEscape ? `\\${replacement}` : replacement;
 					atBracketStart = false;
 					i = end + 1;
@@ -825,9 +847,21 @@ function normalizePosixCharacterClasses(pattern: string): string {
 			continue;
 		}
 		// A `]` is the class close only when it is NOT in the leading slot; right after
-		// `[` it is a literal member (e.g. `[]...]`), so the class — and any later
-		// `[:posix:]` token — keeps parsing.
-		if (ch === "]" && !atBracketStart) inBracket = false;
+		// `[`, or right after a `[!`/`[^` negation prefix, it is a literal member
+		// (e.g. `[]...]`, `[!]...]`), so the class — and any later `[:posix:]` token —
+		// keeps parsing.
+		if (ch === "]" && !atBracketStart) {
+			inBracket = false;
+			result += ch;
+			continue;
+		}
+		// Only the first `!`/`^` right after `[` is the negation prefix; it keeps the
+		// leading slot (where `]` stays literal) open across exactly one such char.
+		if (atBracketStart && !negationSeen && (ch === "!" || ch === "^")) {
+			negationSeen = true;
+			result += ch;
+			continue;
+		}
 		result += ch;
 		atBracketStart = false;
 	}

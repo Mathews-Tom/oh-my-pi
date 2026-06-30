@@ -967,6 +967,63 @@ describe("Claude Code rule discovery", () => {
 		expect(paths.some(rulePath => rulePath.endsWith("asecret.md"))).toBe(true);
 		expect(paths.some(rulePath => rulePath.endsWith("a{private,secret}.md"))).toBe(false);
 	});
+	test("keeps a leading ] literal after a negation prefix in a linked rule ignore", async () => {
+		if (process.platform === "win32") return;
+		// In `[!]\-z]`, the `]` right after the `[!` negation prefix is a literal class
+		// member, so the class is the negated set of `]`, `-`, `z` (git/fnmatch: it ignores
+		// `asecret.md` but keeps `-secret.md`, `zsecret.md`, `]secret.md`). Closing the class
+		// on that leading `]` would turn `\-` into an outside-bracket escape and match the
+		// wrong names, leaking or suppressing the wrong linked rules.
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/[!]\\-z]secret.md\n");
+		const sharedRules = path.join(root, "shared-rules-negated-leading-bracket");
+		await writeFile(path.join(sharedRules, "asecret.md"), "A secret.\n");
+		await writeFile(path.join(sharedRules, "-secret.md"), "Hyphen keep.\n");
+		await writeFile(path.join(sharedRules, "zsecret.md"), "Z keep.\n");
+		await writeFile(path.join(sharedRules, "]secret.md"), "Bracket keep.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const paths = result.items.map(rule => rule.path);
+		expect(paths.some(rulePath => rulePath.endsWith("keep.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("-secret.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("zsecret.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("]secret.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("asecret.md"))).toBe(false);
+	});
+	test("keeps a leading ] literal before a POSIX class after a negation prefix", async () => {
+		if (process.platform === "win32") return;
+		// In `[!][:upper:]]`, the `]` right after the `[!` negation prefix is a literal class
+		// member and `[:upper:]` is a POSIX class, so the class is the negated set of `]` and
+		// A-Z (git/fnmatch: it ignores `bsecret.md` but keeps `Csecret.md` and `]secret.md`).
+		// Closing the class on that leading `]` would drop the POSIX expansion and the symlink
+		// fallback would load rules git suppresses. Distinct base letters (not `a`/`A`) keep
+		// the suppressed and kept fixtures separate files on case-insensitive filesystems.
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/[!][:upper:]]secret.md\n");
+		const sharedRules = path.join(root, "shared-rules-negated-posix-leading-bracket");
+		await writeFile(path.join(sharedRules, "bsecret.md"), "Lower secret.\n");
+		await writeFile(path.join(sharedRules, "Csecret.md"), "Upper keep.\n");
+		await writeFile(path.join(sharedRules, "]secret.md"), "Bracket keep.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const paths = result.items.map(rule => rule.path);
+		expect(paths.some(rulePath => rulePath.endsWith("keep.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("Csecret.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("]secret.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("bsecret.md"))).toBe(false);
+	});
 	test("does not follow .gitignore reached through a symlinked rule directory", async () => {
 		if (process.platform === "win32") return;
 		// Git does not follow symlinks when reading .gitignore files, so a target-side
