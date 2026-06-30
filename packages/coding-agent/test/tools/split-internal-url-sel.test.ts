@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { resetActiveRulesForTests, setActiveRules } from "@oh-my-pi/pi-coding-agent/capability/rule";
+import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import { RuleProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/rule-protocol";
 import { pathTargetsSsh, peelWriteUrlSelector, splitInternalUrlSel } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 
@@ -102,6 +103,36 @@ describe("splitInternalUrlSel", () => {
 			},
 		]);
 		expect(splitInternalUrlSel("rule://C%23:raw")).toEqual({ path: "rule://C%23", sel: "raw" });
+	});
+
+	it("peels rule selectors using the resolver's host priority under decoding collisions", async () => {
+		// Active rules collide under percent-decoding: `C#` (rawHost wins) and the
+		// literal-percent `C%23`. The resolver's exact-match order is rawHost,
+		// rawEncodedHost, hostname — so bare `rule://C%23` resolves to `C#`. Selector
+		// peeling must use the same order: peeling rawEncodedHost first would rewrite
+		// `rule://C%23:raw` to `rule://C%2523` and silently retarget the `C%23` rule.
+		setActiveRules([
+			{
+				name: "C#",
+				path: "/tmp/C#.md",
+				content: "decoded",
+				_source: { provider: "test", providerName: "test", path: "/tmp/C#.md", level: "project" },
+			},
+			{
+				name: "C%23",
+				path: "/tmp/C%23.md",
+				content: "literal-percent",
+				_source: { provider: "test", providerName: "test", path: "/tmp/C%23.md", level: "project" },
+			},
+		]);
+		// Peeling rewrites to the rawHost-encoded form, which resolves back to the
+		// same rule the bare URL targets (`C#`), not the literal-percent `C%23`.
+		const peeled = splitInternalUrlSel("rule://C%23:raw");
+		expect(peeled).toEqual({ path: "rule://C%23", sel: "raw" });
+		const bareTarget = await new RuleProtocolHandler().resolve(parseInternalUrl("rule://C%23"));
+		const peeledTarget = await new RuleProtocolHandler().resolve(parseInternalUrl(peeled.path));
+		expect(bareTarget.content).toBe("decoded");
+		expect(peeledTarget.content).toBe(bareTarget.content);
 	});
 
 	it("keeps completion values unique for raw rule names containing percent encodings", async () => {

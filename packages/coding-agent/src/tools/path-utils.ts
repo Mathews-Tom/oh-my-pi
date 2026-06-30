@@ -349,7 +349,14 @@ export function splitInternalUrlSel(rawPath: string): { path: string; sel?: stri
 		try {
 			const parsed = parseInternalUrl(rawPath);
 			const activeRuleNames = new Set(getActiveRules().map(rule => rule.name));
-			const candidates = [parsed.rawEncodedHost, parsed.rawHost, parsed.hostname].filter(
+			// Peel candidates in the SAME priority order the rule resolver uses for
+			// exact-name matches (RuleProtocolHandler.resolve: rawHost, then
+			// rawEncodedHost, then hostname). Diverging here lets a trailing selector
+			// change which rule is referenced under percent-decoding collisions — e.g.
+			// with active rules `C#` and `C%23`, bare `rule://C%23` resolves to `C#`
+			// (rawHost wins), but peeling rawEncodedHost first would rewrite
+			// `rule://C%23:raw` to `rule://C%2523` and target `C%23` instead.
+			const candidates = [parsed.rawHost, parsed.rawEncodedHost, parsed.hostname].filter(
 				(name, index, names): name is string => Boolean(name) && names.indexOf(name) === index,
 			);
 			for (const initialCandidate of candidates) {
