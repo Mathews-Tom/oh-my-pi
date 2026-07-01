@@ -212,9 +212,15 @@ describe("openai-completions convertMessages", () => {
 		};
 
 		const now = Date.now();
+		// OpenAI-Responses composite ids have the shape `{call_id}|{item_id}`; a
+		// missing `call_id` leaves `|fc_...`. That is non-empty (so it survives the
+		// malformed-tool-call sanitizer in `transformMessages`) but `normalizeToolCallId`
+		// splits on `|` and yields an empty string, so `ensureToolCallId` must synthesize
+		// a stable fallback and remap the matching tool result onto it.
+		const emptyNormalizingId = "|fc_readme";
 		const assistantMessage: AssistantMessage = {
 			role: "assistant",
-			content: [{ type: "toolCall", id: "", name: "read", arguments: { path: "README.md" } }],
+			content: [{ type: "toolCall", id: emptyNormalizingId, name: "read", arguments: { path: "README.md" } }],
 			api: model.api,
 			provider: model.provider,
 			model: model.id,
@@ -229,7 +235,7 @@ describe("openai-completions convertMessages", () => {
 				assistantMessage,
 				{
 					role: "toolResult",
-					toolCallId: "",
+					toolCallId: emptyNormalizingId,
 					toolName: "read",
 					content: [{ type: "text", text: "done" }],
 					isError: false,
@@ -246,6 +252,65 @@ describe("openai-completions convertMessages", () => {
 		expect(messages.find(message => message.role === "assistant")).toBeUndefined();
 		expect(messages.find(message => message.role === "tool")).toBeUndefined();
 		expect(messages.filter(message => message.role === "user")).toHaveLength(1);
+	});
+
+	it("generates fallback tool_call_id values when assistant/tool IDs normalize to empty", () => {
+		const baseModel = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+		const model: Model<"openai-completions"> = {
+			...baseModel,
+			api: "openai-completions",
+			input: ["text"],
+		};
+
+		const now = Date.now();
+		// OpenAI-Responses composite ids have the shape `{call_id}|{item_id}`; a
+		// missing `call_id` leaves `|fc_...`. That is non-empty (so it survives the
+		// malformed-tool-call sanitizer in `transformMessages`) but `normalizeToolCallId`
+		// splits on `|` and yields an empty string, so `ensureToolCallId` must synthesize
+		// a stable fallback and remap the matching tool result onto it.
+		const emptyNormalizingId = "|fc_readme";
+		const assistantMessage: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: emptyNormalizingId, name: "read", arguments: { path: "README.md" } }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: emptyUsage,
+			stopReason: "toolUse",
+			timestamp: now,
+		};
+
+		const context: Context = {
+			messages: [
+				{ role: "user", content: "Read README", timestamp: now - 1 },
+				assistantMessage,
+				{
+					role: "toolResult",
+					toolCallId: emptyNormalizingId,
+					toolName: "read",
+					content: [{ type: "text", text: "done" }],
+					isError: false,
+					timestamp: now + 1,
+				},
+			],
+		};
+
+		const messages = convertMessages(model, context, compat);
+		const assistantParam = messages.find(message => message.role === "assistant") as
+			| { role: "assistant"; tool_calls?: Array<{ id: string }> }
+			| undefined;
+		expect(assistantParam).toBeDefined();
+		expect(assistantParam?.tool_calls).toBeDefined();
+		const generatedId = assistantParam!.tool_calls![0].id;
+		// The fallback branch must have fired: the raw id must not leak through, and
+		// `generateFallbackToolCallId` always mints a `call_`-prefixed hash.
+		expect(generatedId).not.toBe(emptyNormalizingId);
+		expect(generatedId).not.toContain("|");
+		expect(generatedId).toStartWith("call_");
+
+		const toolParam = messages.find(message => message.role === "tool") as { tool_call_id: string } | undefined;
+		expect(toolParam).toBeDefined();
+		expect(toolParam?.tool_call_id).toBe(generatedId);
 	});
 
 	it("serializes string tool arguments into valid JSON objects", () => {

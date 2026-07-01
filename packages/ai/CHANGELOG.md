@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [16.2.11] - 2026-07-01
+
+### Fixed
+
+- Fixed streaming UI glitches and resolved an issue where invalid empty tool call IDs were persisted in the chat history.
+
 ## [16.2.10] - 2026-06-30
 
 ### Added
