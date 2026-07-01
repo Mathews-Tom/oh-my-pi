@@ -212,15 +212,9 @@ describe("openai-completions convertMessages", () => {
 		};
 
 		const now = Date.now();
-		// OpenAI-Responses composite ids have the shape `{call_id}|{item_id}`; a
-		// missing `call_id` leaves `|fc_...`. That is non-empty (so it survives the
-		// malformed-tool-call sanitizer in `transformMessages`) but `normalizeToolCallId`
-		// splits on `|` and yields an empty string, so `ensureToolCallId` must synthesize
-		// a stable fallback and remap the matching tool result onto it.
-		const emptyNormalizingId = "|fc_readme";
 		const assistantMessage: AssistantMessage = {
 			role: "assistant",
-			content: [{ type: "toolCall", id: emptyNormalizingId, name: "read", arguments: { path: "README.md" } }],
+			content: [{ type: "toolCall", id: "", name: "read", arguments: { path: "README.md" } }],
 			api: model.api,
 			provider: model.provider,
 			model: model.id,
@@ -235,7 +229,7 @@ describe("openai-completions convertMessages", () => {
 				assistantMessage,
 				{
 					role: "toolResult",
-					toolCallId: emptyNormalizingId,
+					toolCallId: "",
 					toolName: "read",
 					content: [{ type: "text", text: "done" }],
 					isError: false,
