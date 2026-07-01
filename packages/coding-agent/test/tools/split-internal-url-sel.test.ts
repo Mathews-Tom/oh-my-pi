@@ -75,22 +75,22 @@ describe("splitInternalUrlSel", () => {
 	it("keeps completion values and selector peeling unique for encoded rule names", async () => {
 		setActiveRules([
 			{
-				name: "C%23",
+				name: "C#",
 				path: "/tmp/C#.md",
 				content: "decoded",
 				_source: { provider: "claude", providerName: "claude", path: "/tmp/C#.md", level: "project" },
 			},
 			{
-				name: "C%2523",
+				name: "C%23",
 				path: "/tmp/C%23.md",
 				content: "literal-percent",
 				_source: { provider: "claude", providerName: "claude", path: "/tmp/C%23.md", level: "project" },
 			},
 		]);
 		const completions = await new RuleProtocolHandler().complete();
-		expect(completions.map(completion => completion.value)).toEqual(["C%2523", "C%252523"]);
+		expect(completions.map(completion => completion.value)).toEqual(["C%23", "C%2523"]);
 		expect(completions.map(completion => completion.label ?? null)).toEqual(["C#", "C%23"]);
-		expect(splitInternalUrlSel("rule://C%252523:raw")).toEqual({ path: "rule://C%252523", sel: "raw" });
+		expect(splitInternalUrlSel("rule://C%2523:raw")).toEqual({ path: "rule://C%2523", sel: "raw" });
 	});
 
 	it("keeps encoded rule URLs when selector peeling matches a decoded rule name", () => {

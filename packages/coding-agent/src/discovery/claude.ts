@@ -194,12 +194,19 @@ function scopedClaudeRuleDescription(globs: string[]): string {
 	return `Claude Code rule scoped to ${globs.join(", ")}`;
 }
 
+// Rule identity must stay a human-readable path, never a URL-encoded one: the
+// capability layer dedupes rules by exact `rule.name` (see ruleCapability's `key`),
+// so an encoded segment (e.g. "C#" -> "C%23") could collide with another provider's
+// literal filename ("C%23.md" -> "C%23") and silently shadow it. Escape only the
+// characters that would otherwise be ambiguous with the ":" path-segment separator
+// this function introduces; URL-safety is applied later, only when building a
+// rule:// URL, via encodeRuleUrlHost.
 function claudeRuleNameFromPath(rulesDir: string, filePath: string): string {
 	const relativePath = path.relative(rulesDir, filePath);
 	const withoutExtension = relativePath.replace(/\.(md|mdc)$/, "");
 	return withoutExtension
 		.split(path.sep)
-		.map(segment => encodeURIComponent(segment))
+		.map(segment => segment.replace(/\\/g, "\\\\").replace(/:/g, "\\:"))
 		.join(":");
 }
 

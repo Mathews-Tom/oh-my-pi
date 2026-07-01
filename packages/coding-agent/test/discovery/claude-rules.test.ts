@@ -143,7 +143,7 @@ describe("Claude Code rule discovery", () => {
 		expect(names).not.toContain("secret");
 	});
 
-	test("percent-encodes reserved characters in Claude rule names for rule URLs", async () => {
+	test("keeps Claude rule names human-readable; encoding applies only at the rule:// URL boundary", async () => {
 		await writeFile(path.join(project, ".claude", "rules", "C#.md"), '---\npaths:\n  - "**/*.cs"\n---\nC# rule.\n');
 
 		const result = await loadCapability<Rule>(ruleCapability.id, {
@@ -151,15 +151,13 @@ describe("Claude Code rule discovery", () => {
 			providers: ["claude"],
 		});
 
-		expect(result.items.find(rule => rule.path.endsWith("C#.md"))?.name).toBe("C%23");
+		expect(result.items.find(rule => rule.path.endsWith("C#.md"))?.name).toBe("C#");
 		setActiveRules(result.items);
-		const resource = await new RuleProtocolHandler().resolve(
-			Object.assign(new URL("rule://C%23"), { rawHost: "C#" }),
-		);
+		const resource = await new RuleProtocolHandler().resolve(parseInternalUrl("rule://C%23"));
 		expect(resource.content.trim()).toBe("C# rule.");
 	});
 
-	test("keeps Claude completion values unique across encoded collisions", async () => {
+	test("keeps Claude rule identity distinct from a colliding literal percent-encoded filename", async () => {
 		await writeFile(path.join(project, ".claude", "rules", "C#.md"), "Decoded C# rule.\n");
 		await writeFile(path.join(project, ".claude", "rules", "C%23.md"), "Literal percent rule.\n");
 
@@ -168,14 +166,33 @@ describe("Claude Code rule discovery", () => {
 			providers: ["claude"],
 		});
 
-		expect(result.items.find(rule => rule.path.endsWith("C#.md"))?.name).toBe("C%23");
-		expect(result.items.find(rule => rule.path.endsWith("C%23.md"))?.name).toBe("C%2523");
+		expect(result.items.find(rule => rule.path.endsWith("C#.md"))?.name).toBe("C#");
+		expect(result.items.find(rule => rule.path.endsWith("C%23.md"))?.name).toBe("C%23");
 		setActiveRules(result.items);
 		const completions = await new RuleProtocolHandler().complete();
-		expect(completions.map(completion => completion.value)).toEqual(["C%2523", "C%252523"]);
+		expect(completions.map(completion => completion.value)).toEqual(["C%23", "C%2523"]);
 		expect(completions.map(completion => completion.label ?? null)).toEqual(["C#", "C%23"]);
-		const resource = await new RuleProtocolHandler().resolve(parseInternalUrl("rule://C%252523"));
+		const resource = await new RuleProtocolHandler().resolve(parseInternalUrl("rule://C%2523"));
 		expect(resource.content.trim()).toBe("Literal percent rule.");
+	});
+	test("does not let a Claude rule with reserved characters silently shadow another provider's literal-named rule", async () => {
+		// Regression: claudeRuleNameFromPath used to percent-encode segments, so
+		// `.claude/rules/C#.md` (name "C#") produced the same `rule.name` ("C%23")
+		// as a literal `.agent/rules/C%23.md` file from a lower-priority provider,
+		// silently shadowing it via ruleCapability's name-keyed dedupe.
+		await writeFile(path.join(project, ".claude", "rules", "C#.md"), "Claude C# rule.\n");
+		await writeFile(path.join(project, ".agent", "rules", "C%23.md"), "Agents literal-percent rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude", "agents"],
+		});
+
+		const claudeRule = result.items.find(rule => rule.path.endsWith(path.join(".claude", "rules", "C#.md")));
+		const agentsRule = result.items.find(rule => rule.path.endsWith(path.join(".agent", "rules", "C%23.md")));
+		expect(claudeRule?.name).toBe("C#");
+		expect(agentsRule?.name).toBe("C%23");
+		expect(claudeRule?.name).not.toBe(agentsRule?.name);
 	});
 	test("treats Claude rules with globs but no paths as always-on launch rules", async () => {
 		// Claude Code path-specificity comes only from `paths:`; a Cursor-style

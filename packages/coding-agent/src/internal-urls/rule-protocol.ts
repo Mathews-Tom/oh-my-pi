@@ -64,10 +64,9 @@ export class RuleProtocolHandler implements ProtocolHandler {
 	async complete(): Promise<UrlCompletion[]> {
 		return getActiveRules().map(rule => {
 			const value = encodeRuleUrlHost(rule.name);
-			const label = rule._source.provider === "claude" ? decodeRuleName(rule.name) : rule.name;
 			return {
 				value,
-				...(label !== value ? { label } : {}),
+				...(rule.name !== value ? { label: rule.name } : {}),
 				...(rule.description ? { description: rule.description } : {}),
 			};
 		});
