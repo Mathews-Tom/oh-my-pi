@@ -6,6 +6,65 @@
 
 - Added Claude Code rule discovery so `.claude/rules/**/*.md` and `.claude/rules/**/*.mdc` files load through the standard rules capability with frontmatter metadata preserved ([#2613](https://github.com/can1357/oh-my-pi/issues/2613)).
 
+### Changed
+
+- Optimized session loading and rendering performance, including a 10x speedup for smooth streaming reveals on large messages, 35% faster session resumes for large files using native streaming JSONL parsing, and reduced overhead for edit-patch fallbacks.
+- Improved TUI responsiveness and reduced CPU usage during long-running tool sessions by throttling status-line redraws and optimizing subagent persistence checks.
+- Updated the advisor system prompt and documentation to accurately reflect WATCHDOG.yml tool grants.
+- Improved DuckDuckGo web search error clarity and documented datacenter/shared-egress limitations in provider settings.
+
+### Fixed
+
+- Fixed ctrl+p role-model cycling getting stuck on one transition and skipping every other role: a session-branch traversal regression returned entries leaf-to-root, so the cycle (and session model restore) read the oldest recorded model change instead of the newest.
+- Fixed ctrl+p cycling from a stale slot after the model was switched through another surface (alt+m, /model, retry fallback): the recorded role is now trusted only while its resolved model is still the active model, falling back to matching by model.
+- Fixed the apply_patch tool to prevent silently overwriting pre-existing files during creation or renaming, rejecting upfront with an error instead.
+- Fixed multi-file apply_patch to stop at the first failing file, surface applied vs. skipped paths, and correctly report the error to the agent loop.
+- Fixed process termination (SIGTERM, SIGHUP, uncaught exceptions) skipping editor draft saves, session shutdown events, and background job cleanup.
+- Fixed /quit and /exit commands blocking session closure by introducing a shutdown budget and backgrounding remaining tasks.
+- Fixed git and GitHub CLI subprocesses hanging on interactive prompts by forcing non-interactive environments, adding timeouts, and capping output.
+- Fixed RPC mode abort_bash being blocked by running bash commands by dispatching bash in the background.
+- Fixed task.maxConcurrency and task.maxRecursionDepth limits being bypassed by sub-spawn paths, ensuring limits are dynamically resized and respected.
+- Fixed the edit tool inflating session files by pruning extremely large file snapshots from tool-result details.
+- Fixed workstation OS detection rendering "Kernel: unknown" on macOS 15+.
+- Fixed /copy code and /copy cmd commands being treated as normal prompts instead of copying the requested blocks.
+- Fixed interactive bash status line not updating after directory changes (cd).
+- Fixed session title refreshes ignoring user TITLE_SYSTEM.md overrides during replans, and prevented auto-generated titles from incorrectly preserving all-caps text from user messages.
+- Fixed the live todo HUD going stale during long tool-use loops by adding mid-run reminders for incomplete items.
+- Fixed /shake and mid-stream chat rebuilds erasing active LLM output.
+- Fixed RpcClient failing to restart after being stopped or failing on initial startup.
+- Fixed /collab web guests being unable to answer ask tool questions by routing host UI requests through writable collab peers.
+- Fixed search and AST tools accepting external read URLs by materializing fetched URL text through the read cache before path resolution.
+- Fixed Tavily web search to retry without recency filters if no content is returned.
+- Fixed extension validation failures for omp install pi-lean-ctx by exposing legacy tool factories.
+- Fixed visibility of the focused option in the multi-select ask picker on certain color themes.
+- Fixed TUI row overlapping and duplication in the eval tool's live subagent progress tree under heavy concurrency.
+- Fixed session resumes after silent exits by recording pre-tool start markers and shutdown diagnostics.
+- Fixed status-line redraw crashes when tool-call arguments contain BigInt values.
+- Fixed terminal scrollback rows retaining old colors after theme switches.
+- Fixed Esc key behavior in the TUI to clear unrecoverable input instead of preserving drafts.
+- Fixed marketplace-installed plugins appearing redundantly in both the npm list and the extension status provider.
+- Fixed parent and peer IRC message delivery delays.
+- Fixed provider/model:auto entries in modelRoles collapsing to inherit and losing their auto state on reload.
+- Fixed plan execution prompts to avoid embedding the full plan, referencing the local plan file instead.
+- Fixed subagent live progress leaking raw tool output into the parent TUI.
+- Fixed eval subagents with custom output schemas receiving stale incremental yield labels.
+- Fixed hidden-thinking live status rows rendering as glyph-only lines by adding a persistent label.
+- Fixed /compact summary divider placement to keep it in the live scrollable region.
+- Fixed the time_spent status-line segment ticking continuously during idle sessions.
+- Fixed browser tool schema validation to require the code argument for run calls.
+- Improved robustness of MCP authentication error detection and header-based server discovery.
+- Fixed reliable detection of 401/403 authorization failures during Smithery commands and HTTP RPCs.
+- Improved streaming preview responsiveness for write, edit, and eval tools by decoding streamed string arguments incrementally.
+- Added retry-path diagnostics for assistant-tail removal and scheduled continuations after transient provider errors.
+- Fixed CJK history rendering issues across repeated compactions.
+- Fixed user-invoked skills failing to identify themselves or resolve relative paths across various execution paths.
+- Fixed type errors introduced by the merge sweep: restored the ask row-budget priority field, narrowed dereferenced schema property access, and updated stale test API usage.
+- Fixed git clone and fetch being killed by the 5-minute local-command timeout; network transfers now use a separate 30-minute deadline, overridable per call.
+- Fixed the TUI collab guest (omp join) silently dropping host ask/selector UI requests; they now present through the standard dialog flow and round-trip responses, with cancellation and resync replay handled.
+- Fixed transcript rebuilds (theme change, /shake, focus replay) showing stale streamed write/edit/eval content by sharing the partial-JSON decode between the live streaming path and every rebuild path.
+- Fixed an explicitly configured compaction.reserveTokens equal to the built-in default being silently replaced by the proportional small-window fallback; the setting now defaults to unset and explicit values are always honored.
+- Fixed user-configured LiteLLM discovery providers keeping stale reseller display-name suffixes for up to 24 hours after upgrade by invalidating the warm model cache.
+
 ## [16.2.13] - 2026-07-01
 
 ### Fixed
