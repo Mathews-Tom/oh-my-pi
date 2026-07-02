@@ -30,6 +30,7 @@
 - Fixed RPC mode abort_bash being blocked by running bash commands by dispatching bash in the background.
 - Fixed task.maxConcurrency and task.maxRecursionDepth limits being bypassed by sub-spawn paths, ensuring limits are dynamically resized and respected.
 - Fixed the edit tool inflating session files by pruning extremely large file snapshots from tool-result details.
+- Fixed edit-tool Markdown list guidance so hashline parser errors and the model-facing prompt teach `+- item` escaping instead of steering agents toward full-file `write` fallbacks. ([#4179](https://github.com/can1357/oh-my-pi/issues/4179))
 - Fixed workstation OS detection rendering "Kernel: unknown" on macOS 15+.
 - Fixed /copy code and /copy cmd commands being treated as normal prompts instead of copying the requested blocks.
 - Fixed interactive bash status line not updating after directory changes (cd).
@@ -69,6 +70,10 @@
 - Fixed transcript rebuilds (theme change, /shake, focus replay) showing stale streamed write/edit/eval content by sharing the partial-JSON decode between the live streaming path and every rebuild path.
 - Fixed an explicitly configured compaction.reserveTokens equal to the built-in default being silently replaced by the proportional small-window fallback; the setting now defaults to unset and explicit values are always honored.
 - Fixed user-configured LiteLLM discovery providers keeping stale reseller display-name suffixes for up to 24 hours after upgrade by invalidating the warm model cache.
+### Fixed
+
+- Fixed `mergeTaskBranches` and `applyNestedPatches` leaving stage 1/2/3 unmerged entries in `.git/index` when the post-merge stash pop conflicted with the cherry-picked HEAD. The corrupted index survived indefinitely and every subsequent overlay-isolated task inherited it through the lower layer, causing `captureRepoDeltaPatch` to emit `diff --cc` output that `git apply` rejects with "No valid patches in input". The stash restore now runs behind a 3-way preflight check (`git apply --3way --check`) and a `reset --hard HEAD` cleanup fallback; the stash entry is preserved for manual recovery on conflict, and the merged commits still land on HEAD. ([#4175](https://github.com/can1357/oh-my-pi/issues/4175))
+- Fixed macOS `Command+V` image pastes in Ghostty by binding the Kitty `super+v` key event to the image-paste action alongside `Ctrl+V`. ([#4178](https://github.com/can1357/oh-my-pi/issues/4178))
 
 ## [16.2.13] - 2026-07-01
 
