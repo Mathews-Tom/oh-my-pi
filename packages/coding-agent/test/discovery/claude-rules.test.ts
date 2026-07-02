@@ -10,8 +10,10 @@ import {
 	ruleCapability,
 	setActiveRules,
 } from "@oh-my-pi/pi-coding-agent/capability/rule";
+import { bucketRules } from "@oh-my-pi/pi-coding-agent/capability/rule-buckets";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { loadCapability } from "@oh-my-pi/pi-coding-agent/discovery";
+import { TtsrManager } from "@oh-my-pi/pi-coding-agent/export/ttsr";
 import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import { RuleProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/rule-protocol";
 
@@ -218,6 +220,31 @@ describe("Claude Code rule discovery", () => {
 		expect(globsOnly?.globs).toBeUndefined();
 		expect(pathsScoped?.alwaysApply).not.toBe(true);
 		expect(pathsScoped?.globs).toEqual(["**/*.ts"]);
+	});
+	test("scopes a Claude rule to its paths even when alwaysApply: true is also set", async () => {
+		// Regression: `alwaysApply: true` combined with `paths:` used to short-circuit
+		// transformClaudeRule BEFORE the globs branch ran. Even after fixing that
+		// ordering, bucketRules itself also checks `alwaysApply` before `description`,
+		// so the fix must actively clear the stray flag, not just reorder the checks.
+		await writeFile(
+			path.join(project, ".claude", "rules", "paths-and-always.md"),
+			'---\npaths:\n  - "**/*.ts"\nalwaysApply: true\n---\nCombined paths and alwaysApply rule.\n',
+		);
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const rule = result.items.find(r => r.name === "paths-and-always");
+		expect(rule?.globs).toEqual(["**/*.ts"]);
+		expect(rule?.alwaysApply).not.toBe(true);
+
+		if (!rule) throw new Error("expected paths-and-always rule to be loaded");
+		const mgr = new TtsrManager();
+		const { rulebookRules, alwaysApplyRules } = bucketRules([rule], mgr);
+		expect(alwaysApplyRules).not.toContain(rule);
+		expect(rulebookRules).toContain(rule);
 	});
 	test("preserves globs on conditional (TTSR) Claude rules so the condition stays path-scoped", async () => {
 		// A Claude rule that combines OMP TTSR metadata (`condition:`) with a `globs:`
