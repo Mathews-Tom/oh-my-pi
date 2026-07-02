@@ -50,7 +50,7 @@ describe("multi-path tools tolerate missing entries", () => {
 
 		const result = await tool.execute("search-multi-missing", {
 			pattern: "shared-needle",
-			paths: ["src/", "tests/"],
+			path: "src/; tests/",
 		});
 
 		const text = getText(result);
@@ -68,9 +68,14 @@ describe("multi-path tools tolerate missing entries", () => {
 		const tool = tools.find(entry => entry.name === "grep");
 		if (!tool) throw new Error("Missing grep tool");
 
+		// A JSON-encoded array is unambiguous even when every entry is missing —
+		// the semicolon-delimited string form can't be split with confidence
+		// unless at least one candidate resolves on disk (see path-utils.ts's
+		// delimiter-split heuristic), so it can't exercise this "all missing"
+		// partition path deterministically.
 		const promise = tool.execute("search-all-missing", {
 			pattern: "shared-needle",
-			paths: ["does-not-exist/", "also-missing/"],
+			path: '["does-not-exist/","also-missing/"]',
 		});
 
 		await expect(promise).rejects.toThrow(/Path not found.*does-not-exist.*also-missing/s);
@@ -82,7 +87,7 @@ describe("multi-path tools tolerate missing entries", () => {
 		if (!tool) throw new Error("Missing glob tool");
 
 		const result = await tool.execute("find-multi-missing", {
-			paths: ["src/**/*.ts", "tests/**/*.ts"],
+			path: "src/**/*.ts; tests/**/*.ts",
 		});
 
 		const text = getText(result);
@@ -102,8 +107,12 @@ describe("multi-path tools tolerate missing entries", () => {
 		const tool = tools.find(entry => entry.name === "glob");
 		if (!tool) throw new Error("Missing glob tool");
 
+		// JSON-encoded array: unlike the semicolon-string form, this survives
+		// unambiguously even though neither glob's base directory exists (see
+		// the comment on the "search errors only when every path is missing"
+		// test above).
 		const promise = tool.execute("find-all-missing", {
-			paths: ["nope/**/*.ts", "also-nope/**/*.ts"],
+			path: '["nope/**/*.ts","also-nope/**/*.ts"]',
 		});
 
 		await expect(promise).rejects.toThrow(/Path not found.*nope.*also-nope/s);
