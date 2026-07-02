@@ -6,8 +6,14 @@
 
 - Added Claude Code rule discovery so `.claude/rules/**/*.md` and `.claude/rules/**/*.mdc` files load through the standard rules capability with frontmatter metadata preserved ([#2613](https://github.com/can1357/oh-my-pi/issues/2613)).
 
+### Added
+
+- Added `providers.anthropic.serverSideFallback` (default off; UI in the "Model → Retry & Fallback" group). When enabled, Claude Fable 5 / Mythos 5 requests carry `fallbacks: [{ model: "claude-opus-4-8" }]` via Anthropic's server-side-fallback beta chain so classifier-blocked turns are retried on Opus 4.8 without breaking the current call. Opt-in only — leaving it off preserves the pre-fallback behavior. ([#4177](https://github.com/can1357/oh-my-pi/issues/4177))
+- Added `task.softRequestBudgetNotice` (default off) to opt into the subagent soft-budget wrap-up steering notice while keeping the 1.5x graceful abort guard active.
+
 ### Changed
 
+- Updated the tester subagent prompt to explicitly forbid testing default configuration values and allow skipping tests entirely for trivial changes
 - Optimized session loading and rendering performance, including a 10x speedup for smooth streaming reveals on large messages, 35% faster session resumes for large files using native streaming JSONL parsing, and reduced overhead for edit-patch fallbacks.
 - Improved TUI responsiveness and reduced CPU usage during long-running tool sessions by throttling status-line redraws and optimizing subagent persistence checks.
 - Updated the advisor system prompt and documentation to accurately reflect WATCHDOG.yml tool grants.
@@ -15,6 +21,14 @@
 
 ### Fixed
 
+- Fixed sequential patch/edit failures leaving dirty buffers in multi-file edits by flushing the LSP writethrough queue upfront on early abort paths
+- Fixed the subagent task preview erroneously showing "ctrl+o: Expand" hints on output lines capped inside the already-expanded view
+
+- Fixed the cross-file write batching regression in `apply_patch` multi-file operations by reverting to flushing only on the last file write or explicitly on early failure paths, and refactored error counting to use clean booleans.
+- Fixed collab teardown (`/collab stop`, unrecoverable relay drop) cancelling a hook selector/editor the host user was actively typing in: teardown resolved pending guest asks the same way as a guest cancel, so the mirrored race dismissed the local dialog and dropped its input. Teardown now settles guest asks as `unavailable`, and the local dialog keeps running and wins with its eventual answer.
+- Fixed RPC mode deferred shutdown (`pi.shutdown()`) killing the process while a background-dispatched `bash` command was still running: the response frame is now written before exit, and a shutdown requested mid-bash fires once the command settles even when no further client frames arrive.
+- Fixed collab-guest transcript viewer rendering host-delivered errors raw: multi-line stacks broke the frame's row accounting and absolute host paths leaked to guests; errors are now collapsed to one sanitized, truncated row.
+- Fixed streaming tool-arg previews capturing string fields (e.g. `content`) from nested objects and injecting them as top-level args mid-stream; only top-level keys are read incrementally now.
 - Fixed task.maxConcurrency being breachable when a queued spawn was cancelled: the spawn path could release a semaphore permit it never acquired, letting a later task start while the cap was saturated.
 - Fixed session exit diagnostics recording signal and crash exits (SIGTERM, SIGHUP, uncaught exceptions) as a normal "dispose": the postmortem teardown now threads the real reason into session disposal.
 - Fixed the subagent yield-label guard ignoring JTD discriminator (oneOf) output schemas, which let stale incremental labels pass into successful results when final validation was skipped after retries.
@@ -22,7 +36,7 @@
 - Fixed model discovery ignoring `NODE_EXTRA_CA_CERTS`: the model registry's default fetch now applies the extra-CA wrapper, so `/models` probes work behind private-CA gateways like provider chat requests.
 - Fixed ctrl+p role-model cycling getting stuck on one transition and skipping every other role: a session-branch traversal regression returned entries leaf-to-root, so the cycle (and session model restore) read the oldest recorded model change instead of the newest.
 - Fixed ctrl+p cycling from a stale slot after the model was switched through another surface (alt+m, /model, retry fallback): the recorded role is now trusted only while its resolved model is still the active model, falling back to matching by model.
-- Fixed the apply_patch tool to prevent silently overwriting pre-existing files during creation or renaming, rejecting upfront with an error instead.
+- Fixed the `apply_patch` envelope to reject `*** Add File` / `*** Move to` targeting a pre-existing file upfront instead of silently overwriting it. The JSON `patch` mode's `op: "create"` intentionally remains the documented full-file overwrite (rename stays non-overwriting in both modes).
 - Fixed multi-file apply_patch to stop at the first failing file, surface applied vs. skipped paths, and correctly report the error to the agent loop.
 - Fixed process termination (SIGTERM, SIGHUP, uncaught exceptions) skipping editor draft saves, session shutdown events, and background job cleanup.
 - Fixed /quit and /exit commands blocking session closure by introducing a shutdown budget and backgrounding remaining tasks.
@@ -42,6 +56,8 @@
 - Fixed search and AST tools accepting external read URLs by materializing fetched URL text through the read cache before path resolution.
 - Fixed Tavily web search to retry without recency filters if no content is returned.
 - Fixed extension validation failures for omp install pi-lean-ctx by exposing legacy tool factories.
+- Fixed legacy `createReadTool`/`createReadToolDefinition` ignoring `autoResizeImages`; the option now maps onto the `images.autoResize` setting of the underlying read tool.
+- Fixed legacy `createGrepTool`/`createGrepToolDefinition` silently ignoring options: an explicit `context` parameter is now forwarded to the built-in grep (as symmetric before/after context), the unsupported `limit` parameter is no longer advertised in the tool schema, and supplying legacy `operations` throws a descriptive error at creation time instead of silently searching the local filesystem.
 - Fixed visibility of the focused option in the multi-select ask picker on certain color themes.
 - Fixed TUI row overlapping and duplication in the eval tool's live subagent progress tree under heavy concurrency.
 - Fixed session resumes after silent exits by recording pre-tool start markers and shutdown diagnostics.
@@ -70,8 +86,6 @@
 - Fixed transcript rebuilds (theme change, /shake, focus replay) showing stale streamed write/edit/eval content by sharing the partial-JSON decode between the live streaming path and every rebuild path.
 - Fixed an explicitly configured compaction.reserveTokens equal to the built-in default being silently replaced by the proportional small-window fallback; the setting now defaults to unset and explicit values are always honored.
 - Fixed user-configured LiteLLM discovery providers keeping stale reseller display-name suffixes for up to 24 hours after upgrade by invalidating the warm model cache.
-### Fixed
-
 - Fixed `mergeTaskBranches` and `applyNestedPatches` leaving stage 1/2/3 unmerged entries in `.git/index` when the post-merge stash pop conflicted with the cherry-picked HEAD. The corrupted index survived indefinitely and every subsequent overlay-isolated task inherited it through the lower layer, causing `captureRepoDeltaPatch` to emit `diff --cc` output that `git apply` rejects with "No valid patches in input". The stash restore now runs behind a 3-way preflight check (`git apply --3way --check`) and a `reset --hard HEAD` cleanup fallback; the stash entry is preserved for manual recovery on conflict, and the merged commits still land on HEAD. ([#4175](https://github.com/can1357/oh-my-pi/issues/4175))
 - Fixed macOS `Command+V` image pastes in Ghostty by binding the Kitty `super+v` key event to the image-paste action alongside `Ctrl+V`. ([#4178](https://github.com/can1357/oh-my-pi/issues/4178))
 

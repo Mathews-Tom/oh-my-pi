@@ -380,7 +380,14 @@ describe("InteractiveMode plan review rendering", () => {
 			return "Approve and execute";
 		});
 		vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
-		const promptSpy = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+		const promptSpy = vi.spyOn(session, "prompt").mockImplementation(async promptText => {
+			if (typeof promptText === "string" && promptText.startsWith("Plan approved.")) {
+				const persisted = await Bun.file(resolvedPlanPath).text();
+				expect(persisted).toContain("edited body");
+				expect(persisted).not.toContain("original body");
+			}
+			return undefined as never;
+		});
 
 		await mode.handlePlanApproval({
 			planFilePath,
@@ -388,12 +395,10 @@ describe("InteractiveMode plan review rendering", () => {
 			title: "PLAN",
 		});
 
-		// The synthetic plan-approved prompt now points at the durable plan file
-		// instead of inlining content (avoids stale/oversized inline plans) — it
-		// must reference the same path passed to handlePlanApproval.
+		// The plan-approved prompt stays reference-only; approval must instead
+		// await the durable file mirror before dispatch so read sees the edit.
 		const call = promptSpy.mock.calls.find(isPlanApprovedCall);
 		expect(call).toBeDefined();
-		expect(call?.[0] as string).toContain(planFilePath);
 		expect(call?.[0] as string).not.toContain("edited body");
 		expect(call?.[0] as string).not.toContain("original body");
 		// onPlanEdited mirrored the edit to the plan file — the source of truth
