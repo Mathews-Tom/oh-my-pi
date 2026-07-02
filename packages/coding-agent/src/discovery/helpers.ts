@@ -1791,6 +1791,13 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 
 const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
 
+const pluginCacheInvalidators = new Set<() => void>();
+
+/** Register a process-global plugin cache invalidator called whenever plugin roots are cleared. */
+export function registerPluginCacheInvalidator(invalidator: () => void): void {
+	pluginCacheInvalidators.add(invalidator);
+}
+
 /**
  * List all installed Claude Code plugin roots from the plugin cache.
  * Reads ~/.claude/plugins/installed_plugins.json and ~/.omp/plugins/installed_plugins.json,
@@ -1970,6 +1977,7 @@ export async function listClaudePluginRoots(
  */
 export function clearClaudePluginRootsCache(): void {
 	pluginRootsCache.clear();
+	for (const invalidate of pluginCacheInvalidators) invalidate();
 	preloadedPluginRoots = [...injectedPluginDirRoots];
 	// Re-warm preloaded roots asynchronously so sync LSP config reads stay valid
 	if (lastPreloadHome) {
