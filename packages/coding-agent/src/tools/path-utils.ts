@@ -349,18 +349,24 @@ export function splitInternalUrlSel(rawPath: string): { path: string; sel?: stri
 		try {
 			const parsed = parseInternalUrl(rawPath);
 			const activeRuleNames = new Set(getActiveRules().map(rule => rule.name));
-			// Peel candidates in the SAME priority order the rule resolver uses for
-			// exact-name matches (RuleProtocolHandler.resolve: rawHost, then
-			// rawEncodedHost, then hostname). Diverging here lets a trailing selector
-			// change which rule is referenced under percent-decoding collisions — e.g.
-			// with active rules `C#` and `C%23`, bare `rule://C%23` resolves to `C#`
-			// (rawHost wins), but peeling rawEncodedHost first would rewrite
-			// `rule://C%23:raw` to `rule://C%2523` and target `C%23` instead.
+			// Exact matches take precedence over every peeled candidate, mirroring
+			// RuleProtocolHandler.resolve's own priority (rawHost, then rawEncodedHost,
+			// then hostname) with no selector peeling at all. Checking each candidate's
+			// exact match interleaved with its own peeling — instead of checking all
+			// exact matches first — let a lower-priority peeled match win over a
+			// higher-priority exact match under percent-decoding collisions. E.g. with
+			// active rules `C#` and `C%23`, bare `rule://C%23` resolves to `C#` (rawHost
+			// wins) since decoding `%23` yields `C#`; but with active rules `C#` and
+			// `C%23:raw`, `rule://C%23:raw` has rawEncodedHost `C%23:raw` — an exact
+			// match — while rawHost `C#:raw` is not a rule but peels down to the also-
+			// active `C#`. Peeling `rawHost` first (candidate by candidate) would rewrite
+			// the URL to target `C#` with selector `raw`, when the exact `rawEncodedHost`
+			// match should win and keep the read scoped to the literal `C%23:raw` rule.
 			const candidates = [parsed.rawHost, parsed.rawEncodedHost, parsed.hostname].filter(
 				(name, index, names): name is string => Boolean(name) && names.indexOf(name) === index,
 			);
+			if (candidates.some(candidate => activeRuleNames.has(candidate))) return { path: rawPath };
 			for (const initialCandidate of candidates) {
-				if (activeRuleNames.has(initialCandidate)) return { path: rawPath };
 				const chunks: string[] = [];
 				let candidateMatch = initialCandidate;
 				while (true) {

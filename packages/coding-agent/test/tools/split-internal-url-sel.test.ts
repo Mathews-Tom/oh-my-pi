@@ -135,6 +135,30 @@ describe("splitInternalUrlSel", () => {
 		expect(peeledTarget.content).toBe(bareTarget.content);
 	});
 
+	it("checks exact rule-host matches across all candidates before peeling any selector", async () => {
+		// Unlike the sibling test above, this scenario's second active rule name
+		// literally contains a colon (`C%23:raw`), so its raw-encoded-host form is
+		// itself an exact active-rule match. That exact match must win over peeling
+		// the higher-priority rawHost candidate (`C#:raw` -> peels to `C#`).
+		setActiveRules([
+			{
+				name: "C#",
+				path: "/tmp/C#.md",
+				content: "decoded",
+				_source: { provider: "test", providerName: "test", path: "/tmp/C#.md", level: "project" },
+			},
+			{
+				name: "C%23:raw",
+				path: "/tmp/C%2523raw.md",
+				content: "literal-percent-with-colon",
+				_source: { provider: "test", providerName: "test", path: "/tmp/C%2523raw.md", level: "project" },
+			},
+		]);
+		expect(splitInternalUrlSel("rule://C%23:raw")).toEqual({ path: "rule://C%23:raw" });
+		const resolved = await new RuleProtocolHandler().resolve(parseInternalUrl("rule://C%23:raw"));
+		expect(resolved.content).toBe("literal-percent-with-colon");
+	});
+
 	it("keeps completion values unique for raw rule names containing percent encodings", async () => {
 		setActiveRules([
 			{
