@@ -217,7 +217,13 @@ function transformClaudeRule(rulesDir: string, content: string, filePath: string
 	if (rule.globs && rule.globs.length > 0) {
 		return rule.description ? rule : { ...rule, description: scopedClaudeRuleDescription(rule.globs) };
 	}
-	if (rule.alwaysApply === false || isConditionalTtsrRule(rule)) return rule;
+	if (isConditionalTtsrRule(rule)) return rule;
+	// Claude Code path-specificity comes only from `paths:` (handled above); a
+	// pathless, non-TTSR rule always launches. A Cursor-style `alwaysApply: false`
+	// only stands when a `description` routes the rule to the on-demand rulebook
+	// bucket instead — without one it would match neither bucket in bucketRules
+	// (no condition, not always-apply, no description) and silently disappear.
+	if (rule.alwaysApply === false && rule.description) return rule;
 	return { ...rule, alwaysApply: true };
 }
 

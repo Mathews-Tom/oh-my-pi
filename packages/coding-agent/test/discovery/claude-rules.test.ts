@@ -254,6 +254,42 @@ describe("Claude Code rule discovery", () => {
 		const modifierOnly = result.items.find(rule => rule.name === "modifier-only");
 		expect(modifierOnly?.alwaysApply).toBe(true);
 	});
+	test("forces launch for a pathless Claude rule with alwaysApply: false and no description", async () => {
+		// Regression: a shared rule collection (e.g. reused Cursor .mdc frontmatter)
+		// can set `alwaysApply: false` with no `paths:` and no `description`. Claude
+		// path-specificity comes only from `paths:`, so a pathless rule must still
+		// launch — otherwise bucketRules drops it entirely (no condition, not
+		// always-apply, no description to route it to the rulebook bucket).
+		await writeFile(
+			path.join(project, ".claude", "rules", "pathless-opt-out.md"),
+			"---\nalwaysApply: false\n---\nShared rule with no paths.\n",
+		);
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const rule = result.items.find(r => r.name === "pathless-opt-out");
+		expect(rule?.alwaysApply).toBe(true);
+	});
+	test("honors alwaysApply: false on a pathless Claude rule that has a description", async () => {
+		// A description gives the rule an on-demand rulebook home, so an explicit
+		// `alwaysApply: false` is respected instead of being forced to launch.
+		await writeFile(
+			path.join(project, ".claude", "rules", "on-demand.md"),
+			"---\nalwaysApply: false\ndescription: Fetch on demand.\n---\nOn-demand rule.\n",
+		);
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const rule = result.items.find(r => r.name === "on-demand");
+		expect(rule?.alwaysApply).toBe(false);
+		expect(rule?.description).toBe("Fetch on demand.");
+	});
 	test("keeps rules when unrelated directory-only ignores exist", async () => {
 		await writeFile(path.join(project, ".gitignore"), "node_modules/\ndist/\n");
 		await writeFile(path.join(project, ".claude", "rules", "local.md"), "Local rule.\n");
