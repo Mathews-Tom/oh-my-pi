@@ -332,12 +332,19 @@ describe("streamPiNative event flow", () => {
 	});
 
 	it("does not time out a healthy pi-native stream that keeps making semantic progress", async () => {
+		// Margins are 10x the original tick size (was 15/20ms steps against a 30ms idle
+		// timeout — only 10ms of slack) because this uses real setTimeout-scheduled
+		// chunks racing real internal timeouts; under CI scheduling jitter the original
+		// margins intermittently tripped a false timeout here (and once tripped, the
+		// leftover pending setTimeout callbacks for undelivered chunks fired during the
+		// next test, corrupting it too). 100ms of slack per gap is comfortably immune to
+		// that jitter while keeping the test's total wall time under a second.
 		const final = baseAssistant({ content: [{ type: "text", text: "hello world" }] });
 		const chunks = [
 			{ atMs: 0, bytes: sseEventBytes({ type: "start", partial: baseAssistant() }) },
-			{ atMs: 15, bytes: sseEventBytes({ type: "text_delta", contentIndex: 0, delta: "hello", partial: final }) },
-			{ atMs: 35, bytes: sseEventBytes({ type: "text_delta", contentIndex: 0, delta: " world", partial: final }) },
-			{ atMs: 55, bytes: sseEventBytes({ type: "done", reason: "stop", message: final }) },
+			{ atMs: 150, bytes: sseEventBytes({ type: "text_delta", contentIndex: 0, delta: "hello", partial: final }) },
+			{ atMs: 350, bytes: sseEventBytes({ type: "text_delta", contentIndex: 0, delta: " world", partial: final }) },
+			{ atMs: 550, bytes: sseEventBytes({ type: "done", reason: "stop", message: final }) },
 		];
 		const fetchImpl: FetchImpl = (async () =>
 			new Response(delayedBody(chunks), {
@@ -348,8 +355,8 @@ describe("streamPiNative event flow", () => {
 		const stream = streamPiNative(fakeModel(), baseContext, {
 			apiKey: "k",
 			fetch: fetchImpl,
-			streamFirstEventTimeoutMs: 40,
-			streamIdleTimeoutMs: 30,
+			streamFirstEventTimeoutMs: 400,
+			streamIdleTimeoutMs: 300,
 		});
 
 		const result = await stream.result();
