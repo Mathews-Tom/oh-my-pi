@@ -74,11 +74,10 @@ async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void>
 function isRemovalMissDebugCall(call: unknown[]): boolean {
 	const payload = call[1];
 	return (
-		call[0] === "agent active context assistant removal" &&
+		call[0] === "agent active context assistant removal missed" &&
 		typeof payload === "object" &&
 		payload !== null &&
-		"removed" in payload &&
-		payload.removed === false
+		"reason" in payload
 	);
 }
 
@@ -140,18 +139,19 @@ describe("AgentSession retry diagnostics", () => {
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const debugSpy = vi.spyOn(logger, "debug").mockImplementation(() => {});
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
 
 		const promptPromise = session.prompt("trigger transient error").catch(() => undefined);
 		await waitFor(() => debugSpy.mock.calls.some(isRemovalMissDebugCall));
-		await waitFor(() => debugSpy.mock.calls.some(call => call[0] === "agent.continue failed state after scheduling"));
+		await waitFor(() => warnSpy.mock.calls.some(call => call[0] === "agent.continue failed after scheduling"));
 
 		expect(debugSpy.mock.calls).toContainEqual([
-			"agent active context assistant removal",
-			expect.objectContaining({ reason: "auto-retry", removed: false, lastRole: "assistant" }),
+			"agent active context assistant removal missed",
+			expect.objectContaining({ reason: "auto-retry", lastRole: "assistant" }),
 		]);
-		expect(debugSpy.mock.calls).toContainEqual([
-			"agent.continue failed state after scheduling",
-			expect.objectContaining({ lastRole: "assistant", messageCount: 2 }),
+		expect(warnSpy.mock.calls).toContainEqual([
+			"agent.continue failed after scheduling",
+			expect.objectContaining({ error: expect.stringContaining("Cannot continue from message role") }),
 		]);
 		await session.abort();
 		await promptPromise;
