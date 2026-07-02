@@ -778,14 +778,10 @@ const POSIX_CHARACTER_CLASS_MAP: Record<string, string> = {
 	alpha: "A-Za-z",
 	blank: " \t",
 	digit: "0-9",
-	// `!-~` numerically spans `/` (0x2F); excluded below (split into `!-.` + `0-~`) since
-	// gitignore/fnmatch's FNM_PATHNAME mode never lets a bracket expression match `/`.
-	graph: "!-.0-~",
+	graph: "!-~",
 	lower: "a-z",
-	// Same `/`-spanning-range exclusion as `graph` (split into ` -.` + `0-~`).
-	print: " -.0-~",
-	// `/` dropped from the literal member set for the same reason (was `...,./:;...`).
-	punct: "][\\\\!\"#$%&'()*+,.:;<=>?@\\[^_`{|}~-",
+	print: " -~",
+	punct: "][\\\\!\"#$%&'()*+,./:;<=>?@\\[^_`{|}~-",
 	// POSIX space = space, tab, newline, vertical tab, form feed, carriage return; Git's
 	// [[:space:]] matches all of them in filenames, so emit the full set (not just space/tab).
 	space: " \t\n\u000b\f\r",
@@ -794,11 +790,19 @@ const POSIX_CHARACTER_CLASS_MAP: Record<string, string> = {
 	xdigit: "A-Fa-f0-9",
 };
 
-function normalizePosixCharacterClasses(pattern: string): string {
-	// POSIX bracket classes are only meaningful inside a bracket expression, e.g.
-	// `[[:upper:]]`. A bare `[:upper:]` is an ordinary bracket expression matching one
-	// of the literal characters `:uper`, so it must be left untranslated to match
-	// git/fnmatch semantics.
+const SLASH_CODE_POINT = "/".codePointAt(0) as number;
+
+/**
+ * Stage 1 of `normalizePosixCharacterClasses`: expand `[:posix:]` tokens into their
+ * literal member/range text. POSIX bracket classes are only meaningful inside a bracket
+ * expression, e.g. `[[:upper:]]`. A bare `[:upper:]` is an ordinary bracket expression
+ * matching one of the literal characters `:uper`, so it must be left untranslated to
+ * match git/fnmatch semantics. `/`-exclusion (stage 2, `excludeSlashFromBrackets`) runs
+ * separately on the result, so this stage does not need to special-case `/` itself —
+ * only the position-sensitive bracket metacharacters (`]`, `!`, `^`, trailing `-`) that
+ * stage 2's generic range tokenizer cannot disambiguate without this context.
+ */
+function expandPosixCharacterClasses(pattern: string): string {
 	let result = "";
 	let inBracket = false;
 	// Track the bracket leading slot: `]` is a literal member right after `[`, or right
@@ -807,12 +811,6 @@ function normalizePosixCharacterClasses(pattern: string): string {
 	// A class expansion's leading char may need escaping depending on which slot it lands in.
 	let atBracketStart = false;
 	let negationSeen = false;
-	// gitignore matches with FNM_PATHNAME semantics: a bracket expression — negated or
-	// not, explicit member or POSIX-class-derived — never matches `/`. `Bun.Glob` has no
-	// such notion, so track whether the current bracket is negated and whether it already
-	// excludes `/`, to inject the exclusion at close if not (see the `]`-close branch below).
-	let bracketNegated = false;
-	let bracketSlashSeen = false;
 	for (let i = 0; i < pattern.length; i++) {
 		const ch = pattern[i];
 		if (ch === "\\" && i + 1 < pattern.length) {
@@ -826,8 +824,6 @@ function normalizePosixCharacterClasses(pattern: string): string {
 				inBracket = true;
 				atBracketStart = true;
 				negationSeen = false;
-				bracketNegated = false;
-				bracketSlashSeen = false;
 			}
 			result += ch;
 			continue;
@@ -841,7 +837,7 @@ function normalizePosixCharacterClasses(pattern: string): string {
 					// Position-sensitive bracket metacharacters: `]` is a literal only in the leading
 					// slot (elsewhere it closes the class), while `!`/`^` negate only before any
 					// negation prefix. Escape a class expansion's leading char when its slot would
-					// make it special so Bun.Glob keeps it literal (e.g. `[[:graph:]]` -> `\!-.0-~`,
+					// make it special so Bun.Glob keeps it literal (e.g. `[[:graph:]]` -> `\!-~`,
 					// `[a[:punct:]]` -> `\]...`, but `[![:punct:]]` keeps a leading `]` literal).
 					const firstChar = replacement[0];
 					const needsLeadingEscape =
@@ -852,8 +848,8 @@ function normalizePosixCharacterClasses(pattern: string): string {
 					// `punct`'s expansion ends in a literal trailing `-` (only safe unescaped
 					// right before the bracket closes, per fnmatch/Bun.Glob range rules). If
 					// another member follows before `]` (e.g. `[[:punct:]a]`), that `-` sits
-					// mid-bracket and forms an unintended (and here invalid, silently-rejecting)
-					// range with the next character — escape it so it stays a literal member.
+					// mid-bracket — escape it so stage 2's range tokenizer reads it as a literal
+					// member rather than a range operator against whatever follows.
 					if (expansion.endsWith("-") && pattern[end + 2] !== "]") {
 						expansion = `${expansion.slice(0, -1)}\\-`;
 					}
@@ -872,12 +868,6 @@ function normalizePosixCharacterClasses(pattern: string): string {
 		// (e.g. `[]...]`, `[!]...]`), so the class — and any later `[:posix:]` token —
 		// keeps parsing.
 		if (ch === "]" && !atBracketStart) {
-			// A negated class implicitly matches `/` in Bun.Glob unless it is explicitly
-			// excluded; inject it now if this bracket never saw a literal `/` (from a
-			// POSIX-class expansion or a hand-written member) to exclude.
-			if (bracketNegated && !bracketSlashSeen) {
-				result += "/";
-			}
 			inBracket = false;
 			result += ch;
 			continue;
@@ -886,24 +876,196 @@ function normalizePosixCharacterClasses(pattern: string): string {
 		// leading slot (where `]` stays literal) open across exactly one such char.
 		if (atBracketStart && !negationSeen && (ch === "!" || ch === "^")) {
 			negationSeen = true;
-			bracketNegated = true;
 			result += ch;
-			continue;
-		}
-		if (ch === "/") {
-			// A literal `/` can never be a bracket member under FNM_PATHNAME. In a positive
-			// class git treats it as absent, so drop it; in a negated class keep it explicit
-			// (equivalent to the close-time injection above, but avoids a redundant second
-			// `/` when the author already wrote one).
-			bracketSlashSeen = true;
-			if (bracketNegated) result += ch;
-			atBracketStart = false;
 			continue;
 		}
 		result += ch;
 		atBracketStart = false;
 	}
 	return result;
+}
+
+interface BracketSpan {
+	/** Index of the first content character (after `[`/negation prefix). */
+	contentStart: number;
+	/** Index of the closing `]`. */
+	contentEnd: number;
+	negated: boolean;
+}
+
+/** Locate top-level bracket expressions in an already POSIX-class-expanded pattern. */
+function findBracketSpans(pattern: string): BracketSpan[] {
+	const spans: BracketSpan[] = [];
+	let i = 0;
+	while (i < pattern.length) {
+		const ch = pattern[i];
+		if (ch === "\\" && i + 1 < pattern.length) {
+			i += 2;
+			continue;
+		}
+		if (ch !== "[") {
+			i++;
+			continue;
+		}
+		let j = i + 1;
+		let negated = false;
+		if (pattern[j] === "!" || pattern[j] === "^") {
+			negated = true;
+			j++;
+		}
+		const contentStart = j;
+		if (pattern[j] === "]") j++; // leading `]` is a literal member, not the close
+		while (j < pattern.length) {
+			if (pattern[j] === "\\" && j + 1 < pattern.length) {
+				j += 2;
+				continue;
+			}
+			if (pattern[j] === "]") break;
+			j++;
+		}
+		if (j < pattern.length && pattern[j] === "]") {
+			spans.push({ contentStart, contentEnd: j, negated });
+			i = j + 1;
+			continue;
+		}
+		i++; // unterminated `[` — treat as a literal, keep scanning
+	}
+	return spans;
+}
+
+type BracketToken =
+	| { kind: "literal"; raw: string; code: number }
+	| { kind: "range"; fromRaw: string; toRaw: string; fromCode: number; toCode: number };
+
+function codePointOfUnit(unit: string): number {
+	const ch = unit.length === 2 && unit[0] === "\\" ? unit[1] : unit;
+	return ch.codePointAt(0) as number;
+}
+
+/**
+ * Tokenize bracket content into literal members and `from-to` ranges. A `-` is a range
+ * operator only when it has a member on both sides within the content (a leading `-`,
+ * e.g. `[-abc]`, or trailing `-`, e.g. `[abc-]`, is always literal per fnmatch/git
+ * semantics — `readUnit` naturally treats those as plain literals since there is no
+ * second operand to pair with).
+ */
+function tokenizeBracketContent(content: string): BracketToken[] {
+	const tokens: BracketToken[] = [];
+	let i = 0;
+	const readUnit = (): string => {
+		if (content[i] === "\\" && i + 1 < content.length) {
+			const unit = content.slice(i, i + 2);
+			i += 2;
+			return unit;
+		}
+		const unit = content[i];
+		i += 1;
+		return unit;
+	};
+	while (i < content.length) {
+		const first = readUnit();
+		if (content[i] === "-" && i + 1 < content.length) {
+			i += 1; // consume "-"
+			const second = readUnit();
+			tokens.push({
+				kind: "range",
+				fromRaw: first,
+				toRaw: second,
+				fromCode: codePointOfUnit(first),
+				toCode: codePointOfUnit(second),
+			});
+			continue;
+		}
+		tokens.push({ kind: "literal", raw: first, code: codePointOfUnit(first) });
+	}
+	return tokens;
+}
+
+/**
+ * Exclude `/` from a bracket's matched set: gitignore matches with FNM_PATHNAME
+ * semantics, so a bracket expression — negated or not, a literal member or a range
+ * (POSIX-class-derived or hand-written, e.g. `[.-0]` numerically spans `/`) — never
+ * matches `/`. `Bun.Glob` has no such notion, so:
+ *  - a literal `/` member is dropped from a positive class (git treats it as absent);
+ *  - a range spanning `/` is split around it (`[.-0]` -> `[.0]`, `[!-~]` -> `[!-.0-~]`);
+ *  - a negated class gets an explicit `/` exclusion added if it doesn't already have one
+ *    (`Bun.Glob`'s negation otherwise implicitly allows `/` through, unlike git).
+ */
+function neutralizeSlashInTokens(tokens: BracketToken[], negated: boolean): BracketToken[] {
+	const out: BracketToken[] = [];
+	let slashExcluded = false;
+	for (const token of tokens) {
+		if (token.kind === "literal") {
+			if (token.code === SLASH_CODE_POINT) {
+				slashExcluded = true;
+				if (negated) out.push(token);
+				continue;
+			}
+			out.push(token);
+			continue;
+		}
+		if (token.fromCode <= SLASH_CODE_POINT && SLASH_CODE_POINT <= token.toCode) {
+			slashExcluded = true;
+			if (token.fromCode <= SLASH_CODE_POINT - 1) {
+				out.push(
+					token.fromCode === SLASH_CODE_POINT - 1
+						? { kind: "literal", raw: token.fromRaw, code: token.fromCode }
+						: {
+								kind: "range",
+								fromRaw: token.fromRaw,
+								toRaw: String.fromCodePoint(SLASH_CODE_POINT - 1),
+								fromCode: token.fromCode,
+								toCode: SLASH_CODE_POINT - 1,
+							},
+				);
+			}
+			if (SLASH_CODE_POINT + 1 <= token.toCode) {
+				out.push(
+					SLASH_CODE_POINT + 1 === token.toCode
+						? { kind: "literal", raw: token.toRaw, code: token.toCode }
+						: {
+								kind: "range",
+								fromRaw: String.fromCodePoint(SLASH_CODE_POINT + 1),
+								toRaw: token.toRaw,
+								fromCode: SLASH_CODE_POINT + 1,
+								toCode: token.toCode,
+							},
+				);
+			}
+			if (negated) out.push({ kind: "literal", raw: "/", code: SLASH_CODE_POINT });
+			continue;
+		}
+		out.push(token);
+	}
+	if (negated && !slashExcluded) {
+		out.push({ kind: "literal", raw: "/", code: SLASH_CODE_POINT });
+	}
+	return out;
+}
+
+function renderBracketTokens(tokens: BracketToken[]): string {
+	return tokens.map(token => (token.kind === "literal" ? token.raw : `${token.fromRaw}-${token.toRaw}`)).join("");
+}
+
+/** Stage 2 of `normalizePosixCharacterClasses`: exclude `/` from every bracket's matched set. */
+function excludeSlashFromBrackets(pattern: string): string {
+	const spans = findBracketSpans(pattern);
+	if (spans.length === 0) return pattern;
+	let result = "";
+	let cursor = 0;
+	for (const span of spans) {
+		result += pattern.slice(cursor, span.contentStart);
+		const content = pattern.slice(span.contentStart, span.contentEnd);
+		const tokens = tokenizeBracketContent(content);
+		result += renderBracketTokens(neutralizeSlashInTokens(tokens, span.negated));
+		cursor = span.contentEnd;
+	}
+	result += pattern.slice(cursor);
+	return result;
+}
+
+function normalizePosixCharacterClasses(pattern: string): string {
+	return excludeSlashFromBrackets(expandPosixCharacterClasses(pattern));
 }
 
 function escapeGitignoreLiteralBraces(pattern: string): string {

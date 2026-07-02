@@ -1006,6 +1006,35 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.some(rule => rule.name === "shared:private")).toBe(true);
 		expect(result.items.some(rule => rule.name === "shared:negated")).toBe(true);
 	});
+	test("does not let a hand-written range that numerically spans the path separator cross into a symlinked rules directory", async () => {
+		if (process.platform === "win32") return;
+		// Regression: `[.-0]` numerically spans `/` (0x2E-0x30, and `/` is 0x2F) but
+		// under FNM_PATHNAME semantics still never matches `/` — real Git:
+		// `.claude/rules/shared[.-0]private.md` ignores literal `shared.private.md`
+		// and `shared0private.md` but never `shared/private.md`. Bun.Glob's ranges
+		// have no such notion, so a hand-written (non-POSIX-class) range must be
+		// split around `/` the same way a POSIX-class-derived range is.
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared[.-0]private.md\n");
+		await writeFile(path.join(project, ".claude", "rules", "shared.private.md"), "Sibling dot rule.\n");
+		await writeFile(path.join(project, ".claude", "rules", "shared0private.md"), "Sibling zero rule.\n");
+		const sharedRules = path.join(root, "shared-rules-hand-range-slash-cross");
+		await writeFile(path.join(sharedRules, "private.md"), "Linked private rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		// The sibling files matching the range literally ARE ignored (native path).
+		const paths = result.items.map(rule => rule.path);
+		expect(paths.some(rulePath => rulePath.endsWith("shared.private.md"))).toBe(false);
+		expect(paths.some(rulePath => rulePath.endsWith("shared0private.md"))).toBe(false);
+		// The file reached only by crossing the symlinked "shared/" directory
+		// boundary is NOT ignored — the range must not have matched across "/".
+		expect(result.items.some(rule => rule.name === "shared:private")).toBe(true);
+	});
 	test("keeps a leading ] literal before a POSIX class in linked rule ignores", async () => {
 		if (process.platform === "win32") return;
 		// In `[][:upper:]]`, the first `]` is a literal class member and `[:upper:]` is a
