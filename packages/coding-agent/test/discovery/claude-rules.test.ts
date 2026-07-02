@@ -515,6 +515,30 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).toContain("private");
 	});
 
+	test("excludes an absolute literal path whose parent directory name contains glob metacharacters", async () => {
+		// Under the old code, any pattern containing `[`/`]`/`*`/`?`/`{`/`}` was sent
+		// straight to Bun.Glob without ever checking exact absolute equality first.
+		// Bun.Glob parses `[1]` in `repo[1]` as a single-character class matching only
+		// the literal character "1", so this literal absolute path would never match
+		// itself and `private.md` would have loaded instead of being excluded.
+		const bracketedRoot = path.join(project, "repo[1]");
+		const privateRule = path.join(bracketedRoot, ".claude", "rules", "private.md");
+		await writeFile(
+			path.join(bracketedRoot, ".claude", "settings.json"),
+			JSON.stringify({ claudeMdExcludes: [privateRule] }),
+		);
+		await writeFile(privateRule, "Private rule.\n");
+		await writeFile(path.join(bracketedRoot, ".claude", "rules", "keep.md"), "Keep rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: bracketedRoot,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("keep");
+		expect(result.items.map(rule => rule.name)).not.toContain("private");
+	});
+
 	test("does not exclude via a relative glob claudeMdExcludes pattern lacking a ** prefix", async () => {
 		await writeFile(
 			path.join(project, ".claude", "settings.json"),

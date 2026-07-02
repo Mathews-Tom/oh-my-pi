@@ -245,17 +245,21 @@ function matchesClaudeMdExclude(filePath: string, excludes: ClaudeMdExclude[], h
 	return excludes.some(({ pattern }) => {
 		const normalizedPattern = normalizeClaudeExcludePattern(pattern, home);
 
-		// Claude Code documents every `claudeMdExcludes` entry — literal or glob — as
-		// matching only absolute file paths (e.g. `**/vendor/**/CLAUDE.md`). A relative
-		// entry (literal or glob) is not an absolute-path pattern and must never fall
-		// back to matching relative to the settings baseDir — that would suppress
-		// project rules Claude Code would still load.
-		if (!/[*?[\]{}]/.test(normalizedPattern)) {
-			return (
-				path.isAbsolute(normalizedPattern) &&
-				normalizedFilePath === normalizePathForGlob(path.resolve(normalizedPattern))
-			);
+		// Check exact absolute-path equality before treating any metacharacters as a
+		// glob — a pattern's brackets/braces may be literal filename content (e.g.
+		// `/tmp/repo[1]/.claude/rules/private.md`), and Bun.Glob would otherwise
+		// treat `[1]` as a character class and miss the literal self-match.
+		if (
+			path.isAbsolute(normalizedPattern) &&
+			normalizedFilePath === normalizePathForGlob(path.resolve(normalizedPattern))
+		) {
+			return true;
 		}
+
+		// Claude Code documents every claudeMdExcludes entry as matching only
+		// absolute file paths, so a pattern with no glob syntax that didn't match
+		// exactly above never matches — no baseDir-relative fallback.
+		if (!/[*?[\]{}]/.test(normalizedPattern)) return false;
 
 		return new Bun.Glob(normalizedPattern).match(normalizedFilePath);
 	});
