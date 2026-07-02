@@ -229,7 +229,6 @@ function transformClaudeRule(rulesDir: string, content: string, filePath: string
 
 interface ClaudeMdExclude {
 	pattern: string;
-	baseDir: string;
 }
 
 function normalizeClaudeExcludePattern(pattern: string, home: string): string {
@@ -243,38 +242,32 @@ function normalizePathForGlob(filePath: string): string {
 
 function matchesClaudeMdExclude(filePath: string, excludes: ClaudeMdExclude[], home: string): boolean {
 	const normalizedFilePath = normalizePathForGlob(path.resolve(filePath));
-	return excludes.some(({ pattern, baseDir }) => {
+	return excludes.some(({ pattern }) => {
 		const normalizedPattern = normalizeClaudeExcludePattern(pattern, home);
 
+		// Claude Code documents every `claudeMdExcludes` entry — literal or glob — as
+		// matching only absolute file paths (e.g. `**/vendor/**/CLAUDE.md`). A relative
+		// entry (literal or glob) is not an absolute-path pattern and must never fall
+		// back to matching relative to the settings baseDir — that would suppress
+		// project rules Claude Code would still load.
 		if (!/[*?[\]{}]/.test(normalizedPattern)) {
-			if (path.isAbsolute(normalizedPattern)) {
-				return normalizedFilePath === normalizePathForGlob(path.resolve(normalizedPattern));
-			}
-			const relativeFilePath = normalizePathForGlob(path.relative(path.resolve(baseDir), path.resolve(filePath)));
 			return (
-				relativeFilePath.length > 0 &&
-				relativeFilePath !== ".." &&
-				!relativeFilePath.startsWith("../") &&
-				relativeFilePath === normalizedPattern
+				path.isAbsolute(normalizedPattern) &&
+				normalizedFilePath === normalizePathForGlob(path.resolve(normalizedPattern))
 			);
 		}
 
-		// Claude Code documents `claudeMdExcludes` glob patterns as matching only absolute
-		// file paths (e.g. `**/vendor/**/CLAUDE.md`). A relative glob without a `**` prefix
-		// (e.g. `.claude/rules/*.md`) is not an absolute-path pattern and must not fall back
-		// to matching relative to the settings baseDir — that would suppress project rules
-		// Claude Code would still load.
 		return new Bun.Glob(normalizedPattern).match(normalizedFilePath);
 	});
 }
 
-async function readClaudeMdExcludesFromFile(filePath: string, baseDir: string): Promise<ClaudeMdExclude[]> {
+async function readClaudeMdExcludesFromFile(filePath: string): Promise<ClaudeMdExclude[]> {
 	const content = await readFile(filePath);
 	if (!content) return [];
 	const data = tryParseJson<Record<string, unknown>>(content);
 	const excludes = data?.claudeMdExcludes;
 	if (!Array.isArray(excludes)) return [];
-	return excludes.filter((value): value is string => typeof value === "string").map(pattern => ({ pattern, baseDir }));
+	return excludes.filter((value): value is string => typeof value === "string").map(pattern => ({ pattern }));
 }
 
 function getManagedClaudeSettingsDir(): string {
@@ -311,17 +304,14 @@ async function listManagedClaudeSettingsFiles(): Promise<string[]> {
 
 async function getClaudeMdExcludes(ctx: LoadContext): Promise<ClaudeMdExclude[]> {
 	const userBase = getUserClaude(ctx);
-	const managedBase = getManagedClaudeSettingsDir();
 	const managedSettings = await listManagedClaudeSettingsFiles();
 	const projectSettings = getProjectClaudePathCandidates(ctx, "settings.json");
 	const projectLocalSettings = getProjectClaudePathCandidates(ctx, "settings.local.json");
 	const projectSettingPaths = [...projectSettings, ...projectLocalSettings];
 	const [managed, user, ...project] = await Promise.all([
-		Promise.all(managedSettings.map(filePath => readClaudeMdExcludesFromFile(filePath, managedBase))),
-		readClaudeMdExcludesFromFile(path.join(userBase, "settings.json"), userBase),
-		...projectSettingPaths.map(filePath =>
-			readClaudeMdExcludesFromFile(filePath, path.dirname(path.dirname(filePath))),
-		),
+		Promise.all(managedSettings.map(readClaudeMdExcludesFromFile)),
+		readClaudeMdExcludesFromFile(path.join(userBase, "settings.json")),
+		...projectSettingPaths.map(readClaudeMdExcludesFromFile),
 	]);
 	return [...managed.flat(), ...user, ...project.flat()];
 }

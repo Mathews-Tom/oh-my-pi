@@ -495,7 +495,10 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).not.toContain("managed-private");
 	});
 
-	test("honors project-relative claudeMdExcludes when loading rules", async () => {
+	test("does not exclude via a relative literal claudeMdExcludes pattern", async () => {
+		// Claude Code matches every claudeMdExcludes entry — literal or glob — only
+		// against absolute file paths, so a project-relative literal like
+		// `.claude/rules/private.md` never matches `/repo/.claude/rules/private.md`.
 		await writeFile(
 			path.join(project, ".claude", "settings.json"),
 			JSON.stringify({ claudeMdExcludes: [".claude/rules/private.md"] }),
@@ -509,7 +512,7 @@ describe("Claude Code rule discovery", () => {
 		});
 
 		expect(result.items.map(rule => rule.name)).toContain("keep");
-		expect(result.items.map(rule => rule.name)).not.toContain("private");
+		expect(result.items.map(rule => rule.name)).toContain("private");
 	});
 
 	test("does not exclude via a relative glob claudeMdExcludes pattern lacking a ** prefix", async () => {

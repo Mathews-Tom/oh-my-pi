@@ -33,9 +33,6 @@
 
 ### Added
 
-- Added `providers.anthropic.serverSideFallback` (default off; UI in the "Model → Retry & Fallback" group). When enabled, Claude Fable 5 / Mythos 5 requests carry `fallbacks: [{ model: "claude-opus-4-8" }]` via Anthropic's server-side-fallback beta chain so classifier-blocked turns are retried on Opus 4.8 without breaking the current call. Opt-in only — leaving it off preserves the pre-fallback behavior. ([#4177](https://github.com/can1357/oh-my-pi/issues/4177))
-- Added `task.softRequestBudgetNotice` (default off) to opt into the subagent soft-budget wrap-up steering notice while keeping the 1.5x graceful abort guard active.
-- Added `providers.anthropic.serverSideFallback` configuration option to opt into Anthropic's server-side-fallback beta chain, allowing Claude Fable 5 / Mythos 5 requests to automatically retry on Opus 4.8 when blocked by classifiers.
 - Added `providers.anthropic.serverSideFallback` configuration option to opt into Anthropic's server-side-fallback beta chain, allowing Claude requests to automatically retry on alternative models when blocked by classifiers.
 - Added `task.softRequestBudgetNotice` configuration option to enable subagent soft-budget wrap-up steering notices while keeping the graceful abort guard active.
 
