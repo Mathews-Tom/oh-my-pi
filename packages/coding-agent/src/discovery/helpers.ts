@@ -832,11 +832,20 @@ function normalizePosixCharacterClasses(pattern: string): string {
 					// make it special so Bun.Glob keeps it literal (e.g. `[[:graph:]]` -> `\!-~`,
 					// `[a[:punct:]]` -> `\]...`, but `[![:punct:]]` keeps a leading `]` literal).
 					const firstChar = replacement[0];
-					const needsEscape =
+					const needsLeadingEscape =
 						firstChar === "]"
 							? !atBracketStart
 							: (firstChar === "!" || firstChar === "^") && atBracketStart && !negationSeen;
-					result += needsEscape ? `\\${replacement}` : replacement;
+					let expansion = needsLeadingEscape ? `\\${replacement}` : replacement;
+					// `punct`'s expansion ends in a literal trailing `-` (only safe unescaped
+					// right before the bracket closes, per fnmatch/Bun.Glob range rules). If
+					// another member follows before `]` (e.g. `[[:punct:]a]`), that `-` sits
+					// mid-bracket and forms an unintended (and here invalid, silently-rejecting)
+					// range with the next character — escape it so it stays a literal member.
+					if (expansion.endsWith("-") && pattern[end + 2] !== "]") {
+						expansion = `${expansion.slice(0, -1)}\\-`;
+					}
+					result += expansion;
 					atBracketStart = false;
 					i = end + 1;
 					continue;

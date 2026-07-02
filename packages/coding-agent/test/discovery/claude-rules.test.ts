@@ -941,6 +941,31 @@ describe("Claude Code rule discovery", () => {
 		expect(paths.some(rulePath => rulePath.endsWith("!secret.md"))).toBe(false);
 		expect(paths.some(rulePath => rulePath.endsWith("]secret.md"))).toBe(false);
 	});
+	test("escapes the punct class trailing hyphen when followed by another bracket member in linked rule ignores", async () => {
+		if (process.platform === "win32") return;
+		// Regression: the [:punct:] expansion ends in a literal trailing `-`, safe
+		// unescaped only when it sits right before the bracket closes. Followed by
+		// another member (e.g. [[:punct:]a]), that `-` lands mid-bracket and forms
+		// an invalid range with the next char, silently rejecting the whole bracket
+		// in Bun.Glob and leaking rules Git ignores.
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/shared/[[:punct:]a]secret.md\n");
+		const sharedRules = path.join(root, "shared-rules-posix-punct-hyphen-mid-bracket");
+		await writeFile(path.join(sharedRules, "-secret.md"), "Hyphen secret.\n");
+		await writeFile(path.join(sharedRules, "asecret.md"), "A secret.\n");
+		await writeFile(path.join(sharedRules, "keep.md"), "Keep rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		const paths = result.items.map(rule => rule.path);
+		expect(paths.some(rulePath => rulePath.endsWith("keep.md"))).toBe(true);
+		expect(paths.some(rulePath => rulePath.endsWith("-secret.md"))).toBe(false);
+		expect(paths.some(rulePath => rulePath.endsWith("asecret.md"))).toBe(false);
+	});
 	test("keeps a leading ] literal before a POSIX class in linked rule ignores", async () => {
 		if (process.platform === "win32") return;
 		// In `[][:upper:]]`, the first `]` is a literal class member and `[:upper:]` is a
