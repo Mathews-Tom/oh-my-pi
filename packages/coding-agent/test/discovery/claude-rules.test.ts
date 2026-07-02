@@ -512,6 +512,23 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).not.toContain("private");
 	});
 
+	test("does not exclude via a relative glob claudeMdExcludes pattern lacking a ** prefix", async () => {
+		await writeFile(
+			path.join(project, ".claude", "settings.json"),
+			JSON.stringify({ claudeMdExcludes: [".claude/rules/*.md"] }),
+		);
+		await writeFile(path.join(project, ".claude", "rules", "private.md"), "Private rule.\n");
+		await writeFile(path.join(project, ".claude", "rules", "keep.md"), "Keep rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("keep");
+		expect(result.items.map(rule => rule.name)).toContain("private");
+	});
+
 	test("honors git excludes from a symlinked worktree checkout", async () => {
 		if (process.platform === "win32") return;
 		const repo = path.join(root, "worktree-repo");

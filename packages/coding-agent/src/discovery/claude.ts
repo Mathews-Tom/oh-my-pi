@@ -245,21 +245,26 @@ function matchesClaudeMdExclude(filePath: string, excludes: ClaudeMdExclude[], h
 	const normalizedFilePath = normalizePathForGlob(path.resolve(filePath));
 	return excludes.some(({ pattern, baseDir }) => {
 		const normalizedPattern = normalizeClaudeExcludePattern(pattern, home);
-		const normalizedBaseDir = path.resolve(baseDir);
-		const relativeFilePath = normalizePathForGlob(path.relative(normalizedBaseDir, path.resolve(filePath)));
-		const isRelativeToBase =
-			relativeFilePath.length > 0 && relativeFilePath !== ".." && !relativeFilePath.startsWith("../");
 
 		if (!/[*?[\]{}]/.test(normalizedPattern)) {
 			if (path.isAbsolute(normalizedPattern)) {
 				return normalizedFilePath === normalizePathForGlob(path.resolve(normalizedPattern));
 			}
-			return isRelativeToBase && relativeFilePath === normalizedPattern;
+			const relativeFilePath = normalizePathForGlob(path.relative(path.resolve(baseDir), path.resolve(filePath)));
+			return (
+				relativeFilePath.length > 0 &&
+				relativeFilePath !== ".." &&
+				!relativeFilePath.startsWith("../") &&
+				relativeFilePath === normalizedPattern
+			);
 		}
 
-		const glob = new Bun.Glob(normalizedPattern);
-		if (glob.match(normalizedFilePath)) return true;
-		return isRelativeToBase && glob.match(relativeFilePath);
+		// Claude Code documents `claudeMdExcludes` glob patterns as matching only absolute
+		// file paths (e.g. `**/vendor/**/CLAUDE.md`). A relative glob without a `**` prefix
+		// (e.g. `.claude/rules/*.md`) is not an absolute-path pattern and must not fall back
+		// to matching relative to the settings baseDir — that would suppress project rules
+		// Claude Code would still load.
+		return new Bun.Glob(normalizedPattern).match(normalizedFilePath);
 	});
 }
 
