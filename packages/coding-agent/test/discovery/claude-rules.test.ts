@@ -327,6 +327,24 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).toContain("local");
 	});
 
+	// Under the old code, the custom Git-compatible ignore re-filter (which correctly
+	// normalizes POSIX character classes like `[[:upper:]]`) only ran for symlinked rule
+	// directories. For an ordinary directory, the native glob's own gitignore handling does
+	// not understand POSIX character classes, so a matching rule file was silently kept.
+	test("drops rules matched by a POSIX character class gitignore pattern in an ordinary (non-symlinked) rules directory", async () => {
+		await writeFile(path.join(project, ".gitignore"), ".claude/rules/[[:upper:]]*.md\n");
+		await writeFile(path.join(project, ".claude", "rules", "A.md"), "Uppercase rule.\n");
+		await writeFile(path.join(project, ".claude", "rules", "local.md"), "Local rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("local");
+		expect(result.items.map(rule => rule.name)).not.toContain("A");
+	});
+
 	test("keeps linked rules ignored when a parent remains ignored", async () => {
 		if (process.platform === "win32") return;
 		await writeFile(path.join(project, ".gitignore"), "*\n!.claude/\n!.claude/rules/shared/keep.md\n");

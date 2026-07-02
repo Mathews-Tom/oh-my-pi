@@ -1377,17 +1377,13 @@ export async function loadFilesFromDir<T>(
 
 	if (followSymlinkDirectories && recursive) {
 		const ignoreCache: GitignoreRulesCache = new Map();
-		// The native glob already honors ignore rules for a real directory. Only when the
-		// rules directory — or any ancestor between it and the workspace base, e.g. a
-		// symlinked `.claude` — is a symlink does the walker resolve into the target and
-		// bypass project-local logical ignores, so re-filter native matches only in that
-		// case, avoiding a per-file git subprocess fan-out for ordinary rule directories.
 		const base = workspaceBoundaryFor(dir, level === "user" ? ctx.home : ctx.cwd);
 		if (await pathHasSymlinkedAncestor(dir, base)) {
 			// The native scanner canonicalizes a symlinked search root and applies the
 			// target checkout's own .gitignore, which git does not follow for a symlinked
 			// rules directory. Re-scan without ignore handling so target-side ignores
-			// cannot drop root-level rules, then apply only the project logical filter.
+			// cannot drop root-level rules; the unconditional re-filter below then applies
+			// only the project logical filter.
 			try {
 				const unfiltered = await glob({
 					pattern,
@@ -1400,11 +1396,16 @@ export async function loadFilesFromDir<T>(
 			} catch {
 				// Keep the gitignore-filtered matches if the rescan fails.
 			}
-			const filteredNativeMatches = await Promise.all(
-				matches.map(async match => ((await isGitignoredPath(dir, match.path, ignoreCache, base)) ? null : match)),
-			);
-			matches = filteredNativeMatches.filter((match): match is { path: string } => match !== null);
 		}
+		// Re-filter every match with the Git-compatible matcher — always, not only when
+		// a symlinked ancestor forced a rescan above. The native glob's own gitignore
+		// handling does not cover syntax this matcher explicitly normalizes (e.g. POSIX
+		// character classes like `[[:upper:]]`), so an ordinary, unsymlinked rules
+		// directory can still load a file `git check-ignore` would drop.
+		const filteredNativeMatches = await Promise.all(
+			matches.map(async match => ((await isGitignoredPath(dir, match.path, ignoreCache, base)) ? null : match)),
+		);
+		matches = filteredNativeMatches.filter((match): match is { path: string } => match !== null);
 		const linkedMatches = await Promise.all(
 			(await discoverLinkedFilesFromDir(dir, extensions, ignoreCache, base)).map(async match =>
 				(await isGitignoredPath(dir, match.path, ignoreCache, base)) ? null : match,
