@@ -388,13 +388,16 @@ describe("InteractiveMode plan review rendering", () => {
 			title: "PLAN",
 		});
 
-		// The synthetic plan-approved prompt carries the in-overlay edit, not the
-		// stale on-disk content (preferring editedContent avoids the write race).
+		// The synthetic plan-approved prompt now points at the durable plan file
+		// instead of inlining content (avoids stale/oversized inline plans) — it
+		// must reference the same path passed to handlePlanApproval.
 		const call = promptSpy.mock.calls.find(isPlanApprovedCall);
 		expect(call).toBeDefined();
-		expect(call?.[0] as string).toContain("edited body");
+		expect(call?.[0] as string).toContain(planFilePath);
+		expect(call?.[0] as string).not.toContain("edited body");
 		expect(call?.[0] as string).not.toContain("original body");
-		// onPlanEdited mirrored the edit to the plan file.
+		// onPlanEdited mirrored the edit to the plan file — the source of truth
+		// the synthetic prompt instructs the agent to read.
 		expect(await Bun.file(resolvedPlanPath).text()).toContain("edited body");
 	});
 

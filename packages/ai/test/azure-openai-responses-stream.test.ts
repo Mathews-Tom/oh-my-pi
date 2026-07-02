@@ -304,14 +304,13 @@ describe("azure openai responses streaming", () => {
 				role: "assistant",
 				content: [{ type: "output_text", text: "Commentary answer", annotations: [] }],
 				status: "completed",
-				id: "msg_commentary",
 				phase: "final_answer",
 			},
 			{ role: "user", content: [{ type: "input_text", text: "follow-up" }] },
 		]);
 	});
 
-	it("keeps legacy plain-string text signatures when rebuilding fallback replay history", async () => {
+	it("omits legacy plain-string text signature IDs when rebuilding fallback replay history without reasoning", async () => {
 		const payload = await captureAzurePayload({
 			messages: [
 				{ role: "user", content: "first user", timestamp: Date.now() },
@@ -327,7 +326,6 @@ describe("azure openai responses streaming", () => {
 				role: "assistant",
 				content: [{ type: "output_text", text: "Legacy answer", annotations: [] }],
 				status: "completed",
-				id: "msg_legacy",
 			},
 			{ role: "user", content: [{ type: "input_text", text: "follow-up" }] },
 		]);
