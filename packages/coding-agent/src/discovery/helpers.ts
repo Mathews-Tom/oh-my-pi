@@ -778,10 +778,14 @@ const POSIX_CHARACTER_CLASS_MAP: Record<string, string> = {
 	alpha: "A-Za-z",
 	blank: " \t",
 	digit: "0-9",
-	graph: "!-~",
+	// `!-~` numerically spans `/` (0x2F); excluded below (split into `!-.` + `0-~`) since
+	// gitignore/fnmatch's FNM_PATHNAME mode never lets a bracket expression match `/`.
+	graph: "!-.0-~",
 	lower: "a-z",
-	print: " -~",
-	punct: "][\\\\!\"#$%&'()*+,./:;<=>?@\\[^_`{|}~-",
+	// Same `/`-spanning-range exclusion as `graph` (split into ` -.` + `0-~`).
+	print: " -.0-~",
+	// `/` dropped from the literal member set for the same reason (was `...,./:;...`).
+	punct: "][\\\\!\"#$%&'()*+,.:;<=>?@\\[^_`{|}~-",
 	// POSIX space = space, tab, newline, vertical tab, form feed, carriage return; Git's
 	// [[:space:]] matches all of them in filenames, so emit the full set (not just space/tab).
 	space: " \t\n\u000b\f\r",
@@ -803,6 +807,12 @@ function normalizePosixCharacterClasses(pattern: string): string {
 	// A class expansion's leading char may need escaping depending on which slot it lands in.
 	let atBracketStart = false;
 	let negationSeen = false;
+	// gitignore matches with FNM_PATHNAME semantics: a bracket expression — negated or
+	// not, explicit member or POSIX-class-derived — never matches `/`. `Bun.Glob` has no
+	// such notion, so track whether the current bracket is negated and whether it already
+	// excludes `/`, to inject the exclusion at close if not (see the `]`-close branch below).
+	let bracketNegated = false;
+	let bracketSlashSeen = false;
 	for (let i = 0; i < pattern.length; i++) {
 		const ch = pattern[i];
 		if (ch === "\\" && i + 1 < pattern.length) {
@@ -816,6 +826,8 @@ function normalizePosixCharacterClasses(pattern: string): string {
 				inBracket = true;
 				atBracketStart = true;
 				negationSeen = false;
+				bracketNegated = false;
+				bracketSlashSeen = false;
 			}
 			result += ch;
 			continue;
@@ -829,7 +841,7 @@ function normalizePosixCharacterClasses(pattern: string): string {
 					// Position-sensitive bracket metacharacters: `]` is a literal only in the leading
 					// slot (elsewhere it closes the class), while `!`/`^` negate only before any
 					// negation prefix. Escape a class expansion's leading char when its slot would
-					// make it special so Bun.Glob keeps it literal (e.g. `[[:graph:]]` -> `\!-~`,
+					// make it special so Bun.Glob keeps it literal (e.g. `[[:graph:]]` -> `\!-.0-~`,
 					// `[a[:punct:]]` -> `\]...`, but `[![:punct:]]` keeps a leading `]` literal).
 					const firstChar = replacement[0];
 					const needsLeadingEscape =
@@ -860,6 +872,12 @@ function normalizePosixCharacterClasses(pattern: string): string {
 		// (e.g. `[]...]`, `[!]...]`), so the class — and any later `[:posix:]` token —
 		// keeps parsing.
 		if (ch === "]" && !atBracketStart) {
+			// A negated class implicitly matches `/` in Bun.Glob unless it is explicitly
+			// excluded; inject it now if this bracket never saw a literal `/` (from a
+			// POSIX-class expansion or a hand-written member) to exclude.
+			if (bracketNegated && !bracketSlashSeen) {
+				result += "/";
+			}
 			inBracket = false;
 			result += ch;
 			continue;
@@ -868,7 +886,18 @@ function normalizePosixCharacterClasses(pattern: string): string {
 		// leading slot (where `]` stays literal) open across exactly one such char.
 		if (atBracketStart && !negationSeen && (ch === "!" || ch === "^")) {
 			negationSeen = true;
+			bracketNegated = true;
 			result += ch;
+			continue;
+		}
+		if (ch === "/") {
+			// A literal `/` can never be a bracket member under FNM_PATHNAME. In a positive
+			// class git treats it as absent, so drop it; in a negated class keep it explicit
+			// (equivalent to the close-time injection above, but avoids a redundant second
+			// `/` when the author already wrote one).
+			bracketSlashSeen = true;
+			if (bracketNegated) result += ch;
+			atBracketStart = false;
 			continue;
 		}
 		result += ch;

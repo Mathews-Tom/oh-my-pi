@@ -966,6 +966,46 @@ describe("Claude Code rule discovery", () => {
 		expect(paths.some(rulePath => rulePath.endsWith("-secret.md"))).toBe(false);
 		expect(paths.some(rulePath => rulePath.endsWith("asecret.md"))).toBe(false);
 	});
+	test("does not let a POSIX class or negated bracket cross the path separator into a symlinked rules directory", async () => {
+		if (process.platform === "win32") return;
+		// Regression: gitignore matches with FNM_PATHNAME semantics — a bracket
+		// expression (POSIX-class-derived or hand-written, negated or not) never
+		// matches `/`. Bun.Glob has no such notion by default, so a pattern like
+		// `shared[[:punct:]]private.md` must not also match `shared/private.md`
+		// through a symlinked `shared` directory (real Git: `git check-ignore -v`
+		// never matches it there either — verified separately against real Git).
+		//
+		// The negated-bracket sibling (`shared[^x]negated.md` vs literal
+		// `sharedZnegated.md`) is asserted end-to-end since globset (the native,
+		// non-symlinked ignore path) understands plain negated brackets, unlike
+		// POSIX classes — so both the native and supplemental paths are exercised
+		// there, while the POSIX-class case only exercises the supplemental path
+		// this fix targets (globset has no `[:punct:]` support at all).
+		await writeFile(
+			path.join(project, ".gitignore"),
+			".claude/rules/shared[[:punct:]]private.md\n.claude/rules/shared[^x]negated.md\n",
+		);
+		await writeFile(path.join(project, ".claude", "rules", "sharedZnegated.md"), "Sibling negated rule.\n");
+		const sharedRules = path.join(root, "shared-rules-no-bracket-slash-cross");
+		await writeFile(path.join(sharedRules, "private.md"), "Linked private rule.\n");
+		await writeFile(path.join(sharedRules, "negated.md"), "Linked negated rule.\n");
+		await fs.mkdir(path.join(project, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRules, path.join(project, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		// The negated-bracket sibling IS ignored (pattern works as intended via
+		// the native, non-symlinked path).
+		const paths = result.items.map(rule => rule.path);
+		expect(paths.some(rulePath => rulePath.endsWith("sharedZnegated.md"))).toBe(false);
+		// Files reached only by crossing the symlinked "shared/" directory boundary
+		// are NOT ignored — the bracket must not have matched across "/".
+		expect(result.items.some(rule => rule.name === "shared:private")).toBe(true);
+		expect(result.items.some(rule => rule.name === "shared:negated")).toBe(true);
+	});
 	test("keeps a leading ] literal before a POSIX class in linked rule ignores", async () => {
 		if (process.platform === "win32") return;
 		// In `[][:upper:]]`, the first `]` is a literal class member and `[:upper:]` is a
