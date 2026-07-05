@@ -52,10 +52,9 @@ Consequence: precedence and deduplication are **name-based only**. Two different
 
 ## 2. Discovery sources and normalization
 
-`src/discovery/index.ts` auto-registers providers. For `rules`, current providers are:
-
 - `native` (priority `100`)
 - `omp-plugins` (priority `90`) — `rules/*.{md,mdc}` inside configured extension package roots, normalized via the shared `buildRuleFromMarkdown` path
+- `claude` (priority `80`) — `.claude/rules/**/*.{md,mdc}` at user and project scope
 - `agents` (priority `70`)
 - `cursor` (priority `50`)
 - `windsurf` (priority `50`)
@@ -89,6 +88,24 @@ Loads from both `.agent` and `.agents` directories:
 - user: `~/.agent/rules/*.{md,mdc}` and `~/.agents/rules/*.{md,mdc}`
 
 Normalization uses the shared `buildRuleFromMarkdown` path: filename-derived name, stripped frontmatter body, and parsed `globs`, `alwaysApply`, `description`, `condition`/legacy `ttsr_trigger`, `astCondition`, `scope`, and `interruptMode`.
+
+### Claude provider (`claude.ts`)
+
+Loads from:
+
+- user: `$CLAUDE_CONFIG_DIR/rules/**/*.{md,mdc}` (falls back to `~/.claude/rules/**/*.{md,mdc}`)
+- project: `<ancestor>/.claude/rules/**/*.{md,mdc}` walking upward from `cwd` to the anchor described below; project rules take precedence over same-named user rules
+
+Ancestor walk anchor: the git repo root when known; otherwise `~` when `cwd` is under it; otherwise `cwd` itself (no ancestor walk) — a `cwd` with neither a repo root nor a home anchor has no safe upper bound, so only the project directory is scanned, never its ancestors.
+
+Normalization (`transformClaudeRule`) uses the shared `buildRuleFromMarkdown` path (`globs ?? paths` precedence, same as every other provider) plus Claude-specific scope inference:
+
+- a rule with `globs`/`paths` frontmatter is path-scoped (mirrors Claude Code's own `paths:` field: https://code.claude.com/docs/en/memory#path-specific-rules); a stray `alwaysApply: true` alongside it is cleared so the scoping still applies
+- a rule with `alwaysApply: true`, an accepted TTSR `condition`/`astCondition`, or `alwaysApply: false` plus a `description` keeps that classification
+- any other pathless, non-TTSR rule defaults to `alwaysApply: true` so it is never silently dropped
+- entries matching a `claudeMdExcludes` pattern (from managed, user, or project `settings*.json`) are excluded, same as `CLAUDE.md` context files
+
+Known partial semantic: `globs`/`paths` scoping is advisory only (see §6 and §9) — there is no code path that automatically injects a Claude rule's content when a matching file is read; the model must read the advertised `rule://<name>` URL itself.
 
 ### Cursor provider (`cursor.ts`)
 
@@ -162,11 +179,12 @@ Effective rule provider order is currently:
 
 1. `native` (100)
 2. `omp-plugins` (90)
-3. `agents` (70)
-4. `cursor` (50)
-5. `windsurf` (50)
-6. `cline` (40)
-7. `builtin-defaults` (1)
+3. `claude` (80)
+4. `agents` (70)
+5. `cursor` (50)
+6. `windsurf` (50)
+7. `cline` (40)
+8. `builtin-defaults` (1)
 
 ### Intra-provider ordering caveat
 
@@ -176,6 +194,7 @@ Notable source-order differences:
 
 - `native` appends project `.omp/rules`, user `~/.omp/agent/rules`, user `RULES.md`, then nearest project `RULES.md`.
 - `omp-plugins` appends `rules/` results per configured extension package root.
+- `claude` appends user rules not shadowed by a same-named project rule, then project rules gathered root-ancestor-first; when the same name recurs across ancestor `.claude/rules` directories, the directory closest to `cwd` wins.
 - `agents` appends project-walk `.agent`/`.agents` rule dirs before user home dirs.
 - `cursor` appends user then project results.
 - `windsurf` appends user `global_rules` first, then project rules.
@@ -261,7 +280,7 @@ Implications:
 
 ## 9. Known partial / non-enforced semantics
 
-1. The rule providers currently loaded for `rules` are `native`, `omp-plugins`, `agents`, `cursor`, `windsurf`, `cline`, and embedded `builtin-defaults`; provider files for other tools may parse other config formats but do not register rule loaders.
+1. The rule providers currently loaded for `rules` are `native`, `omp-plugins`, `claude`, `agents`, `cursor`, `windsurf`, `cline`, and embedded `builtin-defaults`; provider files for other tools may parse other config formats but do not register rule loaders.
 2. `globs` metadata is surfaced to prompt/UI and is used as a global path gate for TTSR matching, but it is not used to automatically select rulebook rules for `rule://`.
 3. Rule selection for `rule://` includes rulebook, always-apply, and registered TTSR rules (so a triggered TTSR rule can be re-read), but not rules that registered no condition and carry neither a description nor `alwaysApply`.
 4. Discovery warnings (`loadCapability("rules").warnings`) are produced but `createAgentSession` does not currently surface/log them in this path.
