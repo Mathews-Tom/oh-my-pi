@@ -196,10 +196,11 @@ describe("Claude Code rule discovery", () => {
 		expect(agentsRule?.name).toBe("C%23");
 		expect(claudeRule?.name).not.toBe(agentsRule?.name);
 	});
-	test("treats Claude rules with globs but no paths as always-on launch rules", async () => {
-		// Claude Code path-specificity comes only from `paths:`; a Cursor-style
-		// `globs:` key must NOT scope a Claude rule, so a globs-only rule loads
-		// unconditionally while a `paths:` rule stays path-scoped.
+	test("treats Claude rules with globs the same as paths: both stay path-scoped", async () => {
+		// buildRuleFromMarkdown's shared `globs ?? paths` precedence applies to Claude
+		// rules too, so a Cursor-style `globs:` key scopes a Claude rule exactly like
+		// `paths:` does — both stay path-scoped rather than one silently becoming an
+		// always-on launch rule.
 		await writeFile(
 			path.join(project, ".claude", "rules", "globs-only.md"),
 			'---\nglobs:\n  - "**/*.ts"\n---\nGlobs-only rule.\n',
@@ -216,8 +217,8 @@ describe("Claude Code rule discovery", () => {
 
 		const globsOnly = result.items.find(rule => rule.name === "globs-only");
 		const pathsScoped = result.items.find(rule => rule.name === "paths-scoped");
-		expect(globsOnly?.alwaysApply).toBe(true);
-		expect(globsOnly?.globs).toBeUndefined();
+		expect(globsOnly?.alwaysApply).not.toBe(true);
+		expect(globsOnly?.globs).toEqual(["**/*.ts"]);
 		expect(pathsScoped?.alwaysApply).not.toBe(true);
 		expect(pathsScoped?.globs).toEqual(["**/*.ts"]);
 	});

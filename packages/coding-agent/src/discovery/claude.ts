@@ -212,21 +212,19 @@ function claudeRuleNameFromPath(rulesDir: string, filePath: string): string {
 
 function transformClaudeRule(rulesDir: string, content: string, filePath: string, source: SourceMeta): Rule {
 	const ruleName = claudeRuleNameFromPath(rulesDir, filePath);
-	const rule = buildRuleFromMarkdown(ruleName, content, filePath, source, { ruleName, scopeFromPathsOnly: true });
+	const rule = buildRuleFromMarkdown(ruleName, content, filePath, source, { ruleName });
 	if (rule.globs && rule.globs.length > 0) {
-		// Claude Code's `paths:` makes a rule conditional; rules without it load
-		// unconditionally (https://code.claude.com/docs/en/memory#path-specific-rules).
-		// A Cursor-style `alwaysApply: true` sitting alongside `paths:` in the same
-		// frontmatter must not override that scoping — bucketRules checks
-		// `alwaysApply` before `description`, so a stray `alwaysApply: true` would
-		// otherwise still launch this rule globally instead of scoping it to its globs.
+		// A rule scoped via Claude's `paths:` or Cursor-style `globs:` (buildRuleFromMarkdown's
+		// shared `globs ?? paths` precedence) is path-specific. A stray `alwaysApply: true`
+		// sitting alongside it must not override that scoping — bucketRules checks
+		// `alwaysApply` before `description`, so it would otherwise still launch the rule
+		// globally instead of scoping it to its globs.
 		const scoped = rule.alwaysApply === true ? { ...rule, alwaysApply: false } : rule;
 		return scoped.description ? scoped : { ...scoped, description: scopedClaudeRuleDescription(rule.globs) };
 	}
 	if (rule.alwaysApply === true) return rule;
 	if (isConditionalTtsrRule(rule)) return rule;
-	// Claude Code path-specificity comes only from `paths:` (handled above); a
-	// pathless, non-TTSR rule always launches. A Cursor-style `alwaysApply: false`
+	// A pathless, non-TTSR rule always launches. A Cursor-style `alwaysApply: false`
 	// only stands when a `description` routes the rule to the on-demand rulebook
 	// bucket instead — without one it would match neither bucket in bucketRules
 	// (no condition, not always-apply, no description) and silently disappear.
