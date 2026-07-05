@@ -51,14 +51,29 @@ function getProjectClaude(ctx: LoadContext): string {
 	return path.join(ctx.cwd, CONFIG_DIR);
 }
 
+// The ancestor walk climbs from cwd toward a stopping anchor: the git repo root when
+// known, else the home directory when cwd is under it. When cwd has neither anchor —
+// no git repo, and outside $HOME (e.g. a scratch checkout under /tmp or /workspaces) —
+// there is no safe upper bound; continuing to the filesystem root would load every
+// ancestor .claude/rules directory it finds, leaking unrelated parent-directory rules
+// into the prompt. Anchor at cwd itself in that case so only the project directory
+// (not its ancestors) is scanned.
+function getProjectClaudeAnchor(ctx: LoadContext): string {
+	if (ctx.repoRoot) return ctx.repoRoot;
+	const homeRelative = path.relative(ctx.home, ctx.cwd);
+	const cwdUnderHome = homeRelative === "" || (!homeRelative.startsWith("..") && !path.isAbsolute(homeRelative));
+	return cwdUnderHome ? ctx.home : ctx.cwd;
+}
+
 function getProjectClaudePathCandidates(ctx: LoadContext, ...segments: string[]): string[] {
 	const paths: string[] = [];
+	const anchor = getProjectClaudeAnchor(ctx);
 	let current = ctx.cwd;
 	while (true) {
 		if (current !== ctx.home) {
 			paths.push(path.join(current, CONFIG_DIR, ...segments));
 		}
-		if (current === (ctx.repoRoot ?? ctx.home)) break;
+		if (current === anchor) break;
 		const parent = path.dirname(current);
 		if (parent === current) break;
 		current = parent;

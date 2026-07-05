@@ -120,6 +120,24 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).toEqual(["root", "local"]);
 	});
 
+	test("does not leak ancestor .claude/rules when cwd has no repo root and is outside home", async () => {
+		// No git anchor and cwd outside $HOME (a scratch checkout under /tmp, e.g.) means
+		// getProjectClaudePathCandidates has no safe upper bound for the ancestor walk.
+		// It must stop at cwd itself instead of climbing toward the filesystem root and
+		// loading unrelated parent-directory rules.
+		const outsideDir = path.join(root, "outside");
+		const nestedCwd = path.join(outsideDir, "nested", "deep");
+		await fs.mkdir(nestedCwd, { recursive: true });
+		await writeFile(path.join(outsideDir, ".claude", "rules", "parent.md"), "Leaked parent rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: nestedCwd,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).not.toContain("parent");
+	});
+
 	test("honors the repo .gitignore for ancestor rules when cwd is nested below a symlinked checkout", async () => {
 		if (process.platform === "win32") return;
 		// cwd is nested below a symlinked checkout (link -> realRepo) and the rule dir is an
