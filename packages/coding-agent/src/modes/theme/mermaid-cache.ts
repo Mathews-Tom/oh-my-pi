@@ -32,10 +32,6 @@ function asciiDisplayWidth(ascii: string): number {
 	return max;
 }
 
-type DirectionalMermaidAsciiRenderOptions = MermaidAsciiRenderOptions & {
-	direction: "TD" | "LR";
-};
-
 function renderVariant(
 	source: string,
 	baseOptions: MermaidAsciiRenderOptions,
@@ -46,10 +42,7 @@ function renderVariant(
 	const cached = cache.get(key);
 	if (cached !== undefined) return cached;
 
-	const directionalOptions: DirectionalMermaidAsciiRenderOptions | MermaidAsciiRenderOptions = direction
-		? { ...baseOptions, direction }
-		: baseOptions;
-	const ascii = renderMermaidAsciiSafe(source, directionalOptions);
+	const ascii = renderMermaidAsciiSafe(source, direction ? { ...baseOptions, direction } : baseOptions);
 	cache.set(key, ascii);
 	return ascii;
 }
