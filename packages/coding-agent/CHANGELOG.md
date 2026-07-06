@@ -6,6 +6,24 @@
 
 - Added Claude Code rule discovery so `.claude/rules/**/*.md` and `.claude/rules/**/*.mdc` files load through the standard rules capability with frontmatter metadata preserved ([#2613](https://github.com/can1357/oh-my-pi/issues/2613)).
 
+## [16.3.9] - 2026-07-06
+
+### Added
+
+- Added a `--file` flag to the `say` command to read input text directly from files.
+- Enabled streaming text synthesis in the `say` command for gapless, long-form audio generation.
+- Added voice selection validation to the `say` command.
+
+### Changed
+
+- Improved the `say` command to display the segment count and total duration upon completion.
+
+### Fixed
+
+- Fixed an issue where local llama.cpp vision models remained text-only after a model refresh, ensuring they are correctly recognized as image-capable when configured as the default or vision role.
+- Fixed `omp commit` split plans aborting when lock files (such as `bun.lockb`) were staged alongside their manifests by correctly pairing lock files with their corresponding commit groups and properly handling binary files during split execution.
+- Fixed skill loading to ensure that disabling a higher-priority provider does not drop same-named skills from enabled lower-priority providers.
+
 ## [16.3.8] - 2026-07-05
 
 ### Fixed
