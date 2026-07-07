@@ -348,6 +348,20 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).toContain("local");
 	});
 
+	test("skips non-regular gitignore sources when loading rules", async () => {
+		await fs.mkdir(path.join(home, ".config", "git", "ignore"), { recursive: true });
+		await fs.mkdir(path.join(project, ".gitignore"), { recursive: true });
+		await fs.mkdir(path.join(project, ".ignore"), { recursive: true });
+		await writeFile(path.join(project, ".claude", "rules", "local.md"), "Local rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("local");
+	});
+
 	test("keeps rules when their ignored parent is re-included", async () => {
 		await writeFile(path.join(project, ".gitignore"), ".claude/\n!.claude/\n");
 		await writeFile(path.join(project, ".claude", "rules", "local.md"), "Local rule.\n");

@@ -585,12 +585,15 @@ async function loadIgnoreFile(
 	// by a symlinked ignore file keeps the rules git would leave visible. Configured
 	// ignore sources (core.excludesFile, .git/info/exclude) are read by path and remain
 	// followed.
-	if (skipSymlink && (await fs.promises.lstat(filePath).catch(() => null))?.isSymbolicLink()) {
-		return;
-	}
-	const ignoreFile = Bun.file(filePath);
-	if (!(await ignoreFile.exists())) return;
-	const lines = (await ignoreFile.text()).split(/\r?\n/);
+	const stat = await (skipSymlink ? fs.promises.lstat(filePath) : fs.promises.stat(filePath)).catch(() => null);
+	if (!stat) return;
+	if (skipSymlink && stat.isSymbolicLink()) return;
+	if (!stat.isFile()) return;
+	const text = await Bun.file(filePath)
+		.text()
+		.catch(() => null);
+	if (text === null) return;
+	const lines = text.split(/\r?\n/);
 	for (const line of lines) {
 		if (line.trim().length === 0 || line.startsWith("#")) continue;
 		const negated = line.startsWith("!");
