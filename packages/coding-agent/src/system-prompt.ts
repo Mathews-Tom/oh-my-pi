@@ -25,6 +25,7 @@ import projectPromptTemplate from "./prompts/system/project-prompt.md" with { ty
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
 import { shortenPath } from "./tools/render-utils";
 import { type ActiveRepoContext, resolveActiveRepoContext } from "./utils/active-repo-context";
+import { formatLocalCalendarDate } from "./utils/local-date";
 import { normalizePromptPath } from "./utils/prompt-path";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
 
@@ -401,7 +402,7 @@ export async function loadSystemPromptFiles(options: LoadContextFilesOptions = {
 	return userLevel?.content ?? null;
 }
 
-export const DEFAULT_SYSTEM_PROMPT_TOOL_NAMES = ["read", "bash", "eval", "edit", "write"] as const;
+export const DEFAULT_SYSTEM_PROMPT_TOOL_NAMES = ["read", "bash", "edit", "write"] as const;
 
 export interface SystemPromptToolMetadata {
 	label: string;
@@ -694,7 +695,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		}
 	}
 
-	const date = new Date().toISOString().slice(0, 10);
+	const date = formatLocalCalendarDate();
 	const dateTime = date;
 	const promptCwd = shortenPath(normalizePromptPath(resolvedCwd));
 	const activeRepoContextPrompt = renderActiveRepoContextPrompt(activeRepoContext);
