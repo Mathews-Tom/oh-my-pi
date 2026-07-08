@@ -299,6 +299,13 @@ async function readClaudeMdExcludesFromFile(filePath: string): Promise<ClaudeMdE
 	return excludes.filter((value): value is string => typeof value === "string").map(pattern => ({ pattern }));
 }
 
+// File-based managed settings only. Claude Code also honors OS-managed policy delivery —
+// the `com.anthropic.claudecode` macOS managed-preferences domain and the
+// `HKLM\SOFTWARE\Policies\ClaudeCode` / `HKCU\...` Windows registry keys (see
+// https://code.claude.com/docs/en/settings#settings-files) — which this discovery layer
+// does not read. An organization delivering `claudeMdExcludes` exclusively through MDM
+// or Group Policy, with no `managed-settings.json` on disk, will not have that exclusion
+// honored here, and OMP can load a CLAUDE.md/rule that Claude Code itself would suppress.
 function getManagedClaudeSettingsDir(): string {
 	switch (process.platform) {
 		case "darwin":
