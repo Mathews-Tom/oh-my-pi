@@ -95,7 +95,11 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 	const warnings: string[] = [];
 
 	const userBase = getUserClaude(ctx);
-	const userClaudeJson = path.join(ctx.home, ".claude.json");
+	// `.claude.json` lives beside `~/.claude/` by default (a home-dir sibling, not
+	// inside it), but Claude moves it under the override root — alongside settings.json
+	// — when CLAUDE_CONFIG_DIR is set. `userBase` already carries the trailing `.claude`
+	// segment in the unset case, so join `.claude.json` onto the config root instead.
+	const userClaudeJson = path.join(process.env.CLAUDE_CONFIG_DIR || ctx.home, ".claude.json");
 	const userMcpJson = path.join(userBase, "mcp.json");
 
 	const projectBase = path.join(ctx.cwd, CONFIG_DIR);
