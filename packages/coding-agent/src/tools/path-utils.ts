@@ -405,7 +405,10 @@ export function splitInternalUrlSel(rawPath: string): { path: string; sel?: stri
 			const candidates = [parsed.rawHost, parsed.rawEncodedHost, parsed.hostname].filter(
 				(name, index, names): name is string => Boolean(name) && names.indexOf(name) === index,
 			);
-			if (candidates.some(candidate => activeRuleNames.has(candidate))) return { path: rawPath };
+			const exactCandidates = parsed.port
+				? candidates.filter(candidate => candidate !== parsed.hostname)
+				: candidates;
+			if (exactCandidates.some(candidate => activeRuleNames.has(candidate))) return { path: rawPath };
 			for (const initialCandidate of candidates) {
 				const chunks: string[] = [];
 				let candidateMatch = initialCandidate;

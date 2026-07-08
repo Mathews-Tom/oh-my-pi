@@ -72,6 +72,19 @@ describe("splitInternalUrlSel", () => {
 		expect(splitInternalUrlSel("rule://frontend:raw:1-10")).toEqual({ path: "rule://frontend:raw", sel: "1-10" });
 	});
 
+	it("peels numeric selector tails from active rule names", () => {
+		setActiveRules([
+			{
+				name: "frontend",
+				path: "/tmp/frontend.md",
+				content: "body",
+				_source: { provider: "test", providerName: "test", path: "/tmp/frontend.md", level: "project" },
+			},
+		]);
+		expect(splitInternalUrlSel("rule://frontend:80")).toEqual({ path: "rule://frontend", sel: "80" });
+		expect(splitInternalUrlSel("rule://frontend:80:raw")).toEqual({ path: "rule://frontend", sel: "80:raw" });
+	});
+
 	it("keeps completion values and selector peeling unique for encoded rule names", async () => {
 		setActiveRules([
 			{
