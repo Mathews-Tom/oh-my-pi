@@ -743,6 +743,26 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).toContain("shared:keep");
 	});
 
+	test("does not apply a globally configured core.excludesFile outside a Git worktree", async () => {
+		if (process.platform === "win32") return;
+		// Regression: computeGitignoreRules previously read core.excludesFile (falling back
+		// to ~/.config/git/ignore) unconditionally, even when the scanned directory tree has
+		// no `.git` anywhere in its ancestry. Git itself only applies that global excludes
+		// file inside a real worktree, so an unrelated global ignore (e.g. `*.md`) must not
+		// suppress Claude rules in a non-repo project.
+		await fs.rm(path.join(project, ".git"), { recursive: true, force: true });
+		await writeFile(path.join(home, ".gitconfig"), "[core]\n\texcludesFile = ~/.config/git/ignore\n");
+		await writeFile(path.join(home, ".config", "git", "ignore"), "*.md\n");
+		await writeFile(path.join(project, ".claude", "rules", "keep.md"), "Keep rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("keep");
+	});
+
 	test("honors escaped gitignore patterns for linked rules", async () => {
 		if (process.platform === "win32") return;
 		await writeFile(

@@ -467,7 +467,7 @@ function normalizedRelativePath(from: string, to: string): string {
 	return path.relative(from, to).split(path.sep).join("/");
 }
 
-async function findGitignoreRoot(dir: string, base?: string): Promise<string> {
+async function findGitignoreRoot(dir: string, base?: string): Promise<{ root: string; isGitRoot: boolean }> {
 	const startDir = path.resolve(dir);
 	// Where to begin the upward search. A symlinked rules dir — or, when the workspace
 	// `base` is known, any symlinked ancestor strictly below it (e.g. a symlinked
@@ -494,7 +494,7 @@ async function findGitignoreRoot(dir: string, base?: string): Promise<string> {
 	let highestIgnoreDir: string | undefined;
 	while (true) {
 		if (await pathExists(path.join(current, ".git"))) {
-			return current;
+			return { root: current, isGitRoot: true };
 		}
 		if (
 			(await Bun.file(path.join(current, ".gitignore")).exists()) ||
@@ -503,7 +503,7 @@ async function findGitignoreRoot(dir: string, base?: string): Promise<string> {
 			highestIgnoreDir = current;
 		}
 		const parent = path.dirname(current);
-		if (parent === current) return highestIgnoreDir ?? walkStart;
+		if (parent === current) return { root: highestIgnoreDir ?? walkStart, isGitRoot: false };
 		current = parent;
 	}
 }
@@ -727,22 +727,29 @@ type GitignoreRulesCache = Map<string, Promise<GitignoreRule[]>>;
 async function loadGitignoreRules(
 	rootDir: string,
 	targetDir: string,
+	isGitRoot: boolean,
 	cache?: GitignoreRulesCache,
 ): Promise<GitignoreRule[]> {
-	if (!cache) return computeGitignoreRules(rootDir, targetDir);
+	if (!cache) return computeGitignoreRules(rootDir, targetDir, isGitRoot);
 	const key = `${path.resolve(rootDir)}\u0000${path.resolve(targetDir)}`;
 	const existing = cache.get(key);
 	if (existing) return existing;
-	const promise = computeGitignoreRules(rootDir, targetDir);
+	const promise = computeGitignoreRules(rootDir, targetDir, isGitRoot);
 	cache.set(key, promise);
 	return promise;
 }
 
-async function computeGitignoreRules(rootDir: string, targetDir: string): Promise<GitignoreRule[]> {
+async function computeGitignoreRules(rootDir: string, targetDir: string, isGitRoot: boolean): Promise<GitignoreRule[]> {
 	const rules: GitignoreRule[] = [];
 	const ignoreCase = await resolveGitIgnoreCase(rootDir);
-	const globalIgnore = await gitignorePath(rootDir);
-	if (globalIgnore) await loadIgnoreFile(rules, globalIgnore, rootDir, ignoreCase);
+	// core.excludesFile (and its ~/.config/git/ignore default) is only authoritative inside a
+	// real Git worktree; applying it to a non-repo directory tree (e.g. `~/.claude/rules`
+	// itself, or a scratch project with no `.git` anywhere in its ancestry) would silently
+	// suppress rules based on the user's unrelated global Git config.
+	if (isGitRoot) {
+		const globalIgnore = await gitignorePath(rootDir);
+		if (globalIgnore) await loadIgnoreFile(rules, globalIgnore, rootDir, ignoreCase);
+	}
 	const gitExcludeFile = await resolveGitExcludeFile(rootDir);
 	if (gitExcludeFile) await loadIgnoreFile(rules, gitExcludeFile, rootDir, ignoreCase);
 	const directories: string[] = [];
@@ -1184,8 +1191,8 @@ async function getGitignoreState(
 	base?: string,
 ): Promise<{ ignoredPath: boolean; ignoredAncestors: Set<string> }> {
 	const filePath = path.join(dir, relativePath);
-	const rootDir = await findGitignoreRoot(dir, base);
-	const rules = await loadGitignoreRules(rootDir, path.dirname(filePath), cache);
+	const { root: rootDir, isGitRoot } = await findGitignoreRoot(dir, base);
+	const rules = await loadGitignoreRules(rootDir, path.dirname(filePath), isGitRoot, cache);
 	let ignoredPath = false;
 	const ignoredAncestors = new Set<string>();
 	for (const rule of rules) {
