@@ -138,6 +138,23 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).not.toContain("parent");
 	});
 
+	test("does not leak parent .claude/rules when repo-root cwd has a trailing separator", async () => {
+		const parentDir = path.join(root, "trailing-parent");
+		const projectDir = path.join(parentDir, "project");
+		await fs.mkdir(path.join(projectDir, ".git"), { recursive: true });
+		await writeFile(path.join(parentDir, ".claude", "rules", "parent.md"), "Leaked parent rule.\n");
+		await writeFile(path.join(projectDir, ".claude", "rules", "local.md"), "Local rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: `${projectDir}${path.sep}`,
+			providers: ["claude"],
+		});
+
+		const names = result.items.map(rule => rule.name);
+		expect(names).toContain("local");
+		expect(names).not.toContain("parent");
+	});
+
 	test("honors the repo .gitignore for ancestor rules when cwd is nested below a symlinked checkout", async () => {
 		if (process.platform === "win32") return;
 		// cwd is nested below a symlinked checkout (link -> realRepo) and the rule dir is an
