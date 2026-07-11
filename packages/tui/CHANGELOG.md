@@ -2,13 +2,16 @@
 
 ## [Unreleased]
 
+## [16.4.5] - 2026-07-11
+
 ### Added
 
-- Added `FuzzyText`, a prepared fuzzy-match handle that builds the search index once and matches many queries against it — for callers whose corpus exceeds the internal index cache's admission size (e.g. session/transcript search).
+- Added `FuzzyText`, a prepared fuzzy-match handle that builds the search index once and matches many queries against it, optimizing performance for large corpora like session or transcript searches.
 
 ### Fixed
 
-- Fixed the mid-prompt `/` autocomplete popup lingering until Esc on tokens that are neither a path nor skill-shaped. Skill suggestions previously stayed alive through fuzzy subsequence matches against long skill descriptions, so nearly any prose token kept the popup hovering; matching is now gated to the `skill:` namespace (bare `/`, `s`, `sk`, …), explicit `skill:` queries (fuzzy search retained), and bare skill-name prefixes (`/hum` → `skill:humanizer`). Everything else falls through to path completion or dismisses the popup, and the Tab/Enter staleness guard shares the same gate so a stale popup can no longer rewrite tokens like `/scan` into `/skill:…`.
+- Fixed an issue where the mid-prompt `/` autocomplete popup lingered indefinitely on non-path and non-skill tokens. Autocomplete matching is now properly gated to explicit skill namespaces, queries, and prefixes, preventing stale popups from incorrectly rewriting input on Tab or Enter.
+- Fixed idle Loader animation driving the full TUI render pipeline on every spinner tick by directly rewriting the Loader's visible rows when geometry is unchanged, reducing idle render work while preserving fallback repaint paths ([#5192](https://github.com/can1357/oh-my-pi/issues/5192)).
 
 ## [16.4.1] - 2026-07-10
 
