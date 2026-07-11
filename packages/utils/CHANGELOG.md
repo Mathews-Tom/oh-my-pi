@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [16.4.2] - 2026-07-10
+
+### Added
+
+- Added `stringifyJson` utility with support for BigInt serialization.
+
+## [16.3.12] - 2026-07-08
+
 ### Added
 
 - Added `postmortem.interceptUnhandledRejections()` to register interceptors consulted before an unhandled rejection tears the process down; a consuming interceptor (e.g. the JS eval runtime claiming rejections floated by user cell code) keeps the process alive and owns reporting.

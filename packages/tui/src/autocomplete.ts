@@ -359,9 +359,40 @@ function hasPromptTextBeforeSlash(
 	return textBeforeCursor.slice(0, slashStart).trim() !== "";
 }
 
+const SKILL_NAMESPACE = "skill:";
+
+/**
+ * Whether a mid-prompt slash token (`prose … /tok`) is skill-shaped enough to
+ * surface `name` in the skill popup. Deliberately stricter than submitted
+ * slash-command matching: a stray `/word` in running prose must not keep the
+ * popup alive through fuzzy name/description hits, so a token only matches as
+ * - a prefix of the `skill:` namespace (incl. the bare `/` entry point),
+ * - an explicit `skill:…` query (full fuzzy name/description search), or
+ * - a prefix of the skill's bare name (`/hum` → `skill:humanizer`).
+ * Anything else yields no items, letting the caller fall through to path
+ * completion or close the popup. Shared with the editor's accept-time
+ * staleness guard so Tab/Enter never accepts a skill the refreshed popup
+ * would no longer show.
+ */
+export function midPromptSkillTokenMatches(lowerToken: string, name: string, description?: string): boolean {
+	if (SKILL_NAMESPACE.startsWith(lowerToken)) return true;
+	const lowerName = name.toLowerCase();
+	if (lowerToken.startsWith(SKILL_NAMESPACE)) {
+		if (scoreCommandTextMatch(lowerToken, lowerName) > 0) return true;
+		return !!description && scoreCommandTextMatch(lowerToken, description.toLowerCase()) > 0;
+	}
+	return lowerName.startsWith(SKILL_NAMESPACE) && lowerName.slice(SKILL_NAMESPACE.length).startsWith(lowerToken);
+}
+
 function buildMidPromptSkillCompletions(commands: CommandEntry[], lowerPrefix: string): AutocompleteItem[] {
 	return buildSlashCommandCompletions(
-		commands.filter(cmd => getCommandName(cmd)?.startsWith("skill:")),
+		commands.filter(cmd => {
+			const name = getCommandName(cmd);
+			return (
+				name?.startsWith(SKILL_NAMESPACE) &&
+				midPromptSkillTokenMatches(lowerPrefix, name, getStaticCommandDescription(cmd))
+			);
+		}),
 		lowerPrefix,
 	);
 }
@@ -437,6 +468,9 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				const argumentText = commandText.slice(spaceIndex + 1); // Text after space
 
 				const command = this.#commands.find(cmd => commandMatchesNameOrAlias(cmd, commandName));
+				if (command && "allowArgs" in command && command.allowArgs === false && !/\S/.test(argumentText)) {
+					return null;
+				}
 				if (command && (!("allowArgs" in command) || command.allowArgs !== false)) {
 					if (!("getArgumentCompletions" in command) || !command.getArgumentCompletions) {
 						return null; // No argument completion for this command

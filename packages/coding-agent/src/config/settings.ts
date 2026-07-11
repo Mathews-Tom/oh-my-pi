@@ -22,6 +22,7 @@ import {
 	getProjectDir,
 	isEnoent,
 	logger,
+	MAIN_CONFIG_FILENAMES,
 	procmgr,
 	setWorktreesDir,
 } from "@oh-my-pi/pi-utils";
@@ -60,7 +61,7 @@ export interface RawSettings {
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
 	cwd?: string;
-	/** Agent directory for config.yml storage */
+	/** Agent directory for config.yml/config.yaml storage */
 	agentDir?: string;
 	/** Don't persist to disk (for tests) */
 	inMemory?: boolean;
@@ -234,7 +235,7 @@ export class Settings {
 	#storage: AgentStorage | null = null;
 
 	#configFiles: string[] = [];
-	/** Global settings from config.yml */
+	/** Global settings from config.yml/config.yaml */
 	#global: RawSettings = {};
 	/** Project settings from .claude/settings.yml etc */
 	#project: RawSettings = {};
@@ -264,7 +265,7 @@ export class Settings {
 	private constructor(options: SettingsOptions = {}) {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
-		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, "config.yml");
+		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
 		this.#configFiles = options.configFiles?.map(file => path.resolve(this.#cwd, expandTilde(file))) ?? [];
 		this.#persist = !options.inMemory && options.readOnly !== true;
 
@@ -458,6 +459,7 @@ export class Settings {
 			inMemory: !this.#persist,
 		});
 		cloned.#storage = this.#storage;
+		cloned.#configPath = this.#configPath;
 		cloned.#global = structuredClone(this.#global);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		cloned.#configFiles = [...this.#configFiles];
@@ -602,9 +604,10 @@ export class Settings {
 	}
 
 	/**
-	 * Set a model role (helper for modelRoles record).
+	 * Set a model role (helper for modelRoles record). Passing `undefined`
+	 * clears the role from the persisted record and any runtime override.
 	 */
-	setModelRole(role: ModelRole | string, modelId: string): void {
+	setModelRole(role: ModelRole | string, modelId: string | undefined): void {
 		const current = this.#modelRolesFromLayer(this.#global);
 		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
 		const updateRuntimeOverride =
@@ -613,12 +616,20 @@ export class Settings {
 			!Array.isArray(runtimeOverrides) &&
 			Object.hasOwn(runtimeOverrides, role);
 
-		current[role] = modelId;
+		if (modelId === undefined) {
+			delete current[role];
+		} else {
+			current[role] = modelId;
+		}
 		this.set("modelRoles", current);
 
 		if (updateRuntimeOverride) {
 			const nextRuntimeOverride = this.#modelRolesFromLayer(this.#overrides);
-			nextRuntimeOverride[role] = modelId;
+			if (modelId === undefined) {
+				delete nextRuntimeOverride[role];
+			} else {
+				nextRuntimeOverride[role] = modelId;
+			}
 			this.override("modelRoles", nextRuntimeOverride);
 		}
 	}
@@ -676,16 +687,22 @@ export class Settings {
 
 	async #load(): Promise<Settings> {
 		// Project settings load (loadCapability scans cwd) is independent of the
-		// persist chain (storage open → legacy migration → global config.yml read),
-		// so kick it off first and await after the persist chain completes. The
-		// persist steps remain sequential: migration may write config.yml, which
-		// #loadYaml then reads; migration's db fallback needs #storage opened.
+		// persist chain (storage open → legacy migration → global config read), so
+		// kick it off first and await after the persist chain completes. The
+		// persist steps remain sequential: existing config discovery decides
+		// whether migration may write config.yml before the global config is read;
+		// migration's db fallback needs #storage opened.
 		const projectPromise = this.#loadProjectSettings();
 
 		if (this.#persist) {
 			this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
-			await this.#migrateFromLegacy();
-			this.#global = await this.#loadYaml(this.#configPath!);
+			const existingConfig = await this.#loadExistingMainYaml();
+			if (existingConfig) {
+				this.#global = existingConfig;
+			} else {
+				await this.#migrateFromLegacy();
+				this.#global = await this.#loadYaml(this.#configPath!);
+			}
 			await this.#seedLastChangelogVersionMarker();
 		}
 
@@ -701,8 +718,9 @@ export class Settings {
 	async #loadReadOnly(): Promise<Settings> {
 		const projectPromise = this.#loadProjectSettings();
 
-		if (this.#configPath) {
-			this.#global = await this.#loadYaml(this.#configPath);
+		const existingConfig = await this.#loadExistingMainYaml();
+		if (existingConfig) {
+			this.#global = existingConfig;
 		}
 
 		this.#project = await projectPromise;
@@ -712,18 +730,44 @@ export class Settings {
 	}
 
 	async #loadYaml(filePath: string): Promise<RawSettings> {
+		const loaded = await this.#loadYamlIfPresent(filePath);
+		return loaded ?? {};
+	}
+
+	async #loadYamlIfPresent(filePath: string): Promise<RawSettings | null> {
+		let content: string;
 		try {
-			const content = await Bun.file(filePath).text();
+			content = await Bun.file(filePath).text();
+		} catch (error) {
+			if (isEnoent(error)) return null;
+			logger.warn("Settings: failed to load", { path: filePath, error: String(error) });
+			return {};
+		}
+
+		try {
 			const parsed = YAML.parse(content);
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 				return {};
 			}
 			return this.#migrateRawSettings(parsed as RawSettings);
 		} catch (error) {
-			if (isEnoent(error)) return {};
 			logger.warn("Settings: failed to load", { path: filePath, error: String(error) });
 			return {};
 		}
+	}
+
+	async #loadExistingMainYaml(): Promise<RawSettings | null> {
+		if (!this.#configPath) return null;
+		for (const filename of MAIN_CONFIG_FILENAMES) {
+			const configPath = path.join(this.#agentDir, filename);
+			const loaded = await this.#loadYamlIfPresent(configPath);
+			if (loaded) {
+				this.#configPath = configPath;
+				return loaded;
+			}
+		}
+		this.#configPath = path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
+		return null;
 	}
 
 	async #loadProjectSettings(): Promise<RawSettings> {
@@ -780,14 +824,6 @@ export class Settings {
 
 	async #migrateFromLegacy(): Promise<void> {
 		if (!this.#configPath) return;
-
-		// Check if config.yml already exists
-		try {
-			await Bun.file(this.#configPath).text();
-			return; // Already exists, no migration needed
-		} catch (err) {
-			if (!isEnoent(err)) return;
-		}
 
 		let settings: RawSettings = {};
 		let migrated = false;

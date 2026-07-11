@@ -2,6 +2,37 @@
 
 ## [Unreleased]
 
+## [16.4.3] - 2026-07-11
+
+### Fixed
+
+- Fixed an issue where skipped sibling tool results incorrectly reported that a queued user message caused the skip.
+
+## [16.4.2] - 2026-07-10
+
+### Fixed
+
+- Fixed serialization of BigInt tool arguments to prevent data loss during remote compaction.
+
+## [16.4.1] - 2026-07-10
+
+### Fixed
+
+- Enabled reasoning encryption content for all Responses Lite compaction requests
+
+## [16.4.0] - 2026-07-10
+
+### Added
+
+- Added the `ThinkingLevel.Max` ("max") configuration option, mapping to the `Effort.Max` tier for supported models.
+
+### Fixed
+
+- Fixed remote compaction behavior for Codex Responses Lite (GPT-5.6 family) models across both V1 and V2 endpoints to ensure correct formatting and routing.
+- Fixed an issue where aborted tool-result hooks could trigger subsequent provider calls before the abort signal fully settled.
+
+## [16.3.12] - 2026-07-08
+
 ### Added
 
 - Added per-tool abort metadata so stream-wide aborts can label matching tool-call placeholders separately from unaffected sibling calls ([#2783](https://github.com/can1357/oh-my-pi/issues/2783)).

@@ -1289,13 +1289,17 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const ignoreResultLimits = options.ignoreResultLimits ?? false;
 		const requestedEnd = limit !== undefined ? Math.min(requestedStart + limit, allLines.length) : allLines.length;
 		// Expand only on sides the user actually constrained: leading context
-		// when offset>1, trailing context when a finite limit was set.
+		// when offset>1, trailing context when a finite limit was set. Raw mode
+		// never expands — without line numbers the padding is indistinguishable
+		// from requested content, so `raw:31-31` must return line 31 and nothing
+		// else (verbatim-extraction contract).
+		const rawDisplay = options.raw === true;
 		const expanded = expandRangeWithContext(
 			requestedStart,
 			requestedEnd,
 			allLines.length,
-			offset !== undefined && offset > 1,
-			limit !== undefined,
+			!rawDisplay && offset !== undefined && offset > 1,
+			!rawDisplay && limit !== undefined,
 		);
 		const startLine = expanded.startLine;
 		const endLineExpanded = expanded.endLine;
@@ -2118,13 +2122,10 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		_toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		let { path: readPath } = params;
-		let explicitSelector = params.selector?.trim();
+		let explicitSelector = params.selector?.trim() || undefined;
 		let explicitParsedSelector = explicitSelector === undefined ? undefined : parseSel(explicitSelector);
-		if (
-			params.selector !== undefined &&
-			(explicitSelector === undefined || explicitSelector.length === 0 || explicitParsedSelector?.kind === "none")
-		) {
-			throw invalidSelector(params.selector);
+		if (explicitSelector !== undefined && explicitParsedSelector?.kind === "none") {
+			throw invalidSelector(explicitSelector);
 		}
 		if (readPath.startsWith("file://")) {
 			readPath = expandPath(readPath);
@@ -2530,10 +2531,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					}
 
 					// User-requested 0-indexed range start. Lines BEFORE this become
-					// leading context (added below if offset is explicit).
+					// leading context (added below if offset is explicit). Raw mode
+					// never adds context: without line numbers the padding is
+					// indistinguishable from requested content, so `raw:31-31` must
+					// return line 31 and nothing else.
+					const rawSelector = isRawSelector(parsed);
 					const requestedStart = offset ? Math.max(0, offset - 1) : 0;
-					const expandStart = offset !== undefined && offset > 1;
-					const expandEnd = limit !== undefined;
+					const expandStart = !rawSelector && offset !== undefined && offset > 1;
+					const expandEnd = !rawSelector && limit !== undefined;
 					const leadingContext = expandStart ? Math.min(requestedStart, RANGE_LEADING_CONTEXT_LINES) : 0;
 					const trailingContext = expandEnd ? RANGE_TRAILING_CONTEXT_LINES : 0;
 					const startLine = requestedStart - leadingContext;
@@ -2584,7 +2589,6 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					// verbatim bytes for paste-back-into-tool workflows. Total byte/line
 					// counts in `truncation` keep reflecting the source, not the trimmed
 					// view — column truncation surfaces separately via `.limits()`.
-					const rawSelector = isRawSelector(parsed);
 					const maxColumns = resolveOutputMaxColumns(this.session.settings);
 					// Column truncation is display-only. `collectedLines` MUST stay
 					// byte-for-byte with the on-disk content so the snapshot recorded
@@ -2975,8 +2979,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		const { offset, limit } = selToOffsetLimit(parsedSel);
 		const requestedStart = offset ? Math.max(0, offset - 1) : 0;
-		const expandStart = offset !== undefined && offset > 1;
-		const expandEnd = limit !== undefined;
+		// Raw mode never adds context lines — see the plain-file range path.
+		const expandStart = !rawSelector && offset !== undefined && offset > 1;
+		const expandEnd = !rawSelector && limit !== undefined;
 		const leadingContext = expandStart ? Math.min(requestedStart, RANGE_LEADING_CONTEXT_LINES) : 0;
 		const trailingContext = expandEnd ? RANGE_TRAILING_CONTEXT_LINES : 0;
 		const startLine = requestedStart - leadingContext;
@@ -3314,6 +3319,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 interface ReadRenderArgs {
 	path?: unknown;
 	file_path?: unknown;
+	selector?: unknown;
 	sel?: string;
 	// Legacy fields from old schema — tolerated for in-flight tool calls during transition
 	offset?: number;
@@ -3378,10 +3384,20 @@ function formatReadPathLink(
 
 export const readToolRenderer = {
 	renderCall(args: ReadRenderArgs, _options: RenderResultOptions, uiTheme: Theme): Component {
-		const rawPath =
+		const baseRawPath =
 			typeof args.file_path === "string" ? args.file_path : typeof args.path === "string" ? args.path : "";
-		if (isReadableUrlPath(rawPath)) {
-			return renderReadUrlCall({ path: rawPath, raw: args.raw }, _options, uiTheme);
+		const explicitSelector =
+			typeof args.selector === "string"
+				? args.selector.trim().replace(/^:+/, "")
+				: args.sel?.trim().replace(/^:+/, "");
+		const rawPath =
+			explicitSelector && explicitSelector.length > 0 ? `${baseRawPath}:${explicitSelector}` : baseRawPath;
+		if (isReadableUrlPath(baseRawPath)) {
+			return renderReadUrlCall(
+				{ path: rawPath, raw: args.raw || explicitSelector?.toLowerCase() === "raw" },
+				_options,
+				uiTheme,
+			);
 		}
 
 		const offset = args.offset;
@@ -3405,9 +3421,9 @@ export const readToolRenderer = {
 		args?: ReadRenderArgs,
 	): Component {
 		const urlDetails = result.details as ReadUrlToolDetails | undefined;
-		const rawPathForKind =
+		const baseRawPathForKind =
 			typeof args?.file_path === "string" ? args.file_path : typeof args?.path === "string" ? args.path : "";
-		if (urlDetails?.kind === "url" || isReadableUrlPath(rawPathForKind)) {
+		if (urlDetails?.kind === "url" || isReadableUrlPath(baseRawPathForKind)) {
 			return renderReadUrlResult(
 				result as {
 					content: Array<{ type: string; text?: string }>;
@@ -3422,8 +3438,14 @@ export const readToolRenderer = {
 		if (result.isError) {
 			const rawErrorText = result.content?.find(c => c.type === "text")?.text ?? "";
 			const errorText = (rawErrorText || "Unknown error").replace(/^Error:\s*/, "");
-			const rawPath =
+			const baseRawPath =
 				typeof args?.file_path === "string" ? args.file_path : typeof args?.path === "string" ? args.path : "";
+			const explicitSelector =
+				typeof args?.selector === "string"
+					? args.selector.trim().replace(/^:+/, "")
+					: args?.sel?.trim().replace(/^:+/, "");
+			const rawPath =
+				explicitSelector && explicitSelector.length > 0 ? `${baseRawPath}:${explicitSelector}` : baseRawPath;
 			const filePath =
 				formatReadPathLink(rawPath, { offset: args?.offset, sourcePath: readSourceFsPath(result.details) }) ||
 				shortenPath(rawPath);
@@ -3450,8 +3472,14 @@ export const readToolRenderer = {
 		// echo next to the styled warning line below.
 		const contentText = details?.displayContent?.text ?? stripOutputNotice(rawText, details?.meta);
 		const imageContent = result.content?.find(c => c.type === "image");
-		const rawPath =
+		const baseRawPath =
 			typeof args?.file_path === "string" ? args.file_path : typeof args?.path === "string" ? args.path : "";
+		const explicitSelector =
+			typeof args?.selector === "string"
+				? args.selector.trim().replace(/^:+/, "")
+				: args?.sel?.trim().replace(/^:+/, "");
+		const rawPath =
+			explicitSelector && explicitSelector.length > 0 ? `${baseRawPath}:${explicitSelector}` : baseRawPath;
 		const renderPath = splitReadRenderPath(rawPath);
 		const lang = getLanguageFromPath(renderPath.path);
 

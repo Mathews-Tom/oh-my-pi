@@ -84,6 +84,7 @@ import { canonicalizeMessage } from "../../utils/thinking-display";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
 	buildToolCallStartUpdate,
+	extractAssistantMessageText,
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
@@ -128,6 +129,15 @@ type PromptLifecycleError = Error & { readonly code: "ACP_SESSION_CLOSED" };
 type PromptTurnState = {
 	cancelRequested: boolean;
 	settled: boolean;
+	/**
+	 * Delivery of streamed assistant `error` chunks this turn (the mapper
+	 * surfaces them as `agent_message_chunk`s). Resolves `true` once at least
+	 * one error chunk reached the client — the `agent_end` error fallback in
+	 * {@link AcpAgent##flushUnreportedTurnError} awaits it and stays silent on
+	 * success, so a fallback racing an in-flight delivery can neither duplicate
+	 * the error nor drop it when delivery fails.
+	 */
+	errorTextDelivery: Promise<boolean> | undefined;
 	/**
 	 * `abort()` is in-flight (or its bounded-timeout race). `undefined` while the turn is
 	 * running normally and after cleanup completes. The turn occupies `record.promptTurn`
@@ -425,6 +435,7 @@ export function createAcpExtensionUiContext(
 		setEditorText: () => {},
 		getEditorText: () => "",
 		editor: async () => undefined,
+		addAutocompleteProvider: () => {},
 		setEditorComponent: () => {},
 		get theme() {
 			return theme;
@@ -682,6 +693,7 @@ export class AcpAgent implements Agent {
 			record.promptTurn = {
 				cancelRequested: false,
 				settled: false,
+				errorTextDelivery: undefined,
 				cleanup: undefined,
 				usageBaseline: this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
 				unsubscribe: undefined,
@@ -843,13 +855,16 @@ export class AcpAgent implements Agent {
 			return false;
 		}
 		const built = await buildSkillPromptMessage(skill, parsed.args, "user");
-		await record.session.promptCustomMessage({
-			customType: SKILL_PROMPT_MESSAGE_TYPE,
-			content: built.message,
-			display: true,
-			details: built.details,
-			attribution: "user",
-		});
+		await record.session.promptCustomMessage(
+			{
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
+				content: built.message,
+				display: true,
+				details: built.details,
+				attribution: "user",
+			},
+			{ streamingBehavior: "steer" },
+		);
 		return true;
 	}
 
@@ -1195,6 +1210,10 @@ export class AcpAgent implements Agent {
 			imageDataCache.set(key, resolved);
 			return resolved;
 		};
+		const streamedAssistantError =
+			event.type === "message_update" &&
+			event.message.role === "assistant" &&
+			event.assistantMessageEvent.type === "error";
 		for (const notification of mapAgentSessionEventToAcpSessionUpdates(event, record.session.sessionId, {
 			getMessageId: message => this.#getLiveMessageId(record, message),
 			getMessageProgress: message => this.#getLiveMessageProgress(record, message),
@@ -1202,7 +1221,18 @@ export class AcpAgent implements Agent {
 			cwd: record.session.sessionManager.getCwd(),
 			resolveImageData: resolveImageDataForAcp,
 		})) {
-			await this.#connection.sessionUpdate(notification);
+			const delivery = this.#connection.sessionUpdate(notification);
+			if (streamedAssistantError) {
+				// Resolves true only once the error chunk actually reached the
+				// client — a failed delivery keeps the agent_end fallback armed.
+				const outcome = delivery.then(
+					() => true,
+					() => false,
+				);
+				const prior = promptTurn.errorTextDelivery;
+				promptTurn.errorTextDelivery = prior ? Promise.all([prior, outcome]).then(([a, b]) => a || b) : outcome;
+			}
+			await delivery;
 		}
 		if (event.type === "tool_execution_end") {
 			record.toolArgsById.delete(event.toolCallId);
@@ -1210,13 +1240,100 @@ export class AcpAgent implements Agent {
 		this.#clearLiveAssistantMessageAfterEvent(record, event);
 
 		if (event.type === "agent_end") {
+			await this.#flushMissedFinalAssistantText(record, event);
+			await this.#flushUnreportedTurnError(record, event);
 			await this.#emitEndOfTurnUpdates(record);
 			await this.#waitForAcpPromptIdle(record);
+			record.liveMessageId = undefined;
+			record.liveMessageProgress = undefined;
 			this.#finishPrompt(record, {
 				stopReason: this.#resolveStopReason(event, promptTurn.cancelRequested),
 				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
 			});
 		}
+	}
+
+	/**
+	 * Deliver the final visible answer when the assistant `message_end` never
+	 * reached this prompt turn's subscription. Session event handlers are
+	 * fire-and-forget (`Agent#emit` does not await async listeners), and
+	 * `agent_end` is flushed through the session's `#endInFlight` path while the
+	 * assistant `message_end` fan-out can still be parked on extension delivery —
+	 * so `agent_end` can overtake `message_end`. Once the turn finishes,
+	 * `#finishPrompt` unsubscribes and the fallback text emission in
+	 * `mapAssistantMessageEnd` is lost for good: a client that only received
+	 * `agent_thought_chunk`s stays stuck on the thinking block (#4902). The live
+	 * message progress records whether visible text ever reached the client; if
+	 * it has not, emit the last assistant message's text before the prompt
+	 * resolves. A `message_end` that lands during the end-of-turn waits still
+	 * takes the normal mapper path and sees `textEmitted` already set, so the
+	 * answer is delivered exactly once.
+	 */
+	async #flushMissedFinalAssistantText(
+		record: ManagedSessionRecord,
+		event: Extract<AgentSessionEvent, { type: "agent_end" }>,
+	): Promise<void> {
+		const progress = record.liveMessageProgress;
+		if (!progress || progress.textEmitted) {
+			return;
+		}
+		const lastAssistant = [...event.messages]
+			.reverse()
+			.find((message): message is AssistantMessage => message.role === "assistant");
+		if (!lastAssistant) {
+			return;
+		}
+		const text = extractAssistantMessageText(lastAssistant);
+		if (text.length === 0) {
+			return;
+		}
+		progress.textEmitted = true;
+		await this.#connection.sessionUpdate({
+			sessionId: record.session.sessionId,
+			update: {
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text },
+				messageId: record.liveMessageId,
+			},
+		});
+	}
+
+	/**
+	 * Surface a turn-fatal provider error that never reached the client. A
+	 * request that fails before streaming any assistant events — e.g. GitHub
+	 * Copilot's `HTTP 400 model_not_supported` after retries — emits only
+	 * `agent_end` with an empty assistant message carrying `errorMessage`
+	 * (`Agent#runLoop`'s catch), so no `message_update`/`message_end` ever maps
+	 * to a session update and the client sees the turn end silently. Errors
+	 * that did stream are tracked via {@link PromptTurnState.errorTextDelivery};
+	 * the fallback awaits that delivery and re-sends only when it failed.
+	 */
+	async #flushUnreportedTurnError(
+		record: ManagedSessionRecord,
+		event: Extract<AgentSessionEvent, { type: "agent_end" }>,
+	): Promise<void> {
+		const streamedDelivery = record.promptTurn?.errorTextDelivery;
+		if (streamedDelivery && (await streamedDelivery)) {
+			return;
+		}
+		const lastAssistant = [...event.messages]
+			.reverse()
+			.find((message): message is AssistantMessage => message.role === "assistant");
+		if (lastAssistant?.stopReason !== "error") {
+			return;
+		}
+		const errorMessage = lastAssistant.errorMessage;
+		if (!errorMessage || isSilentAbort(lastAssistant)) {
+			return;
+		}
+		await this.#connection.sessionUpdate({
+			sessionId: record.session.sessionId,
+			update: {
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text: errorMessage },
+				messageId: record.liveMessageId ?? crypto.randomUUID(),
+			},
+		});
 	}
 
 	async #waitForAcpPromptIdle(record: ManagedSessionRecord): Promise<void> {
@@ -1244,8 +1361,16 @@ export class AcpAgent implements Agent {
 		}
 	}
 
+	/**
+	 * Reset live-message tracking once the assistant `message_end` is handled.
+	 * The `agent_end` reset happens inside the `agent_end` branch of
+	 * `#handlePromptEvent` — after `#flushMissedFinalAssistantText` — so a
+	 * `message_end` that arrives during the end-of-turn waits maps against the
+	 * real progress instead of resurrecting a fresh one (which would double-emit
+	 * the final answer).
+	 */
 	#clearLiveAssistantMessageAfterEvent(record: ManagedSessionRecord, event: AgentSessionEvent): void {
-		if ((event.type === "message_end" && event.message.role === "assistant") || event.type === "agent_end") {
+		if (event.type === "message_end" && event.message.role === "assistant") {
 			record.liveMessageId = undefined;
 			record.liveMessageProgress = undefined;
 		}

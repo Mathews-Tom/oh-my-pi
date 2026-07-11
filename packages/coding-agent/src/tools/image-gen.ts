@@ -831,11 +831,10 @@ function buildOpenAIImageHeaders(model: Model, apiKey: string, sessionId: string
 
 	if (model.api === "openai-codex-responses" || model.provider === "openai-codex") {
 		const accountId = getCodexAccountId(apiKey);
-		if (!accountId) {
-			throw new Error("Failed to extract accountId from OpenAI Codex token");
-		}
 		headers.delete("x-api-key");
-		headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
+		if (accountId) {
+			headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
+		}
 		headers.set(OPENAI_HEADERS.BETA, OPENAI_HEADER_VALUES.BETA_RESPONSES);
 		headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
 		headers.set("User-Agent", `pi/${packageJson.version} (${os.platform()} ${os.release()}; ${os.arch()})`);
@@ -1276,7 +1275,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				const xaiCreds = await resolveXAIHttpCredentials(ctx.modelRegistry, resolvedModel);
 				if (!xaiCreds) {
 					throw new Error(
-						"No xAI credentials. Run /login → xAI Grok OAuth (SuperGrok Subscription) or set XAI_API_KEY.",
+						"No xAI credentials. Run /login → xAI Grok OAuth (SuperGrok or X Premium+) or set XAI_API_KEY.",
 					);
 				}
 

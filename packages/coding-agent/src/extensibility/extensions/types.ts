@@ -30,7 +30,7 @@ import type {
 	TSchema,
 } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
-import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
+import type { AutocompleteItem, AutocompleteProvider, Component, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
 import type { Type as arktype } from "arktype";
 import type * as zod from "zod/v4";
@@ -113,6 +113,46 @@ export interface ExtensionUISelectOption {
 
 export type ExtensionUISelectItem = string | ExtensionUISelectOption;
 
+export interface ExtensionAskDialogOption {
+	label: string;
+	description?: string;
+	preview?: string;
+}
+
+export interface ExtensionAskDialogQuestion {
+	id: string;
+	question: string;
+	header?: string;
+	options: ExtensionAskDialogOption[];
+	multi?: boolean;
+	recommended?: number;
+}
+
+export interface ExtensionAskDialogResultItem {
+	id: string;
+	question: string;
+	options: string[];
+	multi: boolean;
+	selectedOptions: string[];
+	customInput?: string;
+	note?: string;
+	timedOut?: boolean;
+}
+
+export interface ExtensionAskDialogSubmitResult {
+	kind: "submit";
+	results: ExtensionAskDialogResultItem[];
+}
+
+/** Chat-redirect result: the user chose "Chat about this" instead of
+ *  answering. Distinct from `undefined` (cancel) so AskTool can hand off to
+ *  the chat loop rather than aborting. */
+export interface ExtensionAskDialogChatResult {
+	kind: "chat";
+}
+
+export type ExtensionAskDialogResult = ExtensionAskDialogSubmitResult | ExtensionAskDialogChatResult;
+
 export function getExtensionUISelectOptionLabel(option: ExtensionUISelectItem): string {
 	return typeof option === "string" ? option : option.label;
 }
@@ -125,6 +165,10 @@ export interface ExtensionUIDialogOptions {
 	timeout?: number;
 	/** Invoked when the UI times out while waiting for a selection/input */
 	onTimeout?: () => void;
+	/** Invoked when the UI-managed timeout countdown starts */
+	onTimeoutStart?: () => void;
+	/** Invoked when user input resets a UI-managed timeout countdown */
+	onTimeoutReset?: () => void;
 	/** Initial cursor position for select dialogs (0-indexed) */
 	initialIndex?: number;
 	/** Render an outlined list for select dialogs */
@@ -163,6 +207,9 @@ export type ExtensionUiComponent = Component & { dispose?(): void };
 export type ExtensionUiComponentFactory = (tui: TUI, theme: Theme) => ExtensionUiComponent;
 export type ExtensionWidgetContent = string[] | ExtensionUiComponentFactory | undefined;
 
+/** Wrap the current autocomplete provider with additional behavior (pi-compatible). */
+export type AutocompleteProviderFactory = (current: AutocompleteProvider) => AutocompleteProvider;
+
 /**
  * UI context for extensions to request interactive UI.
  * Each mode (interactive, RPC, print) provides its own implementation.
@@ -173,6 +220,8 @@ export type ExtensionWidgetContent = string[] | ExtensionUiComponentFactory | un
 // and may be invoked from event handlers that have already taken the agent
 // loop's lock — hooks intentionally cannot.
 export interface ExtensionUIContext {
+	/** True when selector timeouts start only after the dialog is presented. */
+	timeoutStartsOnPresentation?: boolean;
 	/** Show a selector and return the selected label, even when an option also includes a description. */
 	select(
 		title: string,
@@ -185,6 +234,12 @@ export interface ExtensionUIContext {
 
 	/** Show a text input dialog. */
 	input(title: string, placeholder?: string, dialogOptions?: ExtensionUIDialogOptions): Promise<string | undefined>;
+
+	/** Show the rich ask dialog when the interactive TUI surface is available. */
+	askDialog?(
+		questions: ExtensionAskDialogQuestion[],
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionAskDialogResult | undefined>;
 
 	/** Show a notification to the user. */
 	notify(message: string, type?: "info" | "warning" | "error"): void;
@@ -242,6 +297,14 @@ export interface ExtensionUIContext {
 		dialogOptions?: ExtensionUIDialogOptions,
 		editorOptions?: { promptStyle?: boolean },
 	): Promise<string | undefined>;
+
+	/**
+	 * Stack additional autocomplete behavior on top of the built-in provider
+	 * (pi-compatible). Interactive mode rebuilds the editor's provider through
+	 * every registered factory, in registration order; headless modes (print,
+	 * RPC, ACP, subagents) accept and ignore the factory.
+	 */
+	addAutocompleteProvider(factory: AutocompleteProviderFactory): void;
 
 	/**
 	 * Set a custom editor component via factory function, or `undefined` to restore the default editor.
@@ -1107,7 +1170,7 @@ export interface ExtensionAPI {
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): void;
 
-	/** Send a user message to the agent, or queue it when deliverAs is set. */
+	/** Send a user prompt: idle starts a turn; streaming queues as steer unless deliverAs is set. */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
 		options?: { deliverAs?: "steer" | "followUp" },

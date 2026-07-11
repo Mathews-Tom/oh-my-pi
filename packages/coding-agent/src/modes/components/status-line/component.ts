@@ -275,6 +275,7 @@ export class StatusLineComponent implements Component {
 	#planModeStatus: { enabled: boolean; paused: boolean } | null = null;
 	#loopModeStatus: { enabled: boolean } | null = null;
 	#goalModeStatus: { enabled: boolean; paused: boolean } | null = null;
+	#vibeModeStatus: { enabled: boolean } | null = null;
 	#collabStatus: CollabStatus | null = null;
 	#focusedAgentId: string | undefined;
 	#activeRepoCache: ActiveRepoCache | undefined;
@@ -500,6 +501,10 @@ export class StatusLineComponent implements Component {
 
 	setGoalModeStatus(status: { enabled: boolean; paused: boolean } | undefined): void {
 		this.#goalModeStatus = status ?? null;
+	}
+
+	setVibeModeStatus(status: { enabled: boolean } | undefined): void {
+		this.#vibeModeStatus = status ?? null;
 	}
 
 	setCollabStatus(status: CollabStatus | null): void {
@@ -1046,6 +1051,7 @@ export class StatusLineComponent implements Component {
 			planMode: this.#planModeStatus,
 			loopMode: this.#loopModeStatus,
 			goalMode: this.#goalModeStatus,
+			vibeMode: this.#vibeModeStatus,
 			collab: this.#collabStatus,
 			usageStats,
 			contextPercent,

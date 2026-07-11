@@ -70,6 +70,51 @@ describe("Settings", () => {
 		await Bun.sleep(0);
 		await tempDir?.remove();
 	});
+
+	describe("main config file selection", () => {
+		it("loads and updates an existing config.yaml without creating config.yml", async () => {
+			const yamlConfigPath = path.join(agentDir, "config.yaml");
+			await Bun.write(yamlConfigPath, YAML.stringify({ setupVersion: 1 }, null, 2));
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("setupVersion")).toBe(1);
+
+			settings.set("setupVersion", 2);
+			await settings.flush();
+
+			const savedSettings = YAML.parse(await Bun.file(yamlConfigPath).text()) as Record<string, unknown>;
+			expect(savedSettings.setupVersion).toBe(2);
+			expect(await Bun.file(getConfigPath()).exists()).toBe(false);
+		});
+
+		it("clones the selected config.yaml path for persisted settings", async () => {
+			const yamlConfigPath = path.join(agentDir, "config.yaml");
+			await Bun.write(yamlConfigPath, YAML.stringify({ setupVersion: 1 }, null, 2));
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const cloned = await settings.cloneForCwd(tempDir.join("other-project"));
+
+			cloned.set("setupVersion", 2);
+			await cloned.flush();
+
+			const savedSettings = YAML.parse(await Bun.file(yamlConfigPath).text()) as Record<string, unknown>;
+			expect(savedSettings.setupVersion).toBe(2);
+			expect(await Bun.file(getConfigPath()).exists()).toBe(false);
+		});
+
+		it("creates config.yml for new persisted settings when no main config exists", async () => {
+			const yamlConfigPath = path.join(agentDir, "config.yaml");
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.set("setupVersion", 1);
+			await settings.flush();
+
+			expect(await Bun.file(getConfigPath()).exists()).toBe(true);
+			expect(await Bun.file(yamlConfigPath).exists()).toBe(false);
+			expect((await readSettings()).setupVersion).toBe(1);
+		});
+	});
+
 	describe("defaults", () => {
 		it("keeps eight inline images live by default", async () => {
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
@@ -405,6 +450,31 @@ describe("Settings", () => {
 			settings.clearOverride("modelRoles");
 
 			expect(settings.getModelRole("default")).toBe("anthropic/claude-opus-4-5");
+		});
+		it("clears a role when setModelRole receives undefined", () => {
+			const settings = Settings.isolated();
+
+			settings.setModelRole("smol", "x/y");
+			expect(settings.getModelRole("smol")).toBe("x/y");
+
+			settings.setModelRole("smol", undefined);
+
+			expect(settings.getModelRole("smol")).toBeUndefined();
+			expect(Object.hasOwn(settings.getModelRoles(), "smol")).toBe(false);
+		});
+
+		it("clears a role from the runtime override layer so the effective view updates immediately", () => {
+			const settings = Settings.isolated({
+				modelRoles: { smol: "anthropic/claude-haiku-4-5" },
+			});
+
+			settings.overrideModelRoles({ smol: "openai/gpt-5.2-codex" });
+			expect(settings.getModelRole("smol")).toBe("openai/gpt-5.2-codex");
+
+			settings.setModelRole("smol", undefined);
+
+			expect(settings.getModelRole("smol")).toBeUndefined();
+			expect(Object.hasOwn(settings.getModelRoles(), "smol")).toBe(false);
 		});
 	});
 

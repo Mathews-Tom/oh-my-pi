@@ -20,6 +20,7 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
 import { createLspWritethrough, type FileDiagnosticsResult, type WritethroughCallback, writethroughNoop } from "../lsp";
+import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
 import { getLanguageFromPath, highlightCode, type Theme } from "../modes/theme/theme";
 import writeDescription from "../prompts/tools/write.md" with { type: "text" };
@@ -323,12 +324,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	}
 
 	readonly #writethrough: WritethroughCallback;
+	readonly #deferredDiagnostics: DeferredDiagnostics | undefined;
 
 	constructor(private readonly session: ToolSession) {
 		const enableLsp = session.enableLsp ?? true;
 		const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
 		const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnWrite");
 		const dedup = enableDiagnostics && session.settings.get("lsp.diagnosticsDeduplicate");
+		this.#deferredDiagnostics =
+			enableDiagnostics && session.queueDeferredDiagnostics ? new DeferredDiagnostics(session, dedup) : undefined;
 		this.#writethrough = enableLsp
 			? createLspWritethrough(session.cwd, {
 					enableFormat,
@@ -931,9 +935,18 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				};
 			}
 
-			const diagnostics = await this.#writethrough(absolutePath, cleanContent, signal, undefined, batchRequest);
+			const diagnostics = await this.#writethrough(
+				absolutePath,
+				cleanContent,
+				signal,
+				undefined,
+				batchRequest,
+				dst => this.#deferredDiagnostics?.begin(dst),
+			);
 			invalidateFsScanAfterWrite(absolutePath);
-			this.session.bumpFileMutationVersion?.(absolutePath);
+			if (!this.#deferredDiagnostics || batchRequest?.flush === false) {
+				this.session.bumpFileMutationVersion?.(absolutePath);
+			}
 			const madeExecutable = await maybeMarkExecutableForShebang(absolutePath, cleanContent);
 
 			const header = maybeWriteSnapshotHeader(this.session, absolutePath, cleanContent);
@@ -983,6 +996,24 @@ const WRITE_STREAMING_PREVIEW_LINES = 12;
 function countLines(text: string): number {
 	if (!text) return 0;
 	return text.split("\n").length;
+}
+
+/** Bounded newline scan: whether `text` spans more than `maxLines` lines.
+ *  Runs on every live compose (the repaint predicate below), so it must not
+ *  materialize the split the way `countLines` does. */
+function exceedsLineCount(text: string, maxLines: number): boolean {
+	if (!text) return false;
+	let lines = 1;
+	for (let index = text.indexOf("\n"); index !== -1; index = text.indexOf("\n", index + 1)) {
+		if (++lines > maxLines) return true;
+	}
+	return false;
+}
+
+function writeContentOf(args: unknown): string {
+	if (args == null || typeof args !== "object" || !("content" in args)) return "";
+	const content = args.content;
+	return typeof content === "string" ? content : "";
 }
 
 function formatLineCountSuffix(lineCount: number, uiTheme: Theme): string {
@@ -1218,4 +1249,12 @@ export const writeToolRenderer = {
 		});
 	},
 	mergeCallAndResult: true,
+	// The collapsed pending preview follows the streaming edge with a tail
+	// window once the content outgrows it (`… (N earlier lines)` + last rows);
+	// the first partial result re-anchors the frame to the top of the file, so
+	// tail rows already committed to viewport/native scrollback would survive
+	// as stale content above the new frame without a full replay. Expanded and
+	// short previews stay top-anchored and skip the (scrollback-wiping) reset.
+	forceFirstResultViewportRepaint: (args: unknown, options: RenderResultOptions) =>
+		!options.expanded && exceedsLineCount(writeContentOf(args), WRITE_STREAMING_PREVIEW_LINES),
 };
