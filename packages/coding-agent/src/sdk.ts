@@ -1409,26 +1409,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	// Discover rules and bucket them in one pass to avoid repeated scans over large rule sets.
-	const { ttsrManager, rulebookRules, alwaysApplyRules, allRules } = await logger.time(
-		"discoverTtsrRules",
-		async () => {
-			const { TtsrManager } = await import("./export/ttsr");
-			const ttsrSettings = settings.getGroup("ttsr");
-			const ttsrManager = new TtsrManager(ttsrSettings);
-			const rulesResult =
-				options.rules !== undefined
-					? { items: options.rules, warnings: undefined }
-					: await loadCapability<Rule>(ruleCapability.id, { cwd });
-			const { rulebookRules, alwaysApplyRules } = bucketRules(rulesResult.items, ttsrManager, {
-				builtinRules: ttsrSettings.builtinRules,
-				disabledRules: ttsrSettings.disabledRules,
-			});
-			if (existingSession.injectedTtsrRules.length > 0) {
-				ttsrManager.restoreInjected(existingSession.injectedTtsrRules);
-			}
-			return { ttsrManager, rulebookRules, alwaysApplyRules, allRules: rulesResult.items };
-		},
-	);
+	const { ttsrManager, rulebookRules, alwaysApplyRules } = await logger.time("discoverTtsrRules", async () => {
+		const { TtsrManager } = await import("./export/ttsr");
+		const ttsrSettings = settings.getGroup("ttsr");
+		const ttsrManager = new TtsrManager(ttsrSettings);
+		const rulesResult =
+			options.rules !== undefined
+				? { items: options.rules, warnings: undefined }
+				: await loadCapability<Rule>(ruleCapability.id, { cwd });
+		const { rulebookRules, alwaysApplyRules } = bucketRules(rulesResult.items, ttsrManager, {
+			builtinRules: ttsrSettings.builtinRules,
+			disabledRules: ttsrSettings.disabledRules,
+		});
+		if (existingSession.injectedTtsrRules.length > 0) {
+			ttsrManager.restoreInjected(existingSession.injectedTtsrRules);
+		}
+		return { ttsrManager, rulebookRules, alwaysApplyRules };
+	});
+	const activeRules = [...rulebookRules, ...alwaysApplyRules, ...ttsrManager.getRules()];
 
 	// Resolve contextFiles up-front (it's needed before tool creation). The
 	// workspace tree scan is slow on large repos and we MUST NOT block startup on
@@ -1571,7 +1569,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			contextFiles,
 			workspaceTree: resolvedWorkspaceTree,
 			skills,
-			rules: allRules,
+			rules: activeRules,
 			eventBus,
 			outputSchema: options.outputSchema,
 			requireYieldTool: options.requireYieldTool,
@@ -1678,7 +1676,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// registered with the manager and bucketed out before rulebook/always,
 			// so without this a TTSR-only rule (e.g. a triggered builtin) is not
 			// addressable and `rule://` reports "Available: none".
-			setActiveRules([...rulebookRules, ...alwaysApplyRules, ...ttsrManager.getRules()]);
+			setActiveRules(activeRules);
 			if (asyncJobManager) AsyncJobManager.setInstance(asyncJobManager);
 		}
 		const localProtocolOptions = options.localProtocolOptions ?? {
