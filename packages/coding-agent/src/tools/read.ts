@@ -2204,7 +2204,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const internalRouter = InternalUrlRouter.instance();
 		if (internalRouter.canHandle(readPath)) {
 			const internalTarget =
-				explicitSelector === undefined ? splitInternalUrlSel(readPath) : { path: readPath, sel: explicitSelector };
+				explicitSelector === undefined
+					? splitInternalUrlSel(readPath, this.session.rules)
+					: { path: readPath, sel: explicitSelector };
 			const parsed = explicitParsedSelector ?? parseSel(internalTarget.sel);
 			if (internalTarget.sel !== undefined && parsed.kind === "none") {
 				throw new ToolError(
@@ -3156,6 +3158,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			signal,
 			localProtocolOptions: this.session.localProtocolOptions,
 			skills: this.session.skills,
+			rules: this.session.rules,
 		});
 		const details: ReadToolDetails = { resolvedPath: resource.sourcePath, contentType: resource.contentType };
 

@@ -16,6 +16,7 @@ import { loadCapability } from "@oh-my-pi/pi-coding-agent/discovery";
 import { TtsrManager } from "@oh-my-pi/pi-coding-agent/export/ttsr";
 import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import { RuleProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/rule-protocol";
+import { splitInternalUrlSel } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 
 async function writeFile(filePath: string, content: string): Promise<void> {
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
@@ -1467,5 +1468,21 @@ describe("Claude Code rule discovery", () => {
 		const names = result.items.map(rule => rule.name);
 		expect(names).toContain("shared:private");
 		expect(names).toContain("shared:keep");
+	});
+	test("resolves and peels rule URLs with the caller's session rules", async () => {
+		await writeFile(path.join(project, ".claude", "rules", "api.md"), "Session A rule.\n");
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+		const sessionARules = result.items;
+		const sessionBRule: Rule = { ...sessionARules[0], content: "Session B rule.\n" };
+		setActiveRules([sessionBRule]);
+
+		const handler = new RuleProtocolHandler();
+		const resource = await handler.resolve(parseInternalUrl("rule://api"), { rules: sessionARules });
+		expect(resource.content.trim()).toBe("Session A rule.");
+		expect(await handler.complete("", { rules: sessionARules })).toMatchObject([{ value: "api" }]);
+		expect(splitInternalUrlSel("rule://api:80", sessionARules)).toEqual({ path: "rule://api", sel: "80" });
 	});
 });

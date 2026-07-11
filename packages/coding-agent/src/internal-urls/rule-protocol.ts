@@ -5,7 +5,7 @@
  * - rule://<name> - Reads rule content
  */
 import { getActiveRules } from "../capability/rule";
-import type { InternalResource, InternalUrl, ProtocolHandler, UrlCompletion } from "./types";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
 
 function decodeRuleName(name: string): string {
 	try {
@@ -26,8 +26,8 @@ export class RuleProtocolHandler implements ProtocolHandler {
 	readonly scheme = "rule";
 	readonly immutable = true;
 
-	async resolve(url: InternalUrl): Promise<InternalResource> {
-		const rules = getActiveRules();
+	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
+		const rules = context?.rules ?? getActiveRules();
 
 		const ruleName = url.rawHost || url.hostname;
 		if (!ruleName) {
@@ -61,8 +61,8 @@ export class RuleProtocolHandler implements ProtocolHandler {
 		};
 	}
 
-	async complete(): Promise<UrlCompletion[]> {
-		return getActiveRules().map(rule => {
+	async complete(_query?: string, context?: ResolveContext): Promise<UrlCompletion[]> {
+		return (context?.rules ?? getActiveRules()).map(rule => {
 			const value = encodeRuleUrlHost(rule.name);
 			return {
 				value,

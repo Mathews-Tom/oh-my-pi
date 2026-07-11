@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import { isEnoent, isEnotdir, stripWindowsExtendedLengthPathPrefix } from "@oh-my-pi/pi-utils";
-import { getActiveRules } from "../capability/rule";
+import { getActiveRules, type Rule } from "../capability/rule";
 import type { Skill } from "../extensibility/skills";
 import { InternalUrlRouter, type LocalProtocolOptions, parseInternalUrl } from "../internal-urls";
 import { encodeRuleUrlHost } from "../internal-urls/rule-protocol";
@@ -376,7 +376,10 @@ export async function splitPathAndSelPreferringLiteral(
  * Falls back to the input unchanged when nothing matches.
  */
 
-export function splitInternalUrlSel(rawPath: string): { path: string; sel?: string } {
+export function splitInternalUrlSel(
+	rawPath: string,
+	rules: readonly Rule[] = getActiveRules(),
+): { path: string; sel?: string } {
 	const schemeMatch = rawPath.match(INTERNAL_URL_SCHEME_RE);
 	if (!schemeMatch) return { path: rawPath };
 	const scheme = schemeMatch[1].toLowerCase();
@@ -388,7 +391,7 @@ export function splitInternalUrlSel(rawPath: string): { path: string; sel?: stri
 	if (scheme === "rule") {
 		try {
 			const parsed = parseInternalUrl(rawPath);
-			const activeRuleNames = new Set(getActiveRules().map(rule => rule.name));
+			const activeRuleNames = new Set(rules.map(rule => rule.name));
 			// Exact matches take precedence over every peeled candidate, mirroring
 			// RuleProtocolHandler.resolve's own priority (rawHost, then rawEncodedHost,
 			// then hostname) with no selector peeling at all. Checking each candidate's

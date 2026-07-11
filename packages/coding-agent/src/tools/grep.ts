@@ -158,6 +158,7 @@ async function parsePathSpecs(
 	rawEntries: readonly string[],
 	cwd: string,
 	explicitSelector?: string,
+	rules?: ResolveContext["rules"],
 ): Promise<GrepPathSpec[]> {
 	const normalizedSelector = explicitSelector?.trim() || undefined;
 	const explicitRanges = normalizedSelector === undefined ? undefined : parseLineRanges(normalizedSelector);
@@ -193,7 +194,7 @@ async function parsePathSpecs(
 		// verbatim/index display modes (`raw`, `conflicts`) carry no meaning for
 		// content search, so we accept them — searching the whole resource — and
 		// still honor any embedded line range as a match filter.
-		const internalSplit = splitInternalUrlSel(entry);
+		const internalSplit = splitInternalUrlSel(entry, rules);
 		if (internalSplit.sel !== undefined) {
 			// Reject selectors read's parseSel would reject (`:-10`, `:1-1:1-2`,
 			// `:conflicts:1-1`) instead of silently widening the search or dropping a chunk.
@@ -806,6 +807,7 @@ async function resolveInternalSearchInputs(opts: {
 	archiveDisplayMap: ReadonlyMap<string, string>;
 	localProtocolOptions?: LocalProtocolOptions;
 	skills?: ResolveContext["skills"];
+	rules?: ResolveContext["rules"];
 }): Promise<InternalSearchInputResolution> {
 	const internalRouter = InternalUrlRouter.instance();
 	const paths = opts.resolvedPaths.slice();
@@ -820,6 +822,7 @@ async function resolveInternalSearchInputs(opts: {
 		signal: opts.signal,
 		localProtocolOptions: opts.localProtocolOptions,
 		skills: opts.skills,
+		rules: opts.rules,
 		skipDirectoryListing: true,
 		// Try path-only first so large artifacts (and any other handler that
 		// separates path from content) resolve without materializing bytes.
@@ -968,7 +971,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 			const scopedPaths = toPathList(rawPath);
 			const effectivePaths = scopedPaths.length > 0 ? scopedPaths : ["."];
 			const rawEntries = await expandDelimitedPathEntries(effectivePaths, this.session.cwd);
-			const pathSpecs = await parsePathSpecs(rawEntries, this.session.cwd, selector);
+			const pathSpecs = await parsePathSpecs(rawEntries, this.session.cwd, selector, this.session.rules);
 			const materializedExternalPaths = new Map<string, string>();
 			const materializeExternalUrlForSearch = async (rawPath: string) => {
 				const target = parseReadUrlTarget(rawPath);
@@ -998,6 +1001,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 					archiveDisplayMap,
 					localProtocolOptions: this.session.localProtocolOptions,
 					skills: this.session.skills,
+					rules: this.session.rules,
 				});
 				const searchablePaths = internalResolution.paths;
 				const { virtualResources, virtualPathSet, virtualInputIndexes } = internalResolution;
