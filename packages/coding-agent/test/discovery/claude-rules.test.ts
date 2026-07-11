@@ -1484,6 +1484,9 @@ describe("Claude Code rule discovery", () => {
 		expect(resource.content.trim()).toBe("Session A rule.");
 		expect(await handler.complete("", { rules: sessionARules })).toMatchObject([{ value: "api" }]);
 		expect(splitInternalUrlSel("rule://api:80", sessionARules)).toEqual({ path: "rule://api", sel: "80" });
+		await expect(handler.resolve(parseInternalUrl("rule://api:80"), { rules: sessionARules })).rejects.toThrow(
+			"Unknown rule: api:80",
+		);
 		const disabledManager = new TtsrManager();
 		const { rulebookRules, alwaysApplyRules } = bucketRules(sessionARules, disabledManager, {
 			disabledRules: ["api"],

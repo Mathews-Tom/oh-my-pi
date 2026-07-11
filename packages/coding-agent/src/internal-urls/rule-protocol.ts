@@ -34,7 +34,7 @@ export class RuleProtocolHandler implements ProtocolHandler {
 			throw new Error("rule:// URL requires a rule name: rule://<name>");
 		}
 
-		const exactNames = [url.rawHost, url.rawEncodedHost, url.hostname].filter(
+		const exactNames = [url.rawHost, url.rawEncodedHost, ...(url.port ? [] : [url.hostname])].filter(
 			(name, index, names): name is string => Boolean(name) && names.indexOf(name) === index,
 		);
 		let rule = exactNames
