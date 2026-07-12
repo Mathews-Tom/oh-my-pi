@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [16.4.6] - 2026-07-12
+
+### Added
+
+- Added support for width-changing editor text decorators on standalone presentation lines, with decorated output safely truncated to the available content width.
+
 ## [16.4.5] - 2026-07-11
 
 ### Added
