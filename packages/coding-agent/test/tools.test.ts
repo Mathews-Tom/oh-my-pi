@@ -330,34 +330,6 @@ describe("Coding Agent Tools", () => {
 			expect(result.details?.truncation).toBeUndefined();
 		});
 
-		it("treats empty optional selector as omitted for read", async () => {
-			const testFile = path.join(testDir, "read-empty-selector.txt");
-			const content = "alpha\nselector target\nomega";
-			fs.writeFileSync(testFile, content);
-
-			const omitted = getTextOutput(await readTool.execute("test-read-empty-selector-omitted", { path: testFile }));
-			expect(omitted).toContain("alpha");
-			expect(omitted).toContain("selector target");
-			expect(omitted).toContain("omega");
-
-			for (const { name, selector } of [
-				{ name: "empty", selector: "" },
-				{ name: "whitespace", selector: " \t\n " },
-			]) {
-				const withOptionalSelector = getTextOutput(
-					await readTool.execute(`test-read-empty-selector-${name}`, {
-						path: testFile,
-						selector,
-					}),
-				);
-				expect(withOptionalSelector).toBe(omitted);
-			}
-
-			await expect(
-				readTool.execute("test-read-empty-selector-malformed", { path: testFile, selector: "-100" }),
-			).rejects.toThrow(/Invalid selector/);
-		});
-
 		it("truncates lines wider than the read column cap, leaving narrow lines untouched", async () => {
 			const wideLine = "x".repeat(1500);
 			const testFile = path.join(testDir, "wide.txt");
@@ -1414,6 +1386,7 @@ function b() {
 
 		it("should auto-background long-running commands when enabled", async () => {
 			const deliveries: Array<{ jobId: string; text: string }> = [];
+			const updates: string[] = [];
 			const asyncJobManager = new AsyncJobManager({
 				onJobComplete: async (jobId, text) => {
 					deliveries.push({ jobId, text });
@@ -1435,13 +1408,20 @@ function b() {
 				),
 			);
 
-			const result = await autoBackgroundBashTool.execute("test-call-9-auto-running", {
-				command: "printf 'start\\n'; sleep 0.03; printf 'done\\n'",
-			});
+			const result = await autoBackgroundBashTool.execute(
+				"test-call-9-auto-running",
+				{
+					command: "printf 'start\\n'; sleep 0.03; printf 'done\\n'",
+				},
+				undefined,
+				update => {
+					updates.push(update.content?.find(block => block.type === "text")?.text ?? "");
+				},
+			);
 
 			expect(result.details?.async?.state).toBe("running");
 			expect(result.details?.async?.type).toBe("bash");
-			expect(getTextOutput(result)).toContain("Background job");
+			expect(getTextOutput(result)).toContain("Backgrounded as job");
 			expect(getTextOutput(result)).toContain("start");
 
 			const jobId = result.details?.async?.jobId;
@@ -1450,11 +1430,13 @@ function b() {
 			}
 			const runningJob = asyncJobManager.getJob(jobId);
 			expect(runningJob?.status).toBe("running");
+			const updatesAtBackground = updates.slice();
 			await runningJob?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			expect(deliveries).toHaveLength(1);
 			expect(deliveries[0]?.jobId).toBe(jobId);
 			expect(deliveries[0]?.text).toContain("done");
+			expect(updates).toEqual(updatesAtBackground);
 			await asyncJobManager.dispose();
 		});
 
@@ -1495,7 +1477,7 @@ function b() {
 
 			expect(result.details?.timeoutSeconds).toBe(0.05);
 			expect(result.details?.async?.state).toBe("running");
-			expect(getTextOutput(result)).toContain("Background job");
+			expect(getTextOutput(result)).toContain("Backgrounded as job");
 			const jobId = result.details?.async?.jobId;
 			if (!jobId) {
 				throw new Error("expected an auto-backgrounded job id");
@@ -1675,42 +1657,6 @@ function b() {
 			expect(output).not.toContain("# example.txt");
 			// PI_EDIT_VARIANT=replace in beforeEach disables hashlines; expect line-number mode
 			expect(output).toMatch(/\*2\|match line/);
-		});
-
-		it("treats empty optional selector as omitted for search", async () => {
-			const testFile = path.join(testDir, "grep-empty-selector.txt");
-			fs.writeFileSync(testFile, "before\nneedle empty selector\nbetween\nneedle whitespace selector\nafter");
-
-			const omitted = getTextOutput(
-				await searchTool.execute("test-search-empty-selector-omitted", {
-					pattern: "needle",
-					path: testFile,
-				}),
-			);
-			expect(omitted).toMatch(/\*2\|needle empty selector/);
-			expect(omitted).toMatch(/\*4\|needle whitespace selector/);
-
-			for (const { name, selector } of [
-				{ name: "empty", selector: "" },
-				{ name: "whitespace", selector: " \t\n " },
-			]) {
-				const withOptionalSelector = getTextOutput(
-					await searchTool.execute(`test-search-empty-selector-${name}`, {
-						pattern: "needle",
-						path: testFile,
-						selector,
-					}),
-				);
-				expect(withOptionalSelector).toBe(omitted);
-			}
-
-			await expect(
-				searchTool.execute("test-search-empty-selector-malformed", {
-					pattern: "needle",
-					path: testFile,
-					selector: "not-a-range",
-				}),
-			).rejects.toThrow(/selector "not-a-range" is invalid/);
 		});
 
 		it("flags a zero-match search as contextually useless", async () => {

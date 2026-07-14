@@ -22,11 +22,12 @@ import {
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import { formatNumber } from "@oh-my-pi/pi-utils";
-import { getRoleInfo, MODEL_ROLE_IDS } from "../../config/model-roles";
+import { getModelMatchPreferences, resolveModelRoleValue } from "../../config/model-resolver";
+import { getKnownRoleIds, getRoleInfo, MODEL_ROLE_IDS } from "../../config/model-roles";
 import type { Settings } from "../../config/settings";
 import type { ModelPerfStats } from "../../session/agent-storage";
-import { AUTO_THINKING, type ConfiguredThinkingLevel } from "../../thinking";
-import { theme } from "../theme/theme";
+import { AUTO_THINKING, type ConfiguredThinkingLevel, parseConfiguredThinkingLevel } from "../../thinking";
+import { type ThemeColor, theme } from "../theme/theme";
 import {
 	matchesSelectCancel,
 	matchesSelectDown,
@@ -35,12 +36,14 @@ import {
 	matchesSelectUp,
 } from "../utils/keybinding-matchers";
 
-/** One selectable model row. `selector` is the canonical `provider/id` key. */
+/** One selectable row. `selector` is a canonical model key or host-specific virtual key. */
 export interface ModelBrowserItem {
 	provider: string;
 	id: string;
 	model: Model;
 	selector: string;
+	/** Optional foreground color for the row label. */
+	labelColor?: ThemeColor;
 }
 
 /** Resolved role assignment as displayed by the browser and the hub. */
@@ -53,6 +56,67 @@ export interface RoleAssignment {
 
 /** Map of role id to its resolved assignment (absent roles are unresolved). */
 export type RoleAssignments = Record<string, RoleAssignment | undefined>;
+
+/**
+ * Resolve every known role to its display assignment: configured role values
+ * resolve against `allModels`; unconfigured roles fall back to auto-selection
+ * over `autoCandidates` (skipped when empty). Shared by the /models hub and
+ * the alt+p session picker.
+ */
+export function resolveRoleAssignments(
+	settings: Settings,
+	allModels: ReadonlyArray<Model>,
+	autoCandidates: ReadonlyArray<Model>,
+): RoleAssignments {
+	const resolvedThinkingLevel = (
+		role: string,
+		resolved: { explicitThinkingLevel: boolean; thinkingLevel?: ConfiguredThinkingLevel },
+	): ConfiguredThinkingLevel => {
+		if (resolved.explicitThinkingLevel && resolved.thinkingLevel !== undefined) {
+			return resolved.thinkingLevel;
+		}
+		if (role === "default") {
+			return parseConfiguredThinkingLevel(settings.get("defaultThinkingLevel")) ?? ThinkingLevel.Inherit;
+		}
+		return ThinkingLevel.Inherit;
+	};
+
+	const roles: RoleAssignments = {};
+	const matchPreferences = getModelMatchPreferences(settings);
+	const knownRoles = getKnownRoleIds(settings);
+	const configuredRoles = new Set<string>();
+	const catalog = [...allModels];
+
+	for (const role of knownRoles) {
+		const roleValue = settings.getModelRole(role);
+		if (!roleValue) continue;
+		configuredRoles.add(role);
+		const resolved = resolveModelRoleValue(roleValue, catalog, { settings, matchPreferences });
+		if (resolved.model) {
+			roles[role] = {
+				model: resolved.model,
+				thinkingLevel: resolvedThinkingLevel(role, resolved),
+				autoSelected: false,
+			};
+		}
+	}
+
+	if (autoCandidates.length > 0) {
+		const candidates = [...autoCandidates];
+		for (const role of knownRoles) {
+			if (configuredRoles.has(role)) continue;
+			const resolved = resolveModelRoleValue(`pi/${role}`, candidates, { settings, matchPreferences });
+			if (!resolved.model) continue;
+			roles[role] = {
+				model: resolved.model,
+				thinkingLevel: resolvedThinkingLevel(role, resolved),
+				autoSelected: true,
+			};
+		}
+	}
+
+	return roles;
+}
 
 /** Wrap raw models into browser items. */
 export function buildBrowserItems(models: ReadonlyArray<Model>): ModelBrowserItem[] {
@@ -256,7 +320,6 @@ export interface ModelBrowserOptions {
 	disableOverContext?: boolean;
 	/** Host-provided empty-state text (e.g. provider discovery status). */
 	emptyText?: () => string | undefined;
-	initialQuery?: string;
 }
 
 /** Rendered rows before the list window: search row + blank. */
@@ -290,9 +353,15 @@ export class ModelBrowser implements Component {
 	#currentContextTokens: number;
 	#disableOverContext: boolean;
 	#emptyText?: () => string | undefined;
+	/** Keep role-like virtual rows in their host-defined order during search. */
+	#preserveQueryOrder = false;
 	/** First visible list row; panned by the wheel, snapped to the selection on keyboard navigation. */
 	#windowStart = 0;
 	#windowCount = 0;
+	/** Whether the host pane owns arrow keys; drives cursor strength and the selected-row band. */
+	#focused = true;
+	/** `provider/id` of the session's active model; marked in rows and detail. */
+	#currentSelector: string | undefined;
 
 	/** Enter or click-on-selected. */
 	onActivate?: (item: ModelBrowserItem) => void;
@@ -308,9 +377,11 @@ export class ModelBrowser implements Component {
 		this.#currentContextTokens = Number.isFinite(tokens) && tokens > 0 ? Math.floor(tokens) : 0;
 		this.#disableOverContext = options.disableOverContext ?? false;
 		this.#emptyText = options.emptyText;
-		if (options.initialQuery) {
-			this.#searchInput.setValue(options.initialQuery);
-		}
+	}
+
+	/** Mark `selector` as the session's active model (undefined clears the mark). */
+	setCurrentSelector(selector: string | undefined): void {
+		this.#currentSelector = selector;
 	}
 
 	/** Replace the scope's base items; the live query re-applies and selection is pinned by selector. */
@@ -344,6 +415,18 @@ export class ModelBrowser implements Component {
 
 	setShowProvider(show: boolean): void {
 		this.#showProvider = show;
+	}
+	/** Keep the source order after fuzzy filtering instead of applying model-specific ranking. */
+	setPreserveQueryOrder(preserve: boolean): void {
+		this.#preserveQueryOrder = preserve;
+	}
+	/** Allow hosts to toggle context-window eligibility between browser modes. */
+	setDisableOverContext(disable: boolean): void {
+		this.#disableOverContext = disable;
+	}
+	/** Focused: accent cursor + selected-row background band. Unfocused: dim cursor, no band. */
+	setFocused(focused: boolean): void {
+		this.#focused = focused;
 	}
 
 	/** Total rendered height for the current `maxVisible` (host layout budgeting). */
@@ -416,18 +499,27 @@ export class ModelBrowser implements Component {
 		this.#windowStart = this.#clampWindowStart(this.#windowStart);
 	}
 
-	moveSelection(delta: number): void {
+	/**
+	 * Move the selection by `delta` rows, skipping disabled rows. Single steps
+	 * wrap at the ends; `wrap: false` (page/home/end jumps) clamps instead.
+	 */
+	moveSelection(delta: number, options: { wrap?: boolean } = {}): void {
 		const count = this.#visibleItems.length;
 		if (count === 0) return;
-		let index = this.#selectedIndex;
-		for (let step = 0; step < count; step++) {
-			index = (index + delta + count) % count;
-			const item = this.#visibleItems[index];
-			if (item && !this.#isDisabled(item)) {
-				this.#setSelectedIndex(index);
-				return;
+		if (options.wrap ?? true) {
+			let index = this.#selectedIndex;
+			for (let step = 0; step < count; step++) {
+				index = (index + delta + count) % count;
+				const item = this.#visibleItems[index];
+				if (item && !this.#isDisabled(item)) {
+					this.#setSelectedIndex(index);
+					return;
+				}
 			}
+			return;
 		}
+		const target = Math.max(0, Math.min(this.#selectedIndex + delta, count - 1));
+		this.#setSelectedIndex(this.#coerceSelectedIndex(target));
 	}
 
 	#setSelectedIndex(index: number): void {
@@ -480,17 +572,21 @@ export class ModelBrowser implements Component {
 			// queries all flow through the same fuzzy matcher.
 			const ranked = fuzzyRank(this.#baseItems, query, ({ provider, id }) => `${provider}/${id}`);
 			const matches = ranked.map(result => result.item);
-			// Match quality is the primary key while searching: an exact
-			// "gpt-5.5" must beat the MRU (or role-assigned) "gpt-5.6", so
-			// role rank is skipped and MRU only breaks ties. Scores are
-			// bucketed so sub-point position noise (provider-name length)
-			// can't split equally good matches; within a bucket the stable
-			// sort keeps sortModelItems' MRU/version order.
-			sortModelItems(matches, { roles: this.#roles, mruOrder: this.#mruOrder, skipRoleRank: true });
-			const buckets = new Map<ModelBrowserItem, number>();
-			for (const result of ranked) buckets.set(result.item, Math.round(result.score / 10));
-			matches.sort((a, b) => (buckets.get(a) ?? 0) - (buckets.get(b) ?? 0));
-			items = matches;
+			if (this.#preserveQueryOrder) {
+				items = matches;
+			} else {
+				// Match quality is the primary key while searching: an exact
+				// "gpt-5.5" must beat the MRU (or role-assigned) "gpt-5.6", so
+				// role rank is skipped and MRU only breaks ties. Scores are
+				// bucketed so sub-point position noise (provider-name length)
+				// can't split equally good matches; within a bucket the stable
+				// sort keeps sortModelItems' MRU/version order.
+				sortModelItems(matches, { roles: this.#roles, mruOrder: this.#mruOrder, skipRoleRank: true });
+				const buckets = new Map<ModelBrowserItem, number>();
+				for (const result of ranked) buckets.set(result.item, Math.round(result.score / 10));
+				matches.sort((a, b) => (buckets.get(a) ?? 0) - (buckets.get(b) ?? 0));
+				items = matches;
+			}
 		} else {
 			items = this.#baseItems;
 		}
@@ -514,11 +610,19 @@ export class ModelBrowser implements Component {
 			return;
 		}
 		if (matchesSelectPageUp(data)) {
-			this.moveSelection(-this.#maxVisible);
+			this.moveSelection(-this.#maxVisible, { wrap: false });
 			return;
 		}
 		if (matchesSelectPageDown(data)) {
-			this.moveSelection(this.#maxVisible);
+			this.moveSelection(this.#maxVisible, { wrap: false });
+			return;
+		}
+		if (matchesKey(data, "home")) {
+			this.moveSelection(-this.#visibleItems.length, { wrap: false });
+			return;
+		}
+		if (matchesKey(data, "end")) {
+			this.moveSelection(this.#visibleItems.length, { wrap: false });
 			return;
 		}
 		if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
@@ -574,6 +678,10 @@ export class ModelBrowser implements Component {
 			this.#setSelectedIndex(index);
 		}
 	}
+	/** Drop the hover band. Hosts call this when the pointer leaves the browser pane. */
+	clearHover(): void {
+		this.#hoveredIndex = null;
+	}
 
 	/** List index under a frame-local row, or null when off-list or on a disabled row. */
 	#hoverIndexAt(line: number): number | null {
@@ -583,22 +691,6 @@ export class ModelBrowser implements Component {
 		const item = this.#visibleItems[index];
 		if (!item || this.#isDisabled(item)) return null;
 		return index;
-	}
-
-	#chipsFor(model: Model): string {
-		const parts: string[] = [];
-		const seen = new Set<string>();
-		const pushChip = (role: string) => {
-			if (seen.has(role)) return;
-			seen.add(role);
-			const assignment = this.#roles[role];
-			if (!assignment || !modelsAreEqual(assignment.model, model)) return;
-			if (getRoleInfo(role, this.#settings).hidden) return;
-			parts.push(formatRoleChip(role, assignment, this.#settings));
-		};
-		for (const role of MODEL_ROLE_IDS) pushChip(role);
-		for (const role in this.#roles) pushChip(role);
-		return parts.length > 0 ? ` ${parts.join(" ")}` : "";
 	}
 
 	/** `0.9s 118t/s` measured-perf cell for the row's meta block; empty when unmeasured or the column is off. */
@@ -627,13 +719,19 @@ export class ModelBrowser implements Component {
 			return `  ${line}  `;
 		}
 		const disabled = this.#isDisabled(item);
-		const prefix = selected ? `${theme.fg("accent", theme.nav.cursor)} ` : "  ";
+		const prefix = selected && this.#focused ? `${theme.fg("accent", theme.nav.cursor)} ` : "  ";
 		const providerPrefix = this.#showProvider ? theme.fg("dim", `${item.provider}/`) : "";
-		const name = selected ? theme.fg("accent", item.id) : item.id;
+		const name = item.labelColor
+			? theme.fg(item.labelColor, item.id)
+			: selected
+				? theme.fg("accent", item.id)
+				: item.id;
+		const currentMark =
+			item.selector === this.#currentSelector ? ` ${theme.fg("success", theme.status.enabled)}` : "";
 		const overLimit = disabled
 			? ` ${theme.status.disabled} context>${formatNumber(item.model.contextWindow ?? 0).toLowerCase()}`
 			: "";
-		let left = `${prefix}${providerPrefix}${name}${this.#chipsFor(item.model)}${overLimit}`;
+		let left = `${prefix}${providerPrefix}${name}${currentMark}${overLimit}`;
 
 		// Perf column collapses entirely when no visible row has measurements.
 		const perfCol =
@@ -648,7 +746,9 @@ export class ModelBrowser implements Component {
 		if (disabled) {
 			line = theme.fg("dim", Bun.stripANSI(line));
 		}
-		if (hovered && !selected && !disabled) {
+		// The bg band is reserved for the mouse: it marks hover, nothing else.
+		// Keyboard selection is the cursor glyph + accent name.
+		if (hovered && !disabled) {
 			line = theme.bg("selectedBg", line);
 		}
 		return line;
@@ -678,6 +778,9 @@ export class ModelBrowser implements Component {
 		}
 
 		const chips: string[] = [];
+		if (selected.selector === this.#currentSelector) {
+			chips.push(theme.fg("success", `${theme.status.enabled} current`));
+		}
 		const seen = new Set<string>();
 		const pushRole = (role: string) => {
 			if (seen.has(role)) return;

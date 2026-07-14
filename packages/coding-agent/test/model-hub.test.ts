@@ -75,7 +75,6 @@ interface HubHarness {
 	hub: ModelHubComponent;
 	onAssign: ReturnType<typeof vi.fn>;
 	onUnassign: ReturnType<typeof vi.fn>;
-	onPick: ReturnType<typeof vi.fn>;
 	onLoginRequest: ReturnType<typeof vi.fn>;
 	onCancel: ReturnType<typeof vi.fn>;
 	onFallbackChainChange: Mock<(role: string, chain: string[]) => void>;
@@ -98,7 +97,6 @@ function createHub(options: {
 	const ui = { requestRender: vi.fn(), terminal: { rows: 40 } } as unknown as TUI;
 	const onAssign = vi.fn();
 	const onUnassign = vi.fn();
-	const onPick = vi.fn();
 	const onLoginRequest = vi.fn();
 	const onCancel = vi.fn();
 	// Mirror the controller: persist chain edits so the hub's re-read sees them.
@@ -119,7 +117,6 @@ function createHub(options: {
 		{
 			onAssign: options.callbacks?.onAssign ?? onAssign,
 			onUnassign: options.callbacks?.onUnassign ?? onUnassign,
-			onPick: options.callbacks?.onPick ?? onPick,
 			onLoginRequest: options.callbacks?.onLoginRequest ?? onLoginRequest,
 			onCycleOrderChange: options.callbacks?.onCycleOrderChange,
 			onFallbackChainChange: options.callbacks?.onFallbackChainChange ?? onFallbackChainChange,
@@ -128,12 +125,13 @@ function createHub(options: {
 		options.hub,
 	);
 	openHubs.push(hub);
-	return { hub, onAssign, onUnassign, onPick, onLoginRequest, onCancel, onFallbackChainChange };
+	return { hub, onAssign, onUnassign, onLoginRequest, onCancel, onFallbackChainChange };
 }
 
 const DOWN = "\x1b[B";
 const UP = "\x1b[A";
 const LEFT = "\x1b[D";
+const ESC = "\x1b";
 
 describe("ModelHub", () => {
 	beforeAll(async () => {
@@ -151,7 +149,7 @@ describe("ModelHub", () => {
 	});
 
 	describe("role chips and roles view", () => {
-		test("shows configured role chips with thinking glyphs, including custom roles", () => {
+		test("tags the selected model's roles in the detail line, including custom roles", () => {
 			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 			if (!model) throw new Error("Expected bundled model anthropic/claude-sonnet-4-5");
 			const settings = Settings.isolated({
@@ -173,7 +171,7 @@ describe("ModelHub", () => {
 			expect(rendered).toContain("●smol");
 		});
 
-		test("renders hollow chips for auto-selected role fallbacks", () => {
+		test("list rows carry no role chips; only the selected model's detail line is tagged", () => {
 			const settings = Settings.isolated({});
 			const haiku = makeModel("test", "claude-haiku-4.5");
 			const codex = makeModel("test", "gpt-5.1-codex");
@@ -181,10 +179,11 @@ describe("ModelHub", () => {
 			installTestTheme();
 
 			const rendered = normalize(hub.render(220));
-			// No roles configured: auto-selection still tags the small/reasoning
-			// candidates (smol → haiku, slow → codex), rendered hollow.
-			expect(rendered).toContain("○smol");
-			expect(rendered).toContain("○slow");
+			// Auto-selection tags smol → haiku and slow → codex, but only the
+			// selected model's chips render (in the detail line). With row
+			// chips both would appear at once.
+			const hollow = ["○smol", "○slow"].filter(chip => rendered.includes(chip));
+			expect(hollow).toHaveLength(1);
 			expect(rendered).not.toContain("●smol");
 		});
 
@@ -607,86 +606,10 @@ describe("ModelHub", () => {
 		});
 	});
 
-	describe("pick mode", () => {
-		test("disables models below the current context size and picks the first enabled one", () => {
-			const small = makeModel("test", "a-small", 4096);
-			const large = makeModel("test", "b-large", 128_000);
-			const { hub, onPick } = createHub({
-				models: [small, large],
-				scoped: true,
-				hub: { mode: "pick", currentContextTokens: 6000 },
-			});
-			installTestTheme();
-
-			const rendered = normalize(hub.render(220));
-			expect(rendered).toContain("a-small");
-			expect(rendered).toContain("context>4.1k");
-			expect(rendered).toContain("Session-only switch");
-
-			hub.handleInput("\n");
-			expect(onPick).toHaveBeenCalledTimes(1);
-			expect(onPick.mock.calls[0]?.[0]).toBe(large);
-		});
-
-		test("uses cached models for Enter while the offline refresh is still pending", () => {
-			const cached = makeModel("test", "cached-fast");
-			const refreshGate = Promise.withResolvers<void>();
-			const refresh = vi.fn(() => refreshGate.promise);
-			const { hub, onPick } = createHub({
-				models: [cached],
-				registry: { refresh },
-				hub: { mode: "pick" },
-			});
-			installTestTheme();
-
-			hub.handleInput("\n");
-			expect(onPick).toHaveBeenCalledTimes(1);
-			expect(onPick.mock.calls[0]?.[0]).toBe(cached);
-			expect(refresh).toHaveBeenCalledTimes(1);
-			refreshGate.resolve();
-		});
-
-		test("focuses list mode initially in pick mode", () => {
-			const model = makeModel("test", "test-model");
-			const { hub } = createHub({
-				models: [model],
-				hub: { mode: "pick" },
-			});
-			const rendered = normalize(hub.render(220));
-			expect(rendered).toContain("↑/↓ models · ← providers");
-		});
-
-		test("focuses scope mode initially in roles mode", () => {
-			const model = makeModel("test", "test-model");
-			const { hub } = createHub({
-				models: [model],
-				hub: { mode: "roles" },
-			});
-			const rendered = normalize(hub.render(220));
-			expect(rendered).toContain("↑/↓ providers · → models");
-		});
-
-		test("keeps the highlighted model when a background refresh reorders the list", async () => {
-			const modelBb = makeModel("test", "bb-model");
-			const modelCc = makeModel("test", "cc-model");
-			const modelAa = makeModel("test", "aa-model");
-			let available = [modelBb, modelCc];
-			const refreshGate = Promise.withResolvers<void>();
-			const { hub, onPick } = createHub({
-				models: () => available,
-				registry: { refresh: () => refreshGate.promise },
-				hub: { mode: "pick" },
-			});
-			installTestTheme();
-
-			hub.handleInput(DOWN); // highlight cc-model
-			available = [modelAa, modelBb, modelCc];
-			refreshGate.resolve();
-			await Bun.sleep(0);
-
-			hub.handleInput("\n");
-			expect(onPick.mock.calls[0]?.[0]?.id).toBe("cc-model");
-		});
+	test("focuses the scope pane initially", () => {
+		const { hub } = createHub({ models: [makeModel("test", "test-model")] });
+		const rendered = normalize(hub.render(220));
+		expect(rendered).toContain("↑/↓ providers · → models");
 	});
 
 	describe("mouse wheel", () => {
@@ -699,12 +622,15 @@ describe("ModelHub", () => {
 
 		test("wheel pans the model list without moving the selection and clamps at the ends", () => {
 			const models = Array.from({ length: 40 }, (_, i) => makeModel("test", `model-${String(i).padStart(2, "0")}`));
-			const { hub, onPick } = createHub({ models, scoped: true, hub: { mode: "pick" } });
+			const { hub } = createHub({ models, scoped: true });
 
 			const before = normalize(hub.render(220)); // establishes mouse geometry
+			// Enter opens the role strip for the selected model — its footer
+			// (`<model-id> → …`) identifies the selection.
 			hub.handleInput("\n");
-			expect(onPick).toHaveBeenCalledTimes(1);
-			const initiallySelected = onPick.mock.calls[0]?.[0];
+			const initialStrip = footerLine(hub.render(220));
+			expect(initialStrip).toContain("→");
+			hub.handleInput(ESC); // close the strip
 
 			// Panning reveals rows that were below the fold...
 			for (let i = 0; i < 8; i++) hub.handleInput(WHEEL_DOWN_BODY);
@@ -714,10 +640,10 @@ describe("ModelHub", () => {
 			const revealed = [...modelIdsIn(panned)].filter(id => !beforeIds.has(id));
 			expect(revealed.length).toBeGreaterThan(0);
 
-			// ...but never moves the selection: Enter still picks the same model.
+			// ...but never moves the selection: Enter still opens the same model's strip.
 			hub.handleInput("\n");
-			expect(onPick).toHaveBeenCalledTimes(2);
-			expect(onPick.mock.calls[1]?.[0]).toBe(initiallySelected);
+			expect(footerLine(hub.render(220))).toBe(initialStrip);
+			hub.handleInput(ESC);
 
 			// The window clamps at the bottom instead of wrapping back to the top...
 			for (let i = 0; i < 500; i++) hub.handleInput(WHEEL_DOWN_BODY);
@@ -772,14 +698,9 @@ describe("ModelHub", () => {
 		test("search inside a provider scope keeps that provider's model (#4522)", () => {
 			const openrouterGlm = makeModel("openrouter", "z-ai/glm-5.2");
 			const customGlm = makeModel("custom-provider", "glm-5.2");
-			const { hub, onPick } = createHub({
-				models: [openrouterGlm, customGlm],
-				hub: { mode: "pick" },
-			});
+			const { hub } = createHub({ models: [openrouterGlm, customGlm] });
 			installTestTheme();
 
-			// Focus scope first to allow scope-hopping
-			hub.handleInput("\t");
 			// Scope-hop: All models → custom-provider → openrouter.
 			hub.handleInput(DOWN);
 			hub.handleInput(DOWN);
@@ -788,9 +709,9 @@ describe("ModelHub", () => {
 			for (const ch of "glm-5.2") hub.handleInput(ch);
 			hub.handleInput("\n");
 
-			expect(onPick).toHaveBeenCalledTimes(1);
-			expect(onPick.mock.calls[0]?.[0]?.provider).toBe("openrouter");
-			expect(onPick.mock.calls[0]?.[0]?.id).toBe("z-ai/glm-5.2");
+			// The role strip opened for the provider-scoped match, not the
+			// identically named custom-provider model.
+			expect(footerLine(hub.render(220))).toContain("z-ai/glm-5.2 →");
 		});
 
 		test("search on All models spans every provider", () => {
