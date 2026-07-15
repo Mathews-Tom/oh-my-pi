@@ -34,6 +34,7 @@ function yieldEmittingSession(initialTools: string[] = ["read", "yield"]): Agent
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
 		getActiveToolNames: () => activeTools,
+		getEnabledToolNames: () => activeTools,
 		setActiveToolsByName: async (toolNames: string[]) => {
 			activeTools = toolNames;
 		},
