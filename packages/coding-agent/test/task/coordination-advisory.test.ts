@@ -4,17 +4,17 @@ import type { TaskItem } from "@oh-my-pi/pi-coding-agent/task/types";
 import { prompt } from "@oh-my-pi/pi-utils";
 import subagentSystemPromptTemplate from "../../src/prompts/system/subagent-system-prompt.md" with { type: "text" };
 
-// Contract: a multi-sibling spawn with spawn capacity and IRC available draws
-// a proactive coordinate-via-irc suggestion, and the subagent COOP prompt
+// Contract: a multi-sibling spawn with capacity and hub messaging available
+// draws a proactive coordination suggestion, and the subagent COOP prompt
 // actively tells peers to coordinate before overlapping edits.
 
 const item = (): TaskItem => ({ task: "do the thing" });
 
 describe("buildCoordinationAdvisory", () => {
-	it("suggests irc coordination for >=2 siblings with capacity and irc enabled", () => {
+	it("suggests hub coordination for >=2 siblings with capacity and messaging enabled", () => {
 		const advice = buildCoordinationAdvisory([item(), item()], true, true);
 		expect(advice).toBeDefined();
-		expect(advice).toContain("`irc`");
+		expect(advice).toContain("`hub`");
 	});
 
 	it("stays silent for a single spawn", () => {
