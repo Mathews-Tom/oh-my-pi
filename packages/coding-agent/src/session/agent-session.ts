@@ -1737,8 +1737,8 @@ export class AgentSession {
 	#prewalk: Prewalk | undefined;
 	/** True once the plan nudge has been queued; scrubbed from context at the switch. */
 	#prewalkPlanInjected = false;
-	/** True after the continuation safety net fires; tool progress re-arms it. */
-	#prewalkContinueInjected = false;
+	/** Armed by plan/tool progress; consumed by one text-only continuation. */
+	#prewalkContinuePending = false;
 	/** True once any successful `todo` call landed — opens the prewalk
 	 *  trigger gate: the switch fires at the first edit/write AFTER the todo
 	 *  list exists (sessions without an ACTIVE todo tool skip the gate). */
@@ -2232,18 +2232,24 @@ export class AgentSession {
 		const prewalk = this.#prewalk;
 		if (!prewalk || context?.message.role !== "assistant") return;
 
-		// Structural safety net: every branch below assumes the agent loop will
-		// run another turn. It won't if THIS turn had no tool calls — the loop
-		// treats a text-only turn as "the agent is done" and ends the session
-		// with no further prompting. The plan nudge explicitly asks for a prose
-		// reply, which makes a text-only turn common right after it — observed
+		const todoCalledThisTurn = context.toolResults.some(result => result.toolName === "todo");
+		if (todoCalledThisTurn) {
+			this.#prewalkTodoSeen = true;
+		}
+
+		// The plan nudge asks for a prose plan before implementation begins,
+		// but the agent loop treats each text-only reply as terminal — observed
 		// silently killing production SWE-bench runs before any code was ever
-		// written. Force one more turn only in that specific, self-created
-		// hazard window.
-		if (context.toolResults.length > 0) {
-			this.#prewalkContinueInjected = false;
-		} else if (this.#prewalkPlanInjected && !this.#prewalkContinueInjected) {
-			this.#prewalkContinueInjected = true;
+		// written. Tool progress re-arms one continuation, allowing split flows
+		// such as plan → todo → prose → read → prose → edit/write. Consuming the
+		// arm before steering also detects completion: two consecutive text-only
+		// replies have no intervening progress, so the second ends naturally
+		// instead of producing the #5551 loop.
+		const hasToolResults = context.toolResults.length > 0;
+		if (this.#prewalkPlanInjected && hasToolResults) {
+			this.#prewalkContinuePending = true;
+		} else if (this.#prewalkContinuePending) {
+			this.#prewalkContinuePending = false;
 			this.agent.steer({
 				role: "custom",
 				customType: PREWALK_CONTINUE_MESSAGE_TYPE,
@@ -2273,6 +2279,7 @@ export class AgentSession {
 		if (!action) {
 			if (!this.#prewalkPlanInjected) {
 				this.#prewalkPlanInjected = true;
+				this.#prewalkContinuePending = true;
 				this.agent.steer({
 					role: "custom",
 					customType: PREWALK_PLAN_MESSAGE_TYPE,
@@ -2333,6 +2340,7 @@ export class AgentSession {
 		}
 		this.#prewalk = { target, thinkingLevel };
 		this.#prewalkPlanInjected = true;
+		this.#prewalkContinuePending = true;
 		this.agent.steer({
 			role: "custom",
 			customType: PREWALK_PLAN_MESSAGE_TYPE,
@@ -11665,9 +11673,9 @@ export class AgentSession {
 			}
 		}
 
-		// Must check the active tool set, not just the registry: tool discovery
-		// (tools.discoveryMode === "all") can register `todo` while hiding it from
-		// the exposed tools. Forcing a named tool_choice for an inactive tool makes
+		// Must check the active tool set, not just the registry: a registered
+		// tool can be hidden from the exposed tools (e.g. unmounted under the
+		// xd:// transport). Forcing a named tool_choice for an inactive tool makes
 		// the provider reject the request (HTTP 400).
 		if (!this.getActiveToolNames().includes("todo")) {
 			logger.warn("Eager todo enforcement skipped because todo is not active", {
