@@ -56,8 +56,7 @@ describe("task spawn policy surfaces", () => {
 		const tool = await TaskTool.create(makeSession("fact-finder,oracle"));
 		const description = tool.description;
 
-		expect(description).toContain("the general-purpose worker (`fact-finder`)");
-		expect(description).toContain("Current spawn policy allows: `fact-finder`, `oracle`.");
-		expect(description).not.toContain("(`task`)");
+		expect(description).toContain("Omit `agent` to use `fact-finder`. Allowed: `fact-finder`, `oracle`.");
+		expect(description).not.toContain("use `task`");
 	});
 });

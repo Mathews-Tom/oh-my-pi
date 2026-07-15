@@ -623,6 +623,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 				const now = performance.now();
 				const frameCount = theme.spinnerFrames.length;
 				this.#spinnerFrame = sharedSpinnerFrame(frameCount, now);
+				this.#updateDisplay();
 				this.#renderState.spinnerFrame = this.#spinnerFrame;
 				// Component-scoped: a spinner tick only changes this tool block, so
 				// the TUI reuses every other root subtree instead of walking the

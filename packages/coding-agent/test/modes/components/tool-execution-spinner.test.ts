@@ -1,6 +1,9 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
-import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
+import {
+	SPINNER_GLYPH_ADVANCE_MS,
+	ToolExecutionComponent,
+} from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { TUI } from "@oh-my-pi/pi-tui";
 
@@ -48,6 +51,8 @@ describe("ToolExecutionComponent live preview spinners", () => {
 
 	it("animates a shell pending header while the call is live", () => {
 		vi.useFakeTimers();
+		let now = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => now);
 		const requestRender = vi.fn();
 		const requestComponentRender = vi.fn();
 		const component = new ToolExecutionComponent(
@@ -61,6 +66,7 @@ describe("ToolExecutionComponent live preview spinners", () => {
 
 		try {
 			const firstFrame = stripVTControlCharacters(component.render(80).join("\n"));
+			now = SPINNER_GLYPH_ADVANCE_MS;
 			vi.advanceTimersByTime(120);
 			const secondFrame = stripVTControlCharacters(component.render(80).join("\n"));
 
