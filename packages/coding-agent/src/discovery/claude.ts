@@ -170,8 +170,11 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 
 	const userBase = getUserClaude(ctx);
 	const userClaudeMd = path.join(userBase, "CLAUDE.md");
+	const claudeMdExcludes = await getClaudeMdExcludes(ctx);
 
-	const userContent = await readFile(userClaudeMd);
+	const userContent = shouldExcludeClaudeRule(userClaudeMd, claudeMdExcludes, ctx.home)
+		? null
+		: await readFile(userClaudeMd);
 	if (userContent !== null) {
 		items.push({
 			path: userClaudeMd,
@@ -183,7 +186,9 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 
 	const projectBase = getProjectClaude(ctx);
 	const projectClaudeMd = path.join(projectBase, "CLAUDE.md");
-	const projectContent = await readFile(projectClaudeMd);
+	const projectContent = shouldExcludeClaudeRule(projectClaudeMd, claudeMdExcludes, ctx.home)
+		? null
+		: await readFile(projectClaudeMd);
 	if (projectContent !== null) {
 		const depth = calculateDepth(ctx.cwd, path.dirname(projectBase), path.sep);
 		items.push({

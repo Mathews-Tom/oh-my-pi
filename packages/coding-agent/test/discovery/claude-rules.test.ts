@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { type ContextFile, contextFileCapability } from "@oh-my-pi/pi-coding-agent/capability/context-file";
 import * as capabilityFs from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import {
@@ -1521,5 +1522,26 @@ describe("Claude Code rule discovery", () => {
 		await expect(handler.resolve(parseInternalUrl("rule://api"), { rules: visibleRules })).rejects.toThrow(
 			"Unknown rule: api",
 		);
+	});
+	test("honors claudeMdExcludes when loading CLAUDE.md context", async () => {
+		const projectClaudeMd = path.join(project, ".claude", "CLAUDE.md");
+		await writeFile(path.join(home, ".claude", "CLAUDE.md"), "User instructions.\n");
+		await writeFile(projectClaudeMd, "Project instructions.\n");
+		await writeFile(
+			path.join(project, ".claude", "settings.json"),
+			JSON.stringify({ claudeMdExcludes: [projectClaudeMd] }),
+		);
+
+		const result = await loadCapability<ContextFile>(contextFileCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items).toHaveLength(1);
+		expect(result.items[0]).toMatchObject({
+			path: path.join(home, ".claude", "CLAUDE.md"),
+			content: "User instructions.\n",
+			level: "user",
+		});
 	});
 });
