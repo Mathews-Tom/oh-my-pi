@@ -151,6 +151,20 @@ describe("Claude Code rule discovery", () => {
 		expect(result.items.map(rule => rule.name)).not.toContain("parent");
 	});
 
+	test("does not apply parent ignores to non-repo project rules", async () => {
+		const scratchRoot = path.join(root, "scratch");
+		const scratchProject = path.join(scratchRoot, "project");
+		await writeFile(path.join(scratchRoot, ".gitignore"), "*.md\n");
+		await writeFile(path.join(scratchProject, ".claude", "rules", "local.md"), "Local rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: scratchProject,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toContain("local");
+	});
+
 	test("does not leak parent .claude/rules when repo-root cwd has a trailing separator", async () => {
 		const parentDir = path.join(root, "trailing-parent");
 		const projectDir = path.join(parentDir, "project");

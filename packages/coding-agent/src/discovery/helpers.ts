@@ -522,7 +522,7 @@ async function findGitignoreRoot(dir: string, base?: string): Promise<{ root: st
 			highestIgnoreDir = current;
 		}
 		const parent = path.dirname(current);
-		if (parent === current) return { root: highestIgnoreDir ?? walkStart, isGitRoot: false };
+		if (parent === current || current === boundary) return { root: highestIgnoreDir ?? walkStart, isGitRoot: false };
 		current = parent;
 	}
 }
