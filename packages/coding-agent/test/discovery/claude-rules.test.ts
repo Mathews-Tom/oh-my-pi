@@ -1544,4 +1544,20 @@ describe("Claude Code rule discovery", () => {
 			level: "user",
 		});
 	});
+	test("uses the repository root to filter linked project rules", async () => {
+		const nestedCwd = path.join(project, "packages", "app");
+		const sharedRulesDir = path.join(root, "shared-claude-rules");
+		await writeFile(path.join(project, ".gitignore"), "*.md\n");
+		await writeFile(path.join(sharedRulesDir, "private.md"), "Private shared rule.\n");
+		await writeFile(path.join(sharedRulesDir, "keep.mdc"), "Kept shared rule.\n");
+		await fs.mkdir(path.join(nestedCwd, ".claude", "rules"), { recursive: true });
+		await fs.symlink(sharedRulesDir, path.join(nestedCwd, ".claude", "rules", "shared"), "dir");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: nestedCwd,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toEqual(["shared:keep"]);
+	});
 });

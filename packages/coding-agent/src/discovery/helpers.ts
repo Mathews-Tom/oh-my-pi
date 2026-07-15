@@ -1418,7 +1418,7 @@ export async function loadFilesFromDir<T>(
 
 	if (followSymlinkDirectories && recursive) {
 		const ignoreCache: GitignoreRulesCache = new Map();
-		const base = workspaceBoundaryFor(dir, level === "user" ? ctx.home : ctx.cwd);
+		const base = workspaceBoundaryFor(dir, level === "user" ? ctx.home : (ctx.repoRoot ?? ctx.cwd));
 		if (respectGitignore && (await pathHasSymlinkedAncestor(dir, base))) {
 			// The native scanner canonicalizes a symlinked search root and applies the
 			// target checkout's own .gitignore, which git does not follow for a symlinked
