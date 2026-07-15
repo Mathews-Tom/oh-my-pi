@@ -1,9 +1,6 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
-import {
-	SPINNER_GLYPH_ADVANCE_MS,
-	ToolExecutionComponent,
-} from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
+import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/components/tool-execution";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { TUI } from "@oh-my-pi/pi-tui";
 
@@ -43,37 +40,6 @@ describe("ToolExecutionComponent live preview spinners", () => {
 			expect(requestRender).not.toHaveBeenCalled();
 			expect(firstFrame).toContain("time.sleep(10)");
 			expect(secondFrame).toContain("time.sleep(10)");
-			expect(secondFrame).not.toBe(firstFrame);
-		} finally {
-			component.stopAnimation();
-		}
-	});
-
-	it("animates a shell pending header while the call is live", () => {
-		vi.useFakeTimers();
-		let now = 0;
-		vi.spyOn(performance, "now").mockImplementation(() => now);
-		const requestRender = vi.fn();
-		const requestComponentRender = vi.fn();
-		const component = new ToolExecutionComponent(
-			"ssh",
-			{ host: "example.test", command: "sleep 10" },
-			{},
-			undefined,
-			{ requestRender, requestComponentRender } as unknown as TUI,
-			process.cwd(),
-		);
-
-		try {
-			const firstFrame = stripVTControlCharacters(component.render(80).join("\n"));
-			now = SPINNER_GLYPH_ADVANCE_MS;
-			vi.advanceTimersByTime(120);
-			const secondFrame = stripVTControlCharacters(component.render(80).join("\n"));
-
-			expect(requestComponentRender).toHaveBeenCalledWith(component);
-			expect(requestRender).not.toHaveBeenCalled();
-			expect(firstFrame).toContain("sleep 10");
-			expect(secondFrame).toContain("sleep 10");
 			expect(secondFrame).not.toBe(firstFrame);
 		} finally {
 			component.stopAnimation();

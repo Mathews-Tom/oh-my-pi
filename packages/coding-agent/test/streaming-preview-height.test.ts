@@ -382,7 +382,7 @@ describe("streaming edit preview height (stable, full tail window)", () => {
 describe("streaming tool call preview height (bounded across renderers)", () => {
 	beforeAll(async () => {
 		// `evalToolRenderer.renderCall` walks the theme during highlighting; the
-		// bash/ssh/eval pending previews exercised below DO NOT read
+		// bash/eval pending previews exercised below DO NOT read
 		// `settings.*`, so the global Settings singleton is intentionally left
 		// untouched here. Resetting/initialising it in `beforeEach` raced with
 		// parallel test files that do the same dance (issue #2582), flipping the
@@ -421,8 +421,8 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 		expect(visibleWidth(topBorder ?? "")).toBe(width);
 	});
 
-	test("bash pending previews stay short with very long multiline args", () => {
-		// Bash windows the collapsed command to a viewport-sized TAIL: the end
+	test("bash pending previews stay short even with very long multiline args", () => {
+		// bash windows the collapsed command to a viewport-sized TAIL: the end
 		// (the live edge while args stream) stays visible behind an "… N earlier
 		// lines" marker on top; the head is elided.
 		const window = previewWindowRows();
