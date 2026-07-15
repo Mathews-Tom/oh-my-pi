@@ -107,6 +107,18 @@ describe("Claude Code rule discovery", () => {
 		);
 	});
 
+	test("does not apply home gitignore rules to user rules", async () => {
+		await writeFile(path.join(home, ".gitignore"), "*.md\n");
+		await writeFile(path.join(home, ".claude", "rules", "global.md"), "Global rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: project,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toEqual(["global"]);
+	});
+
 	test("loads project rules from ancestor .claude directories", async () => {
 		const nestedCwd = path.join(project, "packages", "app");
 		await fs.mkdir(nestedCwd, { recursive: true });

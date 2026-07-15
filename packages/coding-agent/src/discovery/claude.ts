@@ -366,6 +366,7 @@ async function loadClaudeRulesFromDir(
 		extensions: ["md", "mdc"],
 		recursive: true,
 		followSymlinkDirectories: true,
+		respectGitignore: level === "project",
 		excludePath: filePath => shouldExcludeClaudeRule(filePath, excludes, ctx.home),
 		transform: (_name, content, filePath, source) => transformClaudeRule(rulesDir, content, filePath, source),
 	});

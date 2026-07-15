@@ -1267,6 +1267,7 @@ async function discoverLinkedFilesFromDir(
 	extensions: string[] | undefined,
 	cache?: GitignoreRulesCache,
 	base?: string,
+	respectGitignore = true,
 ): Promise<Array<{ path: string }>> {
 	const matches: Array<{ path: string }> = [];
 	async function collectLinkedDir(
@@ -1274,7 +1275,7 @@ async function discoverLinkedFilesFromDir(
 		relativeDir: string,
 		activeRealDirs: ReadonlySet<string>,
 	): Promise<void> {
-		if (relativeDir && (await isGitignoredDirectoryPath(dir, relativeDir, cache, base))) return;
+		if (respectGitignore && relativeDir && (await isGitignoredDirectoryPath(dir, relativeDir, cache, base))) return;
 		const realDir = await fs.promises.realpath(currentDir).catch(() => currentDir);
 		if (activeRealDirs.has(realDir)) return;
 		const nextActiveRealDirs = new Set(activeRealDirs);
@@ -1305,7 +1306,7 @@ async function discoverLinkedFilesFromDir(
 				const entryPath = path.join(currentDir, entry.name);
 				const relativePath = path.join(relativeDir, entry.name);
 				if (!(await isDirectoryPath(entryPath))) return;
-				if (await isGitignoredDirectoryPath(dir, relativePath, cache, base)) return;
+				if (respectGitignore && (await isGitignoredDirectoryPath(dir, relativePath, cache, base))) return;
 				if (entry.isSymbolicLink()) {
 					await collectLinkedDir(entryPath, relativePath, new Set<string>());
 					return;
@@ -1376,12 +1377,20 @@ export async function loadFilesFromDir<T>(
 		followSymlinkDirectories?: boolean;
 		/** Skip files whose absolute path matches a caller-defined exclusion. */
 		excludePath?: (path: string) => boolean | Promise<boolean>;
+		/** Whether to apply Git ignore rules (default: true). */
+		respectGitignore?: boolean;
 	},
 ): Promise<LoadResult<T>> {
 	const items: T[] = [];
 	const warnings: string[] = [];
 	// Build glob pattern based on extensions and recursion
-	const { extensions, recursive = false, followSymlinkDirectories = false, excludePath } = options;
+	const {
+		extensions,
+		recursive = false,
+		followSymlinkDirectories = false,
+		excludePath,
+		respectGitignore = true,
+	} = options;
 
 	let pattern: string;
 	if (extensions && extensions.length > 0) {
@@ -1397,7 +1406,7 @@ export async function loadFilesFromDir<T>(
 		const result = await glob({
 			pattern,
 			path: dir,
-			gitignore: true,
+			gitignore: respectGitignore,
 			hidden: false,
 			fileType: FileType.File,
 		});
@@ -1410,11 +1419,11 @@ export async function loadFilesFromDir<T>(
 	if (followSymlinkDirectories && recursive) {
 		const ignoreCache: GitignoreRulesCache = new Map();
 		const base = workspaceBoundaryFor(dir, level === "user" ? ctx.home : ctx.cwd);
-		if (await pathHasSymlinkedAncestor(dir, base)) {
+		if (respectGitignore && (await pathHasSymlinkedAncestor(dir, base))) {
 			// The native scanner canonicalizes a symlinked search root and applies the
 			// target checkout's own .gitignore, which git does not follow for a symlinked
 			// rules directory. Re-scan without ignore handling so target-side ignores
-			// cannot drop root-level rules; the unconditional re-filter below then applies
+			// cannot drop root-level rules; the project-level re-filter below then applies
 			// only the project logical filter.
 			try {
 				const unfiltered = await glob({
@@ -1429,18 +1438,22 @@ export async function loadFilesFromDir<T>(
 				// Keep the gitignore-filtered matches if the rescan fails.
 			}
 		}
-		// Re-filter every match with the Git-compatible matcher — always, not only when
+		// When enabled, re-filter every match with the Git-compatible matcher — not only
 		// a symlinked ancestor forced a rescan above. The native glob's own gitignore
 		// handling does not cover syntax this matcher explicitly normalizes (e.g. POSIX
 		// character classes like `[[:upper:]]`), so an ordinary, unsymlinked rules
 		// directory can still load a file `git check-ignore` would drop.
-		const filteredNativeMatches = await Promise.all(
-			matches.map(async match => ((await isGitignoredPath(dir, match.path, ignoreCache, base)) ? null : match)),
-		);
+		const filteredNativeMatches = respectGitignore
+			? await Promise.all(
+					matches.map(async match =>
+						(await isGitignoredPath(dir, match.path, ignoreCache, base)) ? null : match,
+					),
+				)
+			: matches;
 		matches = filteredNativeMatches.filter((match): match is { path: string } => match !== null);
 		const linkedMatches = await Promise.all(
-			(await discoverLinkedFilesFromDir(dir, extensions, ignoreCache, base)).map(async match =>
-				(await isGitignoredPath(dir, match.path, ignoreCache, base)) ? null : match,
+			(await discoverLinkedFilesFromDir(dir, extensions, ignoreCache, base, respectGitignore)).map(async match =>
+				respectGitignore && (await isGitignoredPath(dir, match.path, ignoreCache, base)) ? null : match,
 			),
 		);
 		const seen = new Set(matches.map(match => match.path));
