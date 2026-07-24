@@ -19,6 +19,7 @@
 - Added a toggle-list editor in `/settings` for array-of-enum settings: `providers.webSearchOrder` and `providers.imageOrder` (ordered — Enter/Space toggles, ←/→ nudges, 1-9 splices the hovered provider into that position) and `providers.webSearchExclude` now appear under Providers → Services instead of being config-file only.
 - Added `models.yml` Bedrock Converse prompt-cache capability overrides for bundled and opaque inference profiles.
 - Documented Vibe mode (`/vibe`) in `docs/vibe-mode.md` and the `/fresh` provider-stream reset in the session-operations doc, and linked both from the README's new "Session controls" section ([#6440](https://github.com/can1357/oh-my-pi/issues/6440)).
+- Added an opt-in `context_pct.showTokens` status-line segment option that renders the absolute used/window token fraction (e.g. `25.0% 50K/200K`) alongside the context percentage, instead of only the percentage ([#6167](https://github.com/can1357/oh-my-pi/issues/6167)).
 
 ### Changed
 
