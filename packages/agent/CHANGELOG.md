@@ -2,25 +2,27 @@
 
 ## [Unreleased]
 
+## [17.1.0] - 2026-07-24
+
 ### Added
 
-- Classified Cloudflare AI Gateway `cf-aig-cache-status` into bounded `pi.gen_ai.gateway.response_cache.status` values (`hit` | `miss` | `bypass` | `unknown`) on chat spans, without mapping response replay to prompt-cache token attributes or recording arbitrary Cloudflare headers
+- Added support for tracking Cloudflare AI Gateway cache status (hit, miss, bypass, unknown) on chat spans.
 
 ### Changed
 
-- Queued steering no longer hard-aborts non-interruptible tools (e.g. `bash`): it aborts interruptible waits only and raises a cooperative steering signal (`ToolCallContext.steeringSignal`) that long-running tools may observe to finish early or background themselves. The mid-batch steering/IRC watch now runs for every tool batch instead of only batches containing an interruptible tool.
+- Improved tool execution steering behavior: queued steering now cooperatively signals long-running, non-interruptible tools (via ToolCallContext.steeringSignal) to allow graceful early termination or backgrounding, rather than hard-aborting them.
 
 ### Fixed
 
-- Fixed an unbounded allocation loop when a steer (or follow-up) was queued on a session with an empty transcript: `Agent.continue()` now delivers the queued message as the opening turn instead of throwing, so idle-drain callers no longer respin `continue()` on every microtask until OOM ([#6344](https://github.com/can1357/oh-my-pi/issues/6344)).
-- Fixed provider-switched sessions being stranded without their remotely-compacted history: compaction now judges whether a prior OpenAI remote-compaction replay payload can be reused against the active model rather than the whole candidate set, so switching to a model that cannot replay the payload re-expands the originals into a portable local summary instead of leaving the model with only a placeholder ([#6343](https://github.com/can1357/oh-my-pi/issues/6343)).
+- Fixed an out-of-memory (OOM) crash caused by an infinite loop when a steer or follow-up message was queued on an agent session with an empty transcript.
+- Fixed an issue where switching providers or models on a session could lose compacted history; the agent now correctly falls back to a portable local summary if the new model cannot replay the prior provider's remote-compaction payload.
+- Fixed a compaction failure with Anthropic models where serializing prior assistant reasoning inside <thinking> tags triggered reasoning_extraction refusals.
 
 ## [17.0.8] - 2026-07-22
 
 ### Fixed
 
 - Improved resilience against transient stream JSON parse failures by recovering completed tool calls while safely preventing incomplete, unknown, refused, or sensitive calls from executing.
-- Fixed compaction/summarization serializing prior assistant reasoning back to Claude as text (rendered verbatim inside `<thinking>` tags for the `anthropic` dialect), which tripped Anthropic's `reasoning_extraction` refusal and blocked compaction on Fable 5 sessions; `serializeConversation` now drops `thinking` blocks for Anthropic-dialect summary targets while other dialects (e.g. Harmony) keep their native reasoning ([#6093](https://github.com/can1357/oh-my-pi/issues/6093)).
 
 ## [17.0.5] - 2026-07-18
 

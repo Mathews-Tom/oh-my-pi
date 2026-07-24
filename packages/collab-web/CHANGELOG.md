@@ -2,9 +2,12 @@
 
 ## [Unreleased]
 
+## [17.1.0] - 2026-07-24
+
 ### Fixed
 
-- Fixed `xd://resolve`/`xd://reject`/`xd://propose` cards losing action metadata after the xdev unwrap (badge rendered `?`/warn instead of apply/discard/propose semantics), and registered the missing `reject`/`propose` renderers plus the hub-family aliases (`irc`, `job`, `await`, `poll`, `cancel_job`) so those transcript names no longer fall back to generic JSON. ([#5640](https://github.com/can1357/oh-my-pi/issues/5640))
+- Fixed action metadata loss on xd://resolve, xd://reject, and xd://propose cards to ensure correct action badges are rendered.
+- Added proper rendering support for reject, propose, and hub-family aliases (irc, job, await, poll, cancel_job) to prevent them from falling back to generic JSON.
 
 ## [17.0.8] - 2026-07-22
 
