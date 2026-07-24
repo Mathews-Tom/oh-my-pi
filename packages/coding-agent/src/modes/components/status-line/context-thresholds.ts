@@ -57,10 +57,13 @@ export function getContextUsageLevel(contextPercent: number, contextWindow: numb
 
 /**
  * Format context usage for a known window as `<percent>%/<window>`, or, when
- * `showTokens` is true, as `<percent>% <used>/<window>` with the absolute
- * used-token count inserted after the percentage. Unknown windows always
- * render as `<tokens>/?`, because `0.0%/0` suggests a real empty context
- * instead of missing provider metadata.
+ * `showTokens` is true and `usedTokens` is known, as `<percent>% <used>/<window>`
+ * with the absolute used-token count inserted after the percentage. A missing
+ * `usedTokens` falls back to the plain `<percent>%/<window>` format even when
+ * `showTokens` is true, since rendering `0` would misreport a real empty
+ * context instead of an unavailable count. Unknown windows always render as
+ * `<tokens>/?`, because `0.0%/0` suggests a real empty context instead of
+ * missing provider metadata.
  */
 export function formatContextUsage(
 	contextPercent: number | null | undefined,
@@ -72,8 +75,8 @@ export function formatContextUsage(
 		return `${formatNumber(usedTokens ?? 0)}/?`;
 	}
 	const pct = contextPercent === null || contextPercent === undefined ? "?" : `${contextPercent.toFixed(1)}%`;
-	if (showTokens) {
-		return `${pct} ${formatNumber(usedTokens ?? 0)}/${formatNumber(contextWindow)}`;
+	if (showTokens && usedTokens !== undefined) {
+		return `${pct} ${formatNumber(usedTokens)}/${formatNumber(contextWindow)}`;
 	}
 	return `${pct}/${formatNumber(contextWindow)}`;
 }
