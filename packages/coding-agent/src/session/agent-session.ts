@@ -56,6 +56,7 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ModelUsageHealth,
 	ProviderSessionState,
 	ResetCreditAccountStatus,
 	ResetCreditRedeemOutcome,
@@ -96,7 +97,7 @@ import type { AdvisorConfig, AdvisorRuntimeStatus } from "../advisor";
 import { type AsyncJob, AsyncJobManager } from "../async";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import type { ModelRegistry } from "../config/model-registry";
-import type { ResolvedModelRoleValue } from "../config/model-resolver";
+import { type ResolvedModelRoleValue, resolveModelOverride } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
@@ -217,6 +218,7 @@ import type {
 	RoleModelCycleResult,
 	SessionHandoffOptions,
 	SessionStats,
+	UsageFallbackConfirmation,
 } from "./agent-session-types";
 import {
 	ASYNC_INLINE_RESULT_MAX_CHARS,
@@ -285,6 +287,7 @@ import {
 	queueChipText,
 	toRestoredQueuedMessage,
 } from "./queued-messages";
+import { formatRetryFallbackSelector, type RetryFallbackSelector } from "./retry-fallback-chains";
 import { type AdvisorStats, SessionAdvisors, type SessionAdvisorsHost } from "./session-advisors";
 import type { BuildSessionContextOptions, SessionContext } from "./session-context";
 import { getRestorableSessionModels } from "./session-context";
@@ -553,6 +556,9 @@ export class AgentSession {
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
+	#usageFallbackConfirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined;
+	#usageReserveApprovedSelector: string | undefined;
+	#usagePreflightAbortControllers = new Set<AbortController>();
 
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
@@ -1399,6 +1405,7 @@ export class AgentSession {
 			finishBashSessionTransition: (transition, success) => this.#bash.finishSessionTransition(transition, success),
 			cancelOwnAsyncJobs: () => this.#cancelOwnAsyncJobs(),
 			clearCheckpointRuntimeState: () => this.#clearCheckpointRuntimeState(),
+			clearSessionScopedToolState: () => this.#clearSessionScopedToolState(),
 			clearFreshProviderSessionId: () => {
 				this.#freshProviderSessionId = undefined;
 			},
@@ -2817,6 +2824,14 @@ export class AgentSession {
 				this.#beginInFlight();
 				try {
 					await this.#recovery.maybeRestoreRetryFallbackPrimary();
+					if (
+						this.settings.get("retry.modelFallback") &&
+						this.settings.get("retry.usageAwareFallback") &&
+						!(await this.#runUsageAwarePreflight())
+					) {
+						this.#skipAgentContinue("session-unavailable", options);
+						return;
+					}
 					if (signal.aborted || this.#isDisposed) {
 						this.#skipAgentContinue("post-restore-unavailable", options);
 						return;
@@ -3572,6 +3587,177 @@ export class AgentSession {
 		return this.#recovery.retryFallbackModel;
 	}
 
+	/** Install the interactive decision surface for reserve-triggered model changes. */
+	setUsageFallbackConfirmer(
+		confirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined,
+	): void {
+		this.#usageFallbackConfirmer = confirmer;
+	}
+
+	async #runUsageAwarePreflight(): Promise<boolean> {
+		const generation = this.#promptGeneration;
+		const controller = new AbortController();
+		this.#usagePreflightAbortControllers.add(controller);
+		try {
+			await this.#maybeApplyUsageAwareFallback(controller.signal);
+			return !controller.signal.aborted && this.#promptGeneration === generation;
+		} catch (error) {
+			if (controller.signal.aborted || this.#promptGeneration !== generation) return false;
+			throw error;
+		} finally {
+			this.#usagePreflightAbortControllers.delete(controller);
+		}
+	}
+
+	async #confirmUsageFallback(confirmation: UsageFallbackConfirmation, signal: AbortSignal): Promise<boolean> {
+		const confirmer = this.#usageFallbackConfirmer;
+		if (!confirmer || signal.aborted) return false;
+		const aborted = Promise.withResolvers<boolean>();
+		const onAbort = () => aborted.resolve(false);
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			return await Promise.race([confirmer(confirmation), aborted.promise]);
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+	}
+
+	async #maybeApplyUsageAwareFallback(signal: AbortSignal): Promise<void> {
+		if (!this.settings.get("retry.modelFallback") || !this.settings.get("retry.usageAwareFallback")) return;
+		const currentModel = this.model;
+		if (!currentModel) return;
+		const currentSelector = formatRetryFallbackSelector(currentModel, this.thinkingLevel);
+		let health: ModelUsageHealth;
+		try {
+			health = await this.#modelRegistry.authStorage.getModelUsageHealth(currentModel.provider, {
+				modelId: currentModel.id,
+				sessionId: this.sessionId,
+				baseUrl: currentModel.baseUrl,
+				reserveFraction: this.settings.get("retry.usageReservePct") / 100,
+				signal,
+			});
+		} catch (error) {
+			logger.debug("Usage-aware runtime preflight failed open", {
+				provider: currentModel.provider,
+				model: currentModel.id,
+				error: String(error),
+			});
+			return;
+		}
+		if (signal.aborted) return;
+
+		if (health.state === "healthy") {
+			this.#usageReserveApprovedSelector = undefined;
+			const selected = health.accounts.find(account => account.selected);
+			if (selected && selected.state !== "healthy" && health.accounts.some(account => account.state === "healthy")) {
+				this.#modelRegistry.authStorage.releaseSessionCredentialForReselection(
+					currentModel.provider,
+					this.sessionId,
+				);
+			}
+			return;
+		}
+		if (health.state === "unknown") {
+			this.#usageReserveApprovedSelector = undefined;
+			return;
+		}
+		const reservePolicy = this.settings.get("retry.usageReservePolicy");
+		if (reservePolicy === "fail-closed") {
+			const condition = health.state === "reserve" ? "reserve reached" : "usage depleted";
+			throw new Error(`${condition} for ${currentSelector}; reserve policy is fail-closed.`);
+		}
+
+		const role = this.#recovery.resolveRetryFallbackRole(currentSelector, currentModel);
+		if (!role) return;
+		let fallback: { selector: RetryFallbackSelector; apiKey: string } | undefined;
+		for (const candidate of this.#recovery.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
+			if (this.#recovery.isRetryFallbackSelectorSuppressed(candidate)) continue;
+			const resolved = resolveModelOverride([candidate.raw], this.#modelRegistry, this.settings);
+			const candidateModel = resolved.model ?? this.#modelRegistry.find(candidate.provider, candidate.id);
+			if (!candidateModel) continue;
+			if (!this.#modelRegistry.hasConfiguredAuth(candidateModel)) continue;
+			try {
+				const candidateHealth = await this.#modelRegistry.authStorage.getModelUsageHealth(candidateModel.provider, {
+					modelId: candidateModel.id,
+					sessionId: this.sessionId,
+					baseUrl: candidateModel.baseUrl,
+					reserveFraction: this.settings.get("retry.usageReservePct") / 100,
+					signal,
+				});
+				if (signal.aborted) return;
+				if (candidateHealth.state === "depleted" || candidateHealth.state === "reserve") continue;
+				if (candidateHealth.state === "healthy") {
+					const selected = candidateHealth.accounts.find(account => account.selected);
+					if (
+						selected &&
+						selected.state !== "healthy" &&
+						candidateHealth.accounts.some(account => account.state === "healthy")
+					) {
+						this.#modelRegistry.authStorage.releaseSessionCredentialForReselection(
+							candidateModel.provider,
+							this.sessionId,
+						);
+					}
+				}
+			} catch {
+				if (signal.aborted) return;
+				// Unknown usage fails open for an otherwise valid fallback.
+			}
+			if (signal.aborted) return;
+			let apiKey: string | undefined;
+			try {
+				apiKey = await this.#modelRegistry.getApiKey(candidateModel, this.sessionId, { signal });
+			} catch {
+				if (signal.aborted) return;
+				continue;
+			}
+			if (signal.aborted) return;
+			if (!apiKey) continue;
+			fallback = { selector: candidate, apiKey };
+			break;
+		}
+		if (!fallback) return;
+
+		if (health.state === "reserve") {
+			if (reservePolicy === "confirm" && this.#usageFallbackConfirmer) {
+				if (this.#usageReserveApprovedSelector === currentSelector) return;
+				const selected = health.accounts.find(account => account.selected);
+				const remainingFraction =
+					selected?.remainingFraction ??
+					health.accounts.reduce<number | undefined>(
+						(minimum, account) =>
+							account.remainingFraction === undefined
+								? minimum
+								: minimum === undefined
+									? account.remainingFraction
+									: Math.min(minimum, account.remainingFraction),
+						undefined,
+					);
+				const shouldFallback = await this.#confirmUsageFallback(
+					{
+						from: currentSelector,
+						to: fallback.selector.raw,
+						remainingPercent: remainingFraction === undefined ? undefined : Math.max(0, remainingFraction * 100),
+					},
+					signal,
+				);
+				if (signal.aborted) return;
+				if (!shouldFallback) {
+					this.#usageReserveApprovedSelector = currentSelector;
+					return;
+				}
+			}
+		}
+
+		if (signal.aborted) return;
+		this.#usageReserveApprovedSelector = undefined;
+		await this.#recovery.applyRetryFallbackCandidate(role, fallback.selector, currentSelector, {
+			pinFallback: true,
+			apiKey: fallback.apiKey,
+			signal,
+		});
+	}
+
 	/** Effective thinking level applied to the agent (the resolved level when `auto`). */
 	get thinkingLevel(): ThinkingLevel | undefined {
 		return this.#models.thinkingLevel;
@@ -4023,6 +4209,12 @@ export class AgentSession {
 		this.#rewoundToolResultIds.clear();
 	}
 
+	/** Drop mutable tool decisions and directives owned by the previous logical session. */
+	#clearSessionScopedToolState(): void {
+		this.#toolChoiceQueue.clear();
+		this.#tools.clearAcpPermissionDecisions();
+	}
+
 	/**
 	 * Rebuild checkpoint/rewind runtime state from the current branch. Handles two
 	 * cases surfaced by session resume, `switchSession()` reloading the same file,
@@ -4206,8 +4398,6 @@ export class AgentSession {
 		const content = prompt.render(planModeReferencePrompt, {
 			planFilePath,
 		});
-
-		this.#planReferenceSent = true;
 
 		return {
 			role: "custom",
@@ -4445,15 +4635,15 @@ export class AgentSession {
 
 		// If streaming, queue via steer() or followUp() based on option
 		if (this.isStreaming) {
-			if (!options?.streamingBehavior) {
-				throw new AgentBusyError();
-			}
+			const streamingBehavior = options?.streamingBehavior;
+			if (!streamingBehavior) throw new AgentBusyError();
+			if (!(await this.#runUsageAwarePreflight())) return false;
 			// Steer/follow-up the keyword notices BEFORE the queued user message so the
 			// model reads the steering notice ahead of the prompt it modifies.
 			for (const notice of keywordNotices) {
-				await this.sendCustomMessage(notice, { deliverAs: options.streamingBehavior });
+				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
-			if (options.streamingBehavior === "followUp") {
+			if (streamingBehavior === "followUp") {
 				await this.#queueUserMessage(expandedText, options?.images, "followUp");
 			} else {
 				await this.#queueUserMessage(expandedText, options?.images, "steer");
@@ -4540,26 +4730,23 @@ export class AgentSession {
 		}
 
 		if (options?.queueOnly) {
-			if (!options.streamingBehavior) {
-				throw new AgentBusyError();
-			}
+			const streamingBehavior = options?.streamingBehavior;
+			if (!streamingBehavior) throw new AgentBusyError();
+			if (!(await this.#runUsageAwarePreflight())) return;
 			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, options.streamingBehavior);
+				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
-			await this.#queueCustomMessage(message, options.streamingBehavior, options.queueChipText);
+			await this.#queueCustomMessage(message, streamingBehavior, options.queueChipText);
 			return;
 		}
 		if (this.isStreaming) {
-			if (!options?.streamingBehavior) {
-				throw new AgentBusyError();
-			}
+			const streamingBehavior = options?.streamingBehavior;
+			if (!streamingBehavior) throw new AgentBusyError();
+			if (!(await this.#runUsageAwarePreflight())) return;
 			for (const notice of keywordNotices) {
-				await this.sendCustomMessage(notice, { deliverAs: options.streamingBehavior });
+				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
-			await this.sendCustomMessage(message, {
-				deliverAs: options.streamingBehavior,
-				queueChipText: options.queueChipText,
-			});
+			await this.#queueCustomMessage(message, streamingBehavior, options?.queueChipText);
 			return;
 		}
 
@@ -4591,6 +4778,8 @@ export class AgentSession {
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		try {
+			await this.#recovery.maybeRestoreRetryFallbackPrimary();
+			if (!(await this.#runUsageAwarePreflight())) return;
 			// Flush any pending bash messages before the new prompt
 			await this.#bash.flushPending();
 			this.#eval.flushPending();
@@ -4599,8 +4788,6 @@ export class AgentSession {
 			this.#todo.resetCycle();
 			this.#resetPromptMaintenanceState();
 			this.#recovery.setAcceptTerminalEmptyStop(options?.acceptTerminalEmptyStop === true);
-
-			await this.#recovery.maybeRestoreRetryFallbackPrimary();
 
 			// Validate model
 			if (!this.model) {
@@ -4776,6 +4963,17 @@ export class AgentSession {
 				nonMessageTokens,
 				cutoffCount: this.messages.length + messages.length,
 			});
+			// Commit the plan-reference delivery flag only now that the message is
+			// actually handed to agent.prompt. Every pre-send setup step above can
+			// return (generation-bail) or throw (@-mention reads, before_agent_start
+			// hooks, pre-prompt compaction) before this point; setting the flag at
+			// construction time (#buildPlanReferenceMessage) stranded it `true` with
+			// nothing delivered, so the retry skipped re-injection and the executor
+			// lost the approved plan (issue #4094). The compaction-success resets
+			// (issue #1246) still clear it for re-injection on the next turn.
+			if (planReferenceMessage) {
+				this.#planReferenceSent = true;
+			}
 			try {
 				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
 			} finally {
@@ -4949,6 +5147,7 @@ export class AgentSession {
 		}
 
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
+		if (!(await this.#runUsageAwarePreflight())) return;
 		await this.#queueUserMessage(expandedText, images, "steer");
 	}
 
@@ -4966,6 +5165,7 @@ export class AgentSession {
 
 		const expandedText =
 			options?.expandPromptTemplates === false ? text : expandPromptTemplate(text, [...this.#promptTemplates]);
+		if (!(await this.#runUsageAwarePreflight())) return;
 		if (!options?.synthetic) {
 			await this.#queueUserMessage(expandedText, images, "followUp");
 			return;
@@ -5177,6 +5377,7 @@ export class AgentSession {
 	): Promise<void> {
 		this.#beginInFlight();
 		try {
+			if (!(await this.#runUsageAwarePreflight())) return;
 			const acceptTerminalEmptyStop = options?.acceptTerminalEmptyStop === true;
 			if (acceptTerminalEmptyStop) {
 				this.#resetPromptMaintenanceState();
@@ -5272,6 +5473,7 @@ export class AgentSession {
 				this.#queueHiddenNextTurnMessage(normalizedAppMessage, options?.triggerTurn ?? false);
 				return false;
 			}
+			if (!(await this.#runUsageAwarePreflight())) return false;
 
 			if (options?.deliverAs === "followUp") {
 				this.agent.followUp(normalizedAppMessage);
@@ -5353,6 +5555,8 @@ export class AgentSession {
 			text = textParts.join("\n");
 			if (images.length === 0) images = undefined;
 		}
+
+		if (options?.deliverAs && !(await this.#runUsageAwarePreflight())) return;
 
 		if (options?.deliverAs === "followUp") {
 			await this.#queueUserMessage(text, images, "followUp");
@@ -5578,6 +5782,7 @@ export class AgentSession {
 		this.#abortInProgress = true;
 		try {
 			this.#abortAutolearnCapture();
+			for (const controller of this.#usagePreflightAbortControllers) controller.abort();
 			this.abortRetry();
 			this.#promptGeneration++;
 			this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -5690,6 +5895,7 @@ export class AgentSession {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 		}
 
+		this.#clearSessionScopedToolState();
 		this.#clearCheckpointRuntimeState();
 		this.setTodoPhases([]);
 		this.#freshProviderSessionId = undefined;
@@ -6810,6 +7016,9 @@ export class AgentSession {
 			if (switchingToDifferentSession) {
 				await this.#memory.resetContextForNewTranscript();
 			}
+			if (switchingToDifferentSession) {
+				this.#clearSessionScopedToolState();
+			}
 			this.#reconnectToAgent();
 			try {
 				await this.#sessionSwitchReconciler?.();
@@ -6932,6 +7141,7 @@ export class AgentSession {
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 		}
+		this.#clearSessionScopedToolState();
 		this.#rehydrateCheckpointRewindState();
 		this.#todo.syncFromBranch();
 		this.#freshProviderSessionId = undefined;
@@ -7028,6 +7238,8 @@ export class AgentSession {
 		} finally {
 			this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 		}
+
+		this.#clearSessionScopedToolState();
 
 		this.#rehydrateCheckpointRewindState();
 		this.sessionManager.appendMessage({
@@ -7508,6 +7720,26 @@ export class AgentSession {
 			},
 			signal,
 		});
+	}
+
+	/** Models whose live `/usage` reports map to a quantitative provider scope. */
+	getUsageReportingModelSelectors(reports: readonly UsageReport[]): string[] {
+		const modelsByProvider = new Map<string, Model[]>();
+		for (const model of this.#modelRegistry.getAvailable()) {
+			const models = modelsByProvider.get(model.provider) ?? [];
+			models.push(model);
+			modelsByProvider.set(model.provider, models);
+		}
+		const selectors = new Set<string>();
+		for (const [provider, models] of modelsByProvider) {
+			const modelIds = this.#modelRegistry.authStorage.getUsageReportingModelIds(
+				provider,
+				models.map(model => model.id),
+				reports,
+			);
+			for (const modelId of modelIds) selectors.add(`${provider}/${modelId}`);
+		}
+		return [...selectors].sort((left, right) => left.localeCompare(right));
 	}
 
 	/**

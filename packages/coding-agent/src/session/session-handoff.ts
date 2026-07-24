@@ -56,6 +56,7 @@ export interface SessionHandoffHost {
 	finishBashSessionTransition(transition: BashSessionTransition, success: boolean): void;
 	cancelOwnAsyncJobs(): void;
 	clearCheckpointRuntimeState(): void;
+	clearSessionScopedToolState(): void;
 	clearFreshProviderSessionId(): void;
 	syncAgentSessionId(): void;
 	rekeyMemoryForCurrentSessionId(): void;
@@ -235,6 +236,8 @@ export class SessionHandoff {
 			} finally {
 				this.#host.finishBashSessionTransition(bashTransition, sessionTransitioned);
 			}
+
+			this.#host.clearSessionScopedToolState();
 
 			this.#host.clearCheckpointRuntimeState();
 			// agent.reset() clears the core steering/follow-up queues. Preserve any queued

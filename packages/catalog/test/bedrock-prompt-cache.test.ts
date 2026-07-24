@@ -107,17 +107,23 @@ describe("Bedrock prompt-cache compat", () => {
 			"us.amazon.nova-micro-v1:0",
 			"us.amazon.nova-pro-v1:0",
 			"us.amazon.nova-premier-v1:0",
+			"global.amazon.nova-2-lite-v1:0",
 		] as const) {
 			expect(getBundledModel<"bedrock-converse-stream">("amazon-bedrock", id)?.compat).toEqual(expected);
 		}
 
-		// AWS documents both the in-region model IDs and the US geo inference IDs.
+		// AWS documents in-region model IDs plus geo/global inference-profile IDs.
 		for (const id of [
 			"amazon.nova-lite-v1:0",
 			"amazon.nova-micro-v1:0",
 			"amazon.nova-pro-v1:0",
 			"amazon.nova-premier-v1:0",
 			"us.amazon.nova-premier-v1:0",
+			"amazon.nova-2-lite-v1:0",
+			"us.amazon.nova-2-lite-v1:0",
+			"eu.amazon.nova-2-lite-v1:0",
+			"jp.amazon.nova-2-lite-v1:0",
+			"global.amazon.nova-2-lite-v1:0",
 		] as const) {
 			expect(buildModel(bedrockSpec({ id })).compat).toEqual(expected);
 		}
@@ -128,7 +134,17 @@ describe("Bedrock prompt-cache compat", () => {
 		const unknown = buildModel(bedrockSpec({ id: opaqueProfileId }));
 		expect(unknown.compat.promptCacheMode).toBe("none");
 
-		for (const id of ["amazon.nova-premier-v1:1", "us.amazon.nova-unknown-v1:0"]) {
+		for (const id of [
+			"amazon.nova-lite-v1:1",
+			"amazon.nova-micro-v1:1",
+			"amazon.nova-pro-v1:1",
+			"amazon.nova-premier-v1:1",
+			"amazon.nova-2-lite-v1:1",
+			"global.amazon.nova-2-lite-v1:1",
+			"global.amazon.nova-2-lite-v2:0",
+			"us.amazon.nova-2-lite-v1:0-preview",
+			"us.amazon.nova-unknown-v1:0",
+		]) {
 			expect(buildModel(bedrockSpec({ id })).compat.promptCacheMode).toBe("none");
 		}
 		const sparse = {

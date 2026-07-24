@@ -127,6 +127,77 @@ describe("Bedrock prompt cache checkpoints", () => {
 		]);
 	});
 
+	test("emits default-5m checkpoints for every AWS-documented Nova 2 Lite ID", async () => {
+		const expected: Payload = {
+			system: [{ text: "Use concise answers." }, { cachePoint: { type: "default" } }],
+			messages: [
+				{
+					role: "user",
+					content: [{ text: "What is the answer?" }, { cachePoint: { type: "default" } }],
+				},
+			],
+			inferenceConfig: { maxTokens: undefined, temperature: undefined, topP: undefined },
+			toolConfig: undefined,
+			additionalModelRequestFields: undefined,
+		};
+
+		const bundled = getBundledModel<"bedrock-converse-stream">("amazon-bedrock", "global.amazon.nova-2-lite-v1:0");
+		expect(bundled).toBeDefined();
+		expect(await capturePayload(bundled!, "long")).toEqual(expected);
+
+		for (const id of [
+			"amazon.nova-2-lite-v1:0",
+			"us.amazon.nova-2-lite-v1:0",
+			"eu.amazon.nova-2-lite-v1:0",
+			"jp.amazon.nova-2-lite-v1:0",
+			"global.amazon.nova-2-lite-v1:0",
+		] as const) {
+			expect(await capturePayload(model(id), "long")).toEqual(expected);
+		}
+	});
+
+	test("does not emit checkpoints for unknown Nova IDs", async () => {
+		for (const id of [
+			"amazon.nova-lite-v1:1",
+			"amazon.nova-micro-v1:1",
+			"amazon.nova-pro-v1:1",
+			"amazon.nova-premier-v1:1",
+			"amazon.nova-2-lite-v1:1",
+			"global.amazon.nova-2-lite-v1:1",
+			"global.amazon.nova-2-lite-v2:0",
+			"us.amazon.nova-2-lite-v1:0-preview",
+			"us.amazon.nova-unknown-v1:0",
+		] as const) {
+			const payload = await capturePayload(model(id), "long");
+			expect(payload.system).toEqual([{ text: "Use concise answers." }]);
+			expect(payload.messages).toEqual([{ role: "user", content: [{ text: "What is the answer?" }] }]);
+			expect(checkpoints(payload)).toHaveLength(0);
+		}
+	});
+
+	test("does not exceed a configured checkpoint maximum", async () => {
+		const base = model("anthropic.claude-haiku-4-5-20251001-v1:0");
+		const disabled: Model<"bedrock-converse-stream"> = {
+			...base,
+			compat: { ...base.compat, promptCacheMaximumCheckpoints: 0 },
+		};
+		const single: Model<"bedrock-converse-stream"> = {
+			...base,
+			compat: { ...base.compat, promptCacheMaximumCheckpoints: 1 },
+		};
+
+		const disabledPayload = await capturePayload(disabled, "long");
+		expect(checkpoints(disabledPayload)).toHaveLength(0);
+
+		const singlePayload = await capturePayload(single, "long");
+		expect(checkpoints(singlePayload)).toEqual([{ cachePoint: { type: "default", ttl: "1h" } }]);
+		expect(singlePayload.messages[0]?.content).toEqual([
+			{ text: "What is the answer?" },
+			{ cachePoint: { type: "default", ttl: "1h" } },
+		]);
+		expect(singlePayload.system).toEqual([{ text: "Use concise answers." }]);
+	});
+
 	test("forces opaque profiles to default checkpoints without granting 1h retention", async () => {
 		await withEnv({ AWS_BEDROCK_FORCE_CACHE: "1" }, async () => {
 			const payload = await capturePayload(

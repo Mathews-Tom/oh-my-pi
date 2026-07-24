@@ -74,6 +74,13 @@ export interface PlanYolo {
 	thinkingLevel?: ConfiguredThinkingLevel;
 }
 
+/** Details shown when confirming a usage-reserve-triggered model fallback. */
+export interface UsageFallbackConfirmation {
+	from: string;
+	to: string;
+	remainingPercent: number | undefined;
+}
+
 /** Identifies a retry fallback chain already entered during startup model resolution. */
 export interface InitialRetryFallbackState {
 	/** Role whose configured primary was unavailable. */
@@ -82,6 +89,8 @@ export interface InitialRetryFallbackState {
 	originalSelector: string;
 	/** Thinking selector configured for the unavailable primary. */
 	originalThinkingLevel: ConfiguredThinkingLevel | undefined;
+	/** Prevent cooldown restoration when startup selected this fallback from live usage health. */
+	pinned?: boolean;
 }
 
 /** Dependencies and initial state used to construct an AgentSession. */

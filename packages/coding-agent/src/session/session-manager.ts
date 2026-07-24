@@ -81,8 +81,6 @@ import {
 
 const JSONL_SUFFIX_LENGTH = ".jsonl".length;
 const DRAFT_ONLY_SESSION_MARKER = ".draft-only-session";
-const SUPERSEDED_COMPACTION_SUMMARY = "[Superseded compaction summary elided after a newer compaction]";
-const SUPERSEDED_COMPACTION_SHORT_SUMMARY = "Superseded compaction elided";
 
 function mintSessionId(): string {
 	return Bun.randomUUIDv7();
@@ -745,26 +743,6 @@ export class SessionManager {
 
 	#shouldHaveSessionFile(): boolean {
 		return this.#forceFileCreation || this.#fileIsCurrent || this.#historyContainsAssistantMessage();
-	}
-
-	#elideSupersededCompactionsOnBranch(leafId: string | null): boolean {
-		if (!leafId) return false;
-		let changed = false;
-		for (const entry of this.#index.pathTo(leafId)) {
-			if (entry.type !== "compaction") continue;
-			if (
-				entry.summary === SUPERSEDED_COMPACTION_SUMMARY &&
-				entry.shortSummary === SUPERSEDED_COMPACTION_SHORT_SUMMARY &&
-				entry.preserveData === undefined
-			) {
-				continue;
-			}
-			entry.summary = SUPERSEDED_COMPACTION_SUMMARY;
-			entry.shortSummary = SUPERSEDED_COMPACTION_SHORT_SUMMARY;
-			entry.preserveData = undefined;
-			changed = true;
-		}
-		return changed;
 	}
 
 	/**
@@ -1979,7 +1957,6 @@ export class SessionManager {
 		fromExtension?: boolean,
 		preserveData?: Record<string, unknown>,
 	): string {
-		const elidedSupersededCompactions = this.#elideSupersededCompactionsOnBranch(this.#index.leafId());
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
 			...this.#freshEntryFields(),
@@ -1992,9 +1969,6 @@ export class SessionManager {
 			preserveData,
 		};
 		this.#recordEntry(entry);
-		if (elidedSupersededCompactions) {
-			void this.#rewriteAtomically().catch(err => this.#noteDiskFailure(err));
-		}
 		return entry.id;
 	}
 

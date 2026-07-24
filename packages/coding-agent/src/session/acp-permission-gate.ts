@@ -12,21 +12,16 @@ export const PERMISSION_REQUIRED_TOOLS: Record<string, true> = {
 	move: true,
 };
 
-/** Permission options indexed by their wire identifiers. */
-export const PERMISSION_OPTIONS_BY_ID: Record<string, ClientBridgePermissionOption> = {
-	allow_once: { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
-	allow_always: { optionId: "allow_always", name: "Always allow", kind: "allow_always" },
-	reject_once: { optionId: "reject_once", name: "Reject", kind: "reject_once" },
-	reject_always: { optionId: "reject_always", name: "Always reject", kind: "reject_always" },
-};
-
 /** Permission options presented to the client on each gated tool call. */
 export const PERMISSION_OPTIONS: ClientBridgePermissionOption[] = [
-	PERMISSION_OPTIONS_BY_ID.allow_once,
-	PERMISSION_OPTIONS_BY_ID.allow_always,
-	PERMISSION_OPTIONS_BY_ID.reject_once,
-	PERMISSION_OPTIONS_BY_ID.reject_always,
+	{ optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+	{ optionId: "allow_always", name: "Always allow", kind: "allow_always" },
+	{ optionId: "reject_once", name: "Reject", kind: "reject_once" },
+	{ optionId: "reject_always", name: "Always reject", kind: "reject_always" },
 ];
+
+/** Permission options indexed by their wire identifiers; unknown IDs miss and fail closed. */
+export const PERMISSION_OPTIONS_BY_ID = new Map(PERMISSION_OPTIONS.map(option => [option.optionId, option]));
 
 function getEditDestructiveIntent(args: unknown): { kind: "delete" | "move"; paths: string[] } | undefined {
 	if (!isRecord(args)) return undefined;

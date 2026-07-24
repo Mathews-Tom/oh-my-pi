@@ -28,8 +28,8 @@ import * as snapcompact from "@oh-my-pi/snapcompact";
  *
  * The fix rebuilds the trailing archive locally via snapcompact.compact() at
  * a threshold-derived frame budget (planArchive truncates the oldest chars),
- * persists it through appendCompaction (write-time elision drops the stale
- * frame payload), and skips the misleading no-progress warning.
+ * persists it through appendCompaction, and skips the misleading no-progress
+ * warning.
  */
 describe("AgentSession snapcompact frame dead-end rescue", () => {
 	let tempDir: TempDir;
@@ -287,13 +287,15 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		expect(compactOptions.maxFrames).toBeDefined();
 		expect(compactOptions.maxFrames as number).toBeLessThan(SEEDED_FRAME_COUNT);
 
-		// The rebuilt entry supersedes the stale one; write-time elision must
-		// have dropped the stale frame payload from the persisted branch.
-		const compactions = sessionManager.getBranch().filter(e => e.type === "compaction") as CompactionEntry[];
+		// The rebuilt entry supersedes the stale one in active context without
+		// destroying the stale archive needed by a later rewind.
+		const compactions = sessionManager
+			.getBranch()
+			.filter((entry): entry is CompactionEntry => entry.type === "compaction");
 		expect(compactions.length).toBe(2);
 		const [stale, rebuilt] = compactions;
-		expect(stale.summary).toContain("Superseded compaction summary elided");
-		expect(stale.preserveData).toBeUndefined();
+		expect(stale.summary).toBe("Archived history onto stale snapcompact frames.");
+		expect(snapcompact.getPreservedArchive(stale.preserveData)?.frames.length).toBe(SEEDED_FRAME_COUNT);
 		const rebuiltArchive = snapcompact.getPreservedArchive(rebuilt.preserveData);
 		expect(rebuiltArchive?.frames.length).toBe(4);
 
@@ -341,11 +343,13 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		await triggerMaintenance();
 
 		expect(compactSpy).toHaveBeenCalledTimes(1);
-		const compactions = sessionManager.getBranch().filter(e => e.type === "compaction") as CompactionEntry[];
+		const compactions = sessionManager
+			.getBranch()
+			.filter((entry): entry is CompactionEntry => entry.type === "compaction");
 		expect(compactions.length).toBe(2);
 		const [hookWritten, rebuilt] = compactions;
-		expect(hookWritten.summary).toContain("Superseded compaction summary elided");
-		expect(hookWritten.preserveData).toBeUndefined();
+		expect(hookWritten.summary).toBe("compacted");
+		expect(snapcompact.getPreservedArchive(hookWritten.preserveData)?.frames.length).toBe(SEEDED_FRAME_COUNT);
 		expect(snapcompact.getPreservedArchive(rebuilt.preserveData)?.frames.length).toBe(4);
 		// Extensions must be notified about the entry that is now active, not
 		// only the hook-written one the rescue superseded.
@@ -391,7 +395,9 @@ describe("AgentSession snapcompact frame dead-end rescue", () => {
 		expect(noProgress[0].level).toBe("warning");
 		// The dead-end badge must live on the ACTIVE (rebuilt) entry — the
 		// collapsed transcript only shows the latest compaction divider.
-		const compactions = sessionManager.getBranch().filter(e => e.type === "compaction") as CompactionEntry[];
+		const compactions = sessionManager
+			.getBranch()
+			.filter((entry): entry is CompactionEntry => entry.type === "compaction");
 		const active = compactions.at(-1);
 		expect(snapcompact.getPreservedArchive(active?.preserveData)?.frames.length).toBe(4);
 		expect(active?.warning).toContain(NO_PROGRESS_FRAGMENT);

@@ -158,6 +158,11 @@ export class SessionTools {
 		return this.#skillsSettings;
 	}
 
+	/** Drops cached per-session ACP `allow_always`/`reject_always` decisions. */
+	clearAcpPermissionDecisions(): void {
+		this.#acpPermissionDecisions.clear();
+	}
+
 	/** Re-wraps active and mounted tools after the ACP client changes. */
 	refreshAcpPermissionGates(): void {
 		this.#acpPermissionDecisions.clear();
@@ -397,7 +402,7 @@ export class SessionTools {
 					if (outcome.outcome === "cancelled") {
 						throw new ToolAbortError("Permission request cancelled");
 					}
-					const selectedOption = PERMISSION_OPTIONS_BY_ID[outcome.optionId];
+					const selectedOption = PERMISSION_OPTIONS_BY_ID.get(outcome.optionId);
 					if (!selectedOption) {
 						throw new ToolError(`Tool permission response used unknown option ID: ${outcome.optionId}`);
 					}
@@ -566,10 +571,15 @@ export class SessionTools {
 		const summaries = new Map(this.#xdevRegistry?.entries().map(entry => [entry.name, entry.summary]) ?? []);
 		const added = [...pending.added].map(name => ({ name, summary: summaries.get(name) ?? "" }));
 		const removed = [...pending.removed].map(name => ({ name }));
+		const docs = this.#xdevRegistry?.docsFor(
+			pending.added,
+			this.#host.settings.get("tools.xdevDocs"),
+			this.#host.settings.get("tools.xdevInlineDevices"),
+		);
 		return {
 			role: "custom",
 			customType: XDEV_MOUNT_NOTICE_MESSAGE_TYPE,
-			content: prompt.render(xdevMountNoticePrompt, { added, removed }),
+			content: prompt.render(xdevMountNoticePrompt, { added, removed, docs }),
 			attribution: "agent",
 			display: false,
 			timestamp: Date.now(),

@@ -173,7 +173,7 @@ interface CachePoint {
 }
 
 interface BedrockPromptCachePolicy {
-	emitCheckpoints: boolean;
+	remainingCheckpoints: number;
 	ttl?: "1h";
 }
 interface TextBlockWire {
@@ -700,30 +700,43 @@ function handleContentBlockStop(
 
 /**
  * Resolve Bedrock's explicit-cache request policy from the catalog's
- * materialized provider contract. `AWS_BEDROCK_FORCE_CACHE` remains an escape
- * hatch for opaque application inference profiles, but it cannot invent 1h
- * retention that the model compat did not explicitly grant.
+ * materialized provider contract. Bedrock enforces each model's minimum
+ * prefix-token requirement, so this boundary intentionally does not locally
+ * count tokens. The emitter prioritizes the final user boundary, then the
+ * system boundary, without exceeding the configured checkpoint maximum.
+ *
+ * `AWS_BEDROCK_FORCE_CACHE` remains an escape hatch for opaque application
+ * inference profiles, defaulting those otherwise-unknown models to the
+ * existing two-checkpoint layout without inventing 1h retention.
  */
 function resolvePromptCachePolicy(
 	model: Model<"bedrock-converse-stream">,
 	cacheRetention: CacheRetention,
 ): BedrockPromptCachePolicy {
 	if (cacheRetention === "none" || model.compat.promptCacheMode === "automatic") {
-		return { emitCheckpoints: false };
+		return { remainingCheckpoints: 0 };
 	}
 
 	const forced = $flag("AWS_BEDROCK_FORCE_CACHE");
-	if (model.compat.promptCacheMode !== "explicit" && !forced) {
-		return { emitCheckpoints: false };
+	const explicit = model.compat.promptCacheMode === "explicit";
+	if (!explicit && !forced) {
+		return { remainingCheckpoints: 0 };
+	}
+
+	const configuredMaximum = explicit ? model.compat.promptCacheMaximumCheckpoints : 2;
+	if (configuredMaximum <= 0) {
+		return { remainingCheckpoints: 0 };
 	}
 
 	return {
-		emitCheckpoints: true,
+		remainingCheckpoints: Math.min(configuredMaximum, 2),
 		...(cacheRetention === "long" && model.compat.supportsLongPromptCacheRetention ? { ttl: "1h" } : {}),
 	};
 }
 
-function createCachePoint(policy: BedrockPromptCachePolicy): CachePoint {
+function takeCachePoint(policy: BedrockPromptCachePolicy): CachePoint | undefined {
+	if (policy.remainingCheckpoints <= 0) return undefined;
+	policy.remainingCheckpoints--;
 	return { cachePoint: { type: "default", ...(policy.ttl ? { ttl: policy.ttl } : {}) } };
 }
 
@@ -747,9 +760,8 @@ function buildSystemPrompt(
 
 	const blocks: SystemContent[] = prompts.map(prompt => ({ text: prompt }));
 
-	if (promptCachePolicy.emitCheckpoints) {
-		blocks.push(createCachePoint(promptCachePolicy));
-	}
+	const cachePoint = takeCachePoint(promptCachePolicy);
+	if (cachePoint) blocks.push(cachePoint);
 
 	return blocks;
 }
@@ -888,11 +900,13 @@ function convertMessages(
 		}
 	}
 
-	// Preserve the existing second checkpoint after the final user message.
-	if (promptCachePolicy.emitCheckpoints && result.length > 0) {
+	// Prioritize the final user checkpoint; buildSystemPrompt consumes any
+	// remaining configured capacity afterward.
+	if (result.length > 0) {
 		const lastMessage = result[result.length - 1];
 		if (lastMessage.role === "user" && lastMessage.content) {
-			(lastMessage.content as UserContent[]).push(createCachePoint(promptCachePolicy));
+			const cachePoint = takeCachePoint(promptCachePolicy);
+			if (cachePoint) (lastMessage.content as UserContent[]).push(cachePoint);
 		}
 	}
 

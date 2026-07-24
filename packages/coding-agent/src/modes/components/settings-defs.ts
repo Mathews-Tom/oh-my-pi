@@ -129,6 +129,13 @@ const CONDITIONS: Record<string, () => boolean> = {
 			return false;
 		}
 	},
+	usageAwareFallbackEnabled: () => {
+		try {
+			return Settings.instance.get("retry.usageAwareFallback") === true;
+		} catch {
+			return false;
+		}
+	},
 	planModeEnabled: () => {
 		try {
 			return Settings.instance.get("plan.enabled");

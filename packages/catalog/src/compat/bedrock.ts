@@ -59,7 +59,12 @@ function detectedBedrockCompat(modelId: string): ResolvedBedrockCompat {
 		id === "amazon.nova-pro-v1:0" ||
 		id === "us.amazon.nova-pro-v1:0" ||
 		id === "amazon.nova-premier-v1:0" ||
-		id === "us.amazon.nova-premier-v1:0"
+		id === "us.amazon.nova-premier-v1:0" ||
+		id === "amazon.nova-2-lite-v1:0" ||
+		id === "us.amazon.nova-2-lite-v1:0" ||
+		id === "eu.amazon.nova-2-lite-v1:0" ||
+		id === "jp.amazon.nova-2-lite-v1:0" ||
+		id === "global.amazon.nova-2-lite-v1:0"
 	) {
 		return EXPLICIT_CHECKPOINTS_1024_5M;
 	}

@@ -306,6 +306,14 @@ export interface OpenAICompat {
 	promptCacheSessionHeader?: "x-grok-conv-id";
 	/** Whether chat-completions payloads should include provider-specific prompt-cache markers. */
 	cacheControlFormat?: "anthropic" | undefined;
+	/**
+	 * Whether this endpoint/model accepts OpenAI's explicit
+	 * `prompt_cache_breakpoint` content markers and `prompt_cache_options`.
+	 * Defaults to the exact first-party model generation allowlist.
+	 */
+	supportsPromptCacheBreakpoints?: boolean;
+	/** The only currently supported minimum lifetime for explicit OpenAI cache breakpoints. */
+	promptCacheBreakpointTtl?: "30m";
 	/** Whether the provider supports the `strict` field in tool definitions. Default: auto-detected per provider/baseUrl (conservative for unknown providers). */
 	supportsStrictMode?: boolean;
 	/**
@@ -468,9 +476,16 @@ export interface BedrockCompat {
 	promptCacheMode?: "none" | "automatic" | "explicit";
 	/** Whether explicit cachePoint blocks accept `ttl: "1h"`; omitted TTL means Bedrock's 5-minute default. */
 	supportsLongPromptCacheRetention?: boolean;
-	/** Minimum prompt-prefix tokens required for an effective checkpoint. Zero means no explicit checkpoints. */
+	/**
+	 * Bedrock-enforced minimum prompt-prefix tokens for an effective checkpoint.
+	 * Capability metadata only: emitters must not estimate local token counts.
+	 * Zero means no explicit checkpoints.
+	 */
 	promptCacheMinimumTokens?: number;
-	/** Maximum explicit cache checkpoints accepted in one request. Zero means no explicit checkpoints. */
+	/**
+	 * Bedrock-enforced maximum explicit cache checkpoints per request.
+	 * Capability metadata only; zero means no explicit checkpoints.
+	 */
 	promptCacheMaximumCheckpoints?: number;
 }
 
@@ -504,6 +519,12 @@ export interface VercelGatewayRouting {
 	only?: string[];
 	/** List of provider slugs to try in order (e.g., ["anthropic", "openai"]). */
 	order?: string[];
+	/** Enables Vercel AI Gateway's provider-aware automatic prompt caching. */
+	caching?: "auto";
+	/** Stable Responses input-item prefix to anchor for automatic caching. */
+	cacheAnchorItems?: number;
+	/** Requested automatic-cache lifetime for the Responses API. */
+	cacheTtl?: "5m" | "1h";
 }
 
 type ResolvedToolStrictMode = NonNullable<OpenAICompat["toolStrictMode"]> | "mixed";
@@ -548,6 +569,14 @@ export interface ResolvedOpenAISharedCompat {
 	emptyLengthFinishIsContextError: boolean;
 	usesOpenAIToolCallIdLimit: boolean;
 	promptCacheSessionHeader?: OpenAICompat["promptCacheSessionHeader"];
+	/**
+	 * Whether this model accepts explicit OpenAI prompt-cache breakpoints.
+	 * Built catalog models always materialize this false-by-default value;
+	 * optionality preserves hand-authored resolved compat fixtures.
+	 */
+	supportsPromptCacheBreakpoints?: boolean;
+	/** Minimum cache lifetime supported by explicit OpenAI prompt-cache breakpoints. */
+	promptCacheBreakpointTtl?: "30m";
 	/** The model sits behind OpenRouter (routing prefs and max-token omission apply). */
 	isOpenRouterHost: boolean;
 	/** Whether this endpoint needs a max-token field even when caller did not set one. */
@@ -604,6 +633,8 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "emptyLengthFinishIsContextError"
 			| "usesOpenAIToolCallIdLimit"
 			| "promptCacheSessionHeader"
+			| "supportsPromptCacheBreakpoints"
+			| "promptCacheBreakpointTtl"
 			| "openRouterRouting"
 			| "isOpenRouterHost"
 			| "supportsStrictMode"
@@ -643,6 +674,9 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 	supportsImageDetailOriginal: boolean;
 	supportsObfuscationOptOut: boolean;
 	streamIdleTimeoutMs?: number;
+	vercelGatewayRouting?: OpenAICompat["vercelGatewayRouting"];
+	/** The model sits behind Vercel AI Gateway's Responses endpoint. */
+	isVercelGatewayHost: boolean;
 }
 
 /**

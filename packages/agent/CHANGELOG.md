@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Classified Cloudflare AI Gateway `cf-aig-cache-status` into bounded `pi.gen_ai.gateway.response_cache.status` values (`hit` | `miss` | `bypass` | `unknown`) on chat spans, without mapping response replay to prompt-cache token attributes or recording arbitrary Cloudflare headers
+
 ### Changed
 
 - Queued steering no longer hard-aborts non-interruptible tools (e.g. `bash`): it aborts interruptible waits only and raises a cooperative steering signal (`ToolCallContext.steeringSignal`) that long-running tools may observe to finish early or background themselves. The mid-batch steering/IRC watch now runs for every tool batch instead of only batches containing an interruptible tool.
@@ -16,8 +20,6 @@
 ### Fixed
 
 - Improved resilience against transient stream JSON parse failures by recovering completed tool calls while safely preventing incomplete, unknown, refused, or sensitive calls from executing.
-### Fixed
-
 - Fixed compaction/summarization serializing prior assistant reasoning back to Claude as text (rendered verbatim inside `<thinking>` tags for the `anthropic` dialect), which tripped Anthropic's `reasoning_extraction` refusal and blocked compaction on Fable 5 sessions; `serializeConversation` now drops `thinking` blocks for Anthropic-dialect summary targets while other dialects (e.g. Harmony) keep their native reasoning ([#6093](https://github.com/can1357/oh-my-pi/issues/6093)).
 
 ## [17.0.5] - 2026-07-18

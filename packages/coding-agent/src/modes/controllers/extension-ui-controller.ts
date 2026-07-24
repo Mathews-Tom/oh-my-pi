@@ -128,6 +128,16 @@ export class ExtensionUiController {
 		};
 		this.ctx.setToolUIContext(uiContext, true);
 		this.#toolUIContext = uiContext;
+		this.ctx.session.setUsageFallbackConfirmer?.(confirmation => {
+			const reserve =
+				confirmation.remainingPercent === undefined
+					? "inside the configured reserve margin"
+					: `${confirmation.remainingPercent.toFixed(1)}% remaining`;
+			return this.showHookConfirm(
+				"Coding-plan reserve reached",
+				`${confirmation.from} has ${reserve}. Switch to ${confirmation.to}? Choose No to keep using the current plan.`,
+			);
+		});
 
 		const extensionRunner = this.ctx.session.extensionRunner;
 		if (!extensionRunner) {
@@ -165,6 +175,8 @@ export class ExtensionUiController {
 			},
 			getThinkingLevel: () => this.ctx.session.thinkingLevel,
 			setThinkingLevel: level => this.ctx.session.setThinkingLevel(level),
+			getServiceTiers: () => this.ctx.session.serviceTierByFamily,
+			setServiceTier: (family, tier) => this.ctx.session.setServiceTierFamily(family, tier),
 			getCommands: () => getSessionSlashCommands(this.ctx.session),
 			getSessionName: () => this.ctx.sessionManager.getSessionName(),
 			setSessionName: name => this.#updateSessionName(name),
@@ -396,6 +408,8 @@ export class ExtensionUiController {
 			},
 			getThinkingLevel: () => this.ctx.session.thinkingLevel,
 			setThinkingLevel: (level, persist) => this.ctx.session.setThinkingLevel(level, persist),
+			getServiceTiers: () => this.ctx.session.serviceTierByFamily,
+			setServiceTier: (family, tier) => this.ctx.session.setServiceTierFamily(family, tier),
 			getCommands: () => getSessionSlashCommands(this.ctx.session),
 			getSessionName: () => this.ctx.sessionManager.getSessionName(),
 			setSessionName: name => this.#updateSessionName(name),
