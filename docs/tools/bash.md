@@ -83,6 +83,150 @@ bash:
 
 Use this setting for safety and user control. It remains useful for commands with no appropriate replacement tool, such as destructive removal, network access, deployment scripts, or project-specific scripts.
 
+#### Preset policies
+
+Three ready-made rule sets. Paste one into `~/.omp/agent/config.yml` or a project config and edit from there. They are ordinary `bash.patterns` lists — there is no tier setting and no separate schema. Conservative and Balanced end with an explicit `match: "*"` fallback rule, the same technique Permissive already uses for its own fallback, so a command matching no other rule is at least prompted under every `tools.approvalMode` — including the default `yolo`. The one exception is a built-in critical pattern: closing that gap in `yolo` needs a non-`yolo` mode or an explicit `tools.approval.bash: prompt`/`deny` policy — `allow` does not qualify — since no `bash.patterns` rule can supply it — see the last matcher property below.
+
+**Conservative** — nothing runs unattended except read-only inspection.
+
+```yaml
+bash:
+  patterns:
+    - match: "rm -rf *"
+      approval: deny
+    - match: "sudo *"
+      approval: deny
+    - match: "git push --force*"
+      approval: deny
+    - match: "git reset --hard*"
+      approval: deny
+    - match: "curl *"
+      approval: prompt
+    - match: "wget *"
+      approval: prompt
+    - match: "git push*"
+      approval: prompt
+    - match: "git diff*--output*"
+      approval: prompt
+    - match: "git log*--output*"
+      approval: prompt
+    - match: "git show*--output*"
+      approval: prompt
+    - match: "git status*"
+      approval: allow
+    - match: "git diff*"
+      approval: allow
+    - match: "git log*"
+      approval: allow
+    - match: "git show*"
+      approval: allow
+    - match: "*"
+      approval: prompt
+```
+
+`git diff`, `git log`, and `git show` accept `--output=<file>`, which writes (and truncates an existing file at) `<file>` — the one way those three otherwise-read-only commands have a side effect from their own flags, which is why they get a dedicated prompt rule above instead of a bare allowance. These presets gate the literal command line; they cannot see or override the local Git configuration or a repository's own hooks. A `diff.external` helper, `core.pager`, `core.editor`, a credential helper, or a hook such as `pre-commit`/`post-checkout` can all execute arbitrary code as a side effect of an otherwise ordinary invocation like `git diff` — audit your own `git config --list` and hooks if that matters for your threat model, and pass an override such as `--no-ext-diff` on the command itself where you need one. This preset is not an exhaustive audit of every Git subcommand, flag, or configuration hook; add further `deny`/`prompt` rules for anything else your workflow needs to gate.
+
+**Balanced** — routine development commands run unattended; network egress, publishing, and history rewrites stop for a person.
+
+The `git *` allowance below is an explicit blocklist, not an allowlist: it permits every Git subcommand except the network, history-rewrite, and publishing forms named above. Git's subcommand and flag surface is too large to enumerate exhaustively — treat the guarded list as covering the common cases, not a guarantee, and use Conservative (which allows only four read-only `git` subcommands) wherever an incomplete blocklist is not an acceptable risk.
+
+```yaml
+bash:
+  patterns:
+    - match: "rm -rf *"
+      approval: deny
+    - match: "sudo *"
+      approval: deny
+    - match: "*git*push*--force*"
+      approval: deny
+    - match: "curl *"
+      approval: prompt
+    - match: "wget *"
+      approval: prompt
+    - match: "*git*push*"
+      approval: prompt
+    - match: "npm publish*"
+      approval: prompt
+    - match: "*git*reset --hard*"
+      approval: prompt
+    - match: "*git*rebase*"
+      approval: prompt
+    - match: "*git*fetch*"
+      approval: prompt
+    - match: "*git*pull*"
+      approval: prompt
+    - match: "*git*clone*"
+      approval: prompt
+    - match: "*git*ls-remote*"
+      approval: prompt
+    - match: "*git*commit*--amend*"
+      approval: prompt
+    - match: "*git*branch*-f*"
+      approval: prompt
+    - match: "*git*archive*--remote*"
+      approval: prompt
+    - match: "*git*submodule*update*"
+      approval: prompt
+    - match: "*git*checkout*-B*"
+      approval: prompt
+    - match: "*git*switch*-C*"
+      approval: prompt
+    - match: "*git*switch*--force-create*"
+      approval: prompt
+    - match: "git *"
+      approval: allow
+    - match: "bun*publish*"
+      approval: prompt
+    - match: "bun *"
+      approval: allow
+    - match: "make*publish*"
+      approval: prompt
+    - match: "make"
+      approval: allow
+    - match: "make *"
+      approval: allow
+    - match: "*"
+      approval: prompt
+```
+
+The `git` rules above cover Git's own network, history-rewrite, force-branch-move, submodule-network, and amend/reset-form subcommands, including a leading global option such as `-C <path>`; other subcommands (`add`, `diff`, `log`, `merge`, plain `checkout`/`switch`, …) still fall through to the broad `git *` allowance. This list targets the risk categories the preset's own description names — network egress, publishing, and history rewrites — not every Git subcommand or config-driven side effect (a repository hook or a helper such as `diff.external` can still run arbitrary code; see the note under Conservative); add further rules for anything else you want gated. "Network egress" here means ad hoc network commands — `curl`, `wget`, and Git's own remote operations (`fetch`, `pull`, `clone`, `ls-remote`, `push`, `archive --remote`, `submodule update --init`/`--remote`) — not a project's own declared package-manager operations: `bun install`/`bun add` also contact a registry, but resolve against the project's already-committed lockfile and are treated as routine development commands here, the same as `bun *`/`make *` running whatever a project defines under that name (this preset has no `npm *` allowance, so a bare `npm install` falls to the trailing prompt rule, not to an allowance). Narrow this preset (or use Conservative) if package-manager network access needs a prompt too. `bun *` and `make *` allow whatever a project defines under `package.json` scripts or a `Makefile` target of that name. The `bun*publish*` prompt rule also catches a script invocation containing the word `publish` (`bun run publish`), since the matcher only sees the literal command line — but not a differently-named script whose implementation happens to call `npm publish` (`bun run release`), or a destructive command hidden behind an unrelated script name; `bash.patterns` cannot see inside a script.
+
+**Permissive** — everything runs unattended except a short refusal list.
+
+```yaml
+bash:
+  patterns:
+    - match: "rm -rf *"
+      approval: deny
+    - match: "rm -fr *"
+      approval: deny
+    - match: "rm -r -f *"
+      approval: deny
+    - match: "rm -f -r *"
+      approval: deny
+    - match: "rm --recursive --force*"
+      approval: deny
+    - match: "rm --force --recursive*"
+      approval: deny
+    - match: "sudo *"
+      approval: deny
+    - match: "*git*push*--force*"
+      approval: prompt
+    - match: "*git*push*-f*"
+      approval: prompt
+    - match: "*"
+      approval: allow
+```
+
+The `rm` and `git push` rules above cover the common flag orderings and global-option placement, not every possible invocation — `rm` accepts further equivalent short/long flag permutations, and a command can still be built to evade a literal-plus-wildcard matcher. Treat Permissive as a fast default, not a security boundary; use Conservative or Balanced where that distinction matters.
+
+Four properties of the matcher decide whether a preset behaves as written:
+
+- **Order the refusals first.** The first matching rule wins, and `allow` is checked by the same scan. `match: "git *"` placed above `match: "git push --force*"` allows the force-push, because the `allow` rule matches first.
+- **`*` is the only wildcard and it matches any run of characters, including none.** `match: "git status*"` covers both `git status` and `git status --short`; `match: "git status"` covers only the exact command. The glob is anchored to the whole command line after runs of whitespace are collapsed to single spaces.
+- **`allow` never applies to a command line containing shell control syntax.** Any of `;`, `&`, `|`, `<`, `>`, `` ` ``, `$`, `(`, `)`, or a newline disqualifies every `allow` rule for that call, so a narrow allowance cannot be used to smuggle an extra segment. `git status && rm -rf build` is not allowed by `match: "git *"`, and neither is `echo $HOME`. `deny` and `prompt` are unaffected: they match the whole line and each shell segment.
+- **Critical patterns force a prompt only outside `yolo` mode, or with an explicit `prompt`/`deny` tool policy — an explicit `allow` does not qualify.** A command matching a built-in critical pattern — `rm -rf /`, fork bombs, remote-fetch-then-execute, writes to `/etc/passwd`, host shutdown — carries a safety override, but `BashTool.approval()` returns that override *before* it reads any matching `bash.patterns` `allow`/`prompt` rule (`bash.ts:501-502` runs before `:504`), so the override itself carries no `bash.patterns` policy. `resolveApproval()` ignores an override with no policy in the default `yolo` mode (`approval.ts:132-147`), so a critical command not covered by an earlier `bash.patterns` `deny` rule still runs unattended under `yolo` — including when `tools.approval.bash` is explicitly `allow`. A `bash.patterns` `deny` rule still takes priority in every mode, since the deny check (`bash.ts:493`) runs before the critical check. To make the override itself stop a critical command, run a non-`yolo` `tools.approvalMode` (see [Modes](../approval-mode.md#modes)) or set `tools.approval.bash: prompt`/`deny`, consistent with [Safety overrides](../approval-mode.md#safety-overrides).
+
 ### `bashInterceptor.patterns`: dedicated-tool routing
 
 `bashInterceptor` is an opt-in routing layer (`bashInterceptor.enabled` defaults to `false`). It is for commands that are technically valid Bash but are better expressed through an available dedicated tool. Each pattern is a regular expression and includes the name of that replacement tool and the explanation shown to the model.

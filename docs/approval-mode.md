@@ -46,9 +46,9 @@ Resolution per tool call:
 
 ### Tool granularity vs command granularity
 
-`tools.approval.<tool>` decides whether a tool may run at all. It cannot distinguish `git status` from `git push --force`, so `bash: prompt` asks about every command line.
+`tools.approval.<tool>` decides whether a tool may run at all. It cannot distinguish `git status` from `git push --force` on its own — with no `bash.patterns` rules configured, `bash: prompt` asks about every command line.
 
-For per-command policy, use `bash.patterns` — an ordered list of `match` globs, each with an `approval` of `allow`, `prompt`, or `deny`. It resolves before the tool-level policy and can auto-approve routine commands while still prompting or refusing on the rest:
+For per-command policy, use `bash.patterns` — an ordered list of `match` globs, each with an `approval` of `allow`, `prompt`, or `deny`. A matching `allow`/`prompt` rule's outcome is used instead of the tool-level policy in every mode, not only `yolo`, so it can auto-approve routine commands while still prompting or refusing on the rest — including overriding a stricter `tools.approval.bash: prompt`. It cannot reopen a tool the user has disabled: `tools.approval.bash: deny` is checked first and always wins, regardless of any `bash.patterns` `allow` rule. In the example below, pairing `bash: prompt` with `git status: allow` still runs `git status` unattended; only a command matching no `bash.patterns` rule falls back to `tools.approval.bash`:
 
 ```yaml
 bash:
