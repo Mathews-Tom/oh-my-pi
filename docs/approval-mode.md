@@ -44,6 +44,25 @@ Resolution per tool call:
 5. Otherwise, a valid user policy wins.
 6. Otherwise, the active mode auto-approves or prompts by tier.
 
+### Tool granularity vs command granularity
+
+`tools.approval.<tool>` decides whether a tool may run at all. It cannot distinguish `git status` from `git push --force`, so `bash: prompt` asks about every command line.
+
+For per-command policy, use `bash.patterns` — an ordered list of `match` globs, each with an `approval` of `allow`, `prompt`, or `deny`. It resolves before the tool-level policy and can auto-approve routine commands while still prompting or refusing on the rest:
+
+```yaml
+bash:
+  patterns:
+    - match: "rm -rf *"
+      approval: deny
+    - match: "curl *"
+      approval: prompt
+    - match: "git status"
+      approval: allow
+```
+
+See [`bash.patterns`: permission policy](./tools/bash.md#bashpatterns-permission-policy) for the matching rules and [Preset policies](./tools/bash.md#preset-policies) for ready-made rule sets.
+
 ## Safety overrides
 
 A tool can force a prompt with object-form approval:

@@ -63,7 +63,7 @@ Two independent settings can prevent a Bash subprocess from starting. They serve
 
 ### `bash.patterns`: permission policy
 
-`bash.patterns` is for commands that must be allowed, confirmed by a person, or refused regardless of whether another tool could perform the work. Rules are ordered; the first matching rule wins. Each rule has a `match` glob and an `approval` value of `allow`, `prompt`, or `deny`.
+`bash.patterns` is for commands that must be allowed, confirmed by a person, or refused regardless of whether another tool could perform the work. Rules are ordered; the first matching rule wins. Each rule has a `match` glob and an `approval` value of `allow`, `prompt`, or `deny`. It is the command-granularity counterpart to the tool-granularity `tools.approval.<tool>` setting described in [Tool approval mode](../approval-mode.md#user-overrides).
 
 ```yaml
 bash:
