@@ -125,6 +125,9 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 	interaction: [
 		"Input",
 		"Approvals",
+		// Beside "Approvals" because it is the sibling axis: approval asks "may
+		// this tool run", these keys ask "may it touch this path".
+		"Permissions",
 		"Notifications",
 		"Speech",
 		"Collab",
