@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed several soundness gaps in the resource permission layer (`permissions.*`, [docs/permissions.md](../../docs/permissions.md)): `grep`/`ast_grep`/`ast_edit` now recheck the files they actually visited after a recursive call, not just the declared scope root; `debug`'s `launch`/`attach`/`evaluate`/`write_memory`/`custom_request` actions are scanned as opaque rather than trusted as structured; `lsp` now validates every URI in a server-returned `WorkspaceEdit` and scans executed workspace commands before applying either; `ssh://` targets are checked against the same deny/allow globs as local paths instead of being treated as exempt; an allow carve-out (including the built-in `**/.env.example` rule) can no longer bypass `permissions.confineWrites`/`confineReads`; a symlink alias whose resolved target matches a deny rule is now caught even under its lexical spelling; a malformed glob pattern in `permissions.deny.*`/`permissions.allow.*` is rejected with a clear error at settings load instead of silently matching nothing; and the opaque-tool literal-scan cap is now enforced within a single oversized argument, not just across arguments.
+
 ## [17.2.3] - 2026-08-01
 
 ### Changed

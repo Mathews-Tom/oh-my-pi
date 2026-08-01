@@ -515,7 +515,7 @@ permissions:
 | `permissions.confineReads` | boolean | `false` | Same for reads; off in every profile by default. |
 | `permissions.deny.read` | array | `[]` | `Bun.Glob` path patterns, merged onto the profile's rules. |
 | `permissions.deny.write` | array | `[]` | Same, for writes. |
-| `permissions.allow.read` | array | `[]` | Carve-outs evaluated before any deny rule or confinement check. |
+| `permissions.allow.read` | array | `[]` | Carve-outs evaluated before a deny-by-name rule, but never before confinement — an allow glob cannot bypass `permissions.confineReads`. |
 | `permissions.allow.write` | array | `[]` | Same, for writes. |
 | `permissions.opaqueToolScan` | enum | `deny` | What to do when `bash`, `eval`, or an MCP tool names a denied path literally: `deny`, `prompt`, or `off`. |
 

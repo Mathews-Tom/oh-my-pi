@@ -54,7 +54,7 @@ Two defaults are deliberate:
 | `permissions.allow.write` | glob list | `[]` | Carve-outs, evaluated first. |
 | `permissions.opaqueToolScan` | `deny` \| `prompt` \| `off` | `deny` | What the literal scan does on a match. |
 
-A profile's deny list is a floor. `permissions.deny.*` adds to it; the only way to punch a hole in it is `permissions.allow.*`.
+A profile's deny list is a floor. `permissions.deny.*` adds to it; the only way to punch a hole in it is `permissions.allow.*`. An allow carve-out only ever overrides a deny-by-name rule — it never bypasses `permissions.confineWrites`/`permissions.confineReads`. The built-in `**/.env.example`/`**/.env.sample` carve-outs exist to let a template sit beside a real secret in the workspace; `write /tmp/.env.example` is still refused under `confineWrites: true` even though the filename matches.
 
 ```yaml
 permissions:
@@ -78,7 +78,7 @@ So a rule that must catch a secret at any depth is written `**/.env`, **never** 
 
 Regex is not supported. A rule such as `"^git push --force"` belongs to the command axis, not this one.
 
-Each target is matched against three spellings — the workspace-relative path, the absolute path, and the basename — so a rule written either way behaves the way it reads.
+Each target is matched against three spellings — the workspace-relative path, the absolute path, and the basename — so a rule written either way behaves the way it reads. A malformed pattern (`Bun.Glob` compiles anything without throwing, silently matching nothing) is rejected with a clear error when settings load, rather than leaving the path it was meant to protect silently unenforced.
 
 ## What is actually enforced
 
@@ -86,17 +86,23 @@ Tools split into two classes, and the split is the honest boundary of the featur
 
 **Class A — structured path tools.** `read`, `write`, `edit`, `glob`, `grep`, `ast_grep`, `ast_edit`, `lsp`, `debug`, `inspect_image`, `security_scan`. These declare which arguments are paths and whether each is read or written, so enforcement is sound. This is the real guardrail.
 
-Resolution mirrors what the tool itself does, so the guard and the tool cannot disagree about which file is at stake. Both the target and its deepest existing ancestor are `realpath`-resolved, so a symlink pointing out of the workspace is caught rather than trusted; a *dangling* symlink is refused outright, because where it lands cannot be determined before the write follows it.
+Resolution mirrors what the tool itself does, so the guard and the tool cannot disagree about which file is at stake. Both the target and its deepest existing ancestor are `realpath`-resolved, so a symlink pointing out of the workspace is caught rather than trusted; a *dangling* symlink is refused outright, because where it lands cannot be determined before the write follows it. Containment checks both the raw (lexical) spelling of a target and its resolved real path against the deny/allow lists, so a symlink alias inside the workspace whose target matches a deny rule (`safe -> .env`) cannot walk past it under a spelling the rule never saw.
 
-**Class B — opaque tools.** `bash`, `eval`, `browser`, `computer`, `hub`, and every MCP or extension tool. These take arbitrary code, and sound enforcement against arbitrary code is undecidable: `cat .env` can be written `$(echo Lmk|base64 -d)`, and no static scan catches that.
+`grep`, `ast_grep`, and `ast_edit` accept a scope root but then recurse beneath it — the pre-execution check above only ever verifies that root. After the tool runs, the gate rechecks every file it reports having actually touched (`result.details.files`) against the same policy, before the result reaches the caller; a denied file the tool already opened locally is refused rather than surfaced. `debug` is action-aware: breakpoint and inspection actions (`set_breakpoint`, `stack_trace`, …) stay Class A, since their complete filesystem surface really is the declared `file`/`program`/`cwd` fields, but `launch`, `attach`, `evaluate`, `write_memory`, and `custom_request` reach execution beyond those fields and are scanned as Class B instead.
 
-They get a best-effort literal scan instead. Shell arguments are tokenized the same way `bash.patterns` tokenizes them; other tools' string arguments are walked and split. A literal reference to a denied path is refused.
+`lsp`'s `rename` and an applied `code_actions` result can return a server-computed `WorkspaceEdit` that touches URIs beyond the input `file` — creates, renames, deletes, or a multi-file edit. Every URI in that edit is checked against the policy immediately before it is written, and a `workspace/executeCommand` a code action triggers gets the same literal scan a Class B tool gets, since a command's real filesystem surface is not statically declared.
+
+**Class B — opaque tools.** `bash`, `eval`, `browser`, `computer`, `hub`, `debug`'s execution/evaluate actions, and every MCP or extension tool. These take arbitrary code, and sound enforcement against arbitrary code is undecidable: `cat .env` can be written `$(echo Lmk|base64 -d)`, and no static scan catches that.
+
+They get a best-effort literal scan instead. Shell arguments are tokenized the same way `bash.patterns` tokenizes them; other tools' string arguments are walked and split. A literal reference to a denied path is refused. The scan is bounded — a resource cap on how many literals one call contributes is enforced incrementally, so one oversized argument cannot grow that bound past its limit before matching even starts.
 
 > **The Class B scan is defence against accidents and naive prompt injection. It is not a sandbox.** Do not configure a deny list and conclude that shell cannot reach those files. The real boundary for arbitrary code is `tools.approval.bash: deny`, which already exists and is untouched by this layer.
 
-`permissions.opaqueToolScan: prompt` turns a scan hit into an interactive confirmation instead of a refusal. `off` disables the scan entirely and leaves only Class A enforcement.
+`permissions.opaqueToolScan: prompt` turns a scan hit into an interactive confirmation instead of a refusal. `off` disables the scan entirely and leaves only Class A enforcement. A headless caller (subagent, `-p`, RPC, ACP) that hits a required prompt with no UI available sees recovery options that match what actually fired — permission-layer settings for a permission denial, approval-tier settings for an ordinary `tools.approval` prompt — not a generic list that cannot clear either.
 
 Unknown MCP and extension tools are treated as Class B, not as pathless — a tool this codebase has never seen may well take a `path` argument.
+
+`security_scan`'s working-tree digest (used to fingerprint a preflight plan and detect staleness before `start`) excludes any file matching `permissions.deny.read`, evaluated fresh from live settings at both preflight and start time, so a secret never contributes to what a scan plan covers.
 
 ## Workspace roots
 
@@ -106,7 +112,9 @@ An isolated worktree subagent is created with `workspace.additionalDirectories` 
 
 ## Exemptions
 
-Internal URLs are not user filesystem targets and are never denied: `local://`, `vault://`, `xd://`, `memory://`, `skill://`, `artifact://`, `agent://`, `history://`, `issue://`, `pr://`, `rule://`, `security://`, `mcp://`, `omp://`, `ssh://`. `http(s)://` is likewise not a path. Denying these would break artifact and device routing without protecting a single file.
+Internal URLs are not user filesystem targets and are never denied: `local://`, `vault://`, `xd://`, `memory://`, `skill://`, `artifact://`, `agent://`, `history://`, `issue://`, `pr://`, `rule://`, `security://`, `mcp://`, `omp://`. `http(s)://` is likewise not a path. Denying these would break artifact and device routing without protecting a single file.
+
+**`ssh://` is not exempt.** It is a real remote filesystem surface reachable via `read`/`write`/`grep`, so `read ssh://host/home/user/.env` faces the same deny/allow globs as the local spelling, matched against the URL's remote path and its basename. Confinement does not apply to it — there is no local root to measure a remote path against — but deny/allow-by-name rules do. An `ssh://` URL with no resolvable remote path fails closed.
 
 ## Failure behaviour
 
