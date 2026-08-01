@@ -473,12 +473,14 @@ export class SecurityCoordinator {
 		);
 		const store = await this.#openStore(this.#host.cwd);
 		const workRoot = path.join(store.projectDirectory, "work");
-		await fs.mkdir(workRoot, { recursive: true, mode: 0o700 });
-		if (process.platform !== "win32") await fs.chmod(workRoot, 0o700);
 		const modelRef: SecurityModelRef = { provider: model.provider, modelId: model.id };
 		if (input.thinkingLevel !== undefined) modelRef.thinkingLevel = input.thinkingLevel;
 		const outputRoot = input.outputRoot ?? path.join(workRoot, Bun.randomUUIDv7());
+		// Authorize before any filesystem side effect below - a denied call
+		// must not have already created `workRoot` (or `chmod`'d it) first.
 		assertSecurityWriteAllowed(path.resolve(this.#host.cwd, outputRoot), this.#host, "output_root");
+		await fs.mkdir(workRoot, { recursive: true, mode: 0o700 });
+		if (process.platform !== "win32") await fs.chmod(workRoot, 0o700);
 		const plan = await createSecurityScanPlan(
 			{
 				cwd: this.#host.cwd,
@@ -507,6 +509,11 @@ export class SecurityCoordinator {
 		const store = await this.#openStore(this.#host.cwd);
 		const plan = await store.getPlan(input.planId);
 		if (!plan) throw new Error(`Unknown security scan plan: ${input.planId}`);
+		// `plan.output.root` was authorized once at `preflight()`, against
+		// whatever `permissions.profile` was live then - a plan created while
+		// permissions were off (or looser) and started later under a
+		// confining profile must not run on the strength of that stale check.
+		assertSecurityWriteAllowed(path.resolve(this.#host.cwd, plan.output.root), this.#host, "output_root");
 		await assertSecurityScanPlanFresh(
 			plan,
 			{

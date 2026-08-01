@@ -210,6 +210,51 @@ describe("native security coordinator", () => {
 		expect(plan.output.root).toBeTruthy();
 	});
 
+	test("does not create the default output's work directory when preflight is denied", async () => {
+		const restrictiveSettings = Settings.isolated({ "security.enabled": true, "permissions.profile": "workspace" });
+		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+		const coordinator = new SecurityCoordinator(
+			{
+				cwd: repositoryRoot,
+				settings: restrictiveSettings,
+				authStorage,
+				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
+				activeModel: mock.model,
+			},
+			{ openStore: storeFactory, gitAdapter },
+		);
+		const store = await storeFactory();
+		const workRoot = path.join(store.projectDirectory, "work");
+		await expect(coordinator.preflight({ credentialId, model: mock.model })).rejects.toThrow(PermissionDeniedError);
+		// The denied call must not have created (or chmod'd) the default
+		// output's parent directory as a side effect before the check ran.
+		await expect(fs.stat(workRoot)).rejects.toThrow();
+	});
+
+	test("reauthorizes a stored plan's output root at start against live permissions", async () => {
+		// `permissions.profile` starts unset (defaults to "off") - anything
+		// passed to `Settings.isolated()`'s own overrides pins that key
+		// permanently, so a later `.set()` below could never change it.
+		const liveSettings = Settings.isolated({ "security.enabled": true });
+		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+		const coordinator = new SecurityCoordinator(
+			{
+				cwd: repositoryRoot,
+				settings: liveSettings,
+				authStorage,
+				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
+				activeModel: mock.model,
+			},
+			{ openStore: storeFactory, gitAdapter },
+		);
+		// Created while permissions are off - the defaulted (outside-workspace)
+		// output root is authorized without objection.
+		const plan = await coordinator.preflight({ credentialId, model: mock.model });
+		// Tightened between preflight and start - e.g. a mid-session `/set`.
+		liveSettings.set("permissions.profile", "workspace");
+		await expect(coordinator.start({ planId: plan.id })).rejects.toThrow(PermissionDeniedError);
+	});
+
 	test("cancellation before session launch has no inference side effects", async () => {
 		let sessionCreations = 0;
 		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
