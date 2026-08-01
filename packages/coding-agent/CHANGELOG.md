@@ -16,6 +16,10 @@
 - Fixed the live Ask dialog crashing the whole session with a `replaceTabs` TypeError when a question reached `AskDialogComponent` without a string `question` field; questions are now normalized at dialog entry, mirroring the transcript renderer ([#7211](https://github.com/can1357/oh-my-pi/issues/7211)).
 - Fixed Codex web search collapsing backend errors to `Codex error (): Unknown error`; the SSE error parser now preserves the backend code and message from top-level, nested `error`, and `response.error` envelopes ([#7200](https://github.com/can1357/oh-my-pi/issues/7200)).
 
+### Added
+
+- Added an opt-in resource permission layer (`permissions.*`) that denies tool access to configured paths independently of approval mode, so a subagent running under forced `yolo` is bound by it too. Defaults to `permissions.profile: off`, which short-circuits before any filesystem work; `workspace` confines writes to the workspace roots and `strict` adds built-in secret deny rules. Enforcement is sound for tools with structured path arguments and best-effort for `bash`, `eval`, and MCP tools. See [docs/permissions.md](../../docs/permissions.md) ([#6710](https://github.com/can1357/oh-my-pi/issues/6710))
+
 ## [17.2.2] - 2026-07-31
 
 ### Added

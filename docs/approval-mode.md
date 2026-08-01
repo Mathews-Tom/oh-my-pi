@@ -44,6 +44,12 @@ Resolution per tool call:
 5. Otherwise, a valid user policy wins.
 6. Otherwise, the active mode auto-approves or prompts by tier.
 
+### Path granularity
+
+`tools.approval` is tool-granularity and `bash.patterns` is command-granularity; neither can express "may this call touch *this file*". That axis is [`permissions.*`](./permissions.md), a separate, off-by-default deny layer.
+
+It is deliberately not a fourth approval tier. Subagents force `tools.approvalMode: yolo`, so a path guard built as a tier or mode would be bypassed by spawning a `task`; `permissions.*` is enforced unconditionally at the tool wrapper instead. It can only ever subtract — no `permissions.*` value auto-approves a call that the rules above would have prompted for or blocked.
+
 ## Safety overrides
 
 A tool can force a prompt with object-form approval:
