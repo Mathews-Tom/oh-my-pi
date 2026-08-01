@@ -255,6 +255,54 @@ describe("native security coordinator", () => {
 		await expect(coordinator.start({ planId: plan.id })).rejects.toThrow(PermissionDeniedError);
 	});
 
+	test("authorizes an explicit output_root under an approved additional directory", async () => {
+		const approvedOutputDir = path.join(temporaryRoot, "approved-reports");
+		await fs.mkdir(approvedOutputDir, { recursive: true });
+		const restrictiveSettings = Settings.isolated({ "security.enabled": true, "permissions.profile": "workspace" });
+		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+		const coordinator = new SecurityCoordinator(
+			{
+				cwd: repositoryRoot,
+				additionalDirectories: [approvedOutputDir],
+				settings: restrictiveSettings,
+				authStorage,
+				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
+				activeModel: mock.model,
+			},
+			{ openStore: storeFactory, gitAdapter },
+		);
+		// `normalizeOutput` requires the output to sit outside the scanned
+		// repository - `additionalDirectories` is the only way for a
+		// confining profile to have anywhere valid to put it.
+		const outputRoot = path.join(approvedOutputDir, "scan-output");
+		const plan = await coordinator.preflight({ credentialId, model: mock.model, outputRoot });
+		expect(plan.output.root).toBe(path.join(await fs.realpath(approvedOutputDir), "scan-output"));
+	});
+
+	test("still denies an output_root outside cwd and every additional directory", async () => {
+		const approvedOutputDir = path.join(temporaryRoot, "approved-reports-2");
+		const outsideDir = path.join(temporaryRoot, "unapproved-reports");
+		await fs.mkdir(approvedOutputDir, { recursive: true });
+		await fs.mkdir(outsideDir, { recursive: true });
+		const restrictiveSettings = Settings.isolated({ "security.enabled": true, "permissions.profile": "workspace" });
+		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+		const coordinator = new SecurityCoordinator(
+			{
+				cwd: repositoryRoot,
+				additionalDirectories: [approvedOutputDir],
+				settings: restrictiveSettings,
+				authStorage,
+				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
+				activeModel: mock.model,
+			},
+			{ openStore: storeFactory, gitAdapter },
+		);
+		const outputRoot = path.join(outsideDir, "scan-output");
+		await expect(coordinator.preflight({ credentialId, model: mock.model, outputRoot })).rejects.toThrow(
+			PermissionDeniedError,
+		);
+	});
+
 	test("cancellation before session launch has no inference side effects", async () => {
 		let sessionCreations = 0;
 		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });

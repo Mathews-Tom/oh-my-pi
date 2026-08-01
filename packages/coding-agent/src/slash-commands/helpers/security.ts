@@ -36,6 +36,7 @@ const DISPOSITIONS: ReadonlySet<SecurityDispositionStatus> = new Set([
 function coordinatorFor(runtime: SlashCommandRuntime) {
 	return getSecurityCoordinator({
 		cwd: runtime.cwd,
+		additionalDirectories: runtime.sessionManager.getAdditionalDirectories(),
 		settings: runtime.settings,
 		authStorage: runtime.session.modelRegistry.authStorage,
 		modelRegistry: runtime.session.modelRegistry,

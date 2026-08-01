@@ -128,6 +128,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 			}
 			return getSecurityCoordinator({
 				cwd: this.session.cwd,
+				additionalDirectories: this.session.additionalDirectories,
 				settings: this.session.settings,
 				authStorage: this.session.authStorage,
 				modelRegistry: this.session.modelRegistry,

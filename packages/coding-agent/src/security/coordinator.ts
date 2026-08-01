@@ -78,6 +78,8 @@ export interface SecurityOperationSnapshot {
 
 export interface SecurityCoordinatorHost {
 	cwd: string;
+	/** `workspace.additionalDirectories`, absolute - approved output locations beyond `cwd` for `confineWrites`. */
+	additionalDirectories?: readonly string[];
 	settings: Settings;
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
@@ -182,14 +184,17 @@ function securityPathPolicy(settings: Settings): SecurityPathPolicy {
  * supplies it; an omitted `output_root` is defaulted to a path under the
  * store's own work directory, which `normalizeOutput` (`preflight.ts`)
  * always requires to sit *outside* the scanned repository — exactly the
- * shape `permissions.confineWrites` exists to catch. `SecurityCoordinatorHost`
- * carries only `cwd` (no `workspace.additionalDirectories`), so this fails
- * closed for anything outside it rather than risk under-checking.
+ * shape `permissions.confineWrites` exists to catch. `additionalDirectories`
+ * (`workspace.additionalDirectories`, when the caller supplies it) lets an
+ * approved external report directory pass the same confinement check the
+ * tool gate itself evaluates against; when the caller has none to give
+ * (e.g. a sessionless coordinator), this still fails closed for anything
+ * outside `cwd` rather than risk under-checking.
  */
 function assertSecurityWriteAllowed(absolutePath: string, host: SecurityCoordinatorHost, field: string): void {
 	const policy = loadPermissionsConfig(host.settings);
 	if (!policy) return;
-	const roots: PermissionRoots = { cwd: host.cwd, additionalDirectories: [] };
+	const roots: PermissionRoots = { cwd: host.cwd, additionalDirectories: host.additionalDirectories ?? [] };
 	const decision = decideTarget({ raw: absolutePath, access: "write", field }, policy, roots);
 	if (decision.kind === "deny") {
 		throw new PermissionDeniedError("security_scan", decision.rule, decision.reason);
