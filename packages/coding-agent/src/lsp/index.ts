@@ -2428,6 +2428,13 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 		try {
 			const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
+			// A server-initiated `workspace/applyEdit` push (`handleApplyEditRequest`,
+			// `client.ts`) has no tool-call context of its own to check a resource
+			// permission against — stamp the current one on the client so that
+			// handler can run the same check an outbound rename/code_actions apply
+			// already gets. Always the latest call's context, since clients are
+			// cached and shared across calls.
+			client.permissionsContext = context;
 			const targetFile = resolvedFile;
 			const isRustAnalyzerServer =
 				serverName === "rust-analyzer" ||

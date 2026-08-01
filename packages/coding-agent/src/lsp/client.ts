@@ -4,6 +4,7 @@ import { MessageFramer } from "../jsonrpc/message-framing";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { applyWorkspaceEdit } from "./edits";
 import { getLspmuxCommand, isLspmuxSupported } from "./lspmux";
+import { assertWorkspaceEditAllowed } from "./permission-guard";
 import type {
 	LspClient,
 	LspJsonRpcId,
@@ -470,6 +471,13 @@ async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequ
 	}
 
 	try {
+		// A server-initiated push, unlike our own outbound rename/code_actions
+		// apply, carries no tool-call context — `client.permissionsContext`
+		// (stamped by `LspTool.execute` on every call) stands in for it, so a
+		// command with no literal denied path in its own arguments still
+		// cannot make the server create, rename, delete, or write outside the
+		// workspace or at a denied path via this path.
+		assertWorkspaceEditAllowed(params.edit, client.permissionsContext, client.name);
 		await applyWorkspaceEdit(params.edit, client.cwd);
 		await sendResponse(client, message.id, { applied: true }, "workspace/applyEdit");
 	} catch (err) {
