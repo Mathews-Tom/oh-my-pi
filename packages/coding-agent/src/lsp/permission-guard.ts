@@ -102,6 +102,31 @@ export function assertDiagnosticTargetsAllowed(
 }
 
 /**
+ * Refuse to run workspace-wide `diagnostics` (`file: "*"`) under a policy
+ * that denies specific paths from being read. This branch spawns an actual
+ * compiler (`tsc`, `cargo check`, `go build`, `pyright`, …) over the whole
+ * project - unlike a glob, its real read surface cannot be expanded to a
+ * finite list and authorized the way {@link assertDiagnosticTargetsAllowed}
+ * checks a glob's matches, so there is no sound way to let it run while
+ * still keeping a denied file's content (or even its diagnostics) out of
+ * the compiler's output. Fails closed rather than risk that leak; a caller
+ * that needs diagnostics under a profile with active read-deny rules must
+ * scope the call to a specific file or glob instead of `*`.
+ */
+export function assertWorkspaceDiagnosticsAllowed(context: AgentToolContext | undefined, toolName: string): void {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy || policy.deny.read.length === 0) return;
+	throw new PermissionDeniedError(
+		toolName,
+		"permissions.deny.read",
+		`Tool "${toolName}" is blocked: workspace-wide diagnostics (file: "*") spawn a compiler whose real read ` +
+			`surface cannot be limited to authorized paths, and permissions.deny.read has active rule(s) under ` +
+			`permissions.profile: ${policy.profile}.\n` +
+			`To allow it: scope the call to a specific file or glob instead of "*", or set permissions.profile: off.`,
+	);
+}
+
+/**
  * Refuse to execute a `workspace/executeCommand` whose arguments reference a
  * denied path. A command's real filesystem surface is not statically
  * declared — the server can do anything with it — so this is the same

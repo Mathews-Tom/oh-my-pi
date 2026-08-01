@@ -7,6 +7,7 @@ import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	assertDiagnosticTargetsAllowed,
 	assertLspCommandAllowed,
+	assertWorkspaceDiagnosticsAllowed,
 	assertWorkspaceEditAllowed,
 } from "@oh-my-pi/pi-coding-agent/lsp/permission-guard";
 import type { Command, WorkspaceEdit } from "@oh-my-pi/pi-coding-agent/lsp/types";
@@ -161,5 +162,24 @@ describe("assertDiagnosticTargetsAllowed", () => {
 		expect(() =>
 			assertDiagnosticTargetsAllowed(targets, contextOf({ "permissions.profile": "off" }), "lsp"),
 		).not.toThrow();
+	});
+});
+
+describe("assertWorkspaceDiagnosticsAllowed", () => {
+	it("denies workspace-wide diagnostics under strict, whose secret-deny list is active by default", () => {
+		expect(() => assertWorkspaceDiagnosticsAllowed(contextOf(STRICT), "lsp")).toThrow(PermissionDeniedError);
+	});
+
+	it("permits workspace-wide diagnostics under workspace, which has no deny.read rules by default", () => {
+		expect(() => assertWorkspaceDiagnosticsAllowed(contextOf(WORKSPACE), "lsp")).not.toThrow();
+	});
+
+	it("denies workspace-wide diagnostics under workspace once a custom deny.read rule is added", () => {
+		const context = contextOf({ ...WORKSPACE, "permissions.deny.read": ["**/private.ts"] });
+		expect(() => assertWorkspaceDiagnosticsAllowed(context, "lsp")).toThrow(PermissionDeniedError);
+	});
+
+	it("no-ops entirely under permissions.profile: off", () => {
+		expect(() => assertWorkspaceDiagnosticsAllowed(contextOf({ "permissions.profile": "off" }), "lsp")).not.toThrow();
 	});
 });

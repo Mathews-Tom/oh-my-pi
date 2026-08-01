@@ -1,5 +1,5 @@
 import * as fs from "node:fs";
-import path from "node:path";
+import * as path from "node:path";
 import type {
 	AgentTool,
 	AgentToolContext,
@@ -51,6 +51,7 @@ import { detectLspmux } from "./lspmux";
 import {
 	assertDiagnosticTargetsAllowed,
 	assertLspCommandAllowed,
+	assertWorkspaceDiagnosticsAllowed,
 	assertWorkspaceEditAllowed,
 } from "./permission-guard";
 import {
@@ -1637,6 +1638,28 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		return session.enableLsp === false ? null : new LspTool(session);
 	}
 
+	/**
+	 * Fetch (or create) a client and stamp this call's `AgentToolContext` on
+	 * it. Clients are cached and shared across calls (`clients` in
+	 * `client.ts`), so a server-initiated `workspace/applyEdit` push -
+	 * received asynchronously, outside any specific request/response - has
+	 * no tool-call context of its own to check a resource permission
+	 * against. Every `execute()` branch that touches a client MUST go
+	 * through this instead of calling `getOrCreateClient` directly, so the
+	 * server-push handler in `client.ts` always sees the latest call's
+	 * context rather than an undefined or stale one from a different action.
+	 */
+	async #resolveClient(
+		config: ServerConfig,
+		initTimeoutMs: number | undefined,
+		signal: AbortSignal | undefined,
+		context: AgentToolContext | undefined,
+	): Promise<LspClient> {
+		const client = await getOrCreateClient(config, this.session.cwd, initTimeoutMs, signal);
+		client.permissionsContext = context;
+		return client;
+	}
+
 	async execute(
 		_toolCallId: string,
 		params: LspParams,
@@ -1707,6 +1730,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		// Diagnostics can be batch or single-file - queries all applicable servers
 		if (action === "diagnostics") {
 			if (file === "*") {
+				assertWorkspaceDiagnosticsAllowed(context, this.name);
 				// `*` => run workspace diagnostics across all configured servers
 				const result = await runWorkspaceDiagnostics(this.session.cwd, signal);
 				return {
@@ -1783,7 +1807,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							allDiagnostics.push(...diagnostics);
 							continue;
 						}
-						const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
+						const client = await this.#resolveClient(serverConfig, undefined, signal, context);
 						if (isProjectAwareLspServer(serverConfig)) {
 							await waitForProjectLoaded(client, signal);
 							throwIfAborted(signal);
@@ -1957,7 +1981,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			for (const [serverName, serverConfig] of servers) {
 				throwIfAborted(signal);
 				try {
-					const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
+					const client = await this.#resolveClient(serverConfig, undefined, signal, context);
 					if (isProjectAwareLspServer(serverConfig)) {
 						await waitForProjectLoaded(client, signal);
 					}
@@ -2113,7 +2137,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 			for (const [serverName, serverConfig] of servers) {
 				try {
-					const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
+					const client = await this.#resolveClient(serverConfig, undefined, signal, context);
 					for (const { oldUri } of pairs) {
 						if (client.openFiles.has(oldUri)) {
 							await sendNotification(client, "textDocument/didClose", { textDocument: { uri: oldUri } }, signal);
@@ -2174,7 +2198,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			for (const [serverName, serverConfig] of serverList) {
 				throwIfAborted(signal);
 				try {
-					const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
+					const client = await this.#resolveClient(serverConfig, undefined, signal, context);
 					respondingServers.add(serverName);
 					const caps = client.serverCapabilities ?? {};
 					sections.push(`${serverName}:`);
@@ -2260,7 +2284,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			}
 
 			try {
-				const client = await getOrCreateClient(chosenConfig, this.session.cwd, undefined, signal);
+				const client = await this.#resolveClient(chosenConfig, undefined, signal, context);
 				if (resolvedTarget) {
 					await ensureFileOpen(client, resolvedTarget, signal);
 				}
@@ -2442,14 +2466,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		if (action === "reload") clearInitializationFailure(serverConfig, this.session.cwd);
 
 		try {
-			const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);
-			// A server-initiated `workspace/applyEdit` push (`handleApplyEditRequest`,
-			// `client.ts`) has no tool-call context of its own to check a resource
-			// permission against — stamp the current one on the client so that
-			// handler can run the same check an outbound rename/code_actions apply
-			// already gets. Always the latest call's context, since clients are
-			// cached and shared across calls.
-			client.permissionsContext = context;
+			const client = await this.#resolveClient(serverConfig, undefined, signal, context);
 			const targetFile = resolvedFile;
 			const isRustAnalyzerServer =
 				serverName === "rust-analyzer" ||
