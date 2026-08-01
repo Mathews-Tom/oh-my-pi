@@ -51,13 +51,20 @@ export function summarizeToolGuards(): ToolGuardSummary {
 }
 
 /**
- * Glob lists come from user settings, so they are untrusted display text: a tab
- * punches a hole in the status area and an overlong entry wraps the pane.
+ * Glob lists come from user settings, so they are untrusted display text: a
+ * tab punches a hole in the status area and an overlong line wraps the pane.
+ * Bounding the *joined* line, not just each individual glob, matters once a
+ * profile configures enough rules that even short entries add up past
+ * `TRUNCATE_LENGTHS.LINE` once comma-joined — truncating each glob alone
+ * never caps that. Tabs are replaced before measuring width, not after:
+ * `replaceTabs` can expand a single-character tab into several spaces, so
+ * truncating first and expanding tabs afterward can push the rendered line
+ * back past the limit the truncation was supposed to enforce.
  */
 function ruleLine(label: string, globs: readonly string[]): string | null {
 	if (globs.length === 0) return null;
-	const rules = globs.map(glob => replaceTabs(truncateToWidth(glob, TRUNCATE_LENGTHS.LINE)));
-	return `  ${label}: ${rules.join(", ")}`;
+	const rules = globs.map(glob => replaceTabs(glob));
+	return truncateToWidth(`  ${label}: ${rules.join(", ")}`, TRUNCATE_LENGTHS.LINE);
 }
 
 /**

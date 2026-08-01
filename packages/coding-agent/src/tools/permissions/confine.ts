@@ -93,45 +93,77 @@ export function confineToRoots(absolutePath: string, roots: readonly string[]): 
 	// Walk up to the deepest ancestor that does exist, resolve that, then
 	// re-apply the segments below it. `path.resolve` above already folded any
 	// `..`, so those segments cannot climb back out.
+	const projected = projectViaDeepestExistingAncestor(resolved);
+	if (projected === null) return { contained: false, reason: "outside" };
+	for (const root of realRoots) {
+		if (isUnderRootLexical(projected, root, { includeRoot: true })) return { contained: true, root };
+	}
+	return { contained: false, reason: "outside" };
+}
+
+/**
+ * Project `resolved` through its deepest existing ancestor's realpath, so a
+ * not-yet-created target still reflects the real directory it will land in.
+ * `ws/link/new-file` under `ws/link -> /etc` projects to `/etc/new-file`
+ * even though `new-file` does not exist yet to realpath outright. Returns
+ * `null` when the ancestor chain runs past the filesystem root without
+ * finding anything real.
+ */
+function projectViaDeepestExistingAncestor(resolved: string): string | null {
 	const tail: string[] = [path.basename(resolved)];
 	let ancestor = path.dirname(resolved);
 	for (;;) {
 		const real = tryRealpath(ancestor);
-		if (real) {
-			const projected = path.join(real, ...[...tail].reverse());
-			for (const root of realRoots) {
-				if (isUnderRootLexical(projected, root, { includeRoot: true })) return { contained: true, root };
-			}
-			return { contained: false, reason: "outside" };
-		}
+		if (real) return path.join(real, ...[...tail].reverse());
 		const parent = path.dirname(ancestor);
 		// Ran past the filesystem root without finding anything real.
-		if (parent === ancestor) return { contained: false, reason: "outside" };
+		if (parent === ancestor) return null;
 		tail.push(path.basename(ancestor));
 		ancestor = parent;
 	}
 }
 
 /**
- * The workspace-relative spelling of `absolutePath`, or `null` when it is
- * under no root.
+ * Every workspace-relative spelling of `absolutePath` that lands under one of
+ * `roots` — the raw (lexical) path plus its realpath-resolved form.
+ *
+ * Both are returned, not just the first one found: a symlink alias inside the
+ * workspace (`safe -> .env`, both under the same root) is contained under its
+ * lexical spelling (`safe`) on the very first root/target pair, which used to
+ * make this function return early and never surface the resolved spelling
+ * (`.env`) at all — so a deny rule written as `**\/.env` never saw the alias.
+ * Returning both lets a caller's glob match test whichever spelling the rule
+ * was written for, without weakening the separate (and stricter) "resolves
+ * outside every root" containment check in {@link confineToRoots}.
  *
  * Realpath-aware on both sides so a symlinked root (macOS `/tmp` ->
  * `/private/tmp`) still yields a relative candidate; without that, a user rule
  * written as `config/secrets.json` would silently never match.
  */
-export function relativeToRoots(absolutePath: string, roots: readonly string[]): string | null {
+export function relativeToRoots(absolutePath: string, roots: readonly string[]): string[] {
 	const resolved = path.resolve(absolutePath);
-	const realTarget = tryRealpath(resolved) ?? resolved;
+	// `resolved` may not exist yet (a write target, or a `read` of a path
+	// about to be created) - `tryRealpath` returns nothing for it then, and
+	// falling back to the lexical spelling would lose the resolved ancestor
+	// `confineToRoots` itself projects through. `safe -> .ssh` (both inside a
+	// workspace root): without this, `safe/new-config` never surfaces the
+	// `.ssh/new-config` spelling a `**/.ssh/**` deny rule was written for.
+	const realTarget = tryRealpath(resolved) ?? projectViaDeepestExistingAncestor(resolved) ?? resolved;
+	const out: string[] = [];
+	const seen = new Set<string>();
 	for (const root of roots) {
 		const resolvedRoot = path.resolve(root);
 		for (const candidateRoot of [resolvedRoot, tryRealpath(resolvedRoot)]) {
 			if (!candidateRoot) continue;
 			for (const target of [resolved, realTarget]) {
 				const relative = path.relative(candidateRoot, target);
-				if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) return relative;
+				if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) continue;
+				if (!seen.has(relative)) {
+					seen.add(relative);
+					out.push(relative);
+				}
 			}
 		}
 	}
-	return null;
+	return out;
 }

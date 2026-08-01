@@ -6,6 +6,7 @@
  * that knows a settings store exists.
  */
 import type { Settings } from "../../config/settings";
+import { validateGlobPattern } from "./matcher";
 import { buildPermissionPolicy } from "./profiles";
 import type { PermissionPolicy, PermissionProfile } from "./types";
 
@@ -15,10 +16,30 @@ type GlobListKey =
 	| "permissions.allow.read"
 	| "permissions.allow.write";
 
+/**
+ * Reads one glob list and validates every pattern before it can ever reach
+ * `matchGlob`. `Bun.Glob` never throws on a malformed pattern — it silently
+ * compiles into something that matches nothing — so a typo'd
+ * `permissions.deny.*` entry would otherwise leave the path it names
+ * unprotected with no error anywhere. Throwing here instead is the same
+ * fail-closed direction the gate already takes for every other unverifiable
+ * input: the exception propagates out of `enforceResourcePermissions` and
+ * blocks the call, so a bad pattern is loud rather than a silent gap.
+ */
 function globList(settings: Settings, key: GlobListKey): readonly string[] | undefined {
 	const value = settings.get(key);
 	if (!Array.isArray(value)) return undefined;
-	return value.filter((entry): entry is string => typeof entry === "string");
+	const patterns = value.filter((entry): entry is string => typeof entry === "string");
+	for (const pattern of patterns) {
+		const problem = validateGlobPattern(pattern);
+		if (problem) {
+			throw new Error(
+				`${key} has an invalid glob pattern "${pattern}": ${problem}. Fix or remove it — a malformed ` +
+					`pattern compiles without error but matches nothing, so the rule it was meant to enforce is silently unenforced.`,
+			);
+		}
+	}
+	return patterns;
 }
 
 /** Cheap pre-check so the `off` path never builds a policy at all. */

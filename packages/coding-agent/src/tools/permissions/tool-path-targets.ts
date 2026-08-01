@@ -16,16 +16,31 @@
  * tool name — MCP, extension, custom — defaults to `opaque`, so a new
  * `filesystem/read_file {path: ".env"}` is scanned rather than waved through.
  */
+import { Patch } from "@oh-my-pi/hashline";
 import { LSP_READONLY_ACTIONS } from "../../lsp";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
-import { unwrapHashlineHeaderPath } from "../plan-mode-guard";
 import type { PathAccess, PathTarget } from "./types";
 
 /** Pulls the declared path arguments out of one tool call's arguments. */
 export type PathTargetExtractor = (args: Record<string, unknown>) => PathTarget[];
 
+/** Pulls the files a tool actually touched out of its result details, for the post-execution recheck. */
+export type ResultPathTargetExtractor = (details: unknown) => PathTarget[];
+
 export type ToolPathClass =
-	| { readonly kind: "structured"; readonly extract: PathTargetExtractor }
+	| {
+			readonly kind: "structured";
+			readonly extract: PathTargetExtractor;
+			/**
+			 * For a tool whose declared scope root can diverge from the files it
+			 * actually opens — `grep`/`ast_grep`/`ast_edit` recurse beneath the
+			 * checked root — this re-derives the real target set from the
+			 * executed result, so the gate can recheck it after the fact.
+			 * `undefined` for every tool whose declared targets are already the
+			 * tool's complete filesystem surface.
+			 */
+			readonly resultTargets?: ResultPathTargetExtractor;
+	  }
 	| { readonly kind: "opaque"; readonly scan: "shell" | "strings" }
 	| { readonly kind: "pathless" };
 
@@ -70,7 +85,6 @@ function delimitedPath(field: string, access: PathAccess): PathTargetExtractor {
 	};
 }
 
-const HASHLINE_HEADER_RE = /^\[.+\]$/;
 const APPLY_PATCH_FILE_RE = /^\*\*\* (?:Add|Delete|Update) File: (.+)$/;
 const APPLY_PATCH_MOVE_RE = /^\*\*\* Move to: (.+)$/;
 // `MV DEST` is hashline's file-level move op (`HL_MOVE_KEYWORD`,
@@ -95,9 +109,27 @@ function stripQuotes(value: string): string {
  * `*** Update File: path` markers. All three are strict, line-anchored
  * grammars and a mode cannot touch a file it does not name, so extracting them
  * is sound rather than best-effort.
+ *
+ * Section headers are parsed with `Patch.parse` — the same splitter
+ * `Patcher.apply` uses — rather than a hand-rolled `[.+]` regex, so a
+ * header's exact interpretation (tag stripping, quoting, a `..` traversal in
+ * the path) can never diverge from what the real executor resolves and
+ * writes. `MV DEST` and the `apply_patch` markers stay a direct per-line
+ * scan: both are single-token grammars with no header-context dependency,
+ * and (unlike the header case) scanning bare lines catches a move/marker even
+ * outside a well-formed section — strictly more cautious than the real
+ * executor, never less.
  */
 export function extractEmbeddedEditPaths(input: string): PathTarget[] {
 	const out: PathTarget[] = [];
+	try {
+		for (const section of Patch.parse(input).sections) {
+			pushPath(out, section.path, "write", "input");
+		}
+	} catch {
+		// Not hashline-shaped input, or a section body parse error the real
+		// executor will also hit; nothing further to extract from headers.
+	}
 	for (const line of input.split("\n")) {
 		const trimmed = line.trim();
 		if (!trimmed) continue;
@@ -107,15 +139,7 @@ export function extractEmbeddedEditPaths(input: string): PathTarget[] {
 			continue;
 		}
 		const move = HASHLINE_MOVE_RE.exec(trimmed);
-		if (move) {
-			pushPath(out, stripQuotes(move[1]), "write", "input");
-			continue;
-		}
-		if (!HASHLINE_HEADER_RE.test(trimmed)) continue;
-		const unwrapped = unwrapHashlineHeaderPath(trimmed);
-		// `unwrapHashlineHeaderPath` returns its input unchanged when the shape
-		// is not a real header, which is how a bracketed body line is skipped.
-		if (unwrapped !== trimmed) pushPath(out, unwrapped, "write", "input");
+		if (move) pushPath(out, stripQuotes(move[1]), "write", "input");
 	}
 	return out;
 }
@@ -145,6 +169,39 @@ const extractDebugPaths: PathTargetExtractor = args => {
 	return out;
 };
 
+/**
+ * `debug` actions whose complete filesystem/execution surface is not covered
+ * by the declared `program`/`file`/`cwd` fields: `launch` and `attach` start
+ * or attach to an arbitrary process with arbitrary `args`, `evaluate` sends
+ * a raw debugger expression, `write_memory` writes raw bytes, and
+ * `custom_request` sends an arbitrary DAP command with an arbitrary
+ * `arguments` payload. A call like
+ * `debug({ action: "launch", program: "/bin/sh", args: ["-c", "cat .env"] })`
+ * only names `/bin/sh` in a declared field, so `extractDebugPaths` would
+ * never see `.env` — these actions get the same best-effort literal scan an
+ * opaque tool does instead of a false sense of structured soundness.
+ * Breakpoint and inspection actions keep the structured classification: their
+ * complete filesystem surface really is `file`/`program`/`cwd`.
+ */
+const DEBUG_OPAQUE_ACTIONS: ReadonlySet<string> = new Set([
+	"launch",
+	"attach",
+	"evaluate",
+	"write_memory",
+	"custom_request",
+]);
+
+/**
+ * `lsp`'s `request` action sends a caller-chosen JSON-RPC `method` (from
+ * `query`) with a caller-chosen `payload` directly to the server - there is
+ * no declared path field at all, so a call like
+ * `lsp({ action: "request", query: "workspace/executeCommand", payload: '{"path":".env"}' })`
+ * would otherwise pass the structured gate with zero targets checked. Scanned
+ * like `debug`'s opaque actions instead: the raw `query`/`payload` strings go
+ * through the same best-effort literal scan an opaque tool gets.
+ */
+const LSP_OPAQUE_ACTIONS: ReadonlySet<string> = new Set(["request"]);
+
 const extractLspPaths: PathTargetExtractor = args => {
 	const out: PathTarget[] = [];
 	// Invert the tool's own central classification (`lsp/index.ts` uses exactly
@@ -173,6 +230,21 @@ const extractSecurityScanPaths: PathTargetExtractor = args => {
 // does not have; they are scanned instead.
 
 /**
+ * The files a recursive search/edit tool actually visited, from its own
+ * result — the post-execution half of the recheck `enforcePostExecutionResourcePermissions`
+ * (`gate.ts`) runs against a policy the declared-argument gate already
+ * evaluated before the call.
+ */
+function extractResultFiles(details: unknown, access: PathAccess): PathTarget[] {
+	if (!details || typeof details !== "object" || !("files" in details)) return [];
+	const { files } = details;
+	if (!Array.isArray(files)) return [];
+	const out: PathTarget[] = [];
+	for (const file of files) pushPath(out, file, access, "files");
+	return out;
+}
+
+/**
  * Every built-in tool, classified.
  *
  * `test/tools/permissions-tool-classes.test.ts` asserts this covers
@@ -185,8 +257,16 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	write: { kind: "structured", extract: singlePath("path", "write") },
 	edit: { kind: "structured", extract: extractEditPaths },
 	glob: { kind: "structured", extract: delimitedPath("path", "read") },
-	grep: { kind: "structured", extract: delimitedPath("path", "read") },
-	ast_grep: { kind: "structured", extract: delimitedPath("path", "read") },
+	grep: {
+		kind: "structured",
+		extract: delimitedPath("path", "read"),
+		resultTargets: details => extractResultFiles(details, "read"),
+	},
+	ast_grep: {
+		kind: "structured",
+		extract: delimitedPath("path", "read"),
+		resultTargets: details => extractResultFiles(details, "read"),
+	},
 	ast_edit: {
 		kind: "structured",
 		extract: args => {
@@ -194,6 +274,12 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 			pushArray(out, args.paths, "write", "paths");
 			return out;
 		},
+		// The tool's dry-run pass reads every matched file to render its
+		// original lines in the preview, before any `resolve` write happens —
+		// so a touched file must clear `deny.read` as well as `deny.write`, not
+		// just the latter, or a read-denied source can still reach the model
+		// through the diff preview even though the eventual write is blocked.
+		resultTargets: details => [...extractResultFiles(details, "read"), ...extractResultFiles(details, "write")],
 	},
 	lsp: { kind: "structured", extract: extractLspPaths },
 	debug: { kind: "structured", extract: extractDebugPaths },
@@ -242,9 +328,25 @@ export const UNKNOWN_TOOL_CLASS: ToolPathClass = { kind: "opaque", scan: "string
  * The class for `toolName`, normalizing the legacy aliases (`search` -> `grep`,
  * `find` -> `glob`) so an alias gets the structured extractor rather than
  * falling through to the coarser opaque scan.
+ *
+ * `args` (the call's own arguments, when the caller has them) lets `debug`
+ * and `lsp` be classified per-action: `TOOL_PATH_CLASSES.debug`/`.lsp` stay
+ * plain structured entries (used directly by tests and as the base
+ * extractor), but a call whose `action` is in {@link DEBUG_OPAQUE_ACTIONS} or
+ * {@link LSP_OPAQUE_ACTIONS} is classified opaque here, since only the actual
+ * call site knows the action.
  */
-export function classifyTool(toolName: string): ToolPathClass {
-	return TOOL_PATH_CLASSES[normalizeToolName(toolName)] ?? UNKNOWN_TOOL_CLASS;
+export function classifyTool(toolName: string, args?: Record<string, unknown> | null): ToolPathClass {
+	const normalized = normalizeToolName(toolName);
+	if (normalized === "debug") {
+		const action = args && typeof args.action === "string" ? args.action : undefined;
+		if (action && DEBUG_OPAQUE_ACTIONS.has(action)) return { kind: "opaque", scan: "strings" };
+	}
+	if (normalized === "lsp") {
+		const action = args && typeof args.action === "string" ? args.action : undefined;
+		if (action && LSP_OPAQUE_ACTIONS.has(action)) return { kind: "opaque", scan: "strings" };
+	}
+	return TOOL_PATH_CLASSES[normalized] ?? UNKNOWN_TOOL_CLASS;
 }
 
 /** The names this table must cover, for the exhaustiveness test. */

@@ -64,6 +64,21 @@ describe("/perm slash command", () => {
 		expect(text).toContain("Allow read: **/.env.example, **/.env.sample");
 	});
 
+	it("bounds the joined rule line to the display-width limit regardless of how many globs are configured", async () => {
+		// Individually-truncated globs used to be joined with no cap on the
+		// combined line - short entries still add up past TRUNCATE_LENGTHS.LINE
+		// once there are enough of them.
+		const manyGlobs = Array.from({ length: 100 }, (_, i) => `**/secret-${i}.env`);
+		const h = acpRuntime({ "permissions.profile": "workspace", "permissions.deny.read": manyGlobs });
+
+		await executeAcpBuiltinSlashCommand("/perm", h.runtime);
+
+		const text = String(h.output.mock.calls.at(-1)?.[0] ?? "");
+		const denyLine = text.split("\n").find(line => line.trimStart().startsWith("Deny read:"));
+		expect(denyLine).toBeDefined();
+		expect(Bun.stringWidth(denyLine ?? "")).toBeLessThanOrEqual(110);
+	});
+
 	it("says Class B is unchecked when the opaque scan is disabled", async () => {
 		const h = acpRuntime({ "permissions.profile": "workspace", "permissions.opaqueToolScan": "off" });
 

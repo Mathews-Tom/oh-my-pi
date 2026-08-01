@@ -8,11 +8,42 @@
  * secrets are covered.
  *
  * `Bun.Glob` accepts any string — a malformed pattern such as `[a-` compiles
- * and then matches nothing rather than throwing. There is deliberately no
- * try/catch here pretending otherwise: if a future runtime does throw, the
- * exception propagates out of the gate and blocks the tool call, which is the
- * fail-closed direction for a deny layer.
+ * and then matches nothing rather than throwing (verified: `new
+ * Bun.Glob("[a-")` never throws for any input tried against it). That would
+ * otherwise leave a typo'd `permissions.deny.*` rule silently unenforced with
+ * no error anywhere, so {@link validateGlobPattern} runs at settings load
+ * (`config.ts`) rather than relying on a throw that never comes.
  */
+
+/**
+ * Cheap, conservative validity check for a glob pattern, independent of
+ * `Bun.Glob`'s own (silently-permissive) behavior.
+ *
+ * Checks only bracket/brace balance — `[...]` character classes and
+ * `{...}` brace expansion — the two constructs a truncated pattern most
+ * commonly leaves open (`[a-`, `{a,b`). Not a full glob-grammar parser; a
+ * pattern that balances but is otherwise nonsensical still compiles (as
+ * always) and is the user's own concern. Returns a human-readable problem
+ * description, or `null` when the pattern is well-formed.
+ */
+export function validateGlobPattern(pattern: string): string | null {
+	let bracketDepth = 0;
+	let braceDepth = 0;
+	for (let i = 0; i < pattern.length; i++) {
+		const ch = pattern[i];
+		if (ch === "\\") {
+			i++; // an escaped char is a literal, even if it's a bracket/brace
+			continue;
+		}
+		if (ch === "[") bracketDepth++;
+		else if (ch === "]") bracketDepth = Math.max(0, bracketDepth - 1);
+		else if (ch === "{") braceDepth++;
+		else if (ch === "}") braceDepth = Math.max(0, braceDepth - 1);
+	}
+	if (bracketDepth > 0) return `unterminated "[" character class`;
+	if (braceDepth > 0) return `unterminated "{" brace expansion`;
+	return null;
+}
 
 /**
  * Compiled globs are cached process-wide keyed by pattern text.
