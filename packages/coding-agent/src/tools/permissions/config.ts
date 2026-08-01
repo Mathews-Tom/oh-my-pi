@@ -42,9 +42,24 @@ function globList(settings: Settings, key: GlobListKey): readonly string[] | und
 	return patterns;
 }
 
-/** Cheap pre-check so the `off` path never builds a policy at all. */
+/**
+ * Cheap pre-check so the `off` path never builds a policy at all.
+ *
+ * `settings.get("permissions.profile")` is typed `PermissionProfile` but
+ * that's a cast, not a runtime guarantee — a settings store that doesn't
+ * validate the schema (a hand-rolled test stub, a corrupted config file, a
+ * value from a since-renamed profile) can return anything. Validated here
+ * against the actual enum and falling back to "off" rather than letting an
+ * unrecognized value reach `buildPermissionPolicy`'s `PROFILE_DEFAULTS`
+ * lookup, which throws an unhelpful `undefined is not an object` instead of
+ * failing loud with a clear cause — and "off" is the safe direction for a
+ * profile-driven feature that already defaults to off.
+ */
+const KNOWN_PROFILES: ReadonlySet<PermissionProfile> = new Set(["off", "workspace", "strict"]);
+
 export function readPermissionProfile(settings: Settings | undefined): PermissionProfile {
-	return settings?.get("permissions.profile") ?? "off";
+	const raw = settings?.get("permissions.profile");
+	return typeof raw === "string" && KNOWN_PROFILES.has(raw as PermissionProfile) ? (raw as PermissionProfile) : "off";
 }
 
 /**
