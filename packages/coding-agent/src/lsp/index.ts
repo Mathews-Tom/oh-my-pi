@@ -2676,7 +2676,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 								return applyWorkspaceEdit(edit, this.session.cwd);
 							},
 							executeCommand: async commandItem => {
-								assertLspCommandAllowed(commandItem, context, this.name);
+								await assertLspCommandAllowed(commandItem, context, this.name);
 								await sendRequest(
 									client,
 									"workspace/executeCommand",

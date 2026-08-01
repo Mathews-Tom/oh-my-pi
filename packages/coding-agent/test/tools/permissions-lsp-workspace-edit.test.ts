@@ -97,19 +97,46 @@ describe("assertWorkspaceEditAllowed", () => {
 });
 
 describe("assertLspCommandAllowed", () => {
-	it("denies a workspace command whose arguments reference a denied secret", () => {
+	it("denies a workspace command whose arguments reference a denied secret", async () => {
 		const command: Command = { title: "Apply fix", command: "internal.applyFix", arguments: [".env"] };
-		expect(() => assertLspCommandAllowed(command, contextOf(STRICT), "lsp")).toThrow(PermissionDeniedError);
+		await expect(assertLspCommandAllowed(command, contextOf(STRICT), "lsp")).rejects.toBeInstanceOf(
+			PermissionDeniedError,
+		);
 	});
 
-	it("permits a command with no denied references", () => {
+	it("permits a command with no denied references", async () => {
 		const command: Command = { title: "Apply fix", command: "internal.applyFix", arguments: ["src/main.ts"] };
-		expect(() => assertLspCommandAllowed(command, contextOf(STRICT), "lsp")).not.toThrow();
+		await expect(assertLspCommandAllowed(command, contextOf(STRICT), "lsp")).resolves.toBeUndefined();
 	});
 
-	it("does not scan at all when opaqueToolScan is off", () => {
+	it("does not scan at all when opaqueToolScan is off", async () => {
 		const command: Command = { title: "Apply fix", command: "internal.applyFix", arguments: [".env"] };
 		const context = contextOf({ ...STRICT, "permissions.opaqueToolScan": "off" });
-		expect(() => assertLspCommandAllowed(command, context, "lsp")).not.toThrow();
+		await expect(assertLspCommandAllowed(command, context, "lsp")).resolves.toBeUndefined();
+	});
+
+	describe("opaqueToolScan: prompt", () => {
+		const PROMPT = { ...STRICT, "permissions.opaqueToolScan": "prompt" };
+
+		it("fails closed with no interactive UI available", async () => {
+			const command: Command = { title: "Apply fix", command: "internal.applyFix", arguments: [".env"] };
+			await expect(assertLspCommandAllowed(command, contextOf(PROMPT), "lsp")).rejects.toBeInstanceOf(
+				PermissionDeniedError,
+			);
+		});
+
+		it("confirms interactively and allows the command when the user approves", async () => {
+			const command: Command = { title: "Apply fix", command: "internal.applyFix", arguments: [".env"] };
+			const confirm = async () => true;
+			const context = { ...contextOf(PROMPT), hasUI: true, ui: { confirm } } as unknown as AgentToolContext;
+			await expect(assertLspCommandAllowed(command, context, "lsp")).resolves.toBeUndefined();
+		});
+
+		it("confirms interactively and denies the command when the user declines", async () => {
+			const command: Command = { title: "Apply fix", command: "internal.applyFix", arguments: [".env"] };
+			const confirm = async () => false;
+			const context = { ...contextOf(PROMPT), hasUI: true, ui: { confirm } } as unknown as AgentToolContext;
+			await expect(assertLspCommandAllowed(command, context, "lsp")).rejects.toBeInstanceOf(PermissionDeniedError);
+		});
 	});
 });

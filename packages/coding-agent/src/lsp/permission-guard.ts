@@ -87,12 +87,20 @@ export function assertWorkspaceEditAllowed(
  * best-effort literal scan an opaque tool (`bash`, `eval`, …) gets, over the
  * command name and its argument list, honouring `permissions.opaqueToolScan`
  * exactly as the top-level gate does for every other opaque call.
+ *
+ * `prompt` mode is honoured interactively when `context.ui`/`context.hasUI`
+ * are available (the caller confirms or denies the specific command), since
+ * this scan runs mid-execution — after the server has already returned the
+ * command — with no path back through the wrapper's own approval prompt.
+ * Without a live UI (a headless caller — subagent, `-p`, RPC, ACP) this
+ * fails closed rather than silently waving the command through, matching
+ * the wrapper's own no-interactive-UI behaviour for a required approval.
  */
-export function assertLspCommandAllowed(
+export async function assertLspCommandAllowed(
 	command: Command,
 	context: AgentToolContext | undefined,
 	toolName: string,
-): void {
+): Promise<void> {
 	const policy = loadPermissionsConfig(context?.settings);
 	if (!policy || policy.opaqueToolScan === "off") return;
 	const roots = requireRootsOrDeny(toolName, policy.profile, permissionRoots(context));
@@ -103,5 +111,20 @@ export function assertLspCommandAllowed(
 		roots,
 	);
 	if (!hit) return;
-	throw new PermissionDeniedError(toolName, hit.rule, scanDenialMessage(toolName, hit));
+	const message = scanDenialMessage(toolName, hit);
+	if (policy.opaqueToolScan === "prompt") {
+		if (context?.hasUI && context.ui) {
+			const approved = await context.ui.confirm(`${toolName}: workspace command needs approval`, message);
+			if (approved) return;
+			throw new PermissionDeniedError(toolName, hit.rule, `${message}\n\nDenied by user.`);
+		}
+		throw new PermissionDeniedError(
+			toolName,
+			hit.rule,
+			`${message}\n\npermissions.opaqueToolScan: prompt requires an interactive UI to confirm a workspace ` +
+				`command mid-execution; none is available here, so this fails closed.\n` +
+				`To allow it: add "${hit.rule}" to permissions.allow.${hit.access}, or set permissions.opaqueToolScan: off.`,
+		);
+	}
+	throw new PermissionDeniedError(toolName, hit.rule, message);
 }
