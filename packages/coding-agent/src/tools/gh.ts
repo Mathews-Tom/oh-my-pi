@@ -19,6 +19,7 @@ import type { ToolSession } from ".";
 import { formatShortSha } from "./gh-format";
 import { type CacheStatus, getOrFetchView, invalidateAllForNumber, resolveGithubCacheAuthKey } from "./github-cache";
 import type { OutputMeta } from "./output-meta";
+import { decideTarget, loadPermissionsConfig, PermissionDeniedError, permissionRoots } from "./permissions";
 import { ToolError, throwIfAborted } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -2476,7 +2477,7 @@ export class GithubTool implements AgentTool<typeof githubSchema, GhToolDetails>
 		params: GithubInput,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<GhToolDetails>,
-		_context?: AgentToolContext,
+		context?: AgentToolContext,
 	): Promise<AgentToolResult<GhToolDetails>> {
 		return untilAborted(signal, async () => {
 			switch (params.op) {
@@ -2487,7 +2488,7 @@ export class GithubTool implements AgentTool<typeof githubSchema, GhToolDetails>
 				case "pr_create":
 					return executePrCreate(this.session, params, signal);
 				case "pr_checkout":
-					return executePrCheckout(this.session, params, signal);
+					return executePrCheckout(this.session, params, signal, context);
 				case "pr_push":
 					return executePrPush(this.session, params, signal);
 				case "search_issues":
@@ -3184,10 +3185,36 @@ function joinSections(sections: string[]): string[] {
 	return sections.flatMap((section, idx) => (idx === 0 ? [section] : ["", "---", "", section]));
 }
 
+/**
+ * Authorize `pr_checkout`'s effective worktree path before creating or
+ * populating it. `github` is classified `pathless` in the resource
+ * permission layer - a `pr_checkout` call names no path argument the gate
+ * can act on - but the worktree it creates always lands under `getWorktreeDir`
+ * (`~/.omp/wt/...`), outside every session root, so `permissions.confineWrites`
+ * would otherwise silently never apply to it.
+ */
+function assertWorktreeWriteAllowed(worktreePath: string, context: AgentToolContext | undefined): void {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy) return;
+	const roots = permissionRoots(context);
+	if (!roots) {
+		throw new PermissionDeniedError(
+			"github",
+			"permissions.profile",
+			`Tool "github" is blocked: permissions.profile is "${policy.profile}" but this call has no session, ` +
+				`so the workspace roots the rules are measured against cannot be determined.\n` +
+				`To allow it: set permissions.profile: off.`,
+		);
+	}
+	const decision = decideTarget({ raw: worktreePath, access: "write", field: "op" }, policy, roots);
+	if (decision.kind === "deny") throw new PermissionDeniedError("github", decision.rule, decision.reason);
+}
+
 async function executePrCheckout(
 	session: ToolSession,
 	params: GithubInput,
 	signal: AbortSignal | undefined,
+	context: AgentToolContext | undefined,
 ): Promise<AgentToolResult<GhToolDetails>> {
 	const repo = normalizeOptionalString(params.repo);
 	const force = params.force ?? false;
@@ -3196,7 +3223,7 @@ async function executePrCheckout(
 	const isMulti = prRefs.length > 1;
 
 	const settled = await Promise.allSettled(
-		prRefs.map(prRef => checkoutPullRequest(session, signal, { prRef, repo, force })),
+		prRefs.map(prRef => checkoutPullRequest(session, signal, { prRef, repo, force }, context)),
 	);
 	const outcomes: PrCheckoutOutcome[] = [];
 	const failures: Array<{ prRef: string | undefined; reason: unknown }> = [];
@@ -3272,6 +3299,7 @@ async function checkoutPullRequest(
 	session: ToolSession,
 	signal: AbortSignal | undefined,
 	options: PrCheckoutOptions,
+	context: AgentToolContext | undefined,
 ): Promise<PrCheckoutOutcome> {
 	const { prRef, repo, force } = options;
 	if (prRef?.startsWith("-")) {
@@ -3362,6 +3390,7 @@ async function checkoutPullRequest(
 			let finalWorktreePath = existingWorktree?.path ?? worktreePath;
 			if (!existingWorktree) {
 				finalWorktreePath = await resolveAvailableWorktreePath(worktreePath, existingWorktrees);
+				assertWorktreeWriteAllowed(finalWorktreePath, context);
 				await fs.mkdir(path.dirname(finalWorktreePath), { recursive: true });
 				await git.worktree.add(repoRoot, finalWorktreePath, localBranch, { signal });
 			}

@@ -1026,6 +1026,55 @@ describe("github tool", () => {
 			expect(runGit(fixture.repoRoot, ["worktree", "list", "--porcelain"])).toContain(`worktree ${worktreePath}`);
 			expect(runGit(worktreePath, ["branch", "--show-current"])).toBe("pr-123");
 		});
+
+		it("denies the worktree write when the resource permission policy confines writes to the session roots", async () => {
+			vi.spyOn(git.github, "json")
+				.mockResolvedValueOnce({
+					number: 456,
+					title: "Denied checkout",
+					url: "https://github.com/base/repo/pull/456",
+					baseRefName: "main",
+					headRefName: fixture.headRefName,
+					headRefOid: fixture.headRefOid,
+					headRepository: { nameWithOwner: "contrib/repo" },
+					headRepositoryOwner: { login: "contrib" },
+					isCrossRepository: true,
+					maintainerCanModify: true,
+				})
+				.mockResolvedValueOnce({
+					nameWithOwner: "contrib/repo",
+					sshUrl: fixture.forkBare,
+					url: fixture.forkBare,
+				});
+
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			const context = {
+				sessionManager: {
+					getCwd: () => fixture.repoRoot,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "test-session",
+				},
+				settings: Settings.isolated({ "permissions.profile": "workspace" }),
+			} as unknown as Parameters<typeof tool.execute>[4];
+
+			// The worktree always lands under `getWorktreeDir` (`~/.omp/wt/...`,
+			// isolated to `tempHome.home` here), outside `fixture.repoRoot` -
+			// `permissions.confineWrites` (on by default under `workspace`) must
+			// refuse it even though `github` declares no path argument at all.
+			const promise = tool.execute(
+				"pr-checkout-denied",
+				{ op: "pr_checkout", pr: "456" },
+				undefined,
+				undefined,
+				context,
+			);
+			await expect(promise).rejects.toThrow(/blocked by permissions\.confineWrites/);
+			// Only the worktree destination (outside `repoRoot`) is what
+			// `permissions.confineWrites` denies - the local branch ref inside
+			// `repoRoot` is created earlier in the same call and stays, same as
+			// any other in-workspace git.config write this tool already does.
+			expect(runGit(fixture.repoRoot, ["worktree", "list", "--porcelain"])).not.toContain("pr-456");
+		});
 	});
 
 	// Both assertions are non-mutating (a no-op add and a rejected add), so they
