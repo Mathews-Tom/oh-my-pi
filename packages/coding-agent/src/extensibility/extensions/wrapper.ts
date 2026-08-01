@@ -373,6 +373,14 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		let result: AgentToolResult<TDetails, TParameters>;
 		let executionError: Error | undefined;
 
+		// Staged-preview head before the call. `ast_edit` registers its apply
+		// closure via `queueResolveHandler` *during* execution, so a denial from
+		// the post-execution recheck below has to unwind it — otherwise the
+		// staged invoker outlives the denial and a later `xd://resolve` dispatch
+		// runs the apply against the very file the denial reported as blocked,
+		// with no second permission check on that path.
+		const stagedHeadBefore = context?.pendingPreviews?.headId();
+
 		try {
 			result = await this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context);
 		} catch (err) {
@@ -393,7 +401,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// output, it propagates and blocks the call exactly as a synchronous
 		// permission denial would have.
 		if (!executionError) {
-			enforcePostExecutionResourcePermissions(this.tool.name, result.details, context);
+			try {
+				enforcePostExecutionResourcePermissions(this.tool.name, result.details, context);
+			} catch (err) {
+				context?.pendingPreviews?.removeSince(stagedHeadBefore);
+				throw err;
+			}
 		}
 		// Emit tool_result event - extensions can modify the result and error status
 		if (this.runner.hasHandlers("tool_result")) {

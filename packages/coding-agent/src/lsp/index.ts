@@ -14,8 +14,10 @@ import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { truncateForPrompt } from "../tools/approval";
 import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
+import { enforceResourcePathTargets } from "../tools/permissions/gate";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
+import { LSP_READONLY_ACTIONS } from "./actions";
 import {
 	clearInitializationFailure,
 	ensureFileOpen,
@@ -44,6 +46,7 @@ import {
 	applyWorkspaceEdit,
 	flattenWorkspaceTextEdits,
 	rangesOverlap,
+	workspaceEditTargetPaths,
 } from "./edits";
 import { resolveFormatOptions } from "./format-options";
 import { detectLspmux } from "./lspmux";
@@ -90,25 +93,9 @@ import {
 	uriToFile,
 } from "./utils";
 
+export { LSP_READONLY_ACTIONS } from "./actions";
 export type { LspServerStatus } from "./client";
 export type { LspToolDetails } from "./types";
-
-/**
- * LSP actions that do not mutate the workspace or language-server state.
- * Anything not in this set (rename, code_actions with apply, rename_file,
- * reload, raw request, etc.) is classified as write-tier.
- */
-export const LSP_READONLY_ACTIONS: ReadonlySet<string> = new Set([
-	"diagnostics",
-	"definition",
-	"type_definition",
-	"implementation",
-	"references",
-	"hover",
-	"symbols",
-	"status",
-	"capabilities",
-]);
 
 export interface LspStartupServerInfo {
 	name: string;
@@ -1599,6 +1586,37 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 }
 
 /**
+ * Apply a server-supplied `WorkspaceEdit` only after every path it names has
+ * cleared the resource permission layer.
+ *
+ * The permission gate classifies `lsp` by its declared arguments, and for
+ * `rename`/`code_actions` those are just the *initiating* file. The edit that
+ * comes back is chosen by the language server and can rename into, create, or
+ * delete any path it likes — including one outside every workspace root, or one
+ * a `permissions.deny.write` rule protects. Checking here, before
+ * `applyWorkspaceEdit` touches the disk, is what makes the declared-argument
+ * gate's guarantee true for this tool rather than merely advertised.
+ *
+ * Not covered here: `workspace/applyEdit`, which a server can push
+ * unsolicited (`lsp/client.ts`). That path has no session handle to resolve
+ * `workspace.additionalDirectories` from, so gating it against `client.cwd`
+ * alone would deny legitimate edits into an `/add-dir` root.
+ */
+export async function applyGuardedWorkspaceEdit(
+	edit: WorkspaceEdit,
+	cwd: string,
+	context: AgentToolContext | undefined,
+): Promise<string[]> {
+	const targets = workspaceEditTargetPaths(edit).map(raw => ({
+		raw,
+		access: "write" as const,
+		field: "workspace edit",
+	}));
+	enforceResourcePathTargets("lsp", targets, context);
+	return applyWorkspaceEdit(edit, cwd);
+}
+
+/**
  * LSP tool for language server protocol operations.
  */
 export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Theme> {
@@ -1636,7 +1654,9 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		params: LspParams,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<LspToolDetails>,
-		_context?: AgentToolContext,
+		// Not `context`: the `code_actions` branch below binds that name to an
+		// LSP `CodeActionContext`.
+		toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<LspToolDetails>> {
 		const { action, file, line, symbol, query, new_name, apply, timeout } = params;
 		if (this.session.lspReadOnly && !LSP_READONLY_ACTIONS.has(action)) {
@@ -2669,7 +2689,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						const appliedAction = await applyCodeAction(selectedAction, {
 							resolveCodeAction: async actionItem =>
 								(await sendRequest(client, "codeAction/resolve", actionItem, signal)) as CodeAction,
-							applyWorkspaceEdit: async edit => applyWorkspaceEdit(edit, this.session.cwd),
+							applyWorkspaceEdit: async edit => applyGuardedWorkspaceEdit(edit, this.session.cwd, toolContext),
 							executeCommand: async commandItem => {
 								await sendRequest(
 									client,
@@ -2765,7 +2785,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					} else {
 						const shouldApply = apply !== false;
 						if (shouldApply) {
-							const applied = await applyWorkspaceEdit(result, this.session.cwd);
+							const applied = await applyGuardedWorkspaceEdit(result, this.session.cwd, toolContext);
 							output = `Applied rename:\n${applied.map(a => `  ${a}`).join("\n")}`;
 						} else {
 							const preview = formatWorkspaceEdit(result, this.session.cwd);

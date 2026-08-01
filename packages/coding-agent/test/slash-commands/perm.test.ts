@@ -60,8 +60,21 @@ describe("/perm slash command", () => {
 		expect(text).toContain("Confine reads to workspace: no");
 		expect(text).toContain("Deny read: **/.env");
 		// `.env.example` is carved out of the secret globs; a report that omitted
-		// the allow list would misdescribe what strict actually denies.
-		expect(text).toContain("Allow read: **/.env.example, **/.env.sample");
+		// it would misdescribe what strict actually denies. It is reported under
+		// its own label rather than as an allow rule, because unlike a user's
+		// `permissions.allow.*` entry it does NOT relax workspace confinement.
+		expect(text).toContain("Deny carve-out read (still confined): **/.env.example, **/.env.sample");
+		expect(text).not.toContain("Allow read:");
+	});
+
+	it("reports a user's allow rules apart from the profile's carve-outs", async () => {
+		const h = acpRuntime({ "permissions.profile": "strict", "permissions.allow.write": ["/tmp/**"] });
+
+		await executeAcpBuiltinSlashCommand("/perm", h.runtime);
+
+		const text = String(h.output.mock.calls.at(-1)?.[0] ?? "");
+		expect(text).toContain("Allow write: /tmp/**");
+		expect(text).toContain("Deny carve-out write (still confined): **/.env.example, **/.env.sample");
 	});
 
 	it("bounds the joined rule line to the display-width limit regardless of how many globs are configured", async () => {

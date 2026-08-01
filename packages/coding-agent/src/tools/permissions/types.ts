@@ -45,7 +45,22 @@ export interface PermissionPolicy {
 	readonly confineReads: boolean;
 	readonly confineWrites: boolean;
 	readonly deny: AccessGlobs;
+	/**
+	 * User-authored `permissions.allow.*`. The full escape hatch: it outranks
+	 * both the deny globs and workspace confinement, because asking for a path
+	 * by name is an explicit statement that the path is in bounds.
+	 */
 	readonly allow: AccessGlobs;
+	/**
+	 * Allow globs the *profile* ships (`strict`'s `**​/.env.example`), which
+	 * exist only to punch a hole in that same profile's deny list.
+	 *
+	 * Deliberately weaker than {@link allow}: a carve-out suppresses a deny
+	 * glob but never workspace confinement, so `strict` stays "workspace +
+	 * secret rules" and a shipped template pattern cannot authorize
+	 * `/tmp/.env.example` outside every root.
+	 */
+	readonly carveOut: AccessGlobs;
 	readonly opaqueToolScan: OpaqueToolScanMode;
 }
 

@@ -252,6 +252,28 @@ export class ToolChoiceQueue {
 		this.#pendingInvokers = [];
 	}
 
+	/**
+	 * Drop every pending invoker registered *after* `id`, keeping `id` and
+	 * everything below it.
+	 *
+	 * Undo for a tool call whose staged preview must not survive: the resource
+	 * permission gate rechecks a tool's real target set only after it executes,
+	 * and `ast_edit` registers its apply closure during execution. Without this,
+	 * a denied `ast_edit` leaves an invoker that a later `xd://resolve` dispatch
+	 * runs with no further permission check — applying to the very file the
+	 * denial reported as blocked. Callers snapshot `peekPendingHead()?.id`
+	 * before the call and pass it here on denial.
+	 *
+	 * `undefined`, or an id no longer present (it resolved mid-call), drops all
+	 * of them: the alternative is guessing which entries the denied call added,
+	 * and leaving one staged is the failure this exists to prevent.
+	 */
+	removePendingInvokersSince(id: string | undefined): void {
+		if (this.#pendingInvokers.length === 0) return;
+		const index = id === undefined ? -1 : this.#pendingInvokers.findIndex(p => p.id === id);
+		this.#pendingInvokers = index < 0 ? [] : this.#pendingInvokers.slice(0, index + 1);
+	}
+
 	/** True when at least one non-forcing pending preview is registered. */
 	get hasPendingInvoker(): boolean {
 		return this.#pendingInvokers.length > 0;

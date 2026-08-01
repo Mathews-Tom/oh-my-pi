@@ -29,6 +29,12 @@ export const STRICT_SECRET_DENY_GLOBS: readonly string[] = [
 //
 // `**/.env.*` would otherwise swallow the checked-in templates that live
 // beside a real `.env` in most repositories.
+//
+// These land in `policy.carveOut`, not `policy.allow`: they exist to relax the
+// secret deny globs above and nothing else. Routing them through the
+// user-authored allow list would also let them outrank `confineWrites`, so
+// `strict` would permit writing `/tmp/.env.example` outside every workspace
+// root — a boundary the profile is supposed to keep.
 export const STRICT_SECRET_ALLOW_GLOBS: readonly string[] = ["**/.env.example", "**/.env.sample"];
 
 const NO_GLOBS: AccessGlobs = { read: [], write: [] };
@@ -37,19 +43,19 @@ interface ProfileDefaults {
 	readonly confineReads: boolean;
 	readonly confineWrites: boolean;
 	readonly deny: AccessGlobs;
-	readonly allow: AccessGlobs;
+	readonly carveOut: AccessGlobs;
 }
 
 const PROFILE_DEFAULTS: Record<PermissionProfile, ProfileDefaults> = {
-	off: { confineReads: false, confineWrites: false, deny: NO_GLOBS, allow: NO_GLOBS },
+	off: { confineReads: false, confineWrites: false, deny: NO_GLOBS, carveOut: NO_GLOBS },
 	// Writes are where an escape is destructive; reading `/var/log` or
 	// `~/.gitconfig` is routine, so reads stay unconfined by default.
-	workspace: { confineReads: false, confineWrites: true, deny: NO_GLOBS, allow: NO_GLOBS },
+	workspace: { confineReads: false, confineWrites: true, deny: NO_GLOBS, carveOut: NO_GLOBS },
 	strict: {
 		confineReads: false,
 		confineWrites: true,
 		deny: { read: STRICT_SECRET_DENY_GLOBS, write: STRICT_SECRET_DENY_GLOBS },
-		allow: { read: STRICT_SECRET_ALLOW_GLOBS, write: STRICT_SECRET_ALLOW_GLOBS },
+		carveOut: { read: STRICT_SECRET_ALLOW_GLOBS, write: STRICT_SECRET_ALLOW_GLOBS },
 	},
 };
 
@@ -80,10 +86,13 @@ function mergeGlobs(base: readonly string[], extra: readonly string[] | undefine
 /**
  * Merge a profile with user overrides into the policy the gate evaluates.
  *
- * Glob lists are unioned rather than replaced: a profile's secret list is a
+ * Deny lists are unioned rather than replaced: a profile's secret list is a
  * floor, and `permissions.deny.*` raises it. There is deliberately no way to
  * subtract from a profile's deny list except through `permissions.allow.*`,
  * which is the single, explicit escape hatch.
+ *
+ * The profile's own carve-outs stay in a separate list so they keep exactly
+ * the power they were written for — see {@link PermissionPolicy.carveOut}.
  */
 export function buildPermissionPolicy(
 	profile: PermissionProfile,
@@ -99,9 +108,25 @@ export function buildPermissionPolicy(
 			write: mergeGlobs(defaults.deny.write, overrides.denyWrite),
 		},
 		allow: {
-			read: mergeGlobs(defaults.allow.read, overrides.allowRead),
-			write: mergeGlobs(defaults.allow.write, overrides.allowWrite),
+			read: mergeGlobs([], overrides.allowRead),
+			write: mergeGlobs([], overrides.allowWrite),
 		},
+		carveOut: defaults.carveOut,
 		opaqueToolScan: overrides.opaqueToolScan ?? "deny",
 	};
+}
+
+/**
+ * Every glob that can suppress a deny rule for `access` — the profile's
+ * carve-outs plus the user's own allow list.
+ *
+ * The two are only equivalent where confinement does not apply: the opaque
+ * literal scan and the `ssh://` path both consult this union, while
+ * {@link PermissionPolicy.allow} alone is what outranks confinement.
+ */
+export function denySuppressingGlobs(policy: PermissionPolicy, access: keyof AccessGlobs): readonly string[] {
+	const carveOut = policy.carveOut[access];
+	if (carveOut.length === 0) return policy.allow[access];
+	if (policy.allow[access].length === 0) return carveOut;
+	return [...carveOut, ...policy.allow[access]];
 }

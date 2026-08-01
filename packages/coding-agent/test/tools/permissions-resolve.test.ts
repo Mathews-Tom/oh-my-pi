@@ -102,6 +102,26 @@ describe("profile strict", () => {
 		expect(decideTarget(target(".env.local"), policy, roots).kind).toBe("deny");
 	});
 
+	it("keeps the .env.example carve-out inside the workspace", () => {
+		// The carve-out exists to relax `**/.env.*`, not `confineWrites`. When it
+		// lived in the same list as a user's allow rules it won outright, so
+		// `strict` — documented as "workspace + secret rules" — permitted writing
+		// a matching name anywhere on the filesystem.
+		const escaping = path.join(outside, ".env.example");
+		const denied = decideTarget(target(escaping, "write"), policy, roots);
+		expect(denied.kind).toBe("deny");
+		if (denied.kind === "deny") expect(denied.rule).toBe("permissions.confineWrites");
+		// Inside a root it still clears the secret deny globs.
+		expect(decideTarget(target(".env.example", "write"), policy, roots).kind).toBe("allow");
+	});
+
+	it("still lets a user allow rule outrank confinement", () => {
+		// The escape hatch every confinement denial message points at: a path the
+		// user named explicitly is in bounds even outside every root.
+		const relaxed = buildPermissionPolicy("strict", { allowWrite: [`${outside}/**`] });
+		expect(decideTarget(target(path.join(outside, "loot.txt"), "write"), relaxed, roots).kind).toBe("allow");
+	});
+
 	it("honours a user allow carve-out over a deny rule", () => {
 		const relaxed = buildPermissionPolicy("strict", { allowRead: ["**/.env.local"] });
 		expect(decideTarget(target(".env.local"), relaxed, roots).kind).toBe("allow");

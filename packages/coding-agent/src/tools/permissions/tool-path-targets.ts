@@ -17,7 +17,10 @@
  * `filesystem/read_file {path: ".env"}` is scanned rather than waved through.
  */
 import { Patch } from "@oh-my-pi/hashline";
-import { LSP_READONLY_ACTIONS } from "../../lsp";
+// The leaf module, not the `../../lsp` barrel: `lsp/index.ts` imports the
+// permission gate to validate server-supplied workspace edits, so pulling the
+// barrel in here would close an import cycle.
+import { LSP_READONLY_ACTIONS } from "../../lsp/actions";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
 import type { PathAccess, PathTarget } from "./types";
 

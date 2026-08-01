@@ -97,11 +97,17 @@ function policyLines(policy: PermissionPolicy): string[] {
 		`  Confine writes to workspace: ${policy.confineWrites ? "yes" : "no"}`,
 		`  Opaque tool scan: ${policy.opaqueToolScan}`,
 	];
+	// The profile's own carve-outs get their own label rather than being folded
+	// into "Allow": they relax the deny globs above but NOT confinement, so a
+	// report that listed `**/.env.example` as an allow rule would tell an
+	// operator that `/tmp/.env.example` is writable under `strict` when it is not.
 	for (const line of [
 		ruleLine("Deny read", policy.deny.read),
 		ruleLine("Deny write", policy.deny.write),
 		ruleLine("Allow read", policy.allow.read),
 		ruleLine("Allow write", policy.allow.write),
+		ruleLine("Deny carve-out read (still confined)", policy.carveOut.read),
+		ruleLine("Deny carve-out write (still confined)", policy.carveOut.write),
 	]) {
 		if (line) lines.push(line);
 	}

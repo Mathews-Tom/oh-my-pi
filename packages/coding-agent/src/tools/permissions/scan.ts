@@ -18,6 +18,7 @@ import * as path from "node:path";
 import { tokenizeShellSegments } from "../shell-tokenize";
 import { relativeToRoots } from "./confine";
 import { matchGlob } from "./matcher";
+import { denySuppressingGlobs } from "./profiles";
 import { isExemptPathArgument, permissionRootList, resolveTargetPath } from "./resolve";
 import type { PathAccess, PermissionPolicy, PermissionRoots } from "./types";
 
@@ -143,6 +144,9 @@ export function scanOpaqueArguments(
 	if (strings.length === 0) return null;
 
 	const rootList = permissionRootList(roots);
+	// The scan only ever suppresses a deny match — it has no confinement step —
+	// so the profile's carve-outs count exactly as much as the user's allow list.
+	const suppressing = { read: denySuppressingGlobs(policy, "read"), write: denySuppressingGlobs(policy, "write") };
 	const seen = new Set<string>();
 	for (const literal of candidateLiterals(strings, scan)) {
 		if (!looksLikePathReference(literal) || seen.has(literal)) continue;
@@ -158,7 +162,7 @@ export function scanOpaqueArguments(
 		const candidates = [...relatives, absolute, path.basename(absolute), literal];
 
 		for (const access of ["read", "write"] as const) {
-			if (matchGlob(policy.allow[access], candidates)) continue;
+			if (matchGlob(suppressing[access], candidates)) continue;
 			const rule = matchGlob(policy.deny[access], candidates);
 			if (rule) return { literal, rule, access };
 		}

@@ -6,7 +6,13 @@ import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { applyGuardedWorkspaceEdit } from "@oh-my-pi/pi-coding-agent/lsp";
+import { workspaceEditTargetPaths } from "@oh-my-pi/pi-coding-agent/lsp/edits";
 import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
+
+/** A zero-width range at the start of the document, for text-edit fixtures. */
+const RANGE_ZERO = { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } };
 
 let workspace: string;
 let worktree: string;
@@ -280,6 +286,21 @@ describe("fail-closed edges", () => {
 		expect(await denialOf("read", { path: ".env:raw" }, contextOf(STRICT))).toContain("**/.env");
 		expect(await denialOf("grep", { pattern: "KEY", path: ".env:1-5" }, contextOf(STRICT))).toContain("**/.env");
 	});
+
+	it("names the bad value when permissions.profile is not a profile", async () => {
+		// Indexing the profile table with an unrecognized value used to throw a
+		// bare `TypeError: undefined is not an object` from inside the gate —
+		// a crash that neither allows nor denies and names nothing to fix.
+		for (const bogus of [{}, "stict", 3]) {
+			const message = await denialOf("read", { path: "src/main.ts" }, contextOf({ "permissions.profile": bogus }));
+			expect(message).toContain("permissions.profile is");
+			expect(message).toContain('"off", "workspace", or "strict"');
+		}
+	});
+
+	it("treats an absent profile as off rather than as an error", async () => {
+		expect((await run("read", { path: ".env" }, contextOf({ "permissions.profile": null }))).calls).toHaveLength(1);
+	});
 });
 
 describe("the layer subtracts, never grants", () => {
@@ -305,5 +326,135 @@ describe("write-side settings reach the policy", () => {
 		expect(await denialOf("write", { path: "svc/.env" }, denied)).toContain("**/.env");
 		const allowed = contextOf({ "permissions.profile": "strict", "permissions.allow.write": ["svc/.env"] });
 		expect((await run("write", { path: "svc/.env" }, allowed)).calls).toHaveLength(1);
+	});
+});
+
+describe("post-execution recheck", () => {
+	/** A tool that reports the files it visited, as `grep`/`ast_edit` do. */
+	function reportingTool(name: string, files: string[], onExecute?: () => void): AgentTool {
+		return {
+			name,
+			description: name,
+			parameters: {},
+			label: name,
+			strict: false,
+			execute: async (): Promise<AgentToolResult> => {
+				onExecute?.();
+				return { content: [{ type: "text", text: "ok" }], details: { files } };
+			},
+		} as unknown as AgentTool;
+	}
+
+	async function runReporting(tool: AgentTool, params: unknown, context: AgentToolContext): Promise<Error | null> {
+		const wrapper = new ExtensionToolWrapper(tool, runner);
+		try {
+			await wrapper.execute("call-1", params as never, undefined, undefined, context);
+			return null;
+		} catch (err) {
+			return err instanceof Error ? err : new Error(String(err));
+		}
+	}
+
+	it("denies a recursive grep that reached a file the declared root did not name", async () => {
+		// `grep({ path: "." })` clears the pre-execution gate — `.` matches no
+		// secret glob — and only the reported file set exposes the `.env` it opened.
+		const tool = reportingTool("grep", [".env"]);
+		const error = await runReporting(tool, { path: "." }, contextOf(STRICT));
+		expect(error?.message).toContain("**/.env");
+	});
+
+	it("drops a preview the denied call staged, so `xd://resolve` cannot apply it", async () => {
+		// `ast_edit` registers its apply closure during execution, before the
+		// recheck below runs. Left registered, a later resolve dispatch would run
+		// it with no further permission check — writing the very file this denial
+		// reports as blocked.
+		const queue = new ToolChoiceQueue();
+		queue.registerPendingInvoker("pre-existing", "write", async () => undefined);
+		const context = contextOf(STRICT);
+		(context as { pendingPreviews?: unknown }).pendingPreviews = {
+			headId: () => queue.peekPendingHead()?.id,
+			removeSince: (id: string | undefined) => queue.removePendingInvokersSince(id),
+		};
+
+		const tool = reportingTool("ast_edit", [".env"], () => {
+			queue.registerPendingInvoker("pending-action:ast_edit:0", "ast_edit", async () => undefined);
+		});
+		const error = await runReporting(tool, { paths: ["."] }, context);
+
+		expect(error?.message).toContain("**/.env");
+		// The denied call's staged apply is gone; an unrelated one that was
+		// already pending survives.
+		expect(queue.peekPendingHead()).toEqual({ id: "pre-existing", sourceToolName: "write" });
+	});
+
+	it("keeps a preview staged when the recheck passes", async () => {
+		const queue = new ToolChoiceQueue();
+		const context = contextOf(STRICT);
+		(context as { pendingPreviews?: unknown }).pendingPreviews = {
+			headId: () => queue.peekPendingHead()?.id,
+			removeSince: (id: string | undefined) => queue.removePendingInvokersSince(id),
+		};
+
+		const tool = reportingTool("ast_edit", ["src/main.ts"], () => {
+			queue.registerPendingInvoker("pending-action:ast_edit:0", "ast_edit", async () => undefined);
+		});
+		expect(await runReporting(tool, { paths: ["src"] }, context)).toBeNull();
+		expect(queue.peekPendingHead()?.id).toBe("pending-action:ast_edit:0");
+	});
+});
+
+describe("lsp workspace edits", () => {
+	function fileUri(absolutePath: string): string {
+		return `file://${absolutePath}`;
+	}
+
+	it("names every destination a workspace edit would touch, including both rename endpoints", () => {
+		const paths = workspaceEditTargetPaths({
+			documentChanges: [
+				{ kind: "rename", oldUri: fileUri(path.join(workspace, "src/a.ts")), newUri: fileUri("/tmp/b.ts") },
+				{ kind: "create", uri: fileUri(path.join(workspace, "src/c.ts")) },
+			],
+		} as never);
+		expect(paths).toEqual([path.join(workspace, "src/a.ts"), "/tmp/b.ts", path.join(workspace, "src/c.ts")]);
+	});
+
+	it("refuses a server-chosen rename destination outside the workspace, and writes nothing", async () => {
+		// The `file` argument the gate checks is in-workspace and allowed; the
+		// destination comes from the language server, so only this check sees it.
+		const destination = path.join(outside, "renamed.ts");
+		const source = path.join(workspace, "src", "main.ts");
+		await expect(
+			applyGuardedWorkspaceEdit(
+				{ documentChanges: [{ kind: "rename", oldUri: fileUri(source), newUri: fileUri(destination) }] } as never,
+				workspace,
+				contextOf(WORKSPACE),
+			),
+		).rejects.toThrow("permissions.confineWrites");
+		expect(fs.existsSync(destination)).toBe(false);
+		expect(fs.existsSync(source)).toBe(true);
+	});
+
+	it("refuses a server-supplied text edit against a denied file", async () => {
+		await expect(
+			applyGuardedWorkspaceEdit(
+				{
+					changes: { [fileUri(path.join(workspace, ".env"))]: [{ range: RANGE_ZERO, newText: "LEAK=1" }] },
+				} as never,
+				workspace,
+				contextOf(STRICT),
+			),
+		).rejects.toThrow("**/.env");
+		expect(fs.readFileSync(path.join(workspace, ".env"), "utf8")).toBe("SECRET=1");
+	});
+
+	it("applies an in-workspace edit the policy permits", async () => {
+		const target = path.join(workspace, "src", "renamed.ts");
+		const applied = await applyGuardedWorkspaceEdit(
+			{ documentChanges: [{ kind: "create", uri: fileUri(target) }] } as never,
+			workspace,
+			contextOf(WORKSPACE),
+		);
+		expect(applied).toHaveLength(1);
+		expect(fs.existsSync(target)).toBe(true);
 	});
 });

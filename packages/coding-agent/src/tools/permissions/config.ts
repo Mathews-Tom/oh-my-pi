@@ -42,9 +42,29 @@ function globList(settings: Settings, key: GlobListKey): readonly string[] | und
 	return patterns;
 }
 
-/** Cheap pre-check so the `off` path never builds a policy at all. */
+const PERMISSION_PROFILES: ReadonlySet<string> = new Set<PermissionProfile>(["off", "workspace", "strict"]);
+
+/**
+ * Cheap pre-check so the `off` path never builds a policy at all.
+ *
+ * The value is validated rather than asserted. `Settings.get` is typed against
+ * the schema, but the gate runs on whatever a session, an override, or an SDK
+ * embedder actually put there, and an unrecognized value used to index
+ * `PROFILE_DEFAULTS` to `undefined` and take the gate down with a bare
+ * `TypeError` — a crash inside a security check decides nothing and names
+ * nothing the operator can fix. Same fail-loud direction as a malformed glob
+ * ({@link globList}): absent means `off`, present-but-wrong is an error.
+ */
 export function readPermissionProfile(settings: Settings | undefined): PermissionProfile {
-	return settings?.get("permissions.profile") ?? "off";
+	const value = settings?.get("permissions.profile");
+	if (value === undefined || value === null) return "off";
+	if (typeof value !== "string" || !PERMISSION_PROFILES.has(value)) {
+		throw new Error(
+			`permissions.profile is ${JSON.stringify(value)}, which is not one of "off", "workspace", or "strict". ` +
+				`Fix or remove it — the resource permission layer cannot tell which rules to apply.`,
+		);
+	}
+	return value as PermissionProfile;
 }
 
 /**

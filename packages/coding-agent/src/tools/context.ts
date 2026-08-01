@@ -15,7 +15,22 @@ declare module "@oh-my-pi/pi-agent-core" {
 		xdevApproved?: boolean;
 		/** Set only after an interactive prompt approves provider computer safety checks. */
 		providerSafetyApproved?: boolean;
+		/**
+		 * Rollback handle for staged previews (`queueResolveHandler`), so a
+		 * post-execution denial can drop an apply closure the denied call
+		 * registered mid-execution. Absent outside a live session, where there is
+		 * no tool-choice queue and so nothing to stage.
+		 */
+		pendingPreviews?: PendingPreviewRollback;
 	}
+}
+
+/** Narrow view of the tool-choice queue's staged-preview registry. See `AgentToolContext.pendingPreviews`. */
+export interface PendingPreviewRollback {
+	/** Id of the currently staged head, or `undefined` when nothing is staged. */
+	headId(): string | undefined;
+	/** Drop every preview staged after `id` — see `ToolChoiceQueue.removePendingInvokersSince`. */
+	removeSince(id: string | undefined): void;
 }
 
 export class ToolContextStore {
@@ -23,7 +38,9 @@ export class ToolContextStore {
 	#hasUI = false;
 	#toolNames: string[] = [];
 
-	constructor(private readonly getBaseContext: () => CustomToolContext) {}
+	constructor(
+		private readonly getBaseContext: () => CustomToolContext & { pendingPreviews?: PendingPreviewRollback },
+	) {}
 
 	getContext(toolCall?: ToolCallContext): AgentToolContext {
 		return {

@@ -235,6 +235,40 @@ function planDocumentChanges(documentChanges: NonNullable<WorkspaceEdit["documen
 }
 
 /**
+ * Every absolute path applying `edit` would create, modify, rename, or delete.
+ *
+ * A `WorkspaceEdit` is *server*-supplied: a rename initiated inside an allowed
+ * file can name any destination the language server chooses, including one
+ * outside every workspace root. The initiating `file` argument is therefore not
+ * the write surface, so callers run this through the resource permission gate
+ * before applying anything (`lsp/index.ts`).
+ *
+ * Derived from the same `planDocumentChanges`/`uriToFile` pair
+ * {@link applyWorkspaceEdit} uses, so the set checked and the set written
+ * cannot diverge. A rename contributes BOTH endpoints: the source is removed
+ * and the destination is written.
+ */
+export function workspaceEditTargetPaths(edit: WorkspaceEdit): string[] {
+	const paths: string[] = [];
+	if (edit.documentChanges) {
+		for (const op of planDocumentChanges(edit.documentChanges)) {
+			if (op.kind === "rename") {
+				paths.push(uriToFile(op.oldUri), uriToFile(op.newUri));
+			} else {
+				paths.push(uriToFile(op.uri));
+			}
+		}
+	}
+	if (edit.changes) {
+		for (const uri in edit.changes) {
+			if (edit.changes[uri].length === 0) continue;
+			paths.push(uriToFile(uri));
+		}
+	}
+	return paths;
+}
+
+/**
  * Apply a workspace edit (collection of file changes).
  * All text-edit batches are overlap-validated before anything is written so a
  * conflict throws without leaving the workspace half-applied.

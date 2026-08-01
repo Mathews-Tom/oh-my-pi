@@ -34,7 +34,7 @@ permissions:
 | `workspace` | Writes must land under `cwd` or a `workspace.additionalDirectories` root. Reads unrestricted. |
 | `strict` | `workspace`, plus built-in deny rules for secrets, on both read and write. |
 
-`strict` denies `**/.env`, `**/.env.*`, `**/id_rsa`, `**/id_ed25519`, `**/id_ecdsa`, `**/*.pem`, `**/*.key`, `**/*.p12`, `**/.aws/credentials`, `**/.ssh/**`, and `**/secrets.json`. It ships carve-outs for `**/.env.example` and `**/.env.sample`, so the common case needs no rule of your own.
+`strict` denies `**/.env`, `**/.env.*`, `**/id_rsa`, `**/id_ed25519`, `**/id_ecdsa`, `**/*.pem`, `**/*.key`, `**/*.p12`, `**/.aws/credentials`, `**/.ssh/**`, and `**/secrets.json`. It ships carve-outs for `**/.env.example` and `**/.env.sample`, so the common case needs no rule of your own. Those carve-outs relax the secret deny rules only — they do not relax confinement, so `strict` still refuses to write `/tmp/.env.example` outside every workspace root. `/perm` reports them on their own `Deny carve-out` line for exactly that reason.
 
 Two defaults are deliberate:
 
@@ -50,11 +50,13 @@ Two defaults are deliberate:
 | `permissions.confineReads` | boolean | `false` | Reads must land under a workspace root. |
 | `permissions.deny.read` | glob list | `[]` | Merged onto the profile's rules. |
 | `permissions.deny.write` | glob list | `[]` | Merged onto the profile's rules. |
-| `permissions.allow.read` | glob list | `[]` | Carve-outs, evaluated first. |
-| `permissions.allow.write` | glob list | `[]` | Carve-outs, evaluated first. |
+| `permissions.allow.read` | glob list | `[]` | Carve-outs, evaluated first — they outrank both the deny rules and confinement. |
+| `permissions.allow.write` | glob list | `[]` | Carve-outs, evaluated first — they outrank both the deny rules and confinement. |
 | `permissions.opaqueToolScan` | `deny` \| `prompt` \| `off` | `deny` | What the literal scan does on a match. |
 
 A profile's deny list is a floor. `permissions.deny.*` adds to it; the only way to punch a hole in it is `permissions.allow.*`.
+
+`permissions.allow.*` is the full escape hatch: naming a path there is an explicit statement that it is in bounds, so it wins over the deny rules *and* over `confineReads`/`confineWrites`. A profile's own carve-outs are deliberately weaker — see `strict` above.
 
 ```yaml
 permissions:
@@ -102,6 +104,11 @@ Tools split into two classes, and the split is the honest boundary of the featur
 **Class A — structured path tools.** `read`, `write`, `edit`, `glob`, `grep`, `ast_grep`, `ast_edit`, `lsp`, `debug`, `inspect_image`, `security_scan`. These declare which arguments are paths and whether each is read or written, so enforcement is sound. This is the real guardrail.
 
 Resolution mirrors what the tool itself does, so the guard and the tool cannot disagree about which file is at stake. Both the target and its deepest existing ancestor are `realpath`-resolved, so a symlink pointing out of the workspace is caught rather than trusted; a *dangling* symlink is refused outright, because where it lands cannot be determined before the write follows it.
+
+Two Class A tools reach past their declared arguments and are checked a second time, because the declared arguments are not the whole surface:
+
+- `grep`, `ast_grep`, and `ast_edit` take a scope root and then recurse beneath it. The file set they report visiting is re-evaluated after the call and before the result reaches the model, so `grep --path .` cannot surface a denied file. A denial also discards any preview the call staged, so the pending `xd://resolve` cannot apply it afterwards.
+- `lsp` `rename` and `code_actions --apply` receive a `WorkspaceEdit` chosen by the *language server*, which can name destinations the call never mentioned. Every path such an edit would create, modify, rename, or delete is checked before anything is written. (A server can also push an unsolicited `workspace/applyEdit`; that path has no session handle to resolve `workspace.additionalDirectories` from and is not covered.)
 
 **Class B — opaque tools.** `bash`, `eval`, `browser`, `computer`, `hub`, and every MCP or extension tool. These take arbitrary code, and sound enforcement against arbitrary code is undecidable: `cat .env` can be written `$(echo Lmk|base64 -d)`, and no static scan catches that.
 

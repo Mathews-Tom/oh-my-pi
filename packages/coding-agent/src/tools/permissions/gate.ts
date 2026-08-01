@@ -172,6 +172,39 @@ export function enforcePostExecutionResourcePermissions(
 	const toolClass = classifyTool(toolName);
 	if (toolClass.kind !== "structured" || !toolClass.resultTargets) return;
 
+	enforceTargets(toolName, toolClass.resultTargets(details), policy, context);
+}
+
+/**
+ * Evaluate a target set a tool derived at runtime, rather than from its
+ * declared arguments.
+ *
+ * The `lsp` tool's write surface is a server-supplied `WorkspaceEdit`, not its
+ * `file` argument: a rename started inside an allowed file can name any
+ * destination the language server chooses. `lsp/index.ts` extracts the real
+ * destinations and calls this *before* applying anything, so the check
+ * precedes the write instead of reporting it afterwards.
+ *
+ * Short-circuits under `permissions.profile: off` exactly like the other two
+ * entry points, so the default configuration pays a single settings read.
+ */
+export function enforceResourcePathTargets(
+	toolName: string,
+	targets: readonly PathTarget[],
+	context: AgentToolContext | undefined,
+): void {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy) return;
+	enforceTargets(toolName, targets, policy, context);
+}
+
+/** Resolve the roots (failing closed without a session) and evaluate `targets`. */
+function enforceTargets(
+	toolName: string,
+	targets: readonly PathTarget[],
+	policy: PermissionPolicy,
+	context: AgentToolContext | undefined,
+): void {
 	const roots = permissionRoots(context);
 	if (!roots) {
 		throw new PermissionDeniedError(
@@ -183,6 +216,6 @@ export function enforcePostExecutionResourcePermissions(
 		);
 	}
 
-	const denial = checkStructuredTargets(toolClass.resultTargets(details), policy, roots);
+	const denial = checkStructuredTargets(targets, policy, roots);
 	if (denial) throw new PermissionDeniedError(toolName, denial.rule, denial.reason);
 }

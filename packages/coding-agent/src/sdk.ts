@@ -2594,6 +2594,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			settings,
 			localProtocolOptions,
 			autoApprove: options.autoApprove ?? false,
+			pendingPreviews: {
+				headId: () => session.toolChoiceQueue.peekPendingHead()?.id,
+				removeSince: (id: string | undefined) => session.toolChoiceQueue.removePendingInvokersSince(id),
+			},
 		});
 		const toolContextStore = new ToolContextStore(getSessionContext);
 		// Native built-in implementations backing same-tool `ctx.invokeTool`, so a tool that

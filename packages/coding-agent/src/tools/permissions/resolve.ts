@@ -10,6 +10,7 @@ import { extractUriScheme } from "../../internal-urls/parse";
 import { isInternalUrlPath, isReadableUrlPath, isSshUrl, resolveToCwd, splitPathAndSel } from "../path-utils";
 import { confineToRoots, relativeToRoots } from "./confine";
 import { matchGlob } from "./matcher";
+import { denySuppressingGlobs } from "./profiles";
 import { ALLOW, type PathTarget, type PermissionDecision, type PermissionPolicy, type PermissionRoots } from "./types";
 
 /**
@@ -84,13 +85,20 @@ const CONFINE_WRITES_RULE = "permissions.confineWrites";
  *
  * Order is fixed by design:
  *
- * 1. an explicit `permissions.allow.<access>` carve-out wins outright — the
- *    gitignore-negation model, so `.env.example` is expressible;
+ * 1. a user-authored `permissions.allow.<access>` entry wins outright — the
+ *    gitignore-negation model, and the escape hatch every confinement denial
+ *    message points at;
  * 2. confinement, when enabled for this access;
  * 3. deny globs, matched against workspace-relative path, absolute path, and
- *    basename so a rule written either way behaves as the user expects.
+ *    basename so a rule written either way behaves as the user expects — with
+ *    the profile's own carve-outs (`policy.carveOut`) suppressing a match.
  *
- * An allow carve-out relaxes *this* layer only. It never touches
+ * Step 3 is where the carve-outs live rather than step 1, so `strict`'s
+ * shipped `**​/.env.example` relaxes `**​/.env.*` without also relaxing
+ * `confineWrites` — writing `/tmp/.env.example` outside every workspace root
+ * stays denied.
+ *
+ * An allow entry relaxes *this* layer only. It never touches
  * `tools.approvalMode` or `tools.approval.<tool>`, so it cannot auto-approve
  * anything the user would otherwise have been prompted for.
  */
@@ -117,7 +125,7 @@ export function decidePathTarget(
 	}
 
 	const denied = matchGlob(policy.deny[target.access], candidates);
-	if (denied) {
+	if (denied && !matchGlob(policy.carveOut[target.access], candidates)) {
 		return {
 			kind: "deny",
 			rule: denied,
@@ -194,6 +202,8 @@ const SSH_URL_RE = /^ssh:\/\/[^/]*(\/.*)?$/i;
  * There is no local root to confine against (the file lives on a remote
  * host), so this checks only the deny/allow globs — the same lists a local
  * path faces — against the URL's remote path component and its basename.
+ * Confinement never applies here, so the profile's carve-outs and the user's
+ * allow list carry identical weight ({@link denySuppressingGlobs}).
  * Unparseable input (no path component at all, e.g. a bare `ssh://host`)
  * fails closed: there is nothing to verify, and `permissions.profile` being
  * active is not a reason to wave it through.
@@ -218,7 +228,7 @@ function decideSshTarget(target: PathTarget, policy: PermissionPolicy): Permissi
 	}
 	const candidates = [decoded, path.posix.basename(decoded)].filter((c): c is string => !!c);
 
-	const allowed = matchGlob(policy.allow[target.access], candidates);
+	const allowed = matchGlob(denySuppressingGlobs(policy, target.access), candidates);
 	if (allowed) return ALLOW;
 
 	const denied = matchGlob(policy.deny[target.access], candidates);
