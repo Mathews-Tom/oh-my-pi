@@ -134,25 +134,60 @@ async function validateScopePaths(repositoryRoot: string, paths: readonly string
 }
 
 /**
- * `denyGlobs` (from the resource-permission policy's `permissions.deny.read`)
- * is a transient, settings-derived input, not part of the persisted request —
- * see the {@link createSecurityScanPlan} doc comment for why it does not need
- * to round-trip through the stored plan.
+ * The resource-permission policy's read axis, as it applies to a security
+ * scan's file selection — transient, settings-derived input, not part of
+ * the persisted request (see the {@link createSecurityScanPlan} doc comment
+ * for why it does not need to round-trip through the stored plan).
+ *
+ * `deny` alone is not enough: a profile's built-in allow carve-out (e.g.
+ * strict's `**\/.env.example` against its own `**\/.env.*` deny rule) must
+ * still contribute to the digest and be reachable by the review session —
+ * only a file that is denied *and not* separately allowed is excluded.
  */
+export interface SecurityPathPolicy {
+	readonly deny: readonly string[];
+	readonly allow: readonly string[];
+}
+
+const NO_SECURITY_PATH_POLICY: SecurityPathPolicy = { deny: [], allow: [] };
+
+function isPathExcludedBySecurityPolicy(candidates: readonly string[], policy: SecurityPathPolicy): boolean {
+	return matchGlob(policy.deny, candidates) !== null && matchGlob(policy.allow, candidates) === null;
+}
+
+/**
+ * Filter a raw multi-file `git diff-tree` blob down to files the policy does
+ * not exclude. Used for both the `ref_diff` target's fingerprint and the
+ * diff text `prepareSecurityExecutionTarget` (`coordinator.ts`) actually
+ * sends to the security-review model, so a denied file's diff never
+ * contributes to either — computing the digest from the full diff while
+ * separately sending the filtered text to the model would let the two
+ * diverge, defeating the point of fingerprinting what the session sees.
+ */
+export function filterDiffByPermissionPolicy(rawDiff: string, policy: SecurityPathPolicy): string {
+	if (policy.deny.length === 0) return rawDiff;
+	const files = git.diff.parseFiles(rawDiff);
+	const kept = files.filter(
+		file => !isPathExcludedBySecurityPolicy([file.filename, path.basename(file.filename)], policy),
+	);
+	if (kept.length === files.length) return rawDiff;
+	return kept.map(file => file.content).join("\n");
+}
+
 async function digestWorkingTree(
 	repositoryRoot: string,
 	includePaths: readonly string[],
 	excludePaths: readonly string[],
 	adapter: SecurityGitAdapter,
 	signal: AbortSignal | undefined,
-	denyGlobs: readonly string[],
+	policy: SecurityPathPolicy,
 ): Promise<string> {
 	const tracked = await adapter.files(repositoryRoot, signal);
 	const untracked = await adapter.untracked(repositoryRoot, signal);
 	const files = [...new Set([...tracked, ...untracked])]
 		.map(normalizeRelativePath)
 		.filter(candidate => pathMatchesSecurityScope(candidate, includePaths, excludePaths))
-		.filter(candidate => matchGlob(denyGlobs, [candidate, path.basename(candidate)]) === null)
+		.filter(candidate => !isPathExcludedBySecurityPolicy([candidate, path.basename(candidate)], policy))
 		.sort();
 	const hasher = new Bun.CryptoHasher("sha256");
 	for (const relativePath of files) {
@@ -187,7 +222,7 @@ async function normalizeTarget(
 	request: SecurityTargetRequest,
 	adapter: SecurityGitAdapter,
 	signal: AbortSignal | undefined,
-	denyGlobs: readonly string[],
+	policy: SecurityPathPolicy,
 ): Promise<SecurityTarget> {
 	if (request.kind === "scoped_path" && !request.includePaths?.some(value => value.trim().length > 0)) {
 		throw new Error("scoped_path security scans require at least one include path");
@@ -202,7 +237,10 @@ async function normalizeTarget(
 		const headRevision = await adapter.resolveRef(repositoryRoot, request.headRevision, signal);
 		if (!baseRevision) throw new Error(`Unknown security scan base revision: ${request.baseRevision}`);
 		if (!headRevision) throw new Error(`Unknown security scan head revision: ${request.headRevision}`);
-		const rawDiff = await adapter.diffTree(repositoryRoot, baseRevision, headRevision, signal);
+		const rawDiff = filterDiffByPermissionPolicy(
+			await adapter.diffTree(repositoryRoot, baseRevision, headRevision, signal),
+			policy,
+		);
 		return {
 			kind: "ref_diff",
 			repositoryRoot,
@@ -224,7 +262,7 @@ async function normalizeTarget(
 		displayName,
 		includePaths,
 		excludePaths,
-		treeDigest: await digestWorkingTree(repositoryRoot, includePaths, excludePaths, adapter, signal, denyGlobs),
+		treeDigest: await digestWorkingTree(repositoryRoot, includePaths, excludePaths, adapter, signal, policy),
 	};
 	if (revision !== null) target.revision = revision;
 	return target;
@@ -321,12 +359,12 @@ interface SecurityPlanMaterial {
 async function buildPlanMaterial(
 	request: SecurityPlanRequest,
 	adapter: SecurityGitAdapter,
-	denyGlobs: readonly string[],
+	policy: SecurityPathPolicy,
 ): Promise<SecurityPlanMaterial> {
 	const repositoryRoot = await adapter.root(path.resolve(request.cwd), request.signal);
 	if (!repositoryRoot) throw new Error(`Security scans require a Git repository: ${request.cwd}`);
 	const canonicalRoot = await fs.realpath(repositoryRoot);
-	const target = await normalizeTarget(canonicalRoot, request.target, adapter, request.signal, denyGlobs);
+	const target = await normalizeTarget(canonicalRoot, request.target, adapter, request.signal, policy);
 	const knowledgeBases = await normalizeKnowledgeBases(request.knowledgeBasePaths, canonicalRoot);
 	const output = await normalizeOutput(canonicalRoot, request.outputRoot, request.archiveExisting ?? false);
 	const model: SecurityModelRef = {
@@ -355,22 +393,22 @@ async function buildPlanMaterial(
 }
 
 /**
- * `denyGlobs` is the resource-permission policy's `permissions.deny.read`
- * list, evaluated fresh from live settings by every caller (`coordinator.ts`)
- * rather than stored on the plan/request — it filters which files
- * contribute to the working-tree digest (see `digestWorkingTree`), not the
- * request shape itself, so it needs no persisted schema slot and no round
- * trip through {@link requestFromPlan}. `assertSecurityScanPlanFresh` passes
- * its own freshly-derived list, computed the same way at the same call site
- * (`coordinator.ts`'s `start()`), so a plan built under one set of deny
- * rules and re-verified under the same live settings digests identically.
+ * `policy` is the resource-permission policy's read axis, evaluated fresh
+ * from live settings by every caller (`coordinator.ts`) rather than stored
+ * on the plan/request — it filters which files contribute to the digest
+ * (see `digestWorkingTree`/`filterDiffByPermissionPolicy`), not the request
+ * shape itself, so it needs no persisted schema slot and no round trip
+ * through {@link requestFromPlan}. `assertSecurityScanPlanFresh` passes its
+ * own freshly-derived policy, computed the same way at the same call site
+ * (`coordinator.ts`'s `start()`), so a plan built under one policy and
+ * re-verified under the same live settings digests identically.
  */
 export async function createSecurityScanPlan(
 	request: SecurityPlanRequest,
 	adapter: SecurityGitAdapter = DEFAULT_SECURITY_GIT_ADAPTER,
-	denyGlobs: readonly string[] = [],
+	policy: SecurityPathPolicy = NO_SECURITY_PATH_POLICY,
 ): Promise<SecurityScanPlan> {
-	const material = await buildPlanMaterial(request, adapter, denyGlobs);
+	const material = await buildPlanMaterial(request, adapter, policy);
 	const fingerprint = `omp-security-plan/v1:sha256:${Bun.SHA256.hash(canonicalSecurityJson(material), "hex")}`;
 	return parseSecurityScanPlan({
 		documentType: "omp-security.scan-plan",
@@ -420,9 +458,9 @@ export async function assertSecurityScanPlanFresh(
 	plan: SecurityScanPlan,
 	freshness: SecurityPlanFreshnessInput,
 	adapter: SecurityGitAdapter = DEFAULT_SECURITY_GIT_ADAPTER,
-	denyGlobs: readonly string[] = [],
+	policy: SecurityPathPolicy = NO_SECURITY_PATH_POLICY,
 ): Promise<void> {
-	const current = await createSecurityScanPlan(requestFromPlan(plan, freshness), adapter, denyGlobs);
+	const current = await createSecurityScanPlan(requestFromPlan(plan, freshness), adapter, policy);
 	if (current.fingerprint !== plan.fingerprint) {
 		throw new StaleSecurityScanPlanError(plan.fingerprint, current.fingerprint);
 	}

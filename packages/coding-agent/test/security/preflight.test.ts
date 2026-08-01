@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
 	assertSecurityScanPlanFresh,
 	createSecurityScanPlan,
+	filterDiffByPermissionPolicy,
 	prepareSecurityOutputDirectory,
 	type SecurityGitAdapter,
 	type SecurityTargetRequest,
@@ -233,7 +234,7 @@ describe("security preflight", () => {
 		}
 	});
 
-	test("denyGlobs excludes a matching file from the working-tree digest", async () => {
+	test("a deny-only policy excludes a matching file from the working-tree digest", async () => {
 		await Bun.write(path.join(repositoryRoot, ".env"), "SECRET=1\n");
 		const secretAwareAdapter: SecurityGitAdapter = {
 			...adapter,
@@ -248,18 +249,121 @@ describe("security preflight", () => {
 			config: {},
 			workflowFingerprint: "fixture",
 		};
-		const withoutDenyGlobs = await createSecurityScanPlan(request, secretAwareAdapter);
-		const withDenyGlobs = await createSecurityScanPlan(request, secretAwareAdapter, ["**/.env"]);
-		expect(withDenyGlobs.target.treeDigest).not.toBe(withoutDenyGlobs.target.treeDigest);
+		const denyOnly = { deny: ["**/.env"], allow: [] };
+		const withoutPolicy = await createSecurityScanPlan(request, secretAwareAdapter);
+		const withPolicy = await createSecurityScanPlan(request, secretAwareAdapter, denyOnly);
+		expect(withPolicy.target.treeDigest).not.toBe(withoutPolicy.target.treeDigest);
 
-		// Mutating .env changes the digest without denyGlobs but not with them —
+		// Mutating .env changes the digest without the policy but not with it —
 		// proof the excluded file never contributed to the digest at all, not
 		// merely that its content happened to hash the same.
 		await Bun.write(path.join(repositoryRoot, ".env"), "SECRET=2\n");
-		const afterMutationWithDenyGlobs = await createSecurityScanPlan(request, secretAwareAdapter, ["**/.env"]);
-		expect(afterMutationWithDenyGlobs.target.treeDigest).toBe(withDenyGlobs.target.treeDigest);
+		const afterMutationWithPolicy = await createSecurityScanPlan(request, secretAwareAdapter, denyOnly);
+		expect(afterMutationWithPolicy.target.treeDigest).toBe(withPolicy.target.treeDigest);
 
-		const afterMutationWithoutDenyGlobs = await createSecurityScanPlan(request, secretAwareAdapter);
-		expect(afterMutationWithoutDenyGlobs.target.treeDigest).not.toBe(withoutDenyGlobs.target.treeDigest);
+		const afterMutationWithoutPolicy = await createSecurityScanPlan(request, secretAwareAdapter);
+		expect(afterMutationWithoutPolicy.target.treeDigest).not.toBe(withoutPolicy.target.treeDigest);
+	});
+
+	test("an allow carve-out keeps a file in the digest despite an overlapping deny rule", async () => {
+		// Mirrors strict's own **/.env.example allow against its **/.env.* deny.
+		await Bun.write(path.join(repositoryRoot, ".env.example"), "SECRET=\n");
+		const secretAwareAdapter: SecurityGitAdapter = {
+			...adapter,
+			files: async () => ["src/a.ts", "src/b.ts", ".env.example"],
+		};
+		const request = {
+			cwd: repositoryRoot,
+			target: { kind: "repository" as const },
+			outputRoot: stateRoot,
+			model: { provider: "openai-codex", modelId: "fixture" },
+			account: { provider: "openai-codex", credentialId: 1 },
+			config: {},
+			workflowFingerprint: "fixture",
+		};
+		const overlapping = { deny: ["**/.env.*"], allow: ["**/.env.example"] };
+		const before = await createSecurityScanPlan(request, secretAwareAdapter, overlapping);
+		await Bun.write(path.join(repositoryRoot, ".env.example"), "SECRET=changed\n");
+		const after = await createSecurityScanPlan(request, secretAwareAdapter, overlapping);
+		// The allowed file's content change must still move the digest — if it
+		// were excluded (deny alone, ignoring the allow carve-out), the digest
+		// would stay identical and a stale plan would pass `start`'s freshness
+		// check even though the allowed file changed underneath it.
+		expect(after.target.treeDigest).not.toBe(before.target.treeDigest);
+	});
+
+	test("filterDiffByPermissionPolicy strips a denied file's diff and preserves an allowed one", () => {
+		const rawDiff = [
+			"diff --git a/src/a.ts b/src/a.ts",
+			"index 000..111 100644",
+			"--- a/src/a.ts",
+			"+++ b/src/a.ts",
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+			"diff --git a/.env b/.env",
+			"index 222..333 100644",
+			"--- a/.env",
+			"+++ b/.env",
+			"@@ -1 +1 @@",
+			"-SECRET=old",
+			"+SECRET=new",
+			"diff --git a/.env.example b/.env.example",
+			"index 444..555 100644",
+			"--- a/.env.example",
+			"+++ b/.env.example",
+			"@@ -1 +1 @@",
+			"-SECRET=",
+			"+SECRET=changed",
+		].join("\n");
+		const filtered = filterDiffByPermissionPolicy(rawDiff, { deny: ["**/.env*"], allow: ["**/.env.example"] });
+		expect(filtered).toContain("src/a.ts");
+		expect(filtered).toContain(".env.example");
+		expect(filtered).not.toContain("SECRET=old");
+		expect(filtered).not.toContain("SECRET=new\n");
+
+		// An empty policy (no deny rules) never touches the diff.
+		expect(filterDiffByPermissionPolicy(rawDiff, { deny: [], allow: [] })).toBe(rawDiff);
+	});
+
+	test("a ref_diff target's fingerprint reflects a filtered diff, not the raw one", async () => {
+		const diffAdapter = (envContent: string): SecurityGitAdapter => ({
+			...adapter,
+			diffTree: async () =>
+				[
+					"diff --git a/src/a.ts b/src/a.ts",
+					"index 000..111 100644",
+					"--- a/src/a.ts",
+					"+++ b/src/a.ts",
+					"@@ -1 +1 @@",
+					"-old",
+					"+new",
+					"diff --git a/.env b/.env",
+					"index 222..333 100644",
+					"--- a/.env",
+					"+++ b/.env",
+					"@@ -1 +1 @@",
+					"-SECRET=old",
+					`+SECRET=${envContent}`,
+				].join("\n"),
+		});
+		const request = {
+			cwd: repositoryRoot,
+			target: { kind: "ref_diff" as const, baseRevision: "base", headRevision: "head" },
+			outputRoot: stateRoot,
+			model: { provider: "openai-codex", modelId: "fixture" },
+			account: { provider: "openai-codex", credentialId: 1 },
+			config: {},
+			workflowFingerprint: "fixture",
+		};
+		const denyOnly = { deny: ["**/.env"], allow: [] };
+		const first = await createSecurityScanPlan(request, diffAdapter("one"), denyOnly);
+		// Changing only the denied file's diff content must not move the
+		// fingerprint once it is filtered out before hashing.
+		const second = await createSecurityScanPlan(request, diffAdapter("two"), denyOnly);
+		expect(second.target.treeDigest).toBe(first.target.treeDigest);
+
+		const unfiltered = await createSecurityScanPlan(request, diffAdapter("one"));
+		expect(unfiltered.target.treeDigest).not.toBe(first.target.treeDigest);
 	});
 });

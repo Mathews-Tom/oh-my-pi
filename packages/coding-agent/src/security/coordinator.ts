@@ -26,11 +26,12 @@ import type {
 	SecurityTargetKind,
 } from "./contracts";
 import { createSecurityScanId } from "./contracts";
-import type { SecurityGitAdapter, SecurityTargetRequest } from "./preflight";
+import type { SecurityGitAdapter, SecurityPathPolicy, SecurityTargetRequest } from "./preflight";
 import {
 	assertSecurityScanPlanFresh,
 	createSecurityScanPlan,
 	DEFAULT_SECURITY_GIT_ADAPTER,
+	filterDiffByPermissionPolicy,
 	prepareSecurityOutputDirectory,
 } from "./preflight";
 import {
@@ -156,15 +157,18 @@ function securityConfigSnapshot(settings: Settings): Record<string, boolean> {
 }
 
 /**
- * The resource-permission policy's `permissions.deny.read` globs, live from
- * settings — `digestWorkingTree` (`preflight.ts`) excludes any matching file
- * from the working-tree digest so a `strict`-profile secret (`.env`,
- * `id_rsa`, …) never contributes to what a preflight/start pair fingerprints
- * or a scan session's working tree ultimately covers. `[]` under
+ * The resource-permission policy's read axis (`permissions.deny.read` /
+ * `permissions.allow.read`), live from settings — `digestWorkingTree` and
+ * `filterDiffByPermissionPolicy` (`preflight.ts`) exclude any file that
+ * matches `deny` and is not separately carved back out by `allow`, so a
+ * `strict`-profile secret (`.env`, `id_rsa`, …) never contributes to what a
+ * preflight/start pair fingerprints, nor to the diff text a `ref_diff`
+ * review session actually reads. `{ deny: [], allow: [] }` under
  * `permissions.profile: off`, matching the gate's own short-circuit.
  */
-function securityDenyReadGlobs(settings: Settings): readonly string[] {
-	return loadPermissionsConfig(settings)?.deny.read ?? [];
+function securityPathPolicy(settings: Settings): SecurityPathPolicy {
+	const policy = loadPermissionsConfig(settings);
+	return { deny: policy?.deny.read ?? [], allow: policy?.allow.read ?? [] };
 }
 
 function createOperationId(): string {
@@ -335,6 +339,7 @@ async function prepareSecurityExecutionTarget(
 	scanId: string,
 	adapter: SecurityGitAdapter,
 	signal: AbortSignal,
+	policy: SecurityPathPolicy,
 ): Promise<PreparedSecurityExecutionTarget> {
 	if (plan.target.kind !== "ref_diff") {
 		return { cwd: plan.repositoryRoot, cleanup: async () => undefined };
@@ -350,7 +355,14 @@ async function prepareSecurityExecutionTarget(
 	try {
 		await git.worktree.add(plan.repositoryRoot, cwd, headRevision, { detach: true, signal });
 		added = true;
-		const diffText = await adapter.diffTree(plan.repositoryRoot, baseRevision, headRevision, signal);
+		// Filtered the same way `normalizeTarget` filtered it for the plan's own
+		// fingerprint (`preflight.ts`) — a denied file's diff must never reach
+		// this prompt-construction step, or the digest and what the model
+		// actually reads would silently diverge.
+		const diffText = filterDiffByPermissionPolicy(
+			await adapter.diffTree(plan.repositoryRoot, baseRevision, headRevision, signal),
+			policy,
+		);
 		return {
 			cwd,
 			diffText,
@@ -454,7 +466,7 @@ export class SecurityCoordinator {
 				signal: input.signal,
 			},
 			this.#gitAdapter,
-			securityDenyReadGlobs(this.#host.settings),
+			securityPathPolicy(this.#host.settings),
 		);
 		await store.putPlan(plan);
 		return plan;
@@ -475,7 +487,7 @@ export class SecurityCoordinator {
 				workflowFingerprint: SECURITY_WORKFLOW_FINGERPRINT,
 			},
 			this.#gitAdapter,
-			securityDenyReadGlobs(this.#host.settings),
+			securityPathPolicy(this.#host.settings),
 		);
 		const operationId = this.#createOperationId();
 		const scanId = createSecurityScanId();
@@ -586,6 +598,7 @@ export class SecurityCoordinator {
 				record.snapshot.scanId,
 				this.#gitAdapter,
 				signal,
+				securityPathPolicy(this.#host.settings),
 			);
 			const activeModel = this.#host.activeModel;
 			const model =
