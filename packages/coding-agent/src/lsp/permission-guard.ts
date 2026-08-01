@@ -128,6 +128,31 @@ export function assertWorkspaceDiagnosticsAllowed(context: AgentToolContext | un
 }
 
 /**
+ * Refuse a targetless LSP action that starts every configured language
+ * server under a policy that denies specific paths from being read.
+ * `capabilities` (with no `file`) and `reload *` both iterate every
+ * configured server and call the client resolver directly — bypassing
+ * `extractLspPaths` entirely, since neither declares a `file` argument for
+ * the pre-execution gate to check — so a project-aware server would start
+ * and index the whole restricted workspace with no check anywhere. Fails
+ * closed the same way {@link assertWorkspaceDiagnosticsAllowed} does for
+ * workspace-wide diagnostics.
+ */
+export function assertLspStartupAllowed(context: AgentToolContext | undefined, toolName: string): void {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy || (policy.deny.read.length === 0 && !policy.confineReads)) return;
+	throw new PermissionDeniedError(
+		toolName,
+		"permissions.deny.read",
+		`Tool "${toolName}" is blocked: this action starts every configured language server, including ` +
+			`project-aware ones whose real read surface (workspace indexing via project references) cannot be ` +
+			`limited to authorized paths, and permissions.profile: ${policy.profile} has active permissions.deny.read ` +
+			`rule(s) or permissions.confineReads: true.\n` +
+			`To allow it: scope the call to a specific file, or set permissions.profile: off.`,
+	);
+}
+
+/**
  * Filter `definition`/`type_definition`/`implementation`/`references`
  * locations down to ones the resource permission policy allows reading. The
  * declared `file` argument is checked before the request goes out, but the

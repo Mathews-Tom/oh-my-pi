@@ -52,6 +52,7 @@ import { detectLspmux } from "./lspmux";
 import {
 	assertDiagnosticTargetsAllowed,
 	assertLspCommandAllowed,
+	assertLspStartupAllowed,
 	assertWorkspaceDiagnosticsAllowed,
 	assertWorkspaceEditAllowed,
 	filterAuthorizedLocations,
@@ -2312,6 +2313,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					};
 				}
 			} else {
+				assertLspStartupAllowed(context, this.name);
 				serverList = getLspServers(config);
 			}
 
@@ -2537,6 +2539,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		}
 
 		if (action === "reload" && (isWorkspace || !resolvedFile)) {
+			assertLspStartupAllowed(context, this.name);
 			// `reload *` is the user's explicit request to re-read config from
 			// disk. Drop the per-cwd cache entry so `.omp/lsp.json`, root markers,
 			// and plugin configs added after the first LSP call become visible —

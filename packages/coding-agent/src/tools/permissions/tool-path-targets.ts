@@ -275,6 +275,13 @@ const extractLspPaths: PathTargetExtractor = args => {
 	const action = typeof args.action === "string" ? args.action : "";
 	const writes = !LSP_READONLY_ACTIONS.has(action);
 	pushPath(out, args.file, writes ? "write" : "read", "file");
+	// A write-tier action with a concrete `file` still reads it first:
+	// `ensureFileOpen` (`lsp/index.ts`) opens the document with
+	// `Bun.file(filePath).text()` and sends its content to the server before
+	// applying `rename`/`code_actions`/etc, so `permissions.deny.read` must
+	// see this target too — checking only "write" left a file readable via
+	// `lsp` whenever writes to it stayed allowed but reads did not.
+	if (writes) pushPath(out, args.file, "read", "file");
 	if (action === "rename_file") pushPath(out, args.new_name, "write", "new_name");
 	return out;
 };

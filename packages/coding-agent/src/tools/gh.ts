@@ -3347,10 +3347,22 @@ async function checkoutPullRequest(
 			// call `git.remote.add`, and `git.fetch`/`git.branch.*`/every
 			// `git.config.setBranch` write into `repoRoot/.git` regardless of
 			// whether a new worktree is created, so `repoRoot` needs the same
-			// check a new worktree gets. The eventual worktree path is resolved
-			// here too (moved up from after the mutations) so it can be
-			// authorized before anything runs, not after.
+			// check a new worktree gets. `repoRoot` alone only confines the
+			// checkout to allowed roots — a `permissions.deny.write:
+			// ["**/.git/**"]` rule never matches `repoRoot` itself, only the
+			// metadata paths inside it, so `gitDir`/`commonDir` (which can
+			// differ from `repoRoot/.git` for a linked worktree) are resolved
+			// and authorized too. The eventual worktree path is resolved here
+			// too (moved up from after the mutations) so it can be authorized
+			// before anything runs, not after.
 			assertGitWriteAllowed(repoRoot, context);
+			const repository = await git.repo.resolve(repoRoot);
+			if (repository) {
+				assertGitWriteAllowed(repository.gitDir, context);
+				if (repository.commonDir !== repository.gitDir) {
+					assertGitWriteAllowed(repository.commonDir, context);
+				}
+			}
 			const finalWorktreePath = existingWorktree
 				? existingWorktree.path
 				: await resolveAvailableWorktreePath(worktreePath, existingWorktrees);

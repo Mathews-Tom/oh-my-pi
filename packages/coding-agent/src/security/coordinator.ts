@@ -669,6 +669,18 @@ export class SecurityCoordinator {
 			const sessionsDirectory = path.join(store.projectDirectory, "sessions");
 			await fs.mkdir(sessionsDirectory, { recursive: true, mode: 0o700 });
 			const sessionManager = SessionManager.create(executionTarget.cwd, sessionsDirectory);
+			// `/add-dir` mutates the live session manager, not settings
+			// (`permissionRoots` reads `context.sessionManager.getAdditionalDirectories()`
+			// directly — see gate.ts), so a knowledge-base path added that way
+			// during the host session is invisible to `cloneForCwd`-derived
+			// settings. Seed the review session's brand-new manager from the
+			// host's live roots here, before it runs any tool call, so
+			// `confineReads`/`confineWrites` see the same roots the outer
+			// `security_scan` gate already accepted the target against.
+			for (const directory of this.#host.additionalDirectories ?? []) {
+				if (path.resolve(directory) === path.resolve(executionTarget.cwd)) continue;
+				await sessionManager.addWorkspaceDirectory(directory);
+			}
 			const publicationTool = createSecurityPublicationTool({
 				plan,
 				scanId: record.snapshot.scanId,
