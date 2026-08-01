@@ -277,4 +277,106 @@ describe("ast_edit tool schema", () => {
 			await removeWithRetries(tempDir);
 		}
 	});
+
+	it("denies the preview (and never queues an apply) when a matched file is denied by the resource permission policy", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-perm-deny-"));
+		try {
+			const filePath = path.join(tempDir, "secret.ts");
+			await Bun.write(filePath, "legacyWrap(x, value)\n");
+			const queue = new ToolChoiceQueue();
+			const context = {
+				sessionManager: {
+					getCwd: () => tempDir,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "test-session",
+				},
+				settings: Settings.isolated({
+					"tools.xdev": false,
+					"permissions.profile": "workspace",
+					"permissions.deny.write": ["**/secret.ts"],
+				}),
+			};
+
+			const tools = await createTools(
+				createTestSession(tempDir, {
+					getToolChoiceQueue: () => queue,
+					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
+					steer: () => {},
+				}),
+			);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+
+			const promise = tool!.execute(
+				"ast-edit-denied-preview",
+				{ ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }], paths: [filePath] },
+				undefined,
+				undefined,
+				context as unknown as Parameters<NonNullable<typeof tool>["execute"]>[4],
+			);
+			await expect(promise).rejects.toThrow(/blocked by the resource permission rule "\*\*\/secret\.ts"/);
+			// The apply callback authorizes files *before* queueing - a denied
+			// preview must never leave a pending action for `xd://resolve` to
+			// blindly apply later.
+			expect(queue.hasPendingInvoker).toBe(false);
+			expect(await Bun.file(filePath).text()).toBe("legacyWrap(x, value)\n");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("rechecks live permissions before applying a staged edit, denying if the policy tightened after preview", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-perm-live-"));
+		try {
+			const filePath = path.join(tempDir, "legacy.ts");
+			await Bun.write(filePath, "legacyWrap(x, value)\n");
+			const queue = new ToolChoiceQueue();
+			// `permissions.profile` starts unset (defaults to "off") - anything
+			// passed to `Settings.isolated()`'s own overrides pins that key
+			// permanently, so a later `.set()` below could never change it.
+			const settings = Settings.isolated({ "tools.xdev": false });
+			const context = {
+				sessionManager: {
+					getCwd: () => tempDir,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "test-session",
+				},
+				settings,
+			};
+
+			const tools = await createTools(
+				createTestSession(tempDir, {
+					getToolChoiceQueue: () => queue,
+					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
+					steer: () => {},
+				}),
+			);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+
+			// Queued with permissions off - the preview is authorized.
+			const previewResult = await tool!.execute(
+				"ast-edit-live-preview",
+				{ ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }], paths: [filePath] },
+				undefined,
+				undefined,
+				context as unknown as Parameters<NonNullable<typeof tool>["execute"]>[4],
+			);
+			expect((previewResult.details as { applied?: boolean }).applied).toBe(false);
+			expect(queue.hasPendingInvoker).toBe(true);
+
+			// Tightened between preview and resolve - e.g. a mid-session `/set`.
+			settings.set("permissions.profile", "strict");
+			settings.set("permissions.deny.write", ["**/legacy.ts"]);
+
+			const invoker = queue.peekPendingInvoker()!;
+			const applyPromise = invoker({ action: "apply", reason: "apply previewed AST edit" });
+			await expect(applyPromise).rejects.toThrow(/blocked by the resource permission rule "\*\*\/legacy\.ts"/);
+			// File must still be untouched - the recheck runs before the real
+			// (non-dry-run) pass, not after it already wrote the file.
+			expect(await Bun.file(filePath).text()).toBe("legacyWrap(x, value)\n");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
 });

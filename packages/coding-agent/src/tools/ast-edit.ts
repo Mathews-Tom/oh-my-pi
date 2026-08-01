@@ -28,6 +28,7 @@ import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { classifyGroupedLines, formatGroupedFiles, groupLineIndicesByBlank } from "./grouped-file-output";
 import type { OutputMeta } from "./output-meta";
 import { isInternalUrlPath, resolveToolSearchScope } from "./path-utils";
+import { checkStructuredTargets, loadPermissionsConfig, PermissionDeniedError, permissionRoots } from "./permissions";
 import {
 	appendParseErrorsBulletList,
 	capParseErrors,
@@ -262,7 +263,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 		params: AstEditSchemaInfer,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<AstEditToolDetails>,
-		_context?: AgentToolContext,
+		context?: AgentToolContext,
 	): Promise<AgentToolResult<AstEditToolDetails>> {
 		return untilAborted(signal, async () => {
 			const ops = params.ops.map((entry, index) => {
@@ -436,14 +437,62 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				outputLines.push("", ...formatParseErrors(cappedParseErrors, parseErrorsTotal));
 			}
 
-			// Register pending action so `resolve` can apply or discard these previewed changes
+			// Register pending action so `resolve` can apply or discard these previewed changes.
+			// Authorize the previewed files *before* queueing: this call's own
+			// post-execution recheck (`enforcePostExecutionResourcePermissions`,
+			// `wrapper.ts`) only guards this tool call's own result — the queued
+			// `apply` callback below runs later, from a *different* tool call
+			// (`write xd://resolve`) whose args never name these paths, so it
+			// would otherwise write a denied file with no check at all.
 			if (!result.applied && result.totalReplacements > 0) {
+				const permissionsPolicy = loadPermissionsConfig(context?.settings);
+				if (permissionsPolicy) {
+					const permissionsRoots = permissionRoots(context);
+					const denial = permissionsRoots
+						? checkStructuredTargets(
+								fileList.map(filePath => ({ raw: filePath, access: "write" as const, field: "files" })),
+								permissionsPolicy,
+								permissionsRoots,
+							)
+						: {
+								rule: "permissions.profile",
+								reason:
+									`Tool "${this.name}" is blocked: permissions.profile is "${permissionsPolicy.profile}" but this ` +
+									`call has no session, so the workspace roots the rules are measured against cannot be ` +
+									`determined.\nTo allow it: set permissions.profile: off.`,
+							};
+					if (denial) throw new PermissionDeniedError(this.name, denial.rule, denial.reason);
+				}
 				const previewReplacementPlural = result.totalReplacements !== 1 ? "s" : "";
 				const previewFilePlural = result.filesTouched !== 1 ? "s" : "";
 				queueResolveHandler(this.session, {
 					label: `AST Edit: ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}`,
 					sourceToolName: this.name,
 					apply: async (_reason: string) => {
+						// Recheck against *live* settings, not the policy captured at
+						// queue time: `permissions.profile` (or the deny/allow globs) can
+						// change between this call's preview and the later `write
+						// xd://resolve` call that invokes this callback - a session that
+						// was `off` when queued but `strict` by resolve time must not let
+						// a stale authorization slip through.
+						const livePolicy = loadPermissionsConfig(context?.settings);
+						if (livePolicy) {
+							const liveRoots = permissionRoots(context);
+							const liveDenial = liveRoots
+								? checkStructuredTargets(
+										fileList.map(filePath => ({ raw: filePath, access: "write" as const, field: "files" })),
+										livePolicy,
+										liveRoots,
+									)
+								: {
+										rule: "permissions.profile",
+										reason:
+											`Tool "${this.name}" is blocked: permissions.profile is "${livePolicy.profile}" but this ` +
+											`call has no session, so the workspace roots the rules are measured against cannot be ` +
+											`determined.\nTo allow it: set permissions.profile: off.`,
+									};
+							if (liveDenial) throw new PermissionDeniedError(this.name, liveDenial.rule, liveDenial.reason);
+						}
 						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 							rewrites: normalizedRewrites,
 							dryRun: false,
