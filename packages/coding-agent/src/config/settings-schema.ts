@@ -3771,7 +3771,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Permissions",
 			label: "Allow Read Globs",
 			description:
-				"Carve-outs evaluated before any deny rule or confinement check, so a specific path can be exempted from a broad rule. Relaxes this layer only — it never auto-approves a tool call.",
+				"Carve-outs from a matching permissions.deny.read rule by name — never from workspace confinement, which is checked first and cannot be bypassed by an allow rule. Relaxes this layer only — it never auto-approves a tool call.",
 		},
 	},
 
@@ -3783,7 +3783,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Permissions",
 			label: "Allow Write Globs",
 			description:
-				"Carve-outs evaluated before any deny rule or confinement check. Relaxes this layer only — it never auto-approves a tool call.",
+				"Carve-outs from a matching permissions.deny.write rule by name — never from workspace confinement, which is checked first and cannot be bypassed by an allow rule. Relaxes this layer only — it never auto-approves a tool call.",
 		},
 	},
 
