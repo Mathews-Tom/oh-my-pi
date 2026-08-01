@@ -114,7 +114,9 @@ bash:
       approval: prompt
     - match: "git status*"
       approval: allow
-    - match: "git diff*"
+    - match: "git diff"
+      approval: allow
+    - match: "git diff *"
       approval: allow
     - match: "git log*"
       approval: allow
@@ -225,7 +227,7 @@ The `rm` and `git push` rules above cover the common flag orderings and global-o
 Four properties of the matcher decide whether a preset behaves as written:
 
 - **Order the refusals first.** The first matching rule wins, and `allow` is checked by the same scan. `match: "git *"` placed above `match: "git push --force*"` allows the force-push, because the `allow` rule matches first.
-- **`*` is the only wildcard and it matches any run of characters, including none.** `match: "git status*"` covers both `git status` and `git status --short`; `match: "git status"` covers only the exact command. The glob is anchored to the whole command line after runs of whitespace are collapsed to single spaces.
+- **`*` is the only wildcard and it matches any run of characters, including none.** `match: "git status*"` covers both `git status` and `git status --short`; `match: "git status"` covers only the exact command. The glob is anchored to the whole command line after runs of whitespace are collapsed to single spaces. There is no subcommand word boundary: `match: "git diff*"` also covers `git difftool`, because `*` matches `tool …` just as readily as ` --stat`. Whenever a Git subcommand name is itself a prefix of another one with different side effects — `diff` vs. `difftool` — an `allow` rule meant for the narrower subcommand needs the exact form plus a space-suffixed variant (`match: "git diff"` and `match: "git diff *"`), not a bare trailing `*`; the Conservative preset above does exactly this to exclude `git difftool`.
 - **`allow` never applies to a command line containing shell control syntax.** Any of `;`, `&`, `|`, `<`, `>`, `` ` ``, `$`, `(`, `)`, or a newline disqualifies every `allow` rule for that call, so a narrow allowance cannot be used to smuggle an extra segment. `git status && rm -rf build` is not allowed by `match: "git *"`, and neither is `echo $HOME`. `deny` and `prompt` are unaffected: they match the whole line and each shell segment.
 - **Critical patterns force a prompt only outside `yolo` mode, or with an explicit `prompt`/`deny` tool policy — an explicit `allow` does not qualify.** A command matching a built-in critical pattern — `rm -rf /`, fork bombs, remote-fetch-then-execute, writes to `/etc/passwd`, host shutdown — carries a safety override, but `BashTool.approval()` returns that override *before* it reads any matching `bash.patterns` `allow`/`prompt` rule (`bash.ts:501-502` runs before `:504`), so the override itself carries no `bash.patterns` policy. `resolveApproval()` ignores an override with no policy in the default `yolo` mode (`approval.ts:132-147`), so a critical command not covered by an earlier `bash.patterns` `deny` rule still runs unattended under `yolo` — including when `tools.approval.bash` is explicitly `allow`. A `bash.patterns` `deny` rule still takes priority in every mode, since the deny check (`bash.ts:493`) runs before the critical check. To make the override itself stop a critical command, run a non-`yolo` `tools.approvalMode` (see [Modes](../approval-mode.md#modes)) or set `tools.approval.bash: prompt`/`deny`, consistent with [Safety overrides](../approval-mode.md#safety-overrides).
 
