@@ -113,25 +113,40 @@ export function confineToRoots(absolutePath: string, roots: readonly string[]): 
 }
 
 /**
- * The workspace-relative spelling of `absolutePath`, or `null` when it is
- * under no root.
+ * Every workspace-relative spelling of `absolutePath` that lands under one of
+ * `roots` — the raw (lexical) path plus its realpath-resolved form.
+ *
+ * Both are returned, not just the first one found: a symlink alias inside the
+ * workspace (`safe -> .env`, both under the same root) is contained under its
+ * lexical spelling (`safe`) on the very first root/target pair, which used to
+ * make this function return early and never surface the resolved spelling
+ * (`.env`) at all — so a deny rule written as `**\/.env` never saw the alias.
+ * Returning both lets a caller's glob match test whichever spelling the rule
+ * was written for, without weakening the separate (and stricter) "resolves
+ * outside every root" containment check in {@link confineToRoots}.
  *
  * Realpath-aware on both sides so a symlinked root (macOS `/tmp` ->
  * `/private/tmp`) still yields a relative candidate; without that, a user rule
  * written as `config/secrets.json` would silently never match.
  */
-export function relativeToRoots(absolutePath: string, roots: readonly string[]): string | null {
+export function relativeToRoots(absolutePath: string, roots: readonly string[]): string[] {
 	const resolved = path.resolve(absolutePath);
 	const realTarget = tryRealpath(resolved) ?? resolved;
+	const out: string[] = [];
+	const seen = new Set<string>();
 	for (const root of roots) {
 		const resolvedRoot = path.resolve(root);
 		for (const candidateRoot of [resolvedRoot, tryRealpath(resolvedRoot)]) {
 			if (!candidateRoot) continue;
 			for (const target of [resolved, realTarget]) {
 				const relative = path.relative(candidateRoot, target);
-				if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) return relative;
+				if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) continue;
+				if (!seen.has(relative)) {
+					seen.add(relative);
+					out.push(relative);
+				}
 			}
 		}
 	}
-	return null;
+	return out;
 }

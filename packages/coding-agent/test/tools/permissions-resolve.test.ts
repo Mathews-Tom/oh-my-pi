@@ -201,3 +201,48 @@ describe("read selector suffixes", () => {
 		expect(decideTarget(target("src/main.ts:1-5"), policy, roots).kind).toBe("allow");
 	});
 });
+
+describe("ssh:// is a filesystem target, not an exempt scheme", () => {
+	const policy = buildPermissionPolicy("strict");
+
+	it("denies a remote read matching a deny glob by its remote path", () => {
+		const decision = decideTarget(target("ssh://host/home/user/.env"), policy, roots);
+		expect(decision.kind).toBe("deny");
+		if (decision.kind === "deny") expect(decision.rule).toBe("**/.env");
+	});
+
+	it("permits an ordinary remote path", () => {
+		expect(decideTarget(target("ssh://host/etc/hosts"), policy, roots).kind).toBe("allow");
+	});
+
+	it("fails closed on an ssh:// URL with no path component", () => {
+		expect(decideTarget(target("ssh://host"), policy, roots).kind).toBe("deny");
+	});
+});
+
+describe("symlink alias deny matching", () => {
+	// A symlink alias whose lexical spelling (`safe`) is itself inside the
+	// workspace is contained under that spelling on the very first
+	// root/target pair `relativeToRoots` checks — this used to return early
+	// and never surface the resolved spelling (`.env`), so a `**/.env` deny
+	// rule never saw the alias.
+	it("denies reading a symlink alias whose resolved target matches a deny rule", () => {
+		const link = path.join(workspace, "safe");
+		fs.rmSync(link, { force: true });
+		fs.symlinkSync(path.join(workspace, ".env"), link);
+		const policy = buildPermissionPolicy("strict");
+		const decision = decideTarget(target("safe"), policy, roots);
+		expect(decision.kind).toBe("deny");
+		if (decision.kind === "deny") expect(decision.rule).toBe("**/.env");
+	});
+
+	it("does not weaken the separate outside-every-root containment check", () => {
+		const link = path.join(workspace, "escape-alias");
+		fs.rmSync(link, { force: true });
+		fs.symlinkSync(path.join(outside, "loot.txt"), link);
+		const policy = buildPermissionPolicy("workspace", { confineReads: true });
+		const decision = decideTarget(target("escape-alias"), policy, roots);
+		expect(decision.kind).toBe("deny");
+		if (decision.kind === "deny") expect(decision.rule).toBe("permissions.confineReads");
+	});
+});

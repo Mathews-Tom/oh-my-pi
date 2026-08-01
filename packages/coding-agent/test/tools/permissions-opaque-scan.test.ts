@@ -104,3 +104,25 @@ describe("policy interaction", () => {
 		expect(scanOpaqueArguments({ command: "ls /usr/bin" }, "shell", confined, roots)).toBeNull();
 	});
 });
+
+describe("literal cap enforcement within a single string", () => {
+	// The cap used to be checked only before expanding each *source* string,
+	// so one sufficiently long value could grow the literal array without
+	// bound and the eventual `push(...tokens)` spread could itself throw
+	// once the array got large enough — defeating the resource bound before
+	// any matching even began.
+	it("does not throw on one oversized string", () => {
+		const filler = Array.from({ length: 200_000 }, (_, i) => `word${i}`).join(" ");
+		expect(() => scanOpaqueArguments({ command: filler }, "shell", STRICT, roots)).not.toThrow();
+	});
+
+	it("stops scanning at the cap within a single string, so a secret far past it is never reached", () => {
+		const filler = Array.from({ length: 10_000 }, (_, i) => `word${i}`).join(" ");
+		expect(scanOpaqueArguments({ command: `${filler} .env` }, "shell", STRICT, roots)).toBeNull();
+	});
+
+	it("still finds a secret comfortably within the cap", () => {
+		const filler = Array.from({ length: 5 }, (_, i) => `word${i}`).join(" ");
+		expect(scanOpaqueArguments({ command: `.env ${filler}` }, "shell", STRICT, roots)?.rule).toBe("**/.env");
+	});
+});

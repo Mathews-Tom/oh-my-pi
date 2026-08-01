@@ -7,7 +7,7 @@
  */
 import * as path from "node:path";
 import { extractUriScheme } from "../../internal-urls/parse";
-import { isInternalUrlPath, isReadableUrlPath, resolveToCwd, splitPathAndSel } from "../path-utils";
+import { isInternalUrlPath, isReadableUrlPath, isSshUrl, resolveToCwd, splitPathAndSel } from "../path-utils";
 import { confineToRoots, relativeToRoots } from "./confine";
 import { matchGlob } from "./matcher";
 import { ALLOW, type PathTarget, type PermissionDecision, type PermissionPolicy, type PermissionRoots } from "./types";
@@ -38,10 +38,18 @@ const ROUTED_INTERNAL_SCHEMES: Record<string, true> = {
  * session's own sandbox and device surface, exactly as plan mode treats them,
  * and `http(s)://` is not a filesystem path either. Confining or denying these
  * would break the artifact and device routes without protecting any file.
+ *
+ * `ssh://` is deliberately excluded even though `isInternalUrlPath` lists it
+ * (`path-utils.ts`'s `TOP_LEVEL_INTERNAL_URL_PREFIXES` is a routing table for
+ * the read/write/search tools, not a permission-exempt set): it is a real
+ * remote filesystem surface reachable via `read`/`write`/`grep`
+ * (`docs/permissions.md`), so `read ssh://host/home/user/.env` must face the
+ * same deny/allow globs as the local spelling — see {@link decideSshTarget}.
  */
 export function isExemptPathArgument(raw: string): boolean {
 	const trimmed = raw.trim();
 	if (!trimmed) return true;
+	if (isSshUrl(trimmed)) return false;
 	if (isInternalUrlPath(trimmed) || isReadableUrlPath(trimmed)) return true;
 	const scheme = extractUriScheme(trimmed);
 	return !!scheme && ROUTED_INTERNAL_SCHEMES[scheme] === true;
@@ -76,9 +84,12 @@ const CONFINE_WRITES_RULE = "permissions.confineWrites";
  *
  * Order is fixed by design:
  *
- * 1. an explicit `permissions.allow.<access>` carve-out wins outright — the
- *    gitignore-negation model, so `.env.example` is expressible;
- * 2. confinement, when enabled for this access;
+ * 1. confinement, when enabled for this access — checked unconditionally, so
+ *    no allow glob (including the built-in `**\/.env.example` carve-out) can
+ *    ever write outside every workspace root;
+ * 2. an explicit `permissions.allow.<access>` carve-out wins over a deny
+ *    glob by name — the gitignore-negation model, so `.env.example` is
+ *    expressible;
  * 3. deny globs, matched against workspace-relative path, absolute path, and
  *    basename so a rule written either way behaves as the user expects.
  *
@@ -93,11 +104,8 @@ export function decidePathTarget(
 	roots: PermissionRoots,
 ): PermissionDecision {
 	const rootList = permissionRootList(roots);
-	const relative = relativeToRoots(absolutePath, rootList);
-	const candidates = [relative, absolutePath, path.basename(absolutePath)].filter((c): c is string => !!c);
-
-	const allowed = matchGlob(policy.allow[target.access], candidates);
-	if (allowed) return ALLOW;
+	const relatives = relativeToRoots(absolutePath, rootList);
+	const candidates = [...relatives, absolutePath, path.basename(absolutePath)];
 
 	const confine = target.access === "write" ? policy.confineWrites : policy.confineReads;
 	if (confine) {
@@ -107,6 +115,9 @@ export function decidePathTarget(
 			return { kind: "deny", rule, reason: containmentReason(containment.reason, target, absolutePath, rootList) };
 		}
 	}
+
+	const allowed = matchGlob(policy.allow[target.access], candidates);
+	if (allowed) return ALLOW;
 
 	const denied = matchGlob(policy.deny[target.access], candidates);
 	if (denied) {
@@ -177,6 +188,57 @@ function targetSpellings(target: PathTarget): PathTarget[] {
 	return [target, { ...target, raw: peeled }];
 }
 
+/** `ssh://[user@]host[:port]/<remote-path>`, capturing the remote path. */
+const SSH_URL_RE = /^ssh:\/\/[^/]*(\/.*)?$/i;
+
+/**
+ * Decide an `ssh://` target against the policy.
+ *
+ * There is no local root to confine against (the file lives on a remote
+ * host), so this checks only the deny/allow globs — the same lists a local
+ * path faces — against the URL's remote path component and its basename.
+ * Unparseable input (no path component at all, e.g. a bare `ssh://host`)
+ * fails closed: there is nothing to verify, and `permissions.profile` being
+ * active is not a reason to wave it through.
+ */
+function decideSshTarget(target: PathTarget, policy: PermissionPolicy): PermissionDecision {
+	const remotePath = SSH_URL_RE.exec(target.raw)?.[1];
+	if (!remotePath) {
+		return {
+			kind: "deny",
+			rule: "permissions.profile",
+			reason:
+				`Cannot resolve a remote path from "${target.raw}" (argument "${target.field}"), so the resource ` +
+				`permission layer cannot verify it (permissions.profile: ${policy.profile}).\n` +
+				`To allow it: pass an ssh:// URL with a path, or set permissions.profile: off.`,
+		};
+	}
+	let decoded: string;
+	try {
+		decoded = decodeURIComponent(remotePath);
+	} catch {
+		decoded = remotePath;
+	}
+	const candidates = [decoded, path.posix.basename(decoded)].filter((c): c is string => !!c);
+
+	const allowed = matchGlob(policy.allow[target.access], candidates);
+	if (allowed) return ALLOW;
+
+	const denied = matchGlob(policy.deny[target.access], candidates);
+	if (denied) {
+		return {
+			kind: "deny",
+			rule: denied,
+			reason:
+				`${target.access === "write" ? "Writing" : "Reading"} "${target.raw}" is blocked by the ` +
+				`resource permission rule "${denied}" (permissions.profile: ${policy.profile}).\n` +
+				`To allow it: add "${denied}" to permissions.allow.${target.access}, ` +
+				`or set permissions.profile: off.`,
+		};
+	}
+	return ALLOW;
+}
+
 /**
  * Decide a raw target end to end: exemption, resolution, then the policy.
  *
@@ -187,6 +249,11 @@ function targetSpellings(target: PathTarget): PathTarget[] {
 export function decideTarget(target: PathTarget, policy: PermissionPolicy, roots: PermissionRoots): PermissionDecision {
 	if (isExemptPathArgument(target.raw)) return ALLOW;
 	for (const spelling of targetSpellings(target)) {
+		if (isSshUrl(spelling.raw)) {
+			const decision = decideSshTarget(spelling, policy);
+			if (decision.kind === "deny") return decision;
+			continue;
+		}
 		const absolutePath = resolveTargetPath(spelling.raw, roots.cwd);
 		if (!absolutePath) {
 			return {

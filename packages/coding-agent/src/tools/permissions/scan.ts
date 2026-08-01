@@ -54,6 +54,24 @@ function collectStrings(value: unknown, out: string[], depth: number): void {
 const LITERAL_SPLIT_RE = /[\s'"`()=]+/;
 
 /**
+ * Push `parts` onto `out` one at a time, stopping the instant `out` reaches
+ * {@link MAX_SCAN_LITERALS}. `out.push(...parts)` was the previous shape —
+ * that materializes every token from a single oversized argument before the
+ * cap is ever consulted (defeating the bound for one long string, not just
+ * many short ones) and a spread call large enough can itself throw
+ * `RangeError` before `push` runs at all. Returns whether the cap was hit, so
+ * the caller can stop scanning further tokens/values without doing any more
+ * work than the cap allows.
+ */
+function pushCapped(out: string[], parts: readonly string[]): boolean {
+	for (const part of parts) {
+		if (out.length >= MAX_SCAN_LITERALS) return true;
+		out.push(part);
+	}
+	return out.length >= MAX_SCAN_LITERALS;
+}
+
+/**
  * Split raw strings into the literals worth testing.
  *
  * Shell arguments go through `tokenizeShellSegments`, the same tokenizer the
@@ -67,17 +85,25 @@ function candidateLiterals(values: readonly string[], scan: "shell" | "strings")
 		if (literals.length >= MAX_SCAN_LITERALS) break;
 		if (scan === "shell") {
 			const before = literals.length;
+			let capped = false;
 			for (const segment of tokenizeShellSegments(value)) {
-				for (const token of segment) literals.push(...token.split(LITERAL_SPLIT_RE));
+				for (const token of segment) {
+					if (pushCapped(literals, token.split(LITERAL_SPLIT_RE))) {
+						capped = true;
+						break;
+					}
+				}
+				if (capped) break;
 			}
 			// A tokenizer that found nothing in *this* value (unterminated
 			// quoting, an empty segment) must still contribute its words —
 			// checked per value, not against the accumulated array, or only
 			// the first value could ever reach the fallback.
-			if (literals.length === before) literals.push(...value.split(LITERAL_SPLIT_RE));
+			if (!capped && literals.length === before) pushCapped(literals, value.split(LITERAL_SPLIT_RE));
+			if (literals.length >= MAX_SCAN_LITERALS) break;
 			continue;
 		}
-		literals.push(...value.split(LITERAL_SPLIT_RE));
+		if (pushCapped(literals, value.split(LITERAL_SPLIT_RE))) break;
 	}
 	return literals;
 }
@@ -128,8 +154,8 @@ export function scanOpaqueArguments(
 		// declared path argument there is nothing to fail closed about.
 		if (!absolute) continue;
 
-		const relative = relativeToRoots(absolute, rootList);
-		const candidates = [relative, absolute, path.basename(absolute), literal].filter((c): c is string => !!c);
+		const relatives = relativeToRoots(absolute, rootList);
+		const candidates = [...relatives, absolute, path.basename(absolute), literal];
 
 		for (const access of ["read", "write"] as const) {
 			if (matchGlob(policy.allow[access], candidates)) continue;
