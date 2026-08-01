@@ -67,6 +67,19 @@ permissions:
       - "**/migrations/**"
 ```
 
+## Inspecting and switching at runtime
+
+`/perm` with no argument prints the active profile, the rules it resolves to, and the tool-class breakdown — including which tools are Class B and therefore only literal-scanned. That last part is deliberate: a command that reported a profile without naming what it cannot guard would imply a stronger guarantee than this layer provides.
+
+```
+/perm                # report the active profile, effective rules, and tool coverage
+/perm off            # disable enforcement for this session
+/perm workspace      # confine writes to the workspace roots
+/perm strict         # workspace confinement plus the built-in secret deny globs
+```
+
+A switch is **session-scoped**: it is a runtime override, never written to settings. The report prints `permissions.profile` so you know the key to set for persistence.
+
 ## Path globs are not command globs
 
 These are two different dialects, on purpose:

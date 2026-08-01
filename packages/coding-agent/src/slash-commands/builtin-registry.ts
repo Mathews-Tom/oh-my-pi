@@ -14,7 +14,7 @@ import {
 	resolveCliModel,
 } from "../config/model-resolver";
 import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
-import type { SettingPath, SettingValue } from "../config/settings";
+import type { SettingPath, Settings, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
 import {
 	clearPluginRootsAndCaches,
@@ -47,6 +47,12 @@ import { formatShakeSummary, type ShakeMode } from "../session/shake-types";
 import type { ComputerTool } from "../tools/computer";
 import { computerExposureMode } from "../tools/computer/exposure";
 import { expandTilde, resolveToCwd } from "../tools/path-utils";
+import {
+	describePermissionState,
+	loadPermissionsConfig,
+	type PermissionProfile,
+	readPermissionProfile,
+} from "../tools/permissions";
 import { urlHyperlinkAlways } from "../tui";
 import {
 	getChangelogPath,
@@ -180,6 +186,31 @@ async function applyVisionMode(session: AgentSession, mode: InspectImageMode): P
 		return "inspect_image is unavailable in this session.";
 	}
 	return `Vision mode: ${mode}. ${formatVisionStatus(session)}`;
+}
+
+const PERMISSION_PROFILES: readonly PermissionProfile[] = ["off", "workspace", "strict"];
+
+function isPermissionProfile(value: string): value is PermissionProfile {
+	return (PERMISSION_PROFILES as readonly string[]).includes(value);
+}
+
+/**
+ * Full `/perm` report for the session's effective permission settings.
+ * `note` marks the report as the result of a switch rather than a query.
+ */
+function formatPermissionStatus(settings: Settings, note?: string): string {
+	return describePermissionState(readPermissionProfile(settings), loadPermissionsConfig(settings), note);
+}
+
+/**
+ * Switch the session's permission profile. Uses `settings.override`, never
+ * `settings.set`: the runtime layer is not written to settings.json, so the
+ * choice dies with the session and the user is told the key to persist it.
+ * Enforcement semantics are untouched — the gate reads the same settings.
+ */
+function applyPermissionProfile(settings: Settings, profile: PermissionProfile): string {
+	settings.override("permissions.profile", profile);
+	return formatPermissionStatus(settings, "Switched for this session only.");
 }
 
 const AUTOCOMPLETE_DETAIL_LIMIT = 48;
@@ -740,6 +771,45 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 			runtime.ctx.showStatus("Usage: /vision [on|off|auto|status]");
 			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "perm",
+		description: "Inspect or switch the resource permission profile for this session",
+		acpDescription: "Inspect or switch the resource permission profile",
+		acpInputHint: "[off|workspace|strict]",
+		subcommands: [
+			{ name: "off", description: "Disable resource permission enforcement this session" },
+			{ name: "workspace", description: "Confine writes to the workspace roots this session" },
+			{ name: "strict", description: "Workspace confinement plus the built-in secret deny globs" },
+		],
+		allowArgs: true,
+		getTuiAutocompleteDescription: runtime => `Permissions: ${readPermissionProfile(runtime.ctx.session.settings)}`,
+		handle: async (command, runtime) => {
+			const arg = command.args.trim().toLowerCase();
+			if (!arg) {
+				await runtime.output(formatPermissionStatus(runtime.session.settings));
+				return commandConsumed();
+			}
+			if (!isPermissionProfile(arg)) return usage("Usage: /perm [off|workspace|strict]", runtime);
+			await runtime.output(applyPermissionProfile(runtime.session.settings, arg));
+			return commandConsumed();
+		},
+		handleTui: (command, runtime) => {
+			const arg = command.args.trim().toLowerCase();
+			runtime.ctx.editor.setText("");
+			if (!arg) {
+				runtime.ctx.showStatus(formatPermissionStatus(runtime.ctx.session.settings));
+				return;
+			}
+			if (!isPermissionProfile(arg)) {
+				runtime.ctx.showStatus("Usage: /perm [off|workspace|strict]");
+				return;
+			}
+			runtime.ctx.showStatus(applyPermissionProfile(runtime.ctx.session.settings, arg));
+			// The chip reads settings at render time, so the bar only picks the
+			// new profile up once the cached status line is invalidated.
+			refreshStatusLine(runtime.ctx);
 		},
 	},
 	{

@@ -1,5 +1,6 @@
 export * from "./config";
 export * from "./confine";
+export * from "./describe";
 export * from "./gate";
 export * from "./matcher";
 export * from "./profiles";
