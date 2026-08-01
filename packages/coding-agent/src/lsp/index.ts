@@ -14,6 +14,7 @@ import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { truncateForPrompt } from "../tools/approval";
 import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
+import { PermissionDeniedError } from "../tools/permissions/gate";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
 import {
@@ -47,6 +48,7 @@ import {
 } from "./edits";
 import { resolveFormatOptions } from "./format-options";
 import { detectLspmux } from "./lspmux";
+import { assertLspCommandAllowed, assertWorkspaceEditAllowed } from "./permission-guard";
 import {
 	type CodeAction,
 	type CodeActionContext,
@@ -1636,7 +1638,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		params: LspParams,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<LspToolDetails>,
-		_context?: AgentToolContext,
+		context?: AgentToolContext,
 	): Promise<AgentToolResult<LspToolDetails>> {
 		const { action, file, line, symbol, query, new_name, apply, timeout } = params;
 		if (this.session.lspReadOnly && !LSP_READONLY_ACTIONS.has(action)) {
@@ -2624,7 +2626,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 				case "code_actions": {
 					const diagnostics = client.diagnostics.get(uri)?.diagnostics ?? [];
-					const context: CodeActionContext = {
+					const codeActionContext: CodeActionContext = {
 						diagnostics,
 						only: !apply && query ? [query] : undefined,
 						triggerKind: 1,
@@ -2636,7 +2638,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						{
 							textDocument: { uri },
 							range: { start: position, end: position },
-							context,
+							context: codeActionContext,
 						},
 						signal,
 					)) as (CodeAction | Command)[] | null;
@@ -2669,8 +2671,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						const appliedAction = await applyCodeAction(selectedAction, {
 							resolveCodeAction: async actionItem =>
 								(await sendRequest(client, "codeAction/resolve", actionItem, signal)) as CodeAction,
-							applyWorkspaceEdit: async edit => applyWorkspaceEdit(edit, this.session.cwd),
+							applyWorkspaceEdit: async edit => {
+								assertWorkspaceEditAllowed(edit, context, this.name);
+								return applyWorkspaceEdit(edit, this.session.cwd);
+							},
 							executeCommand: async commandItem => {
+								assertLspCommandAllowed(commandItem, context, this.name);
 								await sendRequest(
 									client,
 									"workspace/executeCommand",
@@ -2765,6 +2771,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					} else {
 						const shouldApply = apply !== false;
 						if (shouldApply) {
+							assertWorkspaceEditAllowed(result, context, this.name);
 							const applied = await applyWorkspaceEdit(result, this.session.cwd);
 							output = `Applied rename:\n${applied.map(a => `  ${a}`).join("\n")}`;
 						} else {
@@ -2790,7 +2797,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				...(useless ? { useless: true } : {}),
 			};
 		} catch (err) {
-			if (err instanceof ToolError) throw err;
+			if (err instanceof ToolError || err instanceof PermissionDeniedError) throw err;
 			if (err instanceof ToolAbortError || signal?.aborted) {
 				// Distinguish a wall-clock timeout from a caller cancel:
 				// callerSignal aborting → real cancel (re-throw ToolAbortError);
