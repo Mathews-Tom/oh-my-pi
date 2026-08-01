@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [17.2.3] - 2026-08-01
+
+### Added
+
+- Added support for the ai& provider (`aiand`), an OpenAI-compatible inference API with dynamic model discovery (context windows, capabilities, reasoning efforts, and USD pricing from `/v1/models`) and API-key authentication via the `AIAND_API_KEY` environment variable.
+
 ## [17.2.2] - 2026-07-31
 
 ### Added

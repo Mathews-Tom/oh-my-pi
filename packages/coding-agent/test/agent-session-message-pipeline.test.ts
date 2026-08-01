@@ -263,8 +263,10 @@ describe("AgentSession message pipeline", () => {
 			contextWindow: 4096,
 			maxTokens: 1024,
 		} as ModelSpec<Api>) as Model<Api>;
+		const promptCacheKey = "inherited-parent-cache";
 		const session = new AgentSession({
 			agent: new Agent({
+				promptCacheKey,
 				initialState: {
 					model,
 					systemPrompt: ["system prompt"],
@@ -283,7 +285,7 @@ describe("AgentSession message pipeline", () => {
 		const result = await session.runEphemeralTurn({ promptText: "Question?" });
 
 		expect(result.replyText).toBe("Answer");
-		expect(capturedOptions?.promptCacheKey).toBe(cacheSessionId);
+		expect(capturedOptions?.promptCacheKey).toBe(promptCacheKey);
 		expect(capturedOptions?.sessionId).toStartWith(`${cacheSessionId}:side:`);
 		expect(capturedOptions?.sessionId).not.toBe(cacheSessionId);
 		expect(capturedOptions?.preferWebsockets).toBe(true);
