@@ -93,20 +93,31 @@ export function confineToRoots(absolutePath: string, roots: readonly string[]): 
 	// Walk up to the deepest ancestor that does exist, resolve that, then
 	// re-apply the segments below it. `path.resolve` above already folded any
 	// `..`, so those segments cannot climb back out.
+	const projected = projectViaDeepestExistingAncestor(resolved);
+	if (projected === null) return { contained: false, reason: "outside" };
+	for (const root of realRoots) {
+		if (isUnderRootLexical(projected, root, { includeRoot: true })) return { contained: true, root };
+	}
+	return { contained: false, reason: "outside" };
+}
+
+/**
+ * Project `resolved` through its deepest existing ancestor's realpath, so a
+ * not-yet-created target still reflects the real directory it will land in.
+ * `ws/link/new-file` under `ws/link -> /etc` projects to `/etc/new-file`
+ * even though `new-file` does not exist yet to realpath outright. Returns
+ * `null` when the ancestor chain runs past the filesystem root without
+ * finding anything real.
+ */
+function projectViaDeepestExistingAncestor(resolved: string): string | null {
 	const tail: string[] = [path.basename(resolved)];
 	let ancestor = path.dirname(resolved);
 	for (;;) {
 		const real = tryRealpath(ancestor);
-		if (real) {
-			const projected = path.join(real, ...[...tail].reverse());
-			for (const root of realRoots) {
-				if (isUnderRootLexical(projected, root, { includeRoot: true })) return { contained: true, root };
-			}
-			return { contained: false, reason: "outside" };
-		}
+		if (real) return path.join(real, ...[...tail].reverse());
 		const parent = path.dirname(ancestor);
 		// Ran past the filesystem root without finding anything real.
-		if (parent === ancestor) return { contained: false, reason: "outside" };
+		if (parent === ancestor) return null;
 		tail.push(path.basename(ancestor));
 		ancestor = parent;
 	}
@@ -131,7 +142,13 @@ export function confineToRoots(absolutePath: string, roots: readonly string[]): 
  */
 export function relativeToRoots(absolutePath: string, roots: readonly string[]): string[] {
 	const resolved = path.resolve(absolutePath);
-	const realTarget = tryRealpath(resolved) ?? resolved;
+	// `resolved` may not exist yet (a write target, or a `read` of a path
+	// about to be created) - `tryRealpath` returns nothing for it then, and
+	// falling back to the lexical spelling would lose the resolved ancestor
+	// `confineToRoots` itself projects through. `safe -> .ssh` (both inside a
+	// workspace root): without this, `safe/new-config` never surfaces the
+	// `.ssh/new-config` spelling a `**/.ssh/**` deny rule was written for.
+	const realTarget = tryRealpath(resolved) ?? projectViaDeepestExistingAncestor(resolved) ?? resolved;
 	const out: string[] = [];
 	const seen = new Set<string>();
 	for (const root of roots) {

@@ -245,4 +245,20 @@ describe("symlink alias deny matching", () => {
 		expect(decision.kind).toBe("deny");
 		if (decision.kind === "deny") expect(decision.rule).toBe("permissions.confineReads");
 	});
+
+	// `safe -> .ssh` is a symlinked *directory* (not a file), so a target
+	// beneath it (`safe/new-config`) does not exist yet and cannot be
+	// realpath-resolved outright. Without projecting through the deepest
+	// existing ancestor's realpath, `relativeToRoots` only ever surfaced the
+	// lexical spelling `safe/new-config`, so `**/.ssh/**` never matched.
+	it("denies writing beneath a symlinked directory whose resolved ancestor matches a deny rule", () => {
+		const link = path.join(workspace, "safe-dir");
+		fs.rmSync(link, { force: true });
+		fs.mkdirSync(path.join(workspace, ".ssh"), { recursive: true });
+		fs.symlinkSync(path.join(workspace, ".ssh"), link);
+		const policy = buildPermissionPolicy("strict");
+		const decision = decideTarget(target("safe-dir/new-config", "write"), policy, roots);
+		expect(decision.kind).toBe("deny");
+		if (decision.kind === "deny") expect(decision.rule).toBe("**/.ssh/**");
+	});
 });
