@@ -326,6 +326,7 @@ class SessionEntryIndex {
 export type ReadonlySessionManager = Pick<
 	SessionManager,
 	| "getCwd"
+	| "getAdditionalDirectories"
 	| "getSessionDir"
 	| "getSessionId"
 	| "getSessionFile"

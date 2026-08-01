@@ -14,6 +14,7 @@ import type { Settings } from "../../config/settings";
 import type { Theme } from "../../modes/theme/theme";
 import { type ApprovalMode, formatApprovalPrompt, resolveApproval, truncateForPrompt } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
+import { enforceResourcePermissions } from "../../tools/permissions/gate";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
@@ -245,6 +246,18 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					`To allow: remove "tools.approval.${this.tool.name}: deny" from config.`,
 			);
 		}
+
+		// 3. Resource permissions. Unconditional and mode-independent by design:
+		// subagents force `tools.approvalMode: yolo` (`task/executor.ts`), so a
+		// path guard expressed as an approval tier or mode is bypassed by
+		// spawning a `task`. Evaluated on `effectiveParams` for the same reason
+		// the approval gate is, and before `approvalCheck` so a denied path
+		// fails fast instead of prompting for something that cannot run.
+		// `permissions.profile: off` (the default) short-circuits inside on one
+		// settings read, before any filesystem work. It either throws or returns
+		// a reason to confirm — it can never return "approved", so this layer
+		// only ever adds a gate, never removes one.
+		const permissionPrompt = enforceResourcePermissions(this.tool.name, effectiveParams, context);
 		const pendingSafetyChecks = computerSafetyChecks(context);
 		// An xd:// device dispatch already cleared the write tool's outer gate at
 		// this tool's tier — re-prompting would double-ask for one action. The
@@ -257,8 +270,14 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, this.tool.name);
 		const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
 		const approvalCheck = {
-			required: pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && (explicitPrompt || !xdevBypass)),
-			reason: resolved.reason,
+			required:
+				pendingSafetyChecks.length > 0 ||
+				permissionPrompt !== null ||
+				(resolved.policy === "prompt" && (explicitPrompt || !xdevBypass)),
+			// Compose rather than replace: a call can trip both a permission
+			// rule and a `prompt` policy, and the user must see both before
+			// approving once clears both.
+			reason: [permissionPrompt, resolved.reason].filter(Boolean).join("\n\n") || undefined,
 		};
 
 		if (approvalCheck.required) {
@@ -298,8 +317,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						`Tool "${this.tool.name}" has pending provider safety checks but no interactive UI is available.`,
 					);
 				}
+				// Carry the reason through. Headless runs — subagents, RPC, ACP,
+				// `-p` — all land here, and the generic options below name
+				// nothing that clears a resource permission rule.
 				throw new Error(
 					`Tool "${this.tool.name}" requires approval but no interactive UI available.\n` +
+						(approvalCheck.reason ? `Reason: ${approvalCheck.reason}\n` : "") +
 						`Options:\n` +
 						`  1. Set tools.approvalMode: yolo in /settings\n` +
 						`  2. Add tools.approval.${this.tool.name}: allow to config\n` +
