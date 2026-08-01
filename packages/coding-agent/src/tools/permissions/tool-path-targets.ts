@@ -191,6 +191,17 @@ const DEBUG_OPAQUE_ACTIONS: ReadonlySet<string> = new Set([
 	"custom_request",
 ]);
 
+/**
+ * `lsp`'s `request` action sends a caller-chosen JSON-RPC `method` (from
+ * `query`) with a caller-chosen `payload` directly to the server - there is
+ * no declared path field at all, so a call like
+ * `lsp({ action: "request", query: "workspace/executeCommand", payload: '{"path":".env"}' })`
+ * would otherwise pass the structured gate with zero targets checked. Scanned
+ * like `debug`'s opaque actions instead: the raw `query`/`payload` strings go
+ * through the same best-effort literal scan an opaque tool gets.
+ */
+const LSP_OPAQUE_ACTIONS: ReadonlySet<string> = new Set(["request"]);
+
 const extractLspPaths: PathTargetExtractor = args => {
 	const out: PathTarget[] = [];
 	// Invert the tool's own central classification (`lsp/index.ts` uses exactly
@@ -332,6 +343,10 @@ export function classifyTool(toolName: string, args?: Record<string, unknown> | 
 	if (normalized === "debug") {
 		const action = args && typeof args.action === "string" ? args.action : undefined;
 		if (action && DEBUG_OPAQUE_ACTIONS.has(action)) return { kind: "opaque", scan: "strings" };
+	}
+	if (normalized === "lsp") {
+		const action = args && typeof args.action === "string" ? args.action : undefined;
+		if (action && LSP_OPAQUE_ACTIONS.has(action)) return { kind: "opaque", scan: "strings" };
 	}
 	return TOOL_PATH_CLASSES[normalized] ?? UNKNOWN_TOOL_CLASS;
 }

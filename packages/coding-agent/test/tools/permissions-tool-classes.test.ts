@@ -49,6 +49,28 @@ describe("debug action-aware classification", () => {
 	});
 });
 
+describe("lsp action-aware classification", () => {
+	it("classifies action: request as opaque, since a caller-chosen method/payload has no declared path", () => {
+		expect(classifyTool("lsp", { action: "request", query: "workspace/executeCommand", payload: "{}" }).kind).toBe(
+			"opaque",
+		);
+	});
+
+	it("keeps every other lsp action structured", () => {
+		for (const action of ["rename", "rename_file", "code_actions", "diagnostics", "reload", "hover"]) {
+			expect(classifyTool("lsp", { action }).kind).toBe("structured");
+		}
+	});
+
+	it("falls back to structured when no action is known", () => {
+		expect(classifyTool("lsp").kind).toBe("structured");
+	});
+
+	it("leaves the base TOOL_PATH_CLASSES.lsp entry structured for direct use", () => {
+		expect(TOOL_PATH_CLASSES.lsp?.kind).toBe("structured");
+	});
+});
+
 describe("structured extraction", () => {
 	function extract(tool: string, args: Record<string, unknown>) {
 		const cls = TOOL_PATH_CLASSES[tool];

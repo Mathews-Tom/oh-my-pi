@@ -81,6 +81,27 @@ export function assertWorkspaceEditAllowed(
 }
 
 /**
+ * Refuse to read diagnostics for any file a glob/`*` `diagnostics` target
+ * expanded to. `extractLspPaths` only sees the declared `file` argument
+ * literally — a glob like `src/**\/*.ts` or the workspace sentinel `*`
+ * checks that string itself, not the concrete files `resolveDiagnosticTargets`
+ * expands it to and `refreshFile` then opens. Checked here, against the
+ * expanded list, before any of them is opened.
+ */
+export function assertDiagnosticTargetsAllowed(
+	resolvedTargets: readonly string[],
+	context: AgentToolContext | undefined,
+	toolName: string,
+): void {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy) return;
+	const roots = requireRootsOrDeny(toolName, policy.profile, permissionRoots(context));
+	const targets: PathTarget[] = resolvedTargets.map(raw => ({ raw, access: "read", field: "file" }));
+	const denial = checkStructuredTargets(targets, policy, roots);
+	if (denial) throw new PermissionDeniedError(toolName, denial.rule, denial.reason);
+}
+
+/**
  * Refuse to execute a `workspace/executeCommand` whose arguments reference a
  * denied path. A command's real filesystem surface is not statically
  * declared — the server can do anything with it — so this is the same

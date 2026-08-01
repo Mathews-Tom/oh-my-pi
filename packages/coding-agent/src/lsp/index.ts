@@ -48,7 +48,11 @@ import {
 } from "./edits";
 import { resolveFormatOptions } from "./format-options";
 import { detectLspmux } from "./lspmux";
-import { assertLspCommandAllowed, assertWorkspaceEditAllowed } from "./permission-guard";
+import {
+	assertDiagnosticTargetsAllowed,
+	assertLspCommandAllowed,
+	assertWorkspaceEditAllowed,
+} from "./permission-guard";
 import {
 	type CodeAction,
 	type CodeActionContext,
@@ -1741,6 +1745,8 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				};
 			}
 
+			assertDiagnosticTargetsAllowed(targets, context, this.name);
+
 			const detailed = targets.length > 1 || truncatedGlobTargets;
 			const diagnosticsWaitTimeoutMs = detailed
 				? Math.min(BATCH_DIAGNOSTICS_WAIT_TIMEOUT_MS, timeoutSec * 1000)
@@ -2076,6 +2082,15 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 			}
 
+			// `acceptedByUri` is server-computed (`workspace/willRenameFiles`),
+			// not the declared `file`/`new_name` args the pre-execution gate
+			// checked - a server can return edits for unrelated URIs. Reuse the
+			// WorkspaceEdit check via a synthetic edit naming every accepted URI.
+			assertWorkspaceEditAllowed(
+				{ changes: Object.fromEntries([...acceptedByUri.keys()].map(uri => [uri, []])) },
+				context,
+				this.name,
+			);
 			for (const [uri, bucket] of acceptedByUri) {
 				const filePath = uriToFile(uri);
 				await applyTextEdits(filePath, bucket.edits);

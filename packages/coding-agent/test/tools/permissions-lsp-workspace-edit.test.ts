@@ -4,7 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { assertLspCommandAllowed, assertWorkspaceEditAllowed } from "@oh-my-pi/pi-coding-agent/lsp/permission-guard";
+import {
+	assertDiagnosticTargetsAllowed,
+	assertLspCommandAllowed,
+	assertWorkspaceEditAllowed,
+} from "@oh-my-pi/pi-coding-agent/lsp/permission-guard";
 import type { Command, WorkspaceEdit } from "@oh-my-pi/pi-coding-agent/lsp/types";
 import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { PermissionDeniedError } from "@oh-my-pi/pi-coding-agent/tools/permissions";
@@ -138,5 +142,24 @@ describe("assertLspCommandAllowed", () => {
 			const context = { ...contextOf(PROMPT), hasUI: true, ui: { confirm } } as unknown as AgentToolContext;
 			await expect(assertLspCommandAllowed(command, context, "lsp")).rejects.toBeInstanceOf(PermissionDeniedError);
 		});
+	});
+});
+
+describe("assertDiagnosticTargetsAllowed", () => {
+	it("denies a glob-expanded target list that includes a denied secret", () => {
+		const targets = [path.join(workspace, "src", "main.ts"), path.join(workspace, ".env")];
+		expect(() => assertDiagnosticTargetsAllowed(targets, contextOf(STRICT), "lsp")).toThrow(PermissionDeniedError);
+	});
+
+	it("permits an expanded target list with no denied entries", () => {
+		const targets = [path.join(workspace, "src", "main.ts")];
+		expect(() => assertDiagnosticTargetsAllowed(targets, contextOf(STRICT), "lsp")).not.toThrow();
+	});
+
+	it("no-ops entirely under permissions.profile: off", () => {
+		const targets = [path.join(workspace, ".env")];
+		expect(() =>
+			assertDiagnosticTargetsAllowed(targets, contextOf({ "permissions.profile": "off" }), "lsp"),
+		).not.toThrow();
 	});
 });
