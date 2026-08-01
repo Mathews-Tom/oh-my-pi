@@ -1346,6 +1346,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				undefined,
 				batchRequest,
 				dst => this.#deferredDiagnostics?.begin(dst),
+				context,
 			);
 			invalidateFsScanAfterWrite(absolutePath);
 			if (!this.#deferredDiagnostics || batchRequest?.flush === false) {

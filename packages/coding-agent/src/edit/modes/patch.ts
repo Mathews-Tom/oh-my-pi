@@ -7,7 +7,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import {
@@ -1692,6 +1692,7 @@ export interface ExecutePatchSingleOptions {
 	allowCreateOverwrite?: boolean;
 	writethrough: WritethroughCallback;
 	beginDeferredDiagnosticsForPath: (path: string) => WritethroughDeferredHandle;
+	context?: AgentToolContext;
 }
 
 class LspFileSystem implements FileSystem {
@@ -1705,6 +1706,7 @@ class LspFileSystem implements FileSystem {
 		private readonly signal?: AbortSignal,
 		private readonly batchRequest?: LspBatchRequest,
 		private readonly deferredForPath?: (path: string) => WritethroughDeferredHandle,
+		private readonly context?: AgentToolContext,
 	) {}
 
 	#getFile(path: string): Bun.BunFile {
@@ -1746,6 +1748,7 @@ class LspFileSystem implements FileSystem {
 			file,
 			this.batchRequest,
 			deferredForPath ? (dst: string) => deferredForPath(dst) : undefined,
+			this.context,
 		);
 		if (result) {
 			this.#lastDiagnostics = result;
@@ -1807,6 +1810,7 @@ export async function executePatchSingle(
 		allowCreateOverwrite,
 		writethrough,
 		beginDeferredDiagnosticsForPath,
+		context,
 	} = options;
 	const { op: rawOp, rename, diff } = params;
 
@@ -1844,6 +1848,7 @@ export async function executePatchSingle(
 		signal,
 		batchRequest,
 		beginDeferredDiagnosticsForPath,
+		context,
 	);
 	const result = await applyPatch(input, {
 		cwd: session.cwd,

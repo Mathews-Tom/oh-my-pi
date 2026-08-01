@@ -23,7 +23,7 @@ import {
 	type PreparedSection,
 	startClipboardBatch,
 } from "@oh-my-pi/hashline";
-import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { FileDiagnosticsResult, WritethroughCallback, WritethroughDeferredHandle } from "../../lsp";
 import type { ToolSession } from "../../tools";
 import { outputMeta } from "../../tools/output-meta";
@@ -45,6 +45,7 @@ export interface ExecuteHashlineSingleOptions {
 	batchRequest?: LspBatchRequest;
 	writethrough: WritethroughCallback;
 	beginDeferredDiagnosticsForPath: (path: string) => WritethroughDeferredHandle;
+	context?: AgentToolContext;
 }
 
 function noChangeDiagnostic(path: string): string {
@@ -225,6 +226,7 @@ export async function executeHashlineSingle(
 		beginDeferredDiagnosticsForPath: options.beginDeferredDiagnosticsForPath,
 		signal: options.signal,
 		batchRequest: options.batchRequest,
+		context: options.context,
 	});
 	const snapshots = getFileSnapshotStore(options.session);
 	const enforceSeenLines = options.session.settings.get("edit.enforceSeenLines");

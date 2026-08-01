@@ -317,6 +317,53 @@ function extractResultFiles(details: unknown, access: PathAccess): PathTarget[] 
 }
 
 /**
+ * The concrete file `read` actually opened, from its own result
+ * `details.resolvedPath` (or `details.displayReadTargets` for the
+ * delimited multi-path recovery branch). The declared-argument extractor
+ * above only ever sees the original `path` string, but several recovery
+ * branches resolve to a *different* real file without going back through
+ * the pre-execution gate:
+ *
+ * - `ReadTool#tryReadDelimitedPaths` recurses through the tool's own
+ *   `execute` for each `;`-delimited part, bypassing the wrapper's gate
+ *   entirely — `details.displayReadTargets` lists what was actually read.
+ * - Suffix recovery, archive/SQLite backing files, and PDF image members
+ *   all authorize the original (possibly missing, possibly logical)
+ *   argument, then open a different resolved path — `details.resolvedPath`
+ *   is that real target in every one of those branches.
+ *
+ * Rechecked here so `enforcePostExecutionResourcePermissions` (`gate.ts`)
+ * catches a denied file before its content ever reaches the model.
+ */
+function extractReadResultTargets(details: unknown): PathTarget[] {
+	if (!details || typeof details !== "object") return [];
+	const record = details as Record<string, unknown>;
+	const out: PathTarget[] = [];
+	if (Array.isArray(record.displayReadTargets)) {
+		for (const target of record.displayReadTargets) pushPath(out, target, "read", "displayReadTargets");
+		return out;
+	}
+	pushPath(out, record.resolvedPath, "read", "resolvedPath");
+	return out;
+}
+
+/**
+ * The concrete file `write` actually wrote, from its own result
+ * `details.resolvedPath`. Mirrors {@link extractReadResultTargets}'s
+ * archive/SQLite case: `write({ path: "safe.zip:entry" })` authorizes the
+ * logical `safe.zip:entry` spelling, but `#writeArchiveEntry`/`#writeSqliteRow`
+ * realpath and mutate the archive/database's real backing file — which can
+ * differ from the logical path's own containment when the archive itself is
+ * a symlink pointing outside every workspace root.
+ */
+function extractWriteResultTarget(details: unknown): PathTarget[] {
+	if (!details || typeof details !== "object") return [];
+	const out: PathTarget[] = [];
+	pushPath(out, (details as Record<string, unknown>).resolvedPath, "write", "resolvedPath");
+	return out;
+}
+
+/**
  * Every built-in tool, classified.
  *
  * `test/tools/permissions-tool-classes.test.ts` asserts this covers
@@ -325,8 +372,16 @@ function extractResultFiles(details: unknown, access: PathAccess): PathTarget[] 
  */
 export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	// ── Class A: structured path arguments ────────────────────────────────
-	read: { kind: "structured", extract: singlePath("path", "read") },
-	write: { kind: "structured", extract: writePath("path") },
+	read: {
+		kind: "structured",
+		extract: singlePath("path", "read"),
+		resultTargets: extractReadResultTargets,
+	},
+	write: {
+		kind: "structured",
+		extract: writePath("path"),
+		resultTargets: extractWriteResultTarget,
+	},
 	edit: { kind: "structured", extract: extractEditPaths },
 	glob: { kind: "structured", extract: delimitedPath("path", "read") },
 	grep: {

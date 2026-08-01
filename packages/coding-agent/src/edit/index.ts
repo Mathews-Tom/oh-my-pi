@@ -58,6 +58,7 @@ type EditModeDefinition = {
 		signal: AbortSignal | undefined,
 		batchRequest: LspBatchRequest | undefined,
 		onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
+		context?: AgentToolContext,
 	) => Promise<AgentToolResult<EditToolDetails, TInput>>;
 };
 
@@ -505,7 +506,7 @@ export class EditTool implements AgentTool<TInput> {
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<EditToolDetails, TInput>> {
 		const modeDefinition = this.#getModeDefinition();
-		return modeDefinition.execute(this, params, signal, getLspBatchRequest(context?.toolCall), onUpdate);
+		return modeDefinition.execute(this, params, signal, getLspBatchRequest(context?.toolCall), onUpdate, context);
 	}
 
 	#getModeDefinition(): EditModeDefinition {
@@ -552,6 +553,7 @@ export class EditTool implements AgentTool<TInput> {
 					signal: AbortSignal | undefined,
 					batchRequest: LspBatchRequest | undefined,
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
+					context?: AgentToolContext,
 				) => {
 					const { edits, path } = params as PatchParams;
 					const targetPath = await resolveEditPath(tool.session, path, {
@@ -573,6 +575,7 @@ export class EditTool implements AgentTool<TInput> {
 								allowCreateOverwrite: true,
 								writethrough: tool.#writethrough,
 								beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
+								context,
 							}),
 					);
 					return executeSinglePathEntries(targetPath, runs, batchRequest, onUpdate, tool.session.cwd, signal);
@@ -595,6 +598,7 @@ export class EditTool implements AgentTool<TInput> {
 					signal: AbortSignal | undefined,
 					batchRequest: LspBatchRequest | undefined,
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
+					context?: AgentToolContext,
 				) => {
 					const entries = expandApplyPatchToEntries(params as ApplyPatchParams);
 					// Resolve each authored path once per patch so paired hunks (e.g. delete
@@ -624,6 +628,7 @@ export class EditTool implements AgentTool<TInput> {
 									fuzzyThreshold: tool.#fuzzyThreshold,
 									writethrough: tool.#writethrough,
 									beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
+									context,
 								});
 							},
 						};
@@ -640,6 +645,7 @@ export class EditTool implements AgentTool<TInput> {
 					signal: AbortSignal | undefined,
 					batchRequest: LspBatchRequest | undefined,
 					_onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
+					context?: AgentToolContext,
 				) => {
 					const { input } = params as HashlineParams;
 					return executeHashlineSingle({
@@ -649,6 +655,7 @@ export class EditTool implements AgentTool<TInput> {
 						batchRequest,
 						writethrough: tool.#writethrough,
 						beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
+						context,
 					});
 				},
 			},
@@ -661,6 +668,7 @@ export class EditTool implements AgentTool<TInput> {
 					signal: AbortSignal | undefined,
 					batchRequest: LspBatchRequest | undefined,
 					onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
+					context?: AgentToolContext,
 				) => {
 					const { edits, path } = params as ReplaceParams;
 					const targetPath = await resolveEditPath(tool.session, path, { mustExist: true, signal });
@@ -676,6 +684,7 @@ export class EditTool implements AgentTool<TInput> {
 								fuzzyThreshold: tool.#fuzzyThreshold,
 								writethrough: tool.#writethrough,
 								beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
+								context,
 							}),
 					);
 					return executeSinglePathEntries(targetPath, runs, batchRequest, onUpdate, tool.session.cwd, signal);

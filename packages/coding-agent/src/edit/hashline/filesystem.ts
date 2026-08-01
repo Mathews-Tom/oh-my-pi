@@ -19,6 +19,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Filesystem, NotFoundError, type PreflightWriteOptions, type WriteResult } from "@oh-my-pi/hashline";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import type { FileDiagnosticsResult, WritethroughCallback, WritethroughDeferredHandle } from "../../lsp";
 import { FileChangeType, notifyWorkspaceWatchedFiles } from "../../lsp/client";
@@ -44,6 +45,7 @@ export interface HashlineFilesystemOptions {
 	 * via {@link HashlineFilesystem.setBatchRequest}.
 	 */
 	batchRequest?: LspBatchRequest;
+	context?: AgentToolContext;
 }
 
 export class HashlineFilesystem extends Filesystem {
@@ -51,6 +53,7 @@ export class HashlineFilesystem extends Filesystem {
 	readonly #writethrough: WritethroughCallback;
 	readonly #beginDeferredDiagnosticsForPath: (path: string) => WritethroughDeferredHandle;
 	readonly #signal: AbortSignal | undefined;
+	readonly #context: AgentToolContext | undefined;
 	#batchRequest: LspBatchRequest | undefined;
 	#diagnosticsByPath = new Map<string, FileDiagnosticsResult | undefined>();
 
@@ -61,6 +64,7 @@ export class HashlineFilesystem extends Filesystem {
 		this.#beginDeferredDiagnosticsForPath = options.beginDeferredDiagnosticsForPath;
 		this.#signal = options.signal;
 		this.#batchRequest = options.batchRequest;
+		this.#context = options.context;
 	}
 
 	/**
@@ -234,6 +238,7 @@ export class HashlineFilesystem extends Filesystem {
 			Bun.file(absolutePath),
 			this.#batchRequest,
 			dst => (dst === absolutePath ? this.#beginDeferredDiagnosticsForPath(absolutePath) : undefined),
+			this.#context,
 		);
 		invalidateFsScanAfterWrite(absolutePath);
 		this.#diagnosticsByPath.set(relativePath, diagnostics);

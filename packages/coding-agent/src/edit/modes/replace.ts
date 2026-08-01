@@ -4,7 +4,7 @@
  * Provides both character-level and line-level fuzzy matching with progressive
  * fallback strategies for finding text in files.
  */
-import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { type } from "arktype";
 import type { FileDiagnosticsResult, WritethroughCallback, WritethroughDeferredHandle } from "../../lsp";
 import type { ToolSession } from "../../tools";
@@ -1036,6 +1036,7 @@ export interface ExecuteReplaceSingleOptions {
 	fuzzyThreshold: number;
 	writethrough: WritethroughCallback;
 	beginDeferredDiagnosticsForPath: (path: string) => WritethroughDeferredHandle;
+	context?: AgentToolContext;
 }
 
 export async function executeReplaceSingle(
@@ -1051,6 +1052,7 @@ export async function executeReplaceSingle(
 		fuzzyThreshold,
 		writethrough,
 		beginDeferredDiagnosticsForPath,
+		context,
 	} = options;
 	const { old_text, new_text, all } = params;
 
@@ -1106,8 +1108,14 @@ export async function executeReplaceSingle(
 	if (await routeWriteThroughBridge(session, path, absolutePath, finalContent, signal)) {
 		// bridge handled the write; diagnostics not available via writethrough
 	} else {
-		diagnostics = await writethrough(absolutePath, finalContent, signal, Bun.file(absolutePath), batchRequest, dst =>
-			dst === absolutePath ? beginDeferredDiagnosticsForPath(absolutePath) : undefined,
+		diagnostics = await writethrough(
+			absolutePath,
+			finalContent,
+			signal,
+			Bun.file(absolutePath),
+			batchRequest,
+			dst => (dst === absolutePath ? beginDeferredDiagnosticsForPath(absolutePath) : undefined),
+			context,
 		);
 		invalidateFsScanAfterWrite(absolutePath);
 	}
