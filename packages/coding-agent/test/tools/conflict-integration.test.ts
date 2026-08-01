@@ -727,4 +727,81 @@ describe("write resolves conflicts via conflict://N", () => {
 		const after = await Bun.file(filePath).text();
 		expect(after).toBe("// extra line\n// another extra\nline 1\nnewApi(x)\nline N\n");
 	});
+
+	it("`conflict://N` write is gated by the resource permission policy against the entry's real target", async () => {
+		const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "conflict-int-outside-"));
+		try {
+			const filePath = path.join(outsideDir, "secret.ts");
+			await Bun.write(filePath, TWO_WAY);
+			const session = createTestSession(tempDir);
+			const read = await getTool(session, "read");
+			const write = await getTool(session, "write");
+
+			// Registers the conflict without a permission context, exactly like
+			// every other case in this suite - the registration itself is not
+			// what is under test.
+			await read.execute("read-outside", { path: filePath });
+			const context = {
+				sessionManager: {
+					getCwd: () => tempDir,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "test-session",
+				},
+				settings: Settings.isolated({ "permissions.profile": "strict" }),
+			} as unknown as Parameters<typeof write.execute>[4];
+
+			// `path: "conflict://1"` names no filesystem path itself - only the
+			// registered entry's `absolutePath` does, and that path is outside
+			// every workspace root `tempDir`'s session confines writes to.
+			const promise = write.execute(
+				"write-outside",
+				{ path: "conflict://1", content: "newApi(x);\n" },
+				undefined,
+				undefined,
+				context,
+			);
+			await expect(promise).rejects.toThrow(/blocked by permissions\.confineWrites/);
+			// File untouched and the conflict stays registered for a corrected retry.
+			expect(await Bun.file(filePath).text()).toBe(TWO_WAY);
+			expect(session.conflictHistory?.get(1)).toBeDefined();
+		} finally {
+			await removeWithRetries(outsideDir);
+		}
+	});
+
+	it("`conflict://*` bulk resolve is gated per-file against every registered entry's real target", async () => {
+		const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "conflict-int-outside-bulk-"));
+		try {
+			const filePath = path.join(outsideDir, "secret-bulk.ts");
+			await Bun.write(filePath, TWO_WAY);
+			const session = createTestSession(tempDir);
+			const read = await getTool(session, "read");
+			const write = await getTool(session, "write");
+
+			await read.execute("read-outside-bulk", { path: filePath });
+			const context = {
+				sessionManager: {
+					getCwd: () => tempDir,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "test-session",
+				},
+				settings: Settings.isolated({ "permissions.profile": "strict" }),
+			} as unknown as Parameters<typeof write.execute>[4];
+
+			// All entries fail (only one file registered), so the resolver
+			// throws rather than returning a partial success.
+			const promise = write.execute(
+				"write-outside-bulk",
+				{ path: "conflict://*", content: "@theirs" },
+				undefined,
+				undefined,
+				context,
+			);
+			await expect(promise).rejects.toThrow(/Failed to resolve 1 file.*blocked by permissions\.confineWrites/s);
+			expect(await Bun.file(filePath).text()).toBe(TWO_WAY);
+			expect(session.conflictHistory?.get(1)).toBeDefined();
+		} finally {
+			await removeWithRetries(outsideDir);
+		}
+	});
 });
