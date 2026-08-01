@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
 	AstMatchStrictness,
 	astEdit,
+	astGrep,
 	astMatch,
 	blockRangeAt,
 	executeShell,
@@ -251,6 +252,17 @@ describe("pi-natives", () => {
 			expect(result.totalMatches).toBe(1);
 			expect(result.matches.length).toBe(1);
 			expect(result.matches[0].line).toContain("TODO");
+		});
+
+		it("opens only explicitly allowlisted candidates", async () => {
+			const result = await grep({
+				pattern: "TODO|FIXME",
+				path: testDir,
+				allowedPaths: ["file1.ts"],
+			});
+
+			expect(result.matches).toHaveLength(1);
+			expect(result.matches[0]?.path).toBe("file1.ts");
 		});
 
 		it("should handle literal function-call text with parentheses", async () => {
@@ -961,6 +973,19 @@ console.log("ok");
 
 		it("rejects an empty language", async () => {
 			await expect(astMatch({ source: "const a = 1;", lang: "  ", patterns: ["const $A = $B"] })).rejects.toThrow();
+		});
+	});
+
+	describe("astGrep", () => {
+		it("opens only explicitly allowlisted candidates", async () => {
+			const result = await astGrep({
+				patterns: ["export function $NAME() { $$$BODY }"],
+				path: testDir,
+				allowedPaths: ["file1.ts"],
+			});
+
+			expect(result.filesSearched).toBe(1);
+			expect(result.matches[0]?.path).toBe("file1.ts");
 		});
 	});
 });

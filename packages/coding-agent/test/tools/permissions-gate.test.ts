@@ -10,7 +10,9 @@ import { applyGuardedWorkspaceEdit, guardLocationReads } from "@oh-my-pi/pi-codi
 import { workspaceEditTargetPaths } from "@oh-my-pi/pi-coding-agent/lsp/edits";
 import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
-import { enforceResourcePathTargets } from "@oh-my-pi/pi-coding-agent/tools/permissions";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { collectPermittedSearchPaths, enforceResourcePathTargets } from "@oh-my-pi/pi-coding-agent/tools/permissions";
+import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 
 /** A zero-width range at the start of the document, for text-edit fixtures. */
 const RANGE_ZERO = { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } };
@@ -153,6 +155,12 @@ describe("profile strict", () => {
 			expect((await run("read", { path: url }, contextOf(STRICT))).calls).toHaveLength(1);
 		}
 	});
+
+	it("excludes denied recursive candidates before a native search can open them", async () => {
+		const allowedPaths = await collectPermittedSearchPaths(workspace, undefined, true, true, contextOf(STRICT));
+
+		expect(allowedPaths).toEqual(["src/main.ts"]);
+	});
 });
 
 describe("subagent bypass is closed", () => {
@@ -199,6 +207,32 @@ describe("write confinement", () => {
 		);
 	});
 
+	it("denies an existing write target whose contents are read by the executor", async () => {
+		const context = contextOf({
+			...WORKSPACE,
+			"permissions.deny.read": ["**/.env"],
+		});
+		const session = {
+			cwd: workspace,
+			hasUI: false,
+			enableLsp: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: settingsOf({}),
+		} as ToolSession;
+
+		await expect(
+			new WriteTool(session).execute(
+				"write-existing-denied-read",
+				{ path: ".env", content: "REPLACED=1" },
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toThrow("**/.env");
+		expect(await Bun.file(path.join(workspace, ".env")).text()).toBe("SECRET=1");
+	});
+
 	it("permits a write into an additional workspace root", async () => {
 		const calls = (await run("write", { path: path.join(sibling, "new.md") }, contextOf(WORKSPACE))).calls;
 		expect(calls).toHaveLength(1);
@@ -206,6 +240,11 @@ describe("write confinement", () => {
 
 	it("leaves reads unconfined", async () => {
 		expect((await run("read", { path: "/etc/hosts" }, contextOf(WORKSPACE))).calls).toHaveLength(1);
+	});
+
+	it("denies a bracketed hashline write target after normalizing it to its actual path", async () => {
+		const message = await denialOf("write", { path: "[../outside/loot.txt#ABCD]" }, contextOf(WORKSPACE));
+		expect(message).toContain("permissions.confineWrites");
 	});
 });
 
@@ -218,6 +257,15 @@ describe("worktree subagent roots", () => {
 			"permissions.confineWrites",
 		);
 		expect((await run("write", { path: path.join(worktree, "out.txt") }, context)).calls).toHaveLength(1);
+	});
+
+	it("denies managed-skill mutations outside the workspace", async () => {
+		const message = await denialOf(
+			"manage_skill",
+			{ action: "create", name: "persistent-instruction" },
+			contextOf(WORKSPACE),
+		);
+		expect(message).toContain("permissions.confineWrites");
 	});
 });
 

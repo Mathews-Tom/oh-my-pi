@@ -286,6 +286,12 @@ export interface AstFindOptions {
   path?: string
   /** Optional glob filter relative to the search root. */
   glob?: string
+  /**
+   * Exact normalized paths relative to a directory root that may be opened.
+   *
+   * When present, every other candidate is excluded before source is read.
+   */
+  allowedPaths?: Array<string>
   /** Rule selector for multi-rule ast-grep configurations. */
   selector?: string
   /** Pattern strictness; defaults to smart matching when omitted. */
@@ -1025,6 +1031,13 @@ export interface GrepOptions {
    * reached.
    */
   maxCountPerFile?: number
+  /**
+   * Exact normalized paths relative to a directory root that may be opened.
+   *
+   * When present, every other candidate is excluded before its contents are
+   * read. Callers use this to enforce a policy after a metadata-only walk.
+   */
+  allowedPaths?: Array<string>
   /** Abort signal for cancelling the operation. */
   signal?: unknown
   /** Timeout in milliseconds for the operation. */

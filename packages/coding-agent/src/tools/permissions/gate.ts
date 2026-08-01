@@ -17,7 +17,9 @@
  * built-in sits inside the trust boundary. The `xd://` device route is fine —
  * it dispatches through the wrapped inner tool.
  */
+import * as path from "node:path";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { FileType, glob } from "@oh-my-pi/pi-natives";
 import { loadPermissionsConfig } from "./config";
 import { decideTarget } from "./resolve";
 import { scanDenialMessage, scanOpaqueArguments } from "./scan";
@@ -76,6 +78,60 @@ export function checkStructuredTargets(
 		if (decision.kind === "deny") return { target, rule: decision.rule, reason: decision.reason };
 	}
 	return null;
+}
+
+/**
+ * Return the normalized file candidates a native recursive search may open.
+ *
+ * The initial native `glob` is metadata-only. Each candidate then passes the
+ * same read decision as declared targets before its relative path enters the
+ * native search allowlist. A path absent from the returned list is never opened
+ * by the subsequent `grep` or `ast_grep` call.
+ */
+export async function collectPermittedSearchPaths(
+	searchPath: string,
+	globFilter: string | undefined,
+	recursive: boolean,
+	useGitignore: boolean,
+	context: AgentToolContext | undefined,
+	signal?: AbortSignal,
+): Promise<string[] | undefined> {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy) return undefined;
+
+	const roots = permissionRoots(context);
+	if (!roots) {
+		throw new PermissionDeniedError(
+			"search",
+			"permissions.profile",
+			`Search is blocked: permissions.profile is "${policy.profile}" but this call has no session, so the ` +
+				`workspace roots the rules are measured against cannot be determined.\n` +
+				`To allow it: set permissions.profile: off.`,
+		);
+	}
+	const metadata = await Bun.file(searchPath).stat();
+	if (!metadata.isDirectory()) return undefined;
+
+	const candidates = await glob({
+		pattern: globFilter ?? "**/*",
+		path: searchPath,
+		fileType: FileType.File,
+		recursive,
+		hidden: true,
+		gitignore: useGitignore,
+		includeNodeModules: globFilter?.includes("node_modules"),
+		signal,
+	});
+	return candidates.matches
+		.filter(candidate => {
+			const target: PathTarget = {
+				raw: path.resolve(searchPath, candidate.path),
+				access: "read",
+				field: "path",
+			};
+			return decideTarget(target, policy, roots).kind === "allow";
+		})
+		.map(candidate => candidate.path);
 }
 
 /**

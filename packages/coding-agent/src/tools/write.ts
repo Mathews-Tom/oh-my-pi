@@ -57,6 +57,7 @@ import {
 	probeLiteralPathExists,
 	splitPathAndSel,
 } from "./path-utils";
+import { enforceResourcePathTargets } from "./permissions/gate";
 import { enforcePlanModeWrite, resolvePlanPath, unwrapHashlineHeaderPath } from "./plan-mode-guard";
 import {
 	cachedRenderedString,
@@ -1212,7 +1213,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				enforcePlanModeWrite(this.session, resolvedArchivePath.archivePath, {
 					op: resolvedArchivePath.exists ? "update" : "create",
 				});
-
+				if (resolvedArchivePath.exists) {
+					enforceResourcePathTargets(
+						"write",
+						[{ raw: resolvedArchivePath.archivePath, access: "read", field: "path" }],
+						context,
+					);
+				}
 				emitWriteProgress(
 					onUpdate,
 					cleanContent,
@@ -1237,6 +1244,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			const resolvedSqlitePath = await this.#resolveSqliteWritePath(path);
 			if (resolvedSqlitePath) {
 				enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update" });
+				if (resolvedSqlitePath.exists) {
+					enforceResourcePathTargets(
+						"write",
+						[{ raw: resolvedSqlitePath.sqlitePath, access: "read", field: "path" }],
+						context,
+					);
+				}
 
 				emitWriteProgress(onUpdate, cleanContent, path, resolvedSqlitePath.absolutePath);
 				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath);
@@ -1259,6 +1273,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			// Check if file exists and is auto-generated before overwriting
 			if (await fs.exists(absolutePath)) {
+				enforceResourcePathTargets("write", [{ raw: path, access: "read", field: "path" }], context);
 				await assertEditableFile(absolutePath, path, this.session.settings);
 			}
 

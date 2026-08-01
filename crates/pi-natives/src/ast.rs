@@ -2,7 +2,7 @@
 
 use std::{
 	cmp::Ordering,
-	collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap},
+	collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet},
 	path::{Path, PathBuf},
 };
 
@@ -63,30 +63,34 @@ fn resolve_strictness(value: Option<AstMatchStrictness>) -> MatchStrictness {
 #[napi(object)]
 pub struct AstFindOptions<'env> {
 	/// ast-grep patterns to search for (OR across patterns).
-	pub patterns:     Option<Vec<String>>,
+	pub patterns:      Option<Vec<String>>,
 	/// Language override; otherwise inferred from file extension per candidate.
-	pub lang:         Option<String>,
+	pub lang:          Option<String>,
 	/// Single file or directory to scan (combined with `glob` when set).
-	pub path:         Option<String>,
+	pub path:          Option<String>,
 	/// Optional glob filter relative to the search root.
-	pub glob:         Option<String>,
+	pub glob:          Option<String>,
+	/// Exact normalized paths relative to a directory root that may be opened.
+	///
+	/// When present, every other candidate is excluded before source is read.
+	pub allowed_paths: Option<Vec<String>>,
 	/// Rule selector for multi-rule ast-grep configurations.
-	pub selector:     Option<String>,
+	pub selector:      Option<String>,
 	/// Pattern strictness; defaults to smart matching when omitted.
-	pub strictness:   Option<AstMatchStrictness>,
+	pub strictness:    Option<AstMatchStrictness>,
 	/// Maximum matches to return after `offset` (default applies when omitted).
-	pub limit:        Option<u32>,
+	pub limit:         Option<u32>,
 	/// Number of leading matches to skip before applying `limit`.
-	pub offset:       Option<u32>,
+	pub offset:        Option<u32>,
 	/// When true, include meta-variable bindings per match.
-	pub include_meta: Option<bool>,
+	pub include_meta:  Option<bool>,
 	/// Reserved for contextual snippets; not used by the current native find
 	/// path.
-	pub context:      Option<u32>,
+	pub context:       Option<u32>,
 	/// Optional cancellation handle (library-specific).
-	pub signal:       Option<Unknown<'env>>,
+	pub signal:        Option<Unknown<'env>>,
 	/// Wall-clock timeout for the worker task in milliseconds.
-	pub timeout_ms:   Option<u32>,
+	pub timeout_ms:    Option<u32>,
 }
 
 /// One ast-grep match with source range and optional meta-variables.
@@ -425,6 +429,7 @@ fn normalize_search_path(path: Option<String>) -> Result<PathBuf> {
 fn collect_candidates(
 	path: Option<String>,
 	glob: Option<&str>,
+	allowed_paths: Option<&HashSet<String>>,
 	ct: &task::CancelToken,
 ) -> Result<Vec<FileCandidate>> {
 	let search_path = normalize_search_path(path)?;
@@ -473,6 +478,7 @@ fn collect_candidates(
 		.collect_files_with_heartbeat(|| ct.heartbeat())
 		.map_err(iofs::map_walker_error)?
 		.into_iter()
+		.filter(|entry| allowed_paths.is_none_or(|paths| paths.contains(&entry.path)))
 		.map(|entry| FileCandidate {
 			absolute_path: entry.absolute_path(&search_path),
 			display_path:  entry.path,
@@ -642,6 +648,7 @@ pub fn ast_grep(options: AstFindOptions<'_>) -> task::Promise<AstFindResult> {
 		lang,
 		path,
 		glob,
+		allowed_paths,
 		selector,
 		strictness,
 		limit,
@@ -661,10 +668,12 @@ pub fn ast_grep(options: AstFindOptions<'_>) -> task::Promise<AstFindResult> {
 		let strictness = resolve_strictness(strictness);
 		let include_meta = include_meta.unwrap_or(false);
 		let lang_str = lang.as_deref().map(str::trim).filter(|v| !v.is_empty());
-		let candidates: Vec<_> = collect_candidates(path, glob.as_deref(), &ct)?
-			.into_iter()
-			.filter(|candidate| is_supported_file(&candidate.absolute_path, lang_str))
-			.collect();
+		let allowed_paths = allowed_paths.map(|paths| paths.into_iter().collect::<HashSet<_>>());
+		let candidates: Vec<_> =
+			collect_candidates(path, glob.as_deref(), allowed_paths.as_ref(), &ct)?
+				.into_iter()
+				.filter(|candidate| is_supported_file(&candidate.absolute_path, lang_str))
+				.collect();
 
 		let (resolved_candidates, languages) =
 			resolve_candidates_for_find(candidates, lang_str, &ct)?;
@@ -963,7 +972,7 @@ fn ast_edit_blocking(
 	let fail_on_parse_error = fail_on_parse_error.unwrap_or(false);
 
 	let lang_str = lang.as_deref().map(str::trim).filter(|v| !v.is_empty());
-	let candidates: Vec<_> = collect_candidates(path, glob.as_deref(), &ct)?
+	let candidates: Vec<_> = collect_candidates(path, glob.as_deref(), None, &ct)?
 		.into_iter()
 		.filter(|candidate| is_supported_file(&candidate.absolute_path, lang_str))
 		.collect();
@@ -1284,9 +1293,13 @@ mod tests {
 	fn glob_star_matches_only_direct_children() {
 		let tree = make_temp_tree();
 		let ct = task::CancelToken::default();
-		let candidates =
-			collect_candidates(Some(tree.root.to_string_lossy().into_owned()), Some("*.ts"), &ct)
-				.expect("candidate collection should succeed");
+		let candidates = collect_candidates(
+			Some(tree.root.to_string_lossy().into_owned()),
+			Some("*.ts"),
+			None,
+			&ct,
+		)
+		.expect("candidate collection should succeed");
 		let paths = candidates
 			.into_iter()
 			.map(|file| file.display_path)
@@ -1298,14 +1311,40 @@ mod tests {
 	fn glob_double_star_matches_recursively() {
 		let tree = make_temp_tree();
 		let ct = task::CancelToken::default();
-		let candidates =
-			collect_candidates(Some(tree.root.to_string_lossy().into_owned()), Some("**/*.ts"), &ct)
-				.expect("candidate collection should succeed");
+		let candidates = collect_candidates(
+			Some(tree.root.to_string_lossy().into_owned()),
+			Some("**/*.ts"),
+			None,
+			&ct,
+		)
+		.expect("candidate collection should succeed");
 		let paths = candidates
 			.into_iter()
 			.map(|file| file.display_path)
 			.collect::<Vec<_>>();
 		assert_eq!(paths, vec!["a.ts".to_string(), "nested/b.ts".to_string()]);
+	}
+
+	#[test]
+	fn allowed_paths_exclude_unlisted_ast_candidates() {
+		let tree = make_temp_tree();
+		let ct = task::CancelToken::default();
+		let allowed_paths = HashSet::from(["nested/b.ts".to_string()]);
+		let candidates = collect_candidates(
+			Some(tree.root.to_string_lossy().into_owned()),
+			Some("**/*.ts"),
+			Some(&allowed_paths),
+			&ct,
+		)
+		.expect("allowlisted candidate collection should succeed");
+
+		assert_eq!(
+			candidates
+				.into_iter()
+				.map(|file| file.display_path)
+				.collect::<Vec<_>>(),
+			vec!["nested/b.ts".to_string()]
+		);
 	}
 
 	fn make_mixed_temp_tree() -> TempTree {

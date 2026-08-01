@@ -10,6 +10,7 @@
 use std::{
 	borrow::Cow,
 	cell::RefCell,
+	collections::HashSet,
 	fmt,
 	fs::File,
 	io::{self, Read},
@@ -120,6 +121,11 @@ pub struct GrepOptions<'env> {
 	/// from exhausting the global `max_count` budget before other files are
 	/// reached.
 	pub max_count_per_file: Option<u32>,
+	/// Exact normalized paths relative to a directory root that may be opened.
+	///
+	/// When present, every other candidate is excluded before its contents are
+	/// read. Callers use this to enforce a policy after a metadata-only walk.
+	pub allowed_paths:      Option<Vec<String>>,
 	/// Abort signal for cancelling the operation.
 	pub signal:             Option<Unknown<'env>>,
 	/// Timeout in milliseconds for the operation.
@@ -805,6 +811,7 @@ pub(crate) struct GrepConfig {
 	pub(crate) max_columns:        Option<u32>,
 	pub(crate) mode:               Option<GrepOutputMode>,
 	pub(crate) max_count_per_file: Option<u32>,
+	pub(crate) allowed_paths:      Option<HashSet<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,6 +1146,7 @@ fn collect_grep_candidates(
 	search_path: &Path,
 	glob: Option<&str>,
 	type_filter: Option<&TypeFilter>,
+	allowed_paths: Option<&HashSet<String>>,
 	include_hidden: bool,
 	use_gitignore: bool,
 	skip_node_modules: bool,
@@ -1159,6 +1167,9 @@ fn collect_grep_candidates(
 	};
 	if let Some(filter) = type_filter {
 		candidates.retain(|candidate| matches_type_filter_str(&candidate.relative, filter));
+	}
+	if let Some(allowed_paths) = allowed_paths {
+		candidates.retain(|candidate| allowed_paths.contains(&candidate.relative));
 	}
 	Ok(Some(candidates))
 }
@@ -1434,6 +1445,7 @@ fn run_sequential_grep<M: Matcher + Sync>(
 	matcher: &M,
 	glob: Option<&str>,
 	type_filter: Option<&TypeFilter>,
+	allowed_paths: Option<&HashSet<String>>,
 	params: SearchParams,
 	include_hidden: bool,
 	use_gitignore: bool,
@@ -1445,6 +1457,7 @@ fn run_sequential_grep<M: Matcher + Sync>(
 		search_path,
 		glob,
 		type_filter,
+		allowed_paths,
 		include_hidden,
 		use_gitignore,
 		skip_node_modules,
@@ -1466,6 +1479,7 @@ fn run_parallel_streaming_grep<M: Matcher + Sync>(
 	matcher: &M,
 	glob: Option<&str>,
 	type_filter: Option<&TypeFilter>,
+	allowed_paths: Option<&HashSet<String>>,
 	params: SearchParams,
 	include_hidden: bool,
 	use_gitignore: bool,
@@ -1488,6 +1502,11 @@ fn run_parallel_streaming_grep<M: Matcher + Sync>(
 			|file| {
 				if let Some(filter) = type_filter
 					&& !matches_type_filter_str(&file.relative, filter)
+				{
+					return Ok(pi_walker::ParallelWalkControl::Continue);
+				}
+				if let Some(allowed_paths) = allowed_paths
+					&& !allowed_paths.contains(&file.relative)
 				{
 					return Ok(pi_walker::ParallelWalkControl::Continue);
 				}
@@ -1556,6 +1575,7 @@ fn run_windowed_streaming_grep<M: Matcher + Sync>(
 	matcher: &M,
 	glob: Option<&str>,
 	type_filter: Option<&TypeFilter>,
+	allowed_paths: Option<&HashSet<String>>,
 	params: SearchParams,
 	include_hidden: bool,
 	use_gitignore: bool,
@@ -1582,6 +1602,11 @@ fn run_windowed_streaming_grep<M: Matcher + Sync>(
 			|entry| {
 				if let Some(filter) = type_filter
 					&& !matches_type_filter_str(entry.relative_path, filter)
+				{
+					return Ok(pi_walker::WalkDecision::Include);
+				}
+				if let Some(allowed_paths) = allowed_paths
+					&& !allowed_paths.contains(entry.relative_path)
 				{
 					return Ok(pi_walker::WalkDecision::Include);
 				}
@@ -1651,6 +1676,7 @@ fn run_streaming_grep<M: Matcher + Sync>(
 	matcher: &M,
 	glob: Option<&str>,
 	type_filter: Option<&TypeFilter>,
+	allowed_paths: Option<&HashSet<String>>,
 	params: SearchParams,
 	include_hidden: bool,
 	use_gitignore: bool,
@@ -1664,6 +1690,7 @@ fn run_streaming_grep<M: Matcher + Sync>(
 			matcher,
 			glob,
 			type_filter,
+			allowed_paths,
 			params,
 			include_hidden,
 			use_gitignore,
@@ -1676,6 +1703,7 @@ fn run_streaming_grep<M: Matcher + Sync>(
 				matcher,
 				glob,
 				type_filter,
+				allowed_paths,
 				params,
 				include_hidden,
 				use_gitignore,
@@ -1689,6 +1717,7 @@ fn run_streaming_grep<M: Matcher + Sync>(
 			matcher,
 			glob,
 			type_filter,
+			allowed_paths,
 			params,
 			include_hidden,
 			use_gitignore,
@@ -1912,6 +1941,7 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 	let glob = options.glob.as_deref();
 	let _ = glob_util::try_compile_glob(glob, true)?;
 	let type_filter = resolve_type_filter(options.type_filter.as_deref());
+	let allowed_paths = options.allowed_paths.as_ref();
 
 	let params = SearchParams {
 		context_before,
@@ -2074,6 +2104,7 @@ fn grep_sync_with_matcher<M: Matcher + Sync>(
 		matcher,
 		glob,
 		type_filter.as_ref(),
+		allowed_paths,
 		params,
 		include_hidden,
 		use_gitignore,
@@ -2211,6 +2242,7 @@ pub fn grep(
 		max_columns,
 		mode,
 		max_count_per_file,
+		allowed_paths,
 		timeout_ms,
 		signal,
 	} = options;
@@ -2232,6 +2264,7 @@ pub fn grep(
 		context,
 		max_columns,
 		mode,
+		allowed_paths: allowed_paths.map(|paths| paths.into_iter().collect()),
 	};
 	let ct = task::CancelToken::new(timeout_ms, signal);
 	task::blocking("grep", ct, move |ct| grep_sync(config, on_match.as_ref(), ct))
@@ -2325,6 +2358,7 @@ mod tests {
 			max_columns:        None,
 			mode:               None,
 			max_count_per_file: None,
+			allowed_paths:      None,
 		}
 	}
 
@@ -2460,6 +2494,25 @@ mod tests {
 		assert_eq!(result.files_searched, 2);
 		assert_eq!(result.matches.len(), 1);
 		assert_eq!(result.matches[0].path, "a.txt");
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn grep_directory_opens_only_explicitly_allowed_candidates() {
+		let root = TempDirGuard::new();
+		write_file(&root.path().join("allowed.txt"), "needle allowed\n");
+		write_file(&root.path().join("denied.txt"), "needle denied\n");
+
+		let mut config = base_grep_config(root.path());
+		config.allowed_paths = Some(["allowed.txt".to_string()].into());
+		let result = grep_sync(config, None, task::CancelToken::default())
+			.expect("allowlisted directory grep should succeed");
+
+		assert_eq!(result.files_searched, 1);
+		assert_eq!(result.total_matches, 1);
+		assert_eq!(result.matches.len(), 1);
+		assert_eq!(result.matches[0].path, "allowed.txt");
+		assert_eq!(result.matches[0].line, "needle allowed");
 	}
 
 	#[cfg(unix)]
@@ -2763,6 +2816,7 @@ mod tests {
 			&matcher,
 			None,
 			None,
+			None,
 			params,
 			true,
 			true,
@@ -2808,6 +2862,7 @@ mod tests {
 			&matcher,
 			None,
 			None,
+			None,
 			params,
 			true,
 			true,
@@ -2818,6 +2873,7 @@ mod tests {
 		let sequential = super::run_sequential_grep(
 			root.path(),
 			&matcher,
+			None,
 			None,
 			None,
 			params,
@@ -2975,6 +3031,7 @@ mod tests {
 			&matcher,
 			None,
 			None,
+			None,
 			params,
 			true,
 			false,
@@ -3003,6 +3060,7 @@ mod tests {
 		let (results, skipped_oversized, files_searched) = super::run_streaming_grep(
 			root.path(),
 			&matcher,
+			None,
 			None,
 			None,
 			params,
@@ -3043,6 +3101,7 @@ mod tests {
 		let (results, skipped_oversized, files_searched) = super::run_streaming_grep(
 			root.path(),
 			&matcher,
+			None,
 			None,
 			None,
 			params,

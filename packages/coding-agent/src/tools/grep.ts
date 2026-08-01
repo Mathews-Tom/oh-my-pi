@@ -57,6 +57,7 @@ import {
 	splitPathAndSelPreferringLiteral,
 	toPathList,
 } from "./path-utils";
+import { collectPermittedSearchPaths } from "./permissions/gate";
 import {
 	createCachedComponent,
 	formatCodeFrameLine,
@@ -936,7 +937,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 		params: SearchParams,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<GrepToolDetails>,
-		_toolContext?: AgentToolContext,
+		toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<GrepToolDetails>> {
 		const { pattern, path: rawPath, case: caseSensitive, gitignore, skip } = params;
 
@@ -1151,6 +1152,14 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 									}))
 								: (multiTargets ?? []);
 							for (const target of targets) {
+								const allowedPaths = await collectPermittedSearchPaths(
+									target.basePath,
+									target.glob,
+									true,
+									useGitignore,
+									toolContext,
+									signal,
+								);
 								const targetResult = await grep(
 									{
 										pattern: normalizedPattern,
@@ -1166,6 +1175,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 										maxColumns: DEFAULT_MAX_COLUMN,
 										mode: effectiveOutputMode,
 										maxCountPerFile: nativeMaxCountPerFile,
+										allowedPaths,
 										signal,
 										timeoutMs: SEARCH_GREP_TIMEOUT_MS,
 									},
@@ -1198,6 +1208,14 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 								limitReached,
 							};
 						} else {
+							const allowedPaths = await collectPermittedSearchPaths(
+								searchPath,
+								globFilter,
+								true,
+								useGitignore,
+								toolContext,
+								signal,
+							);
 							result = await grep(
 								{
 									pattern: normalizedPattern,
@@ -1213,6 +1231,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 									maxColumns: DEFAULT_MAX_COLUMN,
 									mode: effectiveOutputMode,
 									maxCountPerFile: nativeMaxCountPerFile,
+									allowedPaths,
 									signal,
 									timeoutMs: SEARCH_GREP_TIMEOUT_MS,
 								},

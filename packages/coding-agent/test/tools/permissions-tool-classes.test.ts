@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { getManagedSkillsDir } from "@oh-my-pi/pi-coding-agent/autolearn/managed-skills";
 import {
 	CLASSIFIED_TOOL_NAMES,
 	classifyTool,
@@ -33,9 +34,10 @@ describe("structured extraction", () => {
 		return cls.extract(args);
 	}
 
-	it("reads read/write single path arguments with the right access", () => {
-		expect(extract("read", { path: "a.ts" })).toEqual([{ raw: "a.ts", access: "read", field: "path" }]);
-		expect(extract("write", { path: "a.ts" })).toEqual([{ raw: "a.ts", access: "write", field: "path" }]);
+	it("normalizes hashline write headers before extracting their target", () => {
+		expect(extract("write", { path: "[../outside.txt#ABCD]" })).toEqual([
+			{ raw: "../outside.txt", access: "write", field: "path" },
+		]);
 	});
 
 	it("splits the semicolon-delimited search roots grep and glob accept", () => {
@@ -51,13 +53,18 @@ describe("structured extraction", () => {
 	});
 
 	// The access map inverts the tool's own LSP_READONLY_ACTIONS, so a
-	// write-tier action the tool knows about cannot be missed here.
-	it("classifies lsp navigation as a read and every write-tier action as a write", () => {
+	// write-tier action the tool knows about cannot be missed here. LSP opens
+	// the source document before every request, including mutation requests.
+	it("reads navigation sources and reads plus writes mutation sources", () => {
 		for (const action of ["references", "hover", "definition", "diagnostics", "symbols", "status"]) {
-			expect(extract("lsp", { action, file: "a.ts" })[0]?.access).toBe("read");
+			expect(extract("lsp", { action, file: "a.ts" })).toEqual([{ raw: "a.ts", access: "read", field: "file" }]);
 		}
 		for (const action of ["rename", "rename_file", "code_actions", "request", "reload"]) {
-			expect(extract("lsp", { action, file: "a.ts" })[0]?.access).toBe("write");
+			const targets = extract("lsp", { action, file: "a.ts" });
+			expect(targets.slice(0, 2)).toEqual([
+				{ raw: "a.ts", access: "read", field: "file" },
+				{ raw: "a.ts", access: "write", field: "file" },
+			]);
 		}
 	});
 
@@ -71,6 +78,16 @@ describe("structured extraction", () => {
 	it("keeps security_scan exclude_paths out — a filter is never opened", () => {
 		const targets = extract("security_scan", { include_paths: ["src"], exclude_paths: [".env"], output_root: "out" });
 		expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual(["read:src", "write:out"]);
+	});
+
+	it("treats managed-skill storage as a write target", () => {
+		expect(extract("manage_skill", { action: "create", name: "persistent-instruction" })).toEqual([
+			{
+				raw: `${getManagedSkillsDir()}/persistent-instruction/SKILL.md`,
+				access: "write",
+				field: "name",
+			},
+		]);
 	});
 });
 

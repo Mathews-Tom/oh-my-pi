@@ -16,12 +16,15 @@
  * tool name — MCP, extension, custom — defaults to `opaque`, so a new
  * `filesystem/read_file {path: ".env"}` is scanned rather than waved through.
  */
+import * as path from "node:path";
 import { Patch } from "@oh-my-pi/hashline";
+import { getManagedSkillsDir, sanitizeSkillName } from "../../autolearn/managed-skills";
 // The leaf module, not the `../../lsp` barrel: `lsp/index.ts` imports the
 // permission gate to validate server-supplied workspace edits, so pulling the
 // barrel in here would close an import cycle.
 import { LSP_READONLY_ACTIONS } from "../../lsp/actions";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
+import { unwrapHashlineHeaderPath } from "../plan-mode-guard";
 import type { PathAccess, PathTarget } from "./types";
 
 /** Pulls the declared path arguments out of one tool call's arguments. */
@@ -98,6 +101,17 @@ function delimitedPath(field: string, access: PathAccess): PathTargetExtractor {
 	return args => {
 		const out: PathTarget[] = [];
 		pushDelimited(out, args[field], access, field);
+		return out;
+	};
+}
+
+/** A top-level write path may be a pasted hashline header. Normalize it before
+ *  policy resolution so the guard and WriteTool address the same target. */
+function writePath(field: string): PathTargetExtractor {
+	return args => {
+		const out: PathTarget[] = [];
+		const raw = args[field];
+		pushPath(out, typeof raw === "string" ? unwrapHashlineHeaderPath(raw) : raw, "write", field);
 		return out;
 	};
 }
@@ -252,12 +266,25 @@ const extractLspPaths: PathTargetExtractor = args => {
 	const out: PathTarget[] = [];
 	// Invert the tool's own central classification (`lsp/index.ts` uses exactly
 	// this set to pick its approval tier) rather than restating which actions
-	// write. A local copy drifts: `request` and `reload` are write-tier there
-	// and were missing from an earlier hand-rolled list here.
+	// write. A local copy drifts as new actions are added.
 	const action = typeof args.action === "string" ? args.action : "";
 	const writes = !LSP_READONLY_ACTIONS.has(action);
-	pushPath(out, args.file, writes ? "write" : "read", "file");
+	if (writes) pushReadWrite(out, args.file, "file");
+	else pushPath(out, args.file, "read", "file");
 	if (action === "rename_file") pushPath(out, args.new_name, "write", "new_name");
+	return out;
+};
+
+/**
+ * Managed skills are filesystem mutations even though their storage location
+ * is not caller supplied. Resolve the exact regular-file path the executor
+ * uses so workspace/strict confinement applies to create, update, and delete.
+ */
+const extractManagedSkillPaths: PathTargetExtractor = args => {
+	const out: PathTarget[] = [];
+	if (typeof args.name !== "string") return out;
+	const name = sanitizeSkillName(args.name);
+	pushPath(out, path.join(getManagedSkillsDir(), name, "SKILL.md"), "write", "name");
 	return out;
 };
 
@@ -300,7 +327,7 @@ function extractResultFiles(details: unknown, access: PathAccess): PathTarget[] 
 export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	// ── Class A: structured path arguments ────────────────────────────────
 	read: { kind: "structured", extract: singlePath("path", "read") },
-	write: { kind: "structured", extract: singlePath("path", "write") },
+	write: { kind: "structured", extract: writePath("path") },
 	edit: { kind: "structured", extract: extractEditPaths },
 	glob: { kind: "structured", extract: delimitedPath("path", "read") },
 	grep: {
@@ -344,7 +371,7 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	checkpoint: { kind: "pathless" },
 	github: { kind: "pathless" },
 	learn: { kind: "pathless" },
-	manage_skill: { kind: "pathless" },
+	manage_skill: { kind: "structured", extract: extractManagedSkillPaths },
 	memory_edit: { kind: "pathless" },
 	recall: { kind: "pathless" },
 	reflect: { kind: "pathless" },

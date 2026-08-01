@@ -20,6 +20,7 @@ import { classifyGroupedLines, formatGroupedFiles, groupLineIndicesByBlank } fro
 import { formatMatchLine } from "./match-line-format";
 import type { OutputMeta } from "./output-meta";
 import { resolveToolSearchScope, toPathList } from "./path-utils";
+import { collectPermittedSearchPaths } from "./permissions/gate";
 import {
 	appendParseErrorsBulletList,
 	capParseErrors,
@@ -72,7 +73,14 @@ function retainAstFindMatch(matches: AstFindMatch[], capacity: number, candidate
 
 async function runMultiTargetAstGrep(
 	targets: Array<{ basePath: string; glob?: string }>,
-	options: { patterns: string[]; commonBasePath: string; skip: number; limit: number; signal?: AbortSignal },
+	options: {
+		patterns: string[];
+		commonBasePath: string;
+		skip: number;
+		limit: number;
+		signal?: AbortSignal;
+		context?: AgentToolContext;
+	},
 ): Promise<{
 	matches: AstFindMatch[];
 	totalMatches: number;
@@ -89,6 +97,14 @@ async function runMultiTargetAstGrep(
 	let filesSearched = 0;
 	let limitReached = false;
 	for (const target of targets) {
+		const allowedPaths = await collectPermittedSearchPaths(
+			target.basePath,
+			target.glob,
+			true,
+			true,
+			options.context,
+			options.signal,
+		);
 		const targetResult = await astGrep({
 			patterns: options.patterns,
 			path: target.basePath,
@@ -97,6 +113,7 @@ async function runMultiTargetAstGrep(
 			limit: options.skip + options.limit + 1,
 			includeMeta: true,
 			signal: options.signal,
+			allowedPaths,
 		});
 		totalMatches += targetResult.totalMatches;
 		filesWithMatches += targetResult.filesWithMatches;
@@ -187,7 +204,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 		params: typeof astGrepSchema.infer,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<AstGrepToolDetails>,
-		_context?: AgentToolContext,
+		toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<AstGrepToolDetails>> {
 		return untilAborted(signal, async () => {
 			const pattern = params.pat.trim();
@@ -223,12 +240,16 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
 
 			const DEFAULT_AST_LIMIT = 50;
+			const allowedPaths = multiTargets
+				? undefined
+				: await collectPermittedSearchPaths(resolvedSearchPath, globFilter, true, true, toolContext, signal);
 			const result = multiTargets
 				? await runMultiTargetAstGrep(multiTargets, {
 						patterns,
 						commonBasePath: resolvedSearchPath,
 						skip,
 						limit: DEFAULT_AST_LIMIT,
+						context: toolContext,
 						signal,
 					})
 				: await astGrep({
@@ -237,9 +258,9 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 						glob: globFilter,
 						offset: skip,
 						includeMeta: true,
+						allowedPaths,
 						signal,
 					});
-
 			const normalizedParseErrors = (result.parseErrors ?? []).map(error => {
 				const parseError = error.match(/^.+: (.+: parse error \(syntax tree contains error nodes\))$/);
 				return parseError?.[1] ?? error;
