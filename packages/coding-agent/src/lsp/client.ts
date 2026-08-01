@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { isEnoent, logger, postmortem, ptree, untilAborted } from "@oh-my-pi/pi-utils";
 import { MessageFramer } from "../jsonrpc/message-framing";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
@@ -708,12 +709,19 @@ export function clearInitializationFailure(config: ServerConfig, cwd: string): v
  * @param signal - Optional caller abort signal. Threaded into the initialize `sendRequest`
  *   and the `initialized` notification so a wedged server surfaces the caller's
  *   timeout/cancel instead of falling back to the internal 30s default.
+ * @param context - The calling tool's permission context, attached to the client BEFORE
+ *   its message reader starts. A server can push `workspace/applyEdit` at any point once
+ *   the reader is live, including mid-handshake before `initialize` resolves — stamping
+ *   this only after the whole creation promise settles (the prior fix) left that entire
+ *   window checking against `undefined`, which `assertWorkspaceEditAllowed` treats as
+ *   permissions being off.
  */
 export async function getOrCreateClient(
 	config: ServerConfig,
 	cwd: string,
 	initTimeoutMs?: number,
 	signal?: AbortSignal,
+	context?: AgentToolContext,
 ): Promise<LspClient> {
 	const key = clientKey(config, cwd);
 
@@ -721,6 +729,7 @@ export async function getOrCreateClient(
 	const existingClient = clients.get(key);
 	if (existingClient) {
 		existingClient.lastActivity = Date.now();
+		existingClient.permissionsContext = context;
 		return existingClient;
 	}
 
@@ -787,6 +796,10 @@ export async function getOrCreateClient(
 			activeProgressTokens: new Set(),
 			projectLoaded,
 			resolveProjectLoaded,
+			// Set before `startMessageReader` runs below, so a server push
+			// arriving mid-handshake (before `initialize` even resolves) still
+			// has a context to check against.
+			permissionsContext: context,
 		};
 
 		// Register crash recovery - remove client on process exit

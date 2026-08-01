@@ -282,7 +282,12 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 			pushArray(out, args.paths, "write", "paths");
 			return out;
 		},
-		resultTargets: details => extractResultFiles(details, "write"),
+		// The tool's dry-run pass reads every matched file to render its
+		// original lines in the preview, before any `resolve` write happens —
+		// so a touched file must clear `deny.read` as well as `deny.write`, not
+		// just the latter, or a read-denied source can still reach the model
+		// through the diff preview even though the eventual write is blocked.
+		resultTargets: details => [...extractResultFiles(details, "read"), ...extractResultFiles(details, "write")],
 	},
 	lsp: { kind: "structured", extract: extractLspPaths },
 	debug: { kind: "structured", extract: extractDebugPaths },

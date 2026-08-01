@@ -28,7 +28,13 @@ import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { classifyGroupedLines, formatGroupedFiles, groupLineIndicesByBlank } from "./grouped-file-output";
 import type { OutputMeta } from "./output-meta";
 import { isInternalUrlPath, resolveToolSearchScope } from "./path-utils";
-import { checkStructuredTargets, loadPermissionsConfig, PermissionDeniedError, permissionRoots } from "./permissions";
+import {
+	checkStructuredTargets,
+	loadPermissionsConfig,
+	type PathTarget,
+	PermissionDeniedError,
+	permissionRoots,
+} from "./permissions";
 import {
 	appendParseErrorsBulletList,
 	capParseErrors,
@@ -176,6 +182,22 @@ export interface AstEditToolDetails {
 }
 
 type AstEditSchemaInfer = typeof astEditSchema.infer;
+
+/**
+ * Both the read and write targets `fileList` represents. The queue-time and
+ * apply-time checks previously authorized only `access: "write"`, but the
+ * dry-run preview (queue time) and the real rewrite (apply time) both READ
+ * every matched file first to render the diff/apply the change - under a
+ * policy whose read and write deny rules differ (e.g. `deny.read` without a
+ * matching `deny.write`), a file denied only for reading would still pass
+ * this check and its original content would reach the model in the preview.
+ */
+function astEditFileTargets(fileList: readonly string[]): PathTarget[] {
+	return fileList.flatMap(filePath => [
+		{ raw: filePath, access: "read" as const, field: "files" },
+		{ raw: filePath, access: "write" as const, field: "files" },
+	]);
+}
 
 export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolDetails> {
 	readonly name = "ast_edit";
@@ -449,11 +471,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				if (permissionsPolicy) {
 					const permissionsRoots = permissionRoots(context);
 					const denial = permissionsRoots
-						? checkStructuredTargets(
-								fileList.map(filePath => ({ raw: filePath, access: "write" as const, field: "files" })),
-								permissionsPolicy,
-								permissionsRoots,
-							)
+						? checkStructuredTargets(astEditFileTargets(fileList), permissionsPolicy, permissionsRoots)
 						: {
 								rule: "permissions.profile",
 								reason:
@@ -479,11 +497,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						if (livePolicy) {
 							const liveRoots = permissionRoots(context);
 							const liveDenial = liveRoots
-								? checkStructuredTargets(
-										fileList.map(filePath => ({ raw: filePath, access: "write" as const, field: "files" })),
-										livePolicy,
-										liveRoots,
-									)
+								? checkStructuredTargets(astEditFileTargets(fileList), livePolicy, liveRoots)
 								: {
 										rule: "permissions.profile",
 										reason:

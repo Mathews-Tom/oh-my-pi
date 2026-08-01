@@ -179,11 +179,18 @@ export async function warmupLspServers(cwd: string, options?: LspWarmupOptions):
 	// Servers that don't respond quickly will be initialized lazily on first use
 	const results = await Promise.allSettled(
 		lspServers.map(async ([name, serverConfig]) => {
-			const client = await getOrCreateClient(serverConfig, cwd, serverConfig.warmupTimeoutMs ?? WARMUP_TIMEOUT_MS);
-			// See LspWarmupOptions.context: without this, a server-pushed edit
-			// arriving before any tool call ever touches this client has
-			// nothing to check against.
-			client.permissionsContext = options?.context;
+			// Passed through to getOrCreateClient so a brand-new client's
+			// permissionsContext is set before its message reader starts —
+			// see the parameter doc on getOrCreateClient. A post-hoc
+			// `client.permissionsContext = options?.context` here would leave
+			// the whole init-handshake window checking against `undefined`.
+			const client = await getOrCreateClient(
+				serverConfig,
+				cwd,
+				serverConfig.warmupTimeoutMs ?? WARMUP_TIMEOUT_MS,
+				undefined,
+				options?.context,
+			);
 			return { name, client, fileTypes: serverConfig.fileTypes };
 		}),
 	);
@@ -1652,15 +1659,15 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 	}
 
 	/**
-	 * Fetch (or create) a client and stamp this call's `AgentToolContext` on
-	 * it. Clients are cached and shared across calls (`clients` in
-	 * `client.ts`), so a server-initiated `workspace/applyEdit` push -
-	 * received asynchronously, outside any specific request/response - has
-	 * no tool-call context of its own to check a resource permission
-	 * against. Every `execute()` branch that touches a client MUST go
-	 * through this instead of calling `getOrCreateClient` directly, so the
-	 * server-push handler in `client.ts` always sees the latest call's
-	 * context rather than an undefined or stale one from a different action.
+	 * Fetch (or create) a client for this call's permission context.
+	 * `getOrCreateClient` attaches `context` to a new client's object
+	 * literal before its message reader starts, and re-stamps it on an
+	 * already-cached one - clients are cached and shared across calls, so a
+	 * server-initiated `workspace/applyEdit` push (received asynchronously,
+	 * outside any specific request/response) needs the *latest* call's
+	 * context, not the one from whichever earlier action first created the
+	 * client. Every `execute()` branch that touches a client MUST go
+	 * through this instead of calling `getOrCreateClient` directly.
 	 */
 	async #resolveClient(
 		config: ServerConfig,
@@ -1668,9 +1675,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		signal: AbortSignal | undefined,
 		context: AgentToolContext | undefined,
 	): Promise<LspClient> {
-		const client = await getOrCreateClient(config, this.session.cwd, initTimeoutMs, signal);
-		client.permissionsContext = context;
-		return client;
+		return getOrCreateClient(config, this.session.cwd, initTimeoutMs, signal, context);
 	}
 
 	async execute(

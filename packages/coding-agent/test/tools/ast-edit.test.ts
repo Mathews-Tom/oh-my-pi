@@ -325,6 +325,55 @@ describe("ast_edit tool schema", () => {
 		}
 	});
 
+	it("denies the preview when a matched file is denied for read (not write) by the resource permission policy", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-perm-read-deny-"));
+		try {
+			const filePath = path.join(tempDir, "private.ts");
+			await Bun.write(filePath, "legacyWrap(x, value)\n");
+			const queue = new ToolChoiceQueue();
+			const context = {
+				sessionManager: {
+					getCwd: () => tempDir,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "test-session",
+				},
+				settings: Settings.isolated({
+					"tools.xdev": false,
+					"permissions.profile": "workspace",
+					"permissions.deny.read": ["**/private.ts"],
+				}),
+			};
+
+			const tools = await createTools(
+				createTestSession(tempDir, {
+					getToolChoiceQueue: () => queue,
+					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
+					steer: () => {},
+				}),
+			);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+
+			// The tool reads every matched file during its dry-run preview to
+			// render original lines - a deny.read rule with no corresponding
+			// deny.write rule must still block it, or the denied source's
+			// content reaches the model through the diff even though the
+			// eventual write was never in question.
+			const promise = tool!.execute(
+				"ast-edit-denied-read-preview",
+				{ ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }], paths: [filePath] },
+				undefined,
+				undefined,
+				context as unknown as Parameters<NonNullable<typeof tool>["execute"]>[4],
+			);
+			await expect(promise).rejects.toThrow(/blocked by the resource permission rule "\*\*\/private\.ts"/);
+			expect(queue.hasPendingInvoker).toBe(false);
+			expect(await Bun.file(filePath).text()).toBe("legacyWrap(x, value)\n");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
 	it("rechecks live permissions before applying a staged edit, denying if the policy tightened after preview", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-perm-live-"));
 		try {

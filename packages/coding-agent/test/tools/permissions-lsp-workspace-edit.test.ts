@@ -180,6 +180,11 @@ describe("assertWorkspaceDiagnosticsAllowed", () => {
 		expect(() => assertWorkspaceDiagnosticsAllowed(context, "lsp")).toThrow(PermissionDeniedError);
 	});
 
+	it("denies workspace-wide diagnostics under workspace with confineReads: true even without deny.read rules", () => {
+		const context = contextOf({ ...WORKSPACE, "permissions.confineReads": true });
+		expect(() => assertWorkspaceDiagnosticsAllowed(context, "lsp")).toThrow(PermissionDeniedError);
+	});
+
 	it("no-ops entirely under permissions.profile: off", () => {
 		expect(() => assertWorkspaceDiagnosticsAllowed(contextOf({ "permissions.profile": "off" }), "lsp")).not.toThrow();
 	});

@@ -116,13 +116,13 @@ export function assertDiagnosticTargetsAllowed(
  */
 export function assertWorkspaceDiagnosticsAllowed(context: AgentToolContext | undefined, toolName: string): void {
 	const policy = loadPermissionsConfig(context?.settings);
-	if (!policy || policy.deny.read.length === 0) return;
+	if (!policy || (policy.deny.read.length === 0 && !policy.confineReads)) return;
 	throw new PermissionDeniedError(
 		toolName,
 		"permissions.deny.read",
 		`Tool "${toolName}" is blocked: workspace-wide diagnostics (file: "*") spawn a compiler whose real read ` +
-			`surface cannot be limited to authorized paths, and permissions.deny.read has active rule(s) under ` +
-			`permissions.profile: ${policy.profile}.\n` +
+			`surface cannot be limited to authorized paths, and permissions.profile: ${policy.profile} has active ` +
+			`permissions.deny.read rule(s) or permissions.confineReads: true.\n` +
 			`To allow it: scope the call to a specific file or glob instead of "*", or set permissions.profile: off.`,
 	);
 }

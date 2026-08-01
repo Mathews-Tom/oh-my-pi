@@ -155,12 +155,39 @@ export class SecurityStore {
 		this.#projectDirectory = projectDirectory;
 	}
 
-	static async open(repositoryRoot: string, options: SecurityStoreOptions = {}): Promise<SecurityStore> {
+	/**
+	 * Pure (read-only) half of {@link open}: canonicalize the repository root
+	 * and derive the state directory it maps to, without creating anything
+	 * or touching the on-disk index. Split out so a caller can authorize a
+	 * write target derived from `projectDirectory` (e.g. a security scan's
+	 * default output root) *before* `open`'s `ensurePrivateDirectory` +
+	 * index-initialization side effects run - a denied call must not have
+	 * already created store state on disk.
+	 */
+	static async deriveProjectDirectory(
+		repositoryRoot: string,
+		options: SecurityStoreOptions = {},
+	): Promise<{ canonicalRoot: string; projectKey: string; projectDirectory: string }> {
 		const canonicalRoot = await fs.realpath(path.resolve(repositoryRoot)).catch(() => path.resolve(repositoryRoot));
 		const projectKey = encodeSecurityProjectKey(canonicalRoot);
 		const projectDirectory = options.stateRoot
 			? path.join(path.resolve(options.stateRoot), projectKey)
 			: getSecurityProjectDir(projectKey);
+		return { canonicalRoot, projectKey, projectDirectory };
+	}
+
+	/** {@link deriveProjectDirectory}, resolving the repository root from `cwd` the same way {@link openForCwd} does. */
+	static async deriveProjectDirectoryForCwd(cwd: string, options: SecurityStoreOptions = {}): Promise<string> {
+		const resolvedCwd = path.resolve(cwd);
+		const repositoryRoot = (await git.repo.root(resolvedCwd, options.signal)) ?? resolvedCwd;
+		return (await SecurityStore.deriveProjectDirectory(repositoryRoot, options)).projectDirectory;
+	}
+
+	static async open(repositoryRoot: string, options: SecurityStoreOptions = {}): Promise<SecurityStore> {
+		const { canonicalRoot, projectKey, projectDirectory } = await SecurityStore.deriveProjectDirectory(
+			repositoryRoot,
+			options,
+		);
 		await ensurePrivateDirectory(projectDirectory);
 		const store = new SecurityStore(canonicalRoot, projectKey, projectDirectory);
 		await withSecurityStoreWrite(projectDirectory, () => store.#ensureIndex());

@@ -142,6 +142,18 @@ export type SecurityScanSessionFactory = (input: SecurityScanSessionFactoryInput
 export interface SecurityCoordinatorDependencies {
 	createSession?: SecurityScanSessionFactory;
 	openStore?: (repositoryRoot: string) => Promise<SecurityStore>;
+	/**
+	 * Derive the default output work directory for `cwd` without opening the
+	 * store (no `ensurePrivateDirectory`/index-initialization side effects) -
+	 * used to authorize `preflight`'s effective output path before `openStore`
+	 * runs. Defaults to the same derivation `openStore`'s default
+	 * (`SecurityStore.openForCwd`) uses, so the two agree in production; a
+	 * caller injecting a custom `openStore` (e.g. a test-scoped `stateRoot`)
+	 * SHOULD inject a matching `deriveOutputWorkRoot` too, or this check
+	 * authorizes a path that can diverge from where the opened store actually
+	 * lands.
+	 */
+	deriveOutputWorkRoot?: (cwd: string) => Promise<string>;
 	gitAdapter?: SecurityGitAdapter;
 	now?: () => Date;
 	createOperationId?: () => string;
@@ -412,6 +424,7 @@ export class SecurityCoordinator {
 	readonly #host: SecurityCoordinatorHost;
 	readonly #createSession: SecurityScanSessionFactory;
 	readonly #openStore: (repositoryRoot: string) => Promise<SecurityStore>;
+	readonly #deriveOutputWorkRoot: (cwd: string) => Promise<string>;
 	readonly #gitAdapter: SecurityGitAdapter;
 	readonly #now: () => Date;
 	readonly #createOperationId: () => string;
@@ -422,6 +435,9 @@ export class SecurityCoordinator {
 		this.#host = host;
 		this.#createSession = dependencies.createSession ?? createDefaultSecuritySession;
 		this.#openStore = dependencies.openStore ?? (cwd => SecurityStore.openForCwd(cwd));
+		this.#deriveOutputWorkRoot =
+			dependencies.deriveOutputWorkRoot ??
+			(async cwd => path.join(await SecurityStore.deriveProjectDirectoryForCwd(cwd), "work"));
 		this.#gitAdapter = dependencies.gitAdapter ?? DEFAULT_SECURITY_GIT_ADAPTER;
 		this.#now = dependencies.now ?? (() => new Date());
 		this.#createOperationId = dependencies.createOperationId ?? createOperationId;
@@ -476,14 +492,18 @@ export class SecurityCoordinator {
 			input.credentialId,
 			this.#host.sessionId,
 		);
-		const store = await this.#openStore(this.#host.cwd);
-		const workRoot = path.join(store.projectDirectory, "work");
+		// Derive the work root without opening the store - `open`'s
+		// `ensurePrivateDirectory`/index-write side effects must not run
+		// before `outputRoot` is authorized below, or a denied call has
+		// already created store state on disk. Goes through the injected
+		// dependency (not the static method directly) so a test-scoped
+		// `openStore` and this derivation agree on where the store lands.
+		const workRoot = await this.#deriveOutputWorkRoot(this.#host.cwd);
 		const modelRef: SecurityModelRef = { provider: model.provider, modelId: model.id };
 		if (input.thinkingLevel !== undefined) modelRef.thinkingLevel = input.thinkingLevel;
 		const outputRoot = input.outputRoot ?? path.join(workRoot, Bun.randomUUIDv7());
-		// Authorize before any filesystem side effect below - a denied call
-		// must not have already created `workRoot` (or `chmod`'d it) first.
 		assertSecurityWriteAllowed(path.resolve(this.#host.cwd, outputRoot), this.#host, "output_root");
+		const store = await this.#openStore(this.#host.cwd);
 		await fs.mkdir(workRoot, { recursive: true, mode: 0o700 });
 		if (process.platform !== "win32") await fs.chmod(workRoot, 0o700);
 		const plan = await createSecurityScanPlan(
