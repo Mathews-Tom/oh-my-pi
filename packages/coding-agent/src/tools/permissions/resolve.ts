@@ -3,10 +3,17 @@
  *
  * Pure with respect to configuration — it takes an already-merged
  * {@link PermissionPolicy} and never reads `Settings` — so the whole policy
- * surface is testable without a session.
+ * surface is testable without a session. One narrow exception:
+ * {@link decideVaultTarget} calls `resolveVaultUrlToPath`, which reads the
+ * global settings singleton (`vault.enabled`) and a process-wide vault-root
+ * cache — there is no way to resolve a `vault://` URL to the real file it
+ * addresses without that lookup, and exempting it entirely (the prior
+ * behavior) is unsound: `vault://` is a real filesystem surface, not an
+ * internal one.
  */
 import * as path from "node:path";
 import { extractUriScheme } from "../../internal-urls/parse";
+import { resolveVaultUrlToPath } from "../../internal-urls/vault-protocol";
 import { isInternalUrlPath, isReadableUrlPath, isSshUrl, resolveToCwd, splitPathAndSel } from "../path-utils";
 import { confineToRoots, relativeToRoots } from "./confine";
 import { matchGlob } from "./matcher";
@@ -34,22 +41,25 @@ const ROUTED_INTERNAL_SCHEMES: Record<string, true> = {
 /**
  * True when a raw path argument is not a user filesystem target at all.
  *
- * Internal URLs (`local://`, `vault://`, `xd://`, `memory://`, …) address the
+ * Internal URLs (`local://`, `xd://`, `memory://`, …) address the
  * session's own sandbox and device surface, exactly as plan mode treats them,
  * and `http(s)://` is not a filesystem path either. Confining or denying these
  * would break the artifact and device routes without protecting any file.
  *
- * `ssh://` is deliberately excluded even though `isInternalUrlPath` lists it
- * (`path-utils.ts`'s `TOP_LEVEL_INTERNAL_URL_PREFIXES` is a routing table for
- * the read/write/search tools, not a permission-exempt set): it is a real
+ * `ssh://` and `vault://` are deliberately excluded even though
+ * `isInternalUrlPath` lists both (`path-utils.ts`'s
+ * `TOP_LEVEL_INTERNAL_URL_PREFIXES` is a routing table for the
+ * read/write/search tools, not a permission-exempt set): `ssh://` is a real
  * remote filesystem surface reachable via `read`/`write`/`grep`
  * (`docs/permissions.md`), so `read ssh://host/home/user/.env` must face the
  * same deny/allow globs as the local spelling — see {@link decideSshTarget}.
+ * `vault://` resolves to a real file on disk through the Obsidian
+ * integration — see {@link decideVaultTarget}.
  */
 export function isExemptPathArgument(raw: string): boolean {
 	const trimmed = raw.trim();
 	if (!trimmed) return true;
-	if (isSshUrl(trimmed)) return false;
+	if (isSshUrl(trimmed) || isVaultUrl(trimmed)) return false;
 	if (isInternalUrlPath(trimmed) || isReadableUrlPath(trimmed)) return true;
 	const scheme = extractUriScheme(trimmed);
 	return !!scheme && ROUTED_INTERNAL_SCHEMES[scheme] === true;
@@ -105,7 +115,18 @@ export function decidePathTarget(
 ): PermissionDecision {
 	const rootList = permissionRootList(roots);
 	const relatives = relativeToRoots(absolutePath, rootList);
-	const candidates = [...relatives, absolutePath, path.basename(absolutePath)];
+	// Permission globs are documented and written with `/` (`**/.ssh/**`),
+	// but on Windows `path.relative`/an absolute path use `\`, and `Bun.Glob`
+	// does not treat the two as equivalent - `**/.ssh/**` never matches
+	// `.ssh\config`. `path.basename` alone rescues only filename-only rules;
+	// a directory-scoped rule (the common case) is silently bypassed
+	// without this. `absolutePath` itself is a POSIX-style internal-URL
+	// selector, an already-forward-slash SSH remote path, or a real
+	// filesystem path, so normalizing every backslash here is safe for all
+	// three.
+	const candidates = [...relatives, absolutePath, path.basename(absolutePath)].map(candidate =>
+		candidate.replaceAll("\\", "/"),
+	);
 
 	const confine = target.access === "write" ? policy.confineWrites : policy.confineReads;
 	if (confine) {
@@ -188,6 +209,45 @@ function targetSpellings(target: PathTarget): PathTarget[] {
 	return [target, { ...target, raw: peeled }];
 }
 
+/** `vault://[vault-name|_]/<path>`. */
+const VAULT_URL_RE = /^vault:\/\//i;
+
+/** True when `raw` is a `vault://` URL, checked before general internal-URL exemption. */
+function isVaultUrl(raw: string): boolean {
+	return VAULT_URL_RE.test(raw);
+}
+
+/**
+ * Decide a `vault://` target against the policy.
+ *
+ * Unlike `ssh://`, this resolves to a real *local* file (the Obsidian vault
+ * lives on disk) through `resolveVaultUrlToPath`'s cached-root indirection,
+ * so once resolved it gets the full local-path treatment — confinement plus
+ * deny/allow — exactly as a plain path would, via {@link decidePathTarget}.
+ * Resolution failure (`vault.enabled: false`, no cached vault root yet — the
+ * very first `vault://` call in a session, before any read has discovered
+ * one — a URL shape the resolver rejects, or the target escaping the vault
+ * root) fails closed: "we don't know what this touches" is not a reason to
+ * allow it once a profile is active.
+ */
+function decideVaultTarget(target: PathTarget, policy: PermissionPolicy, roots: PermissionRoots): PermissionDecision {
+	let absolutePath: string;
+	try {
+		absolutePath = resolveVaultUrlToPath(target.raw);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		return {
+			kind: "deny",
+			rule: "permissions.profile",
+			reason:
+				`Cannot resolve "${target.raw}" (argument "${target.field}") to a filesystem path (${detail}), so ` +
+				`the resource permission layer cannot verify it (permissions.profile: ${policy.profile}).\n` +
+				`To allow it: read vault:// first so the vault root is cached, or set permissions.profile: off.`,
+		};
+	}
+	return decidePathTarget(target, absolutePath, policy, roots);
+}
+
 /** `ssh://[user@]host[:port]/<remote-path>`, capturing the remote path. */
 const SSH_URL_RE = /^ssh:\/\/[^/]*(\/.*)?$/i;
 
@@ -251,6 +311,11 @@ export function decideTarget(target: PathTarget, policy: PermissionPolicy, roots
 	for (const spelling of targetSpellings(target)) {
 		if (isSshUrl(spelling.raw)) {
 			const decision = decideSshTarget(spelling, policy);
+			if (decision.kind === "deny") return decision;
+			continue;
+		}
+		if (isVaultUrl(spelling.raw)) {
+			const decision = decideVaultTarget(spelling, policy, roots);
 			if (decision.kind === "deny") return decision;
 			continue;
 		}

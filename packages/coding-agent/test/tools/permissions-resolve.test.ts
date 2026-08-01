@@ -1,7 +1,9 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { VaultProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import * as vaultProtocol from "@oh-my-pi/pi-coding-agent/internal-urls/vault-protocol";
 import {
 	buildPermissionPolicy,
 	confineToRoots,
@@ -260,5 +262,72 @@ describe("symlink alias deny matching", () => {
 		const decision = decideTarget(target("safe-dir/new-config", "write"), policy, roots);
 		expect(decision.kind).toBe("deny");
 		if (decision.kind === "deny") expect(decision.rule).toBe("**/.ssh/**");
+	});
+
+	// Simulates the Windows spelling of a directory-scoped deny rule's target
+	// without needing an actual Windows runner: a POSIX filename may itself
+	// contain a literal backslash, so `sub\widget.txt` here is exactly the
+	// candidate `decidePathTarget` builds - a single path segment holding
+	// the same bytes `path.relative` would emit on Windows for
+	// `sub\widget.txt`. Before normalizing candidates to `/`, a
+	// directory-scoped rule spelled with `/` never matched it.
+	it("normalizes a backslash-separated candidate before glob matching", () => {
+		fs.mkdirSync(path.join(workspace, "winlike"), { recursive: true });
+		fs.writeFileSync(path.join(workspace, "winlike", "sub\\widget.txt"), "secret");
+		const policy = buildPermissionPolicy("workspace", { denyRead: ["**/sub/widget.txt"] });
+		const decision = decideTarget(target("winlike/sub\\widget.txt"), policy, roots);
+		expect(decision.kind).toBe("deny");
+		if (decision.kind === "deny") expect(decision.rule).toBe("**/sub/widget.txt");
+	});
+});
+
+describe("vault:// targets", () => {
+	let vaultRoot: string;
+
+	beforeEach(() => {
+		vaultRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "omp-vault-")));
+		fs.writeFileSync(path.join(vaultRoot, ".env"), "SECRET=1");
+		fs.mkdirSync(path.join(vaultRoot, "Notes"), { recursive: true });
+		fs.writeFileSync(path.join(vaultRoot, "Notes", "note.md"), "hello");
+		vi.spyOn(vaultProtocol, "isVaultEnabled").mockReturnValue(true);
+		VaultProtocolHandler.setActiveVaultPathForTests(vaultRoot);
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		VaultProtocolHandler.resetForTests();
+		fs.rmSync(vaultRoot, { recursive: true, force: true });
+	});
+
+	// The vault directory was previously exempted outright by
+	// `isExemptPathArgument` (it is an internal-URL scheme), even though it
+	// resolves to a real file on disk through the Obsidian integration.
+	it("denies a vault:// target whose backing file matches a deny rule", () => {
+		const policy = buildPermissionPolicy("strict");
+		const decision = decideTarget(target("vault://_/.env"), policy, roots);
+		expect(decision.kind).toBe("deny");
+		if (decision.kind === "deny") expect(decision.rule).toBe("**/.env");
+	});
+
+	it("permits an ordinary vault:// target with no denied backing path", () => {
+		const policy = buildPermissionPolicy("strict");
+		const decision = decideTarget(target("vault://_/Notes/note.md"), policy, roots);
+		expect(decision.kind).toBe("allow");
+	});
+
+	// The very first vault:// call in a session has nothing cached yet
+	// (discovering the root is itself what a read does) - this must fail
+	// closed rather than silently exempting the call the way it used to.
+	it("fails closed when no vault root is cached yet", () => {
+		VaultProtocolHandler.resetForTests();
+		vi.spyOn(vaultProtocol, "isVaultEnabled").mockReturnValue(true);
+		const policy = buildPermissionPolicy("strict");
+		const decision = decideTarget(target("vault://_/note.md"), policy, roots);
+		expect(decision.kind).toBe("deny");
+	});
+
+	it("permits any vault:// target under a policy with no active deny rules", () => {
+		const policy = buildPermissionPolicy("off");
+		expect(decideTarget(target("vault://_/.env"), policy, roots).kind).toBe("allow");
 	});
 });
