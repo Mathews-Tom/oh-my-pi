@@ -224,11 +224,15 @@ bash:
       approval: prompt
     - match: "*git*push*-f*"
       approval: prompt
+    - match: "*git*push*-uf*"
+      approval: prompt
+    - match: "*git*push*-fu*"
+      approval: prompt
     - match: "*"
       approval: allow
 ```
 
-The `rm` and `git push` rules above cover the common flag orderings and global-option placement, not every possible invocation — `rm` accepts further equivalent short/long flag permutations, and a command can still be built to evade a literal-plus-wildcard matcher. Treat Permissive as a fast default, not a security boundary; use Conservative or Balanced where that distinction matters. The "everything unattended" framing describes `yolo` specifically: the trailing `match: "*"` allowance never applies to a command containing shell control syntax (see the matcher properties below), so `echo $HOME` gets no `bash.patterns` verdict at all and falls back to the Bash tool's own `exec` tier — auto-approved under `yolo`, but prompted under `tools.approvalMode: write`/`always-ask`. A critical-pattern command prompts in those non-`yolo` modes too, regardless of any `bash.patterns` policy.
+The `rm` and `git push` rules above cover the common flag orderings and global-option placement, not every possible invocation — `rm` accepts further equivalent short/long flag permutations, and a command can still be built to evade a literal-plus-wildcard matcher. `git push -uf` is a real, commonly-used bundled short form of `--set-upstream --force` (verified with Git 2.55.0), so it needs its own rule alongside `-uf`'s less common reordering `-fu`: neither contains `-f` or `--force` as a matched substring on its own without them. Treat Permissive as a fast default, not a security boundary; use Conservative or Balanced where that distinction matters. The "everything unattended" framing describes `yolo` specifically: the trailing `match: "*"` allowance never applies to a command containing shell control syntax (see the matcher properties below), so `echo $HOME` gets no `bash.patterns` verdict at all and falls back to the Bash tool's own `exec` tier — auto-approved under `yolo`, but prompted under `tools.approvalMode: write`/`always-ask`. A critical-pattern command prompts in those non-`yolo` modes too, regardless of any `bash.patterns` policy.
 
 Four properties of the matcher decide whether a preset behaves as written:
 
