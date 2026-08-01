@@ -4384,7 +4384,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Discovery & MCP",
 			label: "xd:// Tools",
 			description:
-				"Mount rarely-used (discoverable) tools under xd:// device URLs driven via read/write instead of shipping their schemas on every request. Disable to expose every enabled tool top-level.",
+				"Mount rarely-used (discoverable) tools under xd:// device URLs driven via read/write instead of shipping their schemas on every request. Sessions without a granted write tool skip mounting and expose every tool top-level. Disable to expose every enabled tool top-level.",
 		},
 	},
 

@@ -2465,6 +2465,24 @@ export interface OpenRouterModelManagerConfig {
 	fetch?: FetchImpl;
 }
 
+function mapOpenRouterThinking(entry: OpenAICompatibleModelRecord): ThinkingConfig | undefined {
+	const reasoning = entry.reasoning;
+	if (!isRecord(reasoning)) return undefined;
+	const supportedEfforts = reasoning.supported_efforts;
+	if (!Array.isArray(supportedEfforts)) return undefined;
+	const efforts = THINKING_EFFORTS.filter(effort => supportedEfforts.includes(effort));
+	if (efforts.length === 0) return undefined;
+	const defaultLevel =
+		typeof reasoning.default_effort === "string"
+			? THINKING_EFFORTS.find(effort => effort === reasoning.default_effort)
+			: undefined;
+	return {
+		mode: "effort",
+		efforts,
+		...(defaultLevel !== undefined && efforts.includes(defaultLevel) ? { defaultLevel } : {}),
+	};
+}
+
 export function openrouterModelManagerOptions(
 	config?: OpenRouterModelManagerConfig,
 ): ModelManagerOptions<"openrouter"> {
@@ -2496,6 +2514,7 @@ export function openrouterModelManagerOptions(
 					const baseModel = mapWithBundledReference(entry, defaults, reference);
 					const pricing = entry.pricing as Record<string, unknown> | undefined;
 					const params = Array.isArray(entry.supported_parameters) ? (entry.supported_parameters as string[]) : [];
+					const thinking = mapOpenRouterThinking(entry);
 					const modality = String((entry.architecture as Record<string, unknown> | undefined)?.modality ?? "");
 					const topProvider = entry.top_provider as Record<string, unknown> | undefined;
 
@@ -2504,6 +2523,7 @@ export function openrouterModelManagerOptions(
 					return {
 						...baseModel,
 						reasoning: params.includes("reasoning"),
+						...(thinking !== undefined ? { thinking } : {}),
 						input: modality.includes("image") ? ["text", "image"] : ["text"],
 						cost: {
 							input: parseFloat(String(pricing?.prompt ?? "0")) * 1_000_000,
