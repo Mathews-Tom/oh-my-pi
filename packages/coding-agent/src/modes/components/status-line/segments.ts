@@ -4,6 +4,7 @@ import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { formatDuration, formatNumber, getProjectDir, pathIsWithin, relativePathWithinRoot } from "@oh-my-pi/pi-utils";
 import { type ThemeColor, theme } from "../../../modes/theme/theme";
+import { readPermissionProfile } from "../../../tools/permissions/config";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../../tools/render-utils";
 import { fileHyperlink } from "../../../tui/hyperlink";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
@@ -611,6 +612,26 @@ const collabSegment: StatusLineSegment = {
 	},
 };
 
+/**
+ * Resource permission profile chip.
+ *
+ * Hidden at `permissions.profile: off`, which is the default — a user who
+ * never enables the layer sees no new segment. The profile is read at render
+ * time rather than carried on {@link SegmentContext} so a `/perm` switch shows
+ * up on the next repaint without threading a new field through the component.
+ *
+ * Text-only, no icon: the ascii preset exists so the bar stays legible without
+ * a Nerd Font, and there is no `theme.icon` entry for a lock to fall back on.
+ */
+const permissionsSegment: StatusLineSegment = {
+	id: "permissions",
+	render(ctx) {
+		const profile = readPermissionProfile(ctx.session.settings);
+		if (profile === "off") return { content: "", visible: false };
+		return { content: theme.fg("accent", `perm:${profile}`), visible: true };
+	},
+};
+
 function pickUsageColor(percent: number): "muted" | "warning" | "error" {
 	if (percent >= 80) return "error";
 	if (percent >= 50) return "warning";
@@ -696,6 +717,7 @@ export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	session_name: sessionNameSegment,
 	usage: usageSegment,
 	collab: collabSegment,
+	permissions: permissionsSegment,
 };
 
 export function renderSegment(id: StatusLineSegmentId, ctx: SegmentContext): RenderedSegment {

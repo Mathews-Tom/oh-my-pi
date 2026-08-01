@@ -20,6 +20,7 @@
 
 - Added an opt-in resource permission layer (`permissions.*`) that denies tool access to configured paths independently of approval mode, so a subagent running under forced `yolo` is bound by it too. Defaults to `permissions.profile: off`, which short-circuits before any filesystem work; `workspace` confines writes to the workspace roots and `strict` adds built-in secret deny rules. Enforcement is sound for tools with structured path arguments and best-effort for `bash`, `eval`, and MCP tools. See [docs/permissions.md](../../docs/permissions.md) ([#6710](https://github.com/can1357/oh-my-pi/issues/6710))
 - Added the `/perm` slash command to inspect or switch the resource permission profile for the current session. With no argument it reports the active profile, the rules it resolves to, and which tools are Class B (literal-scanned, not sandboxed) so the report cannot be mistaken for a stronger guarantee; `/perm off|workspace|strict` switches for the session only and prints `permissions.profile` for persistence ([#6710](https://github.com/can1357/oh-my-pi/issues/6710))
+- Added a `permissions` status-line segment rendering a `perm:<profile>` chip while a resource permission profile is active. Hidden at the default `permissions.profile: off`, so sessions that never enable the layer are unchanged ([#6710](https://github.com/can1357/oh-my-pi/issues/6710))
 
 ## [17.2.2] - 2026-07-31
 

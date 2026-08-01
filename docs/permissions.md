@@ -80,6 +80,8 @@ permissions:
 
 A switch is **session-scoped**: it is a runtime override, never written to settings. The report prints `permissions.profile` so you know the key to set for persistence.
 
+While a profile is active the status line carries a `perm:<profile>` chip. It is hidden at `profile: off`, so a session that never enables the layer looks exactly as it did before. The chip is the `permissions` status-line segment and can be reordered or removed like any other via `statusLine.leftSegments` / `statusLine.rightSegments`.
+
 ## Path globs are not command globs
 
 These are two different dialects, on purpose:
