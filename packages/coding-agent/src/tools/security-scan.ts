@@ -1,5 +1,11 @@
 import * as path from "node:path";
-import type { AgentTool, AgentToolContext, AgentToolResult, ToolTier } from "@oh-my-pi/pi-agent-core";
+import type {
+	AgentTool,
+	AgentToolContext,
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	ToolTier,
+} from "@oh-my-pi/pi-agent-core";
 import { type } from "arktype";
 import securityScanDescription from "../prompts/tools/security-scan.md" with { type: "text" };
 import { selectSecurityAccount } from "../security/auth";
@@ -159,7 +165,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 		_toolCallId: string,
 		params: SecurityScanParams,
 		signal?: AbortSignal,
-		_onUpdate?: unknown,
+		_onUpdate?: AgentToolUpdateCallback<SecurityScanToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<SecurityScanToolDetails>> {
 		if (!this.session.settings.get("security.enabled")) {
