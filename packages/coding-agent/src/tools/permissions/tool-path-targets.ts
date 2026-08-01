@@ -60,6 +60,20 @@ function pushPath(out: PathTarget[], raw: unknown, access: PathAccess, field: st
 	out.push({ raw: trimmed, access, field });
 }
 
+/**
+ * A path an operation both reads and writes.
+ *
+ * Editing an existing file is not a pure write: patch and replace modes open
+ * it to locate the edit, and a mismatch error quotes the closest actual source
+ * line back to the model. A user who denies only reads
+ * (`permissions.deny.read: ["**​/secret.txt"]`) would otherwise see those
+ * contents through `edit`, which the write-side rules never covered.
+ */
+function pushReadWrite(out: PathTarget[], raw: unknown, field: string): void {
+	pushPath(out, raw, "read", field);
+	pushPath(out, raw, "write", field);
+}
+
 function pushDelimited(out: PathTarget[], raw: unknown, access: PathAccess, field: string): void {
 	if (typeof raw !== "string") return;
 	for (const part of raw.split(MULTI_PATH_SEPARATOR)) pushPath(out, part, access, field);
@@ -88,7 +102,7 @@ function delimitedPath(field: string, access: PathAccess): PathTargetExtractor {
 	};
 }
 
-const APPLY_PATCH_FILE_RE = /^\*\*\* (?:Add|Delete|Update) File: (.+)$/;
+const APPLY_PATCH_FILE_RE = /^\*\*\* (Add|Delete|Update) File: (.+)$/;
 const APPLY_PATCH_MOVE_RE = /^\*\*\* Move to: (.+)$/;
 // `MV DEST` is hashline's file-level move op (`HL_MOVE_KEYWORD`,
 // `packages/hashline/src/format.ts`): the section's final content is written at
@@ -122,12 +136,18 @@ function stripQuotes(value: string): string {
  * and (unlike the header case) scanning bare lines catches a move/marker even
  * outside a well-formed section — strictly more cautious than the real
  * executor, never less.
+ *
+ * Access follows what each op does to the file it names. A hashline section
+ * anchors to tags minted from existing content, and `*** Update File` /
+ * `*** Delete File` both open the file first, so all three read as well as
+ * write. Only the two destinations that are produced rather than consulted —
+ * `*** Add File` and a `MV`/`*** Move to` target — are write-only.
  */
 export function extractEmbeddedEditPaths(input: string): PathTarget[] {
 	const out: PathTarget[] = [];
 	try {
 		for (const section of Patch.parse(input).sections) {
-			pushPath(out, section.path, "write", "input");
+			pushReadWrite(out, section.path, "input");
 		}
 	} catch {
 		// Not hashline-shaped input, or a section body parse error the real
@@ -136,9 +156,15 @@ export function extractEmbeddedEditPaths(input: string): PathTarget[] {
 	for (const line of input.split("\n")) {
 		const trimmed = line.trim();
 		if (!trimmed) continue;
-		const applyPatch = APPLY_PATCH_FILE_RE.exec(trimmed) ?? APPLY_PATCH_MOVE_RE.exec(trimmed);
+		const applyPatch = APPLY_PATCH_FILE_RE.exec(trimmed);
 		if (applyPatch) {
-			pushPath(out, applyPatch[1], "write", "input");
+			if (applyPatch[1] === "Add") pushPath(out, applyPatch[2], "write", "input");
+			else pushReadWrite(out, applyPatch[2], "input");
+			continue;
+		}
+		const moveTo = APPLY_PATCH_MOVE_RE.exec(trimmed);
+		if (moveTo) {
+			pushPath(out, moveTo[1], "write", "input");
 			continue;
 		}
 		const move = HASHLINE_MOVE_RE.exec(trimmed);
@@ -150,7 +176,9 @@ export function extractEmbeddedEditPaths(input: string): PathTarget[] {
 const extractEditPaths: PathTargetExtractor = args => {
 	const out: PathTarget[] = [];
 	// patch/replace modes: one top-level target plus per-edit rename destinations.
-	pushPath(out, args.path, "write", "path");
+	// The target is read as well as written — both modes open it to locate the
+	// edit, and a mismatch error quotes the closest real source line back.
+	pushReadWrite(out, args.path, "path");
 	if (Array.isArray(args.edits)) {
 		for (const edit of args.edits) {
 			if (edit && typeof edit === "object") {
@@ -204,6 +232,21 @@ const DEBUG_OPAQUE_ACTIONS: ReadonlySet<string> = new Set([
  * through the same best-effort literal scan an opaque tool gets.
  */
 const LSP_OPAQUE_ACTIONS: ReadonlySet<string> = new Set(["request"]);
+
+/**
+ * Tools whose class depends on the `action` the call names: structured for
+ * most actions, opaque for the ones listed here.
+ *
+ * The single source of truth for both {@link classifyTool}, which needs it per
+ * call, and `/perm` (`describe.ts`), which needs it to report these tools as
+ * mixed rather than as pure Class A. Splitting those two readings is exactly
+ * how the report came to overstate coverage — enforcement knew `debug launch`
+ * was opaque while the report still called `debug` "enforced exactly".
+ */
+export const ACTION_OPAQUE_TOOLS: Readonly<Record<string, ReadonlySet<string>>> = {
+	debug: DEBUG_OPAQUE_ACTIONS,
+	lsp: LSP_OPAQUE_ACTIONS,
+};
 
 const extractLspPaths: PathTargetExtractor = args => {
 	const out: PathTarget[] = [];
@@ -332,22 +375,19 @@ export const UNKNOWN_TOOL_CLASS: ToolPathClass = { kind: "opaque", scan: "string
  * `find` -> `glob`) so an alias gets the structured extractor rather than
  * falling through to the coarser opaque scan.
  *
- * `args` (the call's own arguments, when the caller has them) lets `debug`
- * and `lsp` be classified per-action: `TOOL_PATH_CLASSES.debug`/`.lsp` stay
- * plain structured entries (used directly by tests and as the base
- * extractor), but a call whose `action` is in {@link DEBUG_OPAQUE_ACTIONS} or
- * {@link LSP_OPAQUE_ACTIONS} is classified opaque here, since only the actual
- * call site knows the action.
+ * `args` (the call's own arguments, when the caller has them) lets the
+ * {@link ACTION_OPAQUE_TOOLS} entries be classified per-action:
+ * `TOOL_PATH_CLASSES.debug`/`.lsp` stay plain structured entries (used
+ * directly by tests and as the base extractor), but a call whose `action` is
+ * listed there is classified opaque here, since only the actual call site
+ * knows the action.
  */
 export function classifyTool(toolName: string, args?: Record<string, unknown> | null): ToolPathClass {
 	const normalized = normalizeToolName(toolName);
-	if (normalized === "debug") {
+	const opaqueActions = ACTION_OPAQUE_TOOLS[normalized];
+	if (opaqueActions) {
 		const action = args && typeof args.action === "string" ? args.action : undefined;
-		if (action && DEBUG_OPAQUE_ACTIONS.has(action)) return { kind: "opaque", scan: "strings" };
-	}
-	if (normalized === "lsp") {
-		const action = args && typeof args.action === "string" ? args.action : undefined;
-		if (action && LSP_OPAQUE_ACTIONS.has(action)) return { kind: "opaque", scan: "strings" };
+		if (action && opaqueActions.has(action)) return { kind: "opaque", scan: "strings" };
 	}
 	return TOOL_PATH_CLASSES[normalized] ?? UNKNOWN_TOOL_CLASS;
 }

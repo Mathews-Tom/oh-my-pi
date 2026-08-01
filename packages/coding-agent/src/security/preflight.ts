@@ -17,6 +17,25 @@ export type SecurityTargetRequest =
 	| { kind: "ref_diff"; baseRevision: string; headRevision: string; includePaths?: string[]; excludePaths?: string[] }
 	| { kind: "working_tree"; includePaths?: string[]; excludePaths?: string[] };
 
+/**
+ * Resource-permission hooks for the two surfaces a scan reaches that its tool
+ * arguments never name.
+ *
+ * A default `target_kind: "repository"` scan declares no path yet reads every
+ * tracked and untracked in-scope file, and an omitted `output_root` is
+ * defaulted to a directory under the security state root and created there.
+ * The permission gate classifies `security_scan` from its declared arguments,
+ * so without these it authorizes both against nothing at all. Each throws to
+ * refuse; supplied by `tools/security-scan.ts`, which is the layer that has
+ * the session context, and absent everywhere else (tests, importers).
+ */
+export interface SecurityScanGuard {
+	/** Every in-scope file the scan enumerated, workspace-relative to `repositoryRoot`. */
+	scope?(relativePaths: readonly string[], repositoryRoot: string): void;
+	/** The effective output directory, resolved and absolute, before it is created. */
+	outputRoot?(absolutePath: string): void;
+}
+
 export interface SecurityPlanRequest {
 	cwd: string;
 	target: SecurityTargetRequest;
@@ -29,6 +48,7 @@ export interface SecurityPlanRequest {
 	workflowFingerprint: string;
 	signal?: AbortSignal;
 	createdAt?: string;
+	guard?: SecurityScanGuard;
 }
 
 export interface SecurityPlanFreshnessInput {
@@ -138,6 +158,7 @@ async function digestWorkingTree(
 	excludePaths: readonly string[],
 	adapter: SecurityGitAdapter,
 	signal?: AbortSignal,
+	guard?: SecurityScanGuard,
 ): Promise<string> {
 	const tracked = await adapter.files(repositoryRoot, signal);
 	const untracked = await adapter.untracked(repositoryRoot, signal);
@@ -145,6 +166,10 @@ async function digestWorkingTree(
 		.map(normalizeRelativePath)
 		.filter(candidate => pathMatchesSecurityScope(candidate, includePaths, excludePaths))
 		.sort();
+	// The resolved scope, before a byte of it is read. A `repository` scan
+	// declares no path at all, so this is the only point at which the resource
+	// permission layer can see that a tracked `.env` is about to be hashed.
+	guard?.scope?.(files, repositoryRoot);
 	const hasher = new Bun.CryptoHasher("sha256");
 	for (const relativePath of files) {
 		if (signal?.aborted) throw signal.reason;
@@ -178,6 +203,7 @@ async function normalizeTarget(
 	request: SecurityTargetRequest,
 	adapter: SecurityGitAdapter,
 	signal?: AbortSignal,
+	guard?: SecurityScanGuard,
 ): Promise<SecurityTarget> {
 	if (request.kind === "scoped_path" && !request.includePaths?.some(value => value.trim().length > 0)) {
 		throw new Error("scoped_path security scans require at least one include path");
@@ -214,7 +240,7 @@ async function normalizeTarget(
 		displayName,
 		includePaths,
 		excludePaths,
-		treeDigest: await digestWorkingTree(repositoryRoot, includePaths, excludePaths, adapter, signal),
+		treeDigest: await digestWorkingTree(repositoryRoot, includePaths, excludePaths, adapter, signal, guard),
 	};
 	if (revision !== null) target.revision = revision;
 	return target;
@@ -239,6 +265,7 @@ async function normalizeOutput(
 	repositoryRoot: string,
 	outputRoot: string,
 	archiveExisting: boolean,
+	guard?: SecurityScanGuard,
 ): Promise<SecurityOutputPlan> {
 	const requested = path.resolve(outputRoot);
 	const parent = await fs.realpath(path.dirname(requested));
@@ -246,6 +273,11 @@ async function normalizeOutput(
 	if (pathIsWithin(canonicalCandidate, repositoryRoot)) {
 		throw new Error("Security output directory must be outside the scanned repository");
 	}
+	// The *effective* root, after the coordinator's default has been applied
+	// and resolved, and before the mkdir below. Checking the caller's argument
+	// instead would leave an omitted `output_root` unexamined while an
+	// explicit one facing the same directory is refused.
+	guard?.outputRoot?.(canonicalCandidate);
 	let existingState: SecurityOutputPlan["existingState"] = "absent";
 	try {
 		const stats = await fs.lstat(canonicalCandidate);
@@ -315,9 +347,14 @@ async function buildPlanMaterial(
 	const repositoryRoot = await adapter.root(path.resolve(request.cwd), request.signal);
 	if (!repositoryRoot) throw new Error(`Security scans require a Git repository: ${request.cwd}`);
 	const canonicalRoot = await fs.realpath(repositoryRoot);
-	const target = await normalizeTarget(canonicalRoot, request.target, adapter, request.signal);
+	const target = await normalizeTarget(canonicalRoot, request.target, adapter, request.signal, request.guard);
 	const knowledgeBases = await normalizeKnowledgeBases(request.knowledgeBasePaths, canonicalRoot);
-	const output = await normalizeOutput(canonicalRoot, request.outputRoot, request.archiveExisting ?? false);
+	const output = await normalizeOutput(
+		canonicalRoot,
+		request.outputRoot,
+		request.archiveExisting ?? false,
+		request.guard,
+	);
 	const model: SecurityModelRef = {
 		provider: request.model.provider,
 		modelId: request.model.modelId,

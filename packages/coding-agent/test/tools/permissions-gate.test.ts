@@ -10,6 +10,7 @@ import { applyGuardedWorkspaceEdit } from "@oh-my-pi/pi-coding-agent/lsp";
 import { workspaceEditTargetPaths } from "@oh-my-pi/pi-coding-agent/lsp/edits";
 import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
+import { enforceResourcePathTargets } from "@oh-my-pi/pi-coding-agent/tools/permissions";
 
 /** A zero-width range at the start of the document, for text-edit fixtures. */
 const RANGE_ZERO = { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } };
@@ -335,6 +336,33 @@ describe("write-side settings reach the policy", () => {
 	});
 });
 
+describe("edit reads the file it rewrites", () => {
+	// A read-only denial used to be invisible to `edit`, which classified its
+	// target purely as a write. Patch and replace modes open the file to locate
+	// the edit, and a mismatch error quotes the closest real source line back to
+	// the model, so the denied contents leak through the write-allowed path.
+	const READ_DENIED = { "permissions.profile": "workspace", "permissions.deny.read": ["**/secret.txt"] };
+
+	it("denies a patch-mode edit whose source is read-denied but write-allowed", async () => {
+		const message = await denialOf("edit", { path: "secret.txt", edits: [] }, contextOf(READ_DENIED));
+		expect(message).toContain("**/secret.txt");
+		expect(message).toContain("Reading");
+	});
+
+	it("denies a hashline edit of a read-denied file", async () => {
+		const params = { input: "[secret.txt#00FF]\nPUT 1.=1:\n+LEAK=1" };
+		expect(await denialOf("edit", params, contextOf(READ_DENIED))).toContain("**/secret.txt");
+	});
+
+	it("still permits creating a new file the read rule names, which is never opened", async () => {
+		// `*** Add File` produces its target rather than consulting it, so the
+		// read rule does not apply — over-denying here would block a legitimate
+		// create for a file that has no contents to leak.
+		const params = { input: ["*** Begin Patch", "*** Add File: secret.txt", "*** End Patch"].join("\n") };
+		expect((await run("edit", params, contextOf(READ_DENIED))).calls).toHaveLength(1);
+	});
+});
+
 describe("post-execution recheck", () => {
 	/** A tool that reports the files it visited, as `grep`/`ast_edit` do. */
 	function reportingTool(name: string, files: string[], onExecute?: () => void): AgentTool {
@@ -406,6 +434,51 @@ describe("post-execution recheck", () => {
 		});
 		expect(await runReporting(tool, { paths: ["src"] }, context)).toBeNull();
 		expect(queue.peekPendingHead()?.id).toBe("pending-action:ast_edit:0");
+	});
+});
+
+describe("security_scan implicit surfaces", () => {
+	// The tool declares `include_paths`/`output_root`, but a default
+	// `target_kind: "repository"` scan names no read path at all and an omitted
+	// `output_root` is defaulted inside the coordinator. Both are resolved
+	// mid-preflight, so `SecurityScanGuard` is the only point that sees them.
+	// These drive the same gate entry point the guard calls.
+	function scanScope(relativePaths: string[], context: AgentToolContext): void {
+		enforceResourcePathTargets(
+			"security_scan",
+			relativePaths.map(relativePath => ({
+				raw: path.resolve(workspace, relativePath),
+				access: "read" as const,
+				field: "scan scope",
+			})),
+			context,
+		);
+	}
+
+	it("refuses a repository scan whose resolved scope includes a denied secret", () => {
+		expect(() => scanScope(["src/main.ts", ".env"], contextOf(STRICT))).toThrow("**/.env");
+	});
+
+	it("permits a repository scan whose resolved scope holds no denied file", () => {
+		expect(() => scanScope(["src/main.ts"], contextOf(STRICT))).not.toThrow();
+	});
+
+	it("refuses an effective output root outside every workspace root", () => {
+		// The default is `<security state dir>/work/<uuid>`, which is outside the
+		// repository by design — checking the caller's argument instead of the
+		// resolved default left exactly this case unexamined.
+		expect(() =>
+			enforceResourcePathTargets(
+				"security_scan",
+				[{ raw: path.join(outside, "work", "abc"), access: "write", field: "output_root" }],
+				contextOf(WORKSPACE),
+			),
+		).toThrow("permissions.confineWrites");
+	});
+
+	it("leaves both surfaces alone when no profile is active", () => {
+		const off = contextOf({ "permissions.profile": "off" });
+		expect(() => scanScope([".env"], off)).not.toThrow();
 	});
 });
 

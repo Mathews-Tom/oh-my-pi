@@ -37,6 +37,23 @@ describe("/perm slash command", () => {
 		expect(text).toContain("permissions.profile");
 	});
 
+	it("reports debug and lsp as action-dependent rather than exactly enforced", async () => {
+		// `classifyTool` downgrades `debug launch` and `lsp request` to the
+		// Class B scan per call. A report that listed those tools under "declared
+		// paths enforced exactly" would promise the opposite of what runs.
+		const h = acpRuntime();
+
+		await executeAcpBuiltinSlashCommand("/perm", h.runtime);
+
+		const text = String(h.output.mock.calls.at(-1)?.[0] ?? "");
+		expect(text).toContain("Class A/B (2) — declared paths enforced except these actions");
+		expect(text).toContain("debug (attach, custom_request, evaluate, launch, write_memory)");
+		expect(text).toContain("lsp (request)");
+		const classA = text.split("\n").find(line => line.trimStart().startsWith("Class A ("));
+		expect(classA).not.toContain("debug");
+		expect(classA).not.toContain("lsp");
+	});
+
 	it("switches the profile for the session only, never persisting it", async () => {
 		const h = acpRuntime();
 

@@ -103,12 +103,19 @@ Tools split into two classes, and the split is the honest boundary of the featur
 
 **Class A — structured path tools.** `read`, `write`, `edit`, `glob`, `grep`, `ast_grep`, `ast_edit`, `lsp`, `debug`, `inspect_image`, `security_scan`. These declare which arguments are paths and whether each is read or written, so enforcement is sound. This is the real guardrail.
 
+`debug` and `lsp` are Class A for most actions and Class B for the ones that reach arbitrary code — `debug` `launch`/`attach`/`evaluate`/`write_memory`/`custom_request`, and `lsp` `request`. Those name a program or a raw protocol payload rather than the files they end up touching, so they fall back to the literal scan. `/perm` lists them on their own `Class A/B` line with the exact actions.
+
+Access follows what an operation does, not which argument it came from. `edit` opens the file it rewrites — patch and replace modes read it to locate the edit, and a mismatch error quotes the closest real source line — so an edit target is checked against the read rules as well as the write rules. Only paths that are produced rather than consulted (a rename destination, `*** Add File`, `MV DEST`) are write-only.
+
 Resolution mirrors what the tool itself does, so the guard and the tool cannot disagree about which file is at stake. Both the target and its deepest existing ancestor are `realpath`-resolved, so a symlink pointing out of the workspace is caught rather than trusted; a *dangling* symlink is refused outright, because where it lands cannot be determined before the write follows it.
 
 Two Class A tools reach past their declared arguments and are checked a second time, because the declared arguments are not the whole surface:
 
 - `grep`, `ast_grep`, and `ast_edit` take a scope root and then recurse beneath it. The file set they report visiting is re-evaluated after the call and before the result reaches the model, so `grep --path .` cannot surface a denied file. A denial also discards any preview the call staged, so the pending `xd://resolve` cannot apply it afterwards.
 - `lsp` `rename` and `code_actions --apply` receive a `WorkspaceEdit` chosen by the *language server*, which can name destinations the call never mentioned. Every path such an edit would create, modify, rename, or delete is checked before anything is written. (A server can also push an unsolicited `workspace/applyEdit`; that path has no session handle to resolve `workspace.additionalDirectories` from and is not covered.)
+- `security_scan` `preflight` reaches two paths its arguments never name. A default `target_kind: "repository"` scan declares no read path yet hashes and reviews every tracked and untracked in-scope file, so the resolved file list is checked before any of it is read — a tracked `.env` fails under `strict`. An omitted `output_root` is defaulted to a directory under the security state root, and the *effective* root is checked before it is created, so it faces the same rules an explicitly-passed one does.
+
+  Note the consequence: a scan output directory must live outside the scanned repository by design, so under `workspace` or `strict` a scan needs that directory in scope — add it with `/add-dir`, or add a `permissions.allow.write` glob for it. The denial names the setting to change.
 
 **Class B — opaque tools.** `bash`, `eval`, `browser`, `computer`, `hub`, and every MCP or extension tool. These take arbitrary code, and sound enforcement against arbitrary code is undecidable: `cat .env` can be written `$(echo Lmk|base64 -d)`, and no static scan catches that.
 

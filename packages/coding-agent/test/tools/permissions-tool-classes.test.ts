@@ -44,8 +44,10 @@ describe("structured extraction", () => {
 
 	it("takes edit rename destinations as writes alongside the target", () => {
 		const targets = extract("edit", { path: "a.ts", edits: [{ rename: "b.ts" }, { diff: "x" }] });
-		expect(targets.map(t => t.raw)).toEqual(["a.ts", "b.ts"]);
-		expect(targets.every(t => t.access === "write")).toBe(true);
+		// The edited file is opened to locate the edit, so it is a read as well
+		// as a write; a rename destination is only produced.
+		expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual(["read:a.ts", "write:a.ts", "write:b.ts"]);
+		expect(targets.filter(t => t.raw === "b.ts").every(t => t.access === "write")).toBe(true);
 	});
 
 	// The access map inverts the tool's own LSP_READONLY_ACTIONS, so a
@@ -73,15 +75,38 @@ describe("structured extraction", () => {
 });
 
 describe("embedded edit payload paths", () => {
-	it("extracts hashline section headers", () => {
-		expect(extractEmbeddedEditPaths("[src/a.ts#1A2B]\nPUT 1.=1:\n+x").map(t => t.raw)).toEqual(["src/a.ts"]);
+	it("extracts hashline section headers as both a read and a write", () => {
+		// A hashline section anchors to a tag minted from the file's existing
+		// content, so applying it opens the file before rewriting it.
+		expect(extractEmbeddedEditPaths("[src/a.ts#1A2B]\nPUT 1.=1:\n+x").map(t => `${t.access}:${t.raw}`)).toEqual([
+			"read:src/a.ts",
+			"write:src/a.ts",
+		]);
 	});
 
-	it("extracts apply_patch file and move markers", () => {
+	it("extracts apply_patch file and move markers, with access per marker", () => {
 		const input = ["*** Begin Patch", "*** Update File: src/a.ts", "*** Move to: src/b.ts", "*** End Patch"].join(
 			"\n",
 		);
-		expect(extractEmbeddedEditPaths(input).map(t => t.raw)).toEqual(["src/a.ts", "src/b.ts"]);
+		// `Update File` opens the source; a move destination is only produced.
+		expect(extractEmbeddedEditPaths(input).map(t => `${t.access}:${t.raw}`)).toEqual([
+			"read:src/a.ts",
+			"write:src/a.ts",
+			"write:src/b.ts",
+		]);
+	});
+
+	it("treats an apply_patch Add File target as a write only", () => {
+		const input = ["*** Begin Patch", "*** Add File: src/new.ts", "*** End Patch"].join("\n");
+		expect(extractEmbeddedEditPaths(input).map(t => `${t.access}:${t.raw}`)).toEqual(["write:src/new.ts"]);
+	});
+
+	it("treats an apply_patch Delete File target as a read and a write", () => {
+		const input = ["*** Begin Patch", "*** Delete File: src/old.ts", "*** End Patch"].join("\n");
+		expect(extractEmbeddedEditPaths(input).map(t => `${t.access}:${t.raw}`)).toEqual([
+			"read:src/old.ts",
+			"write:src/old.ts",
+		]);
 	});
 
 	it("does not mistake a bracketed body line for a header", () => {
@@ -91,15 +116,24 @@ describe("embedded edit payload paths", () => {
 	it("finds a secret target hidden in a hashline payload with no top-level path", () => {
 		const cls = TOOL_PATH_CLASSES.edit;
 		if (cls?.kind !== "structured") throw new Error("edit is not structured");
-		expect(cls.extract({ input: "[.env#00FF]\nPUT 1.=1:\n+LEAK=1" }).map(t => t.raw)).toEqual([".env"]);
+		expect(cls.extract({ input: "[.env#00FF]\nPUT 1.=1:\n+LEAK=1" }).map(t => `${t.access}:${t.raw}`)).toEqual([
+			"read:.env",
+			"write:.env",
+		]);
 	});
 
 	it("extracts a hashline MV destination, which is a write the section performs", () => {
 		const input = "[src/a.ts#1A2B]\nCUT 1.=1\nMV ../../outside/escaped.ts";
-		expect(extractEmbeddedEditPaths(input).map(t => t.raw)).toEqual(["src/a.ts", "../../outside/escaped.ts"]);
+		expect(extractEmbeddedEditPaths(input).map(t => `${t.access}:${t.raw}`)).toEqual([
+			"read:src/a.ts",
+			"write:src/a.ts",
+			"write:../../outside/escaped.ts",
+		]);
 	});
 
 	it("unquotes an MV destination containing spaces", () => {
-		expect(extractEmbeddedEditPaths('MV "dir with spaces/a.ts"').map(t => t.raw)).toEqual(["dir with spaces/a.ts"]);
+		expect(extractEmbeddedEditPaths('MV "dir with spaces/a.ts"').map(t => `${t.access}:${t.raw}`)).toEqual([
+			"write:dir with spaces/a.ts",
+		]);
 	});
 });

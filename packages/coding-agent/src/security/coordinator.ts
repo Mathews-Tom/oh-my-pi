@@ -25,7 +25,7 @@ import type {
 	SecurityTargetKind,
 } from "./contracts";
 import { createSecurityScanId } from "./contracts";
-import type { SecurityGitAdapter, SecurityTargetRequest } from "./preflight";
+import type { SecurityGitAdapter, SecurityScanGuard, SecurityTargetRequest } from "./preflight";
 import {
 	assertSecurityScanPlanFresh,
 	createSecurityScanPlan,
@@ -91,6 +91,8 @@ export interface SecurityPreflightInput {
 	model?: Model;
 	thinkingLevel?: string;
 	signal?: AbortSignal;
+	/** Resource-permission hooks for the scan's implicit read scope and effective output root. */
+	guard?: SecurityScanGuard;
 }
 
 export interface SecurityStartInput {
@@ -439,6 +441,7 @@ export class SecurityCoordinator {
 				config: securityConfigSnapshot(this.#host.settings),
 				workflowFingerprint: SECURITY_WORKFLOW_FINGERPRINT,
 				signal: input.signal,
+				...(input.guard ? { guard: input.guard } : {}),
 			},
 			this.#gitAdapter,
 		);

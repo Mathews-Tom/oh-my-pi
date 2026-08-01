@@ -12,13 +12,21 @@
  * `showStatus` in the TUI and `sessionUpdate` over ACP, and both take a string.
  */
 import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../render-utils";
-import { TOOL_PATH_CLASSES } from "./tool-path-targets";
+import { ACTION_OPAQUE_TOOLS, TOOL_PATH_CLASSES } from "./tool-path-targets";
 import type { PermissionPolicy, PermissionProfile } from "./types";
 
 /** The built-in tool names of each trust class, sorted for stable output. */
 export interface ToolGuardSummary {
-	/** Class A — declared path arguments, enforced exactly. */
+	/** Class A — declared path arguments, enforced exactly, for every action. */
 	readonly structured: readonly string[];
+	/**
+	 * Class A for most actions, Class B for the ones named here. Reported
+	 * apart from {@link structured} because `classifyTool` downgrades these
+	 * per call, and a report that folded them in would promise exact
+	 * enforcement for `debug launch` and `lsp request` — the two calls in the
+	 * table that reach arbitrary code.
+	 */
+	readonly mixed: readonly { readonly name: string; readonly opaqueActions: readonly string[] }[];
 	/** Class B — best-effort literal scan of opaque arguments. Never a sandbox. */
 	readonly opaque: readonly string[];
 	/** No filesystem surface, so nothing to guard. */
@@ -28,13 +36,17 @@ export interface ToolGuardSummary {
 /** Partition {@link TOOL_PATH_CLASSES} by trust class. */
 export function summarizeToolGuards(): ToolGuardSummary {
 	const structured: string[] = [];
+	const mixed: { name: string; opaqueActions: readonly string[] }[] = [];
 	const opaque: string[] = [];
 	const pathless: string[] = [];
 	for (const [name, toolClass] of Object.entries(TOOL_PATH_CLASSES)) {
 		switch (toolClass.kind) {
-			case "structured":
-				structured.push(name);
+			case "structured": {
+				const opaqueActions = ACTION_OPAQUE_TOOLS[name];
+				if (opaqueActions) mixed.push({ name, opaqueActions: [...opaqueActions].sort() });
+				else structured.push(name);
 				break;
+			}
 			case "opaque":
 				opaque.push(name);
 				break;
@@ -45,6 +57,7 @@ export function summarizeToolGuards(): ToolGuardSummary {
 	}
 	return {
 		structured: structured.sort(),
+		mixed: mixed.sort((a, b) => a.name.localeCompare(b.name)),
 		opaque: opaque.sort(),
 		pathless: pathless.sort(),
 	};
@@ -82,9 +95,12 @@ function toolCoverageLines(policy: PermissionPolicy | null): string[] {
 		scan === "off"
 			? "not checked at all, permissions.opaqueToolScan is off"
 			: `best-effort literal scan only, never a sandbox; scan=${scan}`;
+	const mixed = guards.mixed.map(entry => `${entry.name} (${entry.opaqueActions.join(", ")})`).join("; ");
 	return [
 		"Tool coverage:",
 		`  Class A (${guards.structured.length}) — declared paths enforced exactly: ${guards.structured.join(", ")}`,
+		`  Class A/B (${guards.mixed.length}) — declared paths enforced except these actions, ` +
+			`which fall back to the Class B scan: ${mixed}`,
 		`  Class B (${guards.opaque.length}) — ${classB}: ${guards.opaque.join(", ")}`,
 		`  No filesystem surface (${guards.pathless.length}): ${guards.pathless.join(", ")}`,
 		"  MCP, extension, and any other tool absent from the table is treated as Class B.",
