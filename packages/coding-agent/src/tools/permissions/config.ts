@@ -48,16 +48,22 @@ const PERMISSION_PROFILES: ReadonlySet<string> = new Set<PermissionProfile>(["of
  * Cheap pre-check so the `off` path never builds a policy at all.
  *
  * The value is validated rather than asserted. `Settings.get` is typed against
- * the schema, but the gate runs on whatever a session, an override, or an SDK
+ * the schema, but the gate runs on whatever a session override or an SDK
  * embedder actually put there, and an unrecognized value used to index
  * `PROFILE_DEFAULTS` to `undefined` and take the gate down with a bare
  * `TypeError` — a crash inside a security check decides nothing and names
- * nothing the operator can fix. Same fail-loud direction as a malformed glob
- * ({@link globList}): absent means `off`, present-but-wrong is an error.
+ * nothing the operator can fix.
+ *
+ * Falsy means `off`: `undefined`, `null`, `false`, and `""` are all spellings
+ * of "not configured", and `off` is already the default. Anything *truthy*
+ * must be one of the three profiles, which is where the protection that
+ * matters lives — a typo is always a truthy string, so `permissions.profile:
+ * "stict"` is an error rather than a silently disabled guard. Same fail-loud
+ * direction as a malformed glob ({@link globList}).
  */
 export function readPermissionProfile(settings: Settings | undefined): PermissionProfile {
 	const value = settings?.get("permissions.profile");
-	if (value === undefined || value === null) return "off";
+	if (!value) return "off";
 	if (typeof value !== "string" || !PERMISSION_PROFILES.has(value)) {
 		throw new Error(
 			`permissions.profile is ${JSON.stringify(value)}, which is not one of "off", "workspace", or "strict". ` +

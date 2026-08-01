@@ -298,8 +298,14 @@ describe("fail-closed edges", () => {
 		}
 	});
 
-	it("treats an absent profile as off rather than as an error", async () => {
-		expect((await run("read", { path: ".env" }, contextOf({ "permissions.profile": null }))).calls).toHaveLength(1);
+	it("treats every falsy spelling of the profile as off rather than as an error", async () => {
+		// `undefined`, `null`, `false`, and `""` all mean "not configured", and
+		// `settings: { get: () => false }` is the blanket stub much of this suite
+		// uses. None of them is a typo of a profile name, so none is an error.
+		for (const absent of [undefined, null, false, ""]) {
+			const context = contextOf({ "permissions.profile": absent });
+			expect((await run("read", { path: ".env" }, context)).calls).toHaveLength(1);
+		}
 	});
 });
 
