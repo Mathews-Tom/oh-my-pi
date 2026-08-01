@@ -16,9 +16,10 @@
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { loadPermissionsConfig } from "../tools/permissions/config";
 import { checkStructuredTargets, PermissionDeniedError, permissionRoots } from "../tools/permissions/gate";
+import { decideTarget } from "../tools/permissions/resolve";
 import { scanDenialMessage, scanOpaqueArguments } from "../tools/permissions/scan";
 import type { PathTarget, PermissionRoots } from "../tools/permissions/types";
-import type { Command, WorkspaceEdit } from "./types";
+import type { Command, Location, WorkspaceEdit } from "./types";
 import { uriToFile } from "./utils";
 
 function collectWorkspaceEditUris(edit: WorkspaceEdit): string[] {
@@ -123,6 +124,33 @@ export function assertWorkspaceDiagnosticsAllowed(context: AgentToolContext | un
 			`surface cannot be limited to authorized paths, and permissions.deny.read has active rule(s) under ` +
 			`permissions.profile: ${policy.profile}.\n` +
 			`To allow it: scope the call to a specific file or glob instead of "*", or set permissions.profile: off.`,
+	);
+}
+
+/**
+ * Filter `definition`/`type_definition`/`implementation`/`references`
+ * locations down to ones the resource permission policy allows reading. The
+ * declared `file` argument is checked before the request goes out, but the
+ * server-returned locations can land in an entirely different file -
+ * `formatLocationWithContext` opens each one directly to render surrounding
+ * source, so a symbol defined in (or referenced from) a path matching
+ * `permissions.deny.read` would otherwise surface that file's content
+ * through the allowed source's own navigation result. Filtered rather than
+ * denying the whole call, matching how a recursive search tool (`grep`,
+ * `glob`) drops individual denied entries instead of failing outright.
+ */
+export function filterAuthorizedLocations(
+	locations: readonly Location[],
+	context: AgentToolContext | undefined,
+	toolName: string,
+): Location[] {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy) return [...locations];
+	const roots = requireRootsOrDeny(toolName, policy.profile, permissionRoots(context));
+	return locations.filter(
+		location =>
+			decideTarget({ raw: uriToFile(location.uri), access: "read", field: "location" }, policy, roots).kind !==
+			"deny",
 	);
 }
 

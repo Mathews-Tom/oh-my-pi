@@ -53,6 +53,7 @@ import {
 	assertLspCommandAllowed,
 	assertWorkspaceDiagnosticsAllowed,
 	assertWorkspaceEditAllowed,
+	filterAuthorizedLocations,
 } from "./permission-guard";
 import {
 	type CodeAction,
@@ -133,6 +134,14 @@ export interface LspWarmupResult {
 export interface LspWarmupOptions {
 	/** Called when starting to connect to servers */
 	onConnecting?: (serverNames: string[]) => void;
+	/**
+	 * The session's permission context, stamped on every client warmup
+	 * creates. Without this, a client that receives a server-initiated
+	 * `workspace/applyEdit` before any tool call ever touches it has no
+	 * context to check against, and `assertWorkspaceEditAllowed` no-ops as
+	 * though permissions were off even under a strict/workspace session.
+	 */
+	context?: AgentToolContext;
 }
 
 export function discoverStartupLspServers(
@@ -171,6 +180,10 @@ export async function warmupLspServers(cwd: string, options?: LspWarmupOptions):
 	const results = await Promise.allSettled(
 		lspServers.map(async ([name, serverConfig]) => {
 			const client = await getOrCreateClient(serverConfig, cwd, serverConfig.warmupTimeoutMs ?? WARMUP_TIMEOUT_MS);
+			// See LspWarmupOptions.context: without this, a server-pushed edit
+			// arriving before any tool call ever touches this client has
+			// nothing to check against.
+			client.permissionsContext = options?.context;
 			return { name, client, fileTypes: serverConfig.fileTypes };
 		}),
 	);
@@ -2532,7 +2545,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						signal,
 					)) as Location | Location[] | LocationLink | LocationLink[] | null;
 
-					const locations = normalizeLocationResult(result);
+					const locations = filterAuthorizedLocations(normalizeLocationResult(result), context, this.name);
 
 					if (locations.length === 0) {
 						output = "No definition found";
@@ -2557,7 +2570,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						signal,
 					)) as Location | Location[] | LocationLink | LocationLink[] | null;
 
-					const locations = normalizeLocationResult(result);
+					const locations = filterAuthorizedLocations(normalizeLocationResult(result), context, this.name);
 
 					if (locations.length === 0) {
 						output = "No type definition found";
@@ -2582,7 +2595,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						signal,
 					)) as Location | Location[] | LocationLink | LocationLink[] | null;
 
-					const locations = normalizeLocationResult(result);
+					const locations = filterAuthorizedLocations(normalizeLocationResult(result), context, this.name);
 
 					if (locations.length === 0) {
 						output = "No implementation found";
@@ -2622,12 +2635,13 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						await untilAborted(signal, () => Bun.sleep(REFERENCES_RETRY_DELAY_MS));
 					}
 
-					if (!result || result.length === 0) {
+					const references = result ? filterAuthorizedLocations(result, context, this.name) : [];
+					if (references.length === 0) {
 						output = "No references found";
 						useless = true;
 					} else {
-						const contextualReferences = result.slice(0, REFERENCE_CONTEXT_LIMIT);
-						const plainReferences = result.slice(REFERENCE_CONTEXT_LIMIT);
+						const contextualReferences = references.slice(0, REFERENCE_CONTEXT_LIMIT);
+						const plainReferences = references.slice(REFERENCE_CONTEXT_LIMIT);
 						const contextualLines = await Promise.all(
 							contextualReferences.map(location => formatLocationWithContext(location, this.session.cwd)),
 						);
@@ -2639,7 +2653,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 									...plainLines,
 								]
 							: contextualLines;
-						output = `Found ${result.length} reference(s):\n${lines.join("\n")}`;
+						output = `Found ${references.length} reference(s):\n${lines.join("\n")}`;
 					}
 					break;
 				}

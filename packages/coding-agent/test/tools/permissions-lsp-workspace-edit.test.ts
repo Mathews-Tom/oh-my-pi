@@ -9,8 +9,9 @@ import {
 	assertLspCommandAllowed,
 	assertWorkspaceDiagnosticsAllowed,
 	assertWorkspaceEditAllowed,
+	filterAuthorizedLocations,
 } from "@oh-my-pi/pi-coding-agent/lsp/permission-guard";
-import type { Command, WorkspaceEdit } from "@oh-my-pi/pi-coding-agent/lsp/types";
+import type { Command, Location, WorkspaceEdit } from "@oh-my-pi/pi-coding-agent/lsp/types";
 import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { PermissionDeniedError } from "@oh-my-pi/pi-coding-agent/tools/permissions";
 
@@ -181,5 +182,29 @@ describe("assertWorkspaceDiagnosticsAllowed", () => {
 
 	it("no-ops entirely under permissions.profile: off", () => {
 		expect(() => assertWorkspaceDiagnosticsAllowed(contextOf({ "permissions.profile": "off" }), "lsp")).not.toThrow();
+	});
+});
+
+describe("filterAuthorizedLocations", () => {
+	function loc(...segments: string[]): Location {
+		return { uri: fileUri(...segments), range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } } };
+	}
+
+	it("drops a server-returned location whose file matches a deny rule", () => {
+		const locations = [loc("src", "main.ts"), loc(".env")];
+		const filtered = filterAuthorizedLocations(locations, contextOf(STRICT), "lsp");
+		expect(filtered.map(l => l.uri)).toEqual([fileUri("src", "main.ts")]);
+	});
+
+	it("keeps every location when none is denied", () => {
+		const locations = [loc("src", "main.ts"), loc("src", "other.ts")];
+		const filtered = filterAuthorizedLocations(locations, contextOf(STRICT), "lsp");
+		expect(filtered).toHaveLength(2);
+	});
+
+	it("no-ops entirely under permissions.profile: off", () => {
+		const locations = [loc(".env")];
+		const filtered = filterAuthorizedLocations(locations, contextOf({ "permissions.profile": "off" }), "lsp");
+		expect(filtered).toHaveLength(1);
 	});
 });
