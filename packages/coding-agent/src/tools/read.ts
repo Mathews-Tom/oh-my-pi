@@ -112,6 +112,7 @@ import {
 	splitPathAndSel,
 	splitPathAndSelPreferringLiteral,
 } from "./path-utils";
+import { enforceResourcePathTargets } from "./permissions/gate";
 import { formatBytes, replaceTabs, shortenPath, wrapBrackets } from "./render-utils";
 import { REPORT_ISSUE_DEVICE_NAME, reportIssueDeviceUsage } from "./report-tool-issue";
 import { isResolutionDeviceName, resolutionDeviceUsage } from "./resolve";
@@ -960,9 +961,21 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	async #tryReadDelimitedPaths(
 		readPath: string,
 		signal?: AbortSignal,
+		toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<ReadToolDetails> | null> {
 		const parts = await splitDelimitedPathEntry(readPath, this.session.cwd);
 		if (!parts) return null;
+
+		// The permission gate saw one combined literal — `README.md;.env` matches
+		// no secret glob — and the recursive reads below re-enter `execute`, not
+		// the wrapper, so this is the only point at which the paths actually
+		// opened are known. Checked with the same splitter the read performs, so
+		// the guard and the tool cannot disagree about what gets opened.
+		enforceResourcePathTargets(
+			"read",
+			parts.map(part => ({ raw: part, access: "read" as const, field: "path" })),
+			toolContext,
+		);
 
 		const notice = `Note: interpreted as ${parts.length} paths: ${parts.join(", ")}`;
 		const notes = [notice];
@@ -2451,7 +2464,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				}
 
 				if (!recoveredApprovedPlan && !suffixResolution) {
-					const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal);
+					const delimitedResult = await this.#tryReadDelimitedPaths(readPath, signal, _toolContext);
 					if (delimitedResult) return delimitedResult;
 					throw new ToolError(`Path '${localReadPath}' not found`);
 				}

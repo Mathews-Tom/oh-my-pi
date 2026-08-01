@@ -104,6 +104,14 @@ function toolCoverageLines(policy: PermissionPolicy | null): string[] {
 		`  Class B (${guards.opaque.length}) — ${classB}: ${guards.opaque.join(", ")}`,
 		`  No filesystem surface (${guards.pathless.length}): ${guards.pathless.join(", ")}`,
 		"  MCP, extension, and any other tool absent from the table is treated as Class B.",
+		// Named rather than left to be discovered: `grep`/`ast_grep` recurse
+		// inside the native searcher, which reports a count of files searched but
+		// not their names and takes no exclusion globs, so the recheck can only
+		// see files that produced a match. A denied file that matches nothing is
+		// still opened. Closing it needs the native searcher to exclude paths or
+		// return its visited set; until then, saying so is the honest position.
+		"  Recursive search (grep, ast_grep) is rechecked only on files that matched; a denied file",
+		"  beneath an allowed root is still opened if it matches nothing. Deny the root, not the file.",
 	];
 }
 

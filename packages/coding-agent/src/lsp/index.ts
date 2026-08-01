@@ -1586,6 +1586,29 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 }
 
 /**
+ * Check every location a server returned before its source lines are read.
+ *
+ * `definition`, `type_definition`, `implementation`, and `references` are
+ * gated on the *initiating* `file`, but the locations that come back are
+ * chosen by the language server and routinely land in other files — a
+ * dependency, a generated file, something outside every workspace root. Each
+ * one is then handed to `formatLocationWithContext`, which opens it and puts
+ * the surrounding source lines in front of the model, so a `deny.read` rule or
+ * `confineReads` has to be applied here or not at all.
+ */
+export function guardLocationReads(locations: readonly Location[], context: AgentToolContext | undefined): void {
+	enforceResourcePathTargets(
+		"lsp",
+		locations.map(location => ({
+			raw: uriToFile(location.uri),
+			access: "read" as const,
+			field: "result location",
+		})),
+		context,
+	);
+}
+
+/**
  * Apply a server-supplied `WorkspaceEdit` only after every path it names has
  * cleared the resource permission layer.
  *
@@ -2094,6 +2117,20 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 			}
 
+			// `willRenameFiles` answers with edits for whatever URIs the server
+			// chooses, which need not be `file` or `new_name` — the only two paths
+			// the permission gate saw. Same surface `applyGuardedWorkspaceEdit`
+			// covers for `rename`/`code_actions`, so it faces the same check here
+			// before any of it is written.
+			enforceResourcePathTargets(
+				"lsp",
+				[...acceptedByUri.keys()].map(uri => ({
+					raw: uriToFile(uri),
+					access: "write" as const,
+					field: "willRenameFiles edit",
+				})),
+				toolContext,
+			);
 			for (const [uri, bucket] of acceptedByUri) {
 				const filePath = uriToFile(uri);
 				await applyTextEdits(filePath, bucket.edits);
@@ -2517,6 +2554,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						output = "No definition found";
 						useless = true;
 					} else {
+						guardLocationReads(locations, toolContext);
 						const lines = await Promise.all(
 							locations.map(location => formatLocationWithContext(location, this.session.cwd)),
 						);
@@ -2542,6 +2580,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						output = "No type definition found";
 						useless = true;
 					} else {
+						guardLocationReads(locations, toolContext);
 						const lines = await Promise.all(
 							locations.map(location => formatLocationWithContext(location, this.session.cwd)),
 						);
@@ -2567,6 +2606,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						output = "No implementation found";
 						useless = true;
 					} else {
+						guardLocationReads(locations, toolContext);
 						const lines = await Promise.all(
 							locations.map(location => formatLocationWithContext(location, this.session.cwd)),
 						);
@@ -2607,6 +2647,9 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					} else {
 						const contextualReferences = result.slice(0, REFERENCE_CONTEXT_LIMIT);
 						const plainReferences = result.slice(REFERENCE_CONTEXT_LIMIT);
+						// Only the contextual slice is opened; the rest is rendered as
+						// bare `path:line` headers, which name no contents.
+						guardLocationReads(contextualReferences, toolContext);
 						const contextualLines = await Promise.all(
 							contextualReferences.map(location => formatLocationWithContext(location, this.session.cwd)),
 						);

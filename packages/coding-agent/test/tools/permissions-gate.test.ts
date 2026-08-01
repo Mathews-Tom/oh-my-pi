@@ -6,7 +6,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
-import { applyGuardedWorkspaceEdit } from "@oh-my-pi/pi-coding-agent/lsp";
+import { applyGuardedWorkspaceEdit, guardLocationReads } from "@oh-my-pi/pi-coding-agent/lsp";
 import { workspaceEditTargetPaths } from "@oh-my-pi/pi-coding-agent/lsp/edits";
 import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
@@ -479,6 +479,33 @@ describe("security_scan implicit surfaces", () => {
 	it("leaves both surfaces alone when no profile is active", () => {
 		const off = contextOf({ "permissions.profile": "off" });
 		expect(() => scanScope([".env"], off)).not.toThrow();
+	});
+});
+
+describe("lsp result locations", () => {
+	// `definition`/`references` are gated on the initiating `file`, but the
+	// locations that come back are the server's choice and their surrounding
+	// source lines are read and shown. Without this the rules never saw them.
+	function locations(...files: string[]) {
+		return files.map(file => ({
+			uri: `file://${path.isAbsolute(file) ? file : path.join(workspace, file)}`,
+			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+		}));
+	}
+
+	it("refuses to read context from a location the rules deny", () => {
+		expect(() => guardLocationReads(locations("src/main.ts", ".env") as never, contextOf(STRICT))).toThrow("**/.env");
+	});
+
+	it("refuses a location outside every root once reads are confined", () => {
+		const confined = contextOf({ "permissions.profile": "workspace", "permissions.confineReads": true });
+		expect(() => guardLocationReads(locations(path.join(outside, "loot.txt")) as never, confined)).toThrow(
+			"permissions.confineReads",
+		);
+	});
+
+	it("permits ordinary in-workspace locations", () => {
+		expect(() => guardLocationReads(locations("src/main.ts") as never, contextOf(STRICT))).not.toThrow();
 	});
 });
 
