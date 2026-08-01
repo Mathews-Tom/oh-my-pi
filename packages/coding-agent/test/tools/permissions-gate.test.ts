@@ -221,9 +221,43 @@ describe("read confinement", () => {
 	});
 });
 
-describe("opaque tools are not enforced by the structured gate", () => {
-	it("lets a bash call through at this commit's scope", async () => {
-		expect((await run("bash", { command: "echo hi" }, contextOf(STRICT))).calls).toHaveLength(1);
+describe("opaque tool scan", () => {
+	it("denies a bash command naming a denied path", async () => {
+		const message = await denialOf("bash", { command: "cat .env" }, contextOf(STRICT));
+		expect(message).toContain('rule "**/.env"');
+		expect(message).toContain("not a sandbox");
+		expect(message).toContain("tools.approval.bash: deny");
+	});
+
+	it("denies an unknown MCP tool naming a denied path in a nested argument", async () => {
+		const args = { params: { path: ".env" } };
+		expect(await denialOf("mcp__filesystem_read_file", args, contextOf(STRICT))).toContain("**/.env");
+	});
+
+	it("lets an ordinary bash command through", async () => {
+		expect((await run("bash", { command: "bun test src/main.ts" }, contextOf(STRICT))).calls).toHaveLength(1);
+	});
+
+	it("does not scan at all when opaqueToolScan is off", async () => {
+		const context = contextOf({ ...STRICT, "permissions.opaqueToolScan": "off" });
+		expect((await run("bash", { command: "cat .env" }, context)).calls).toHaveLength(1);
+	});
+
+	it("routes to confirmation under opaqueToolScan: prompt and keeps the rule in the message", async () => {
+		// Headless runs — subagents, RPC, ACP, `-p` — have no UI, so a required
+		// approval surfaces as the wrapper's no-interactive-UI refusal. The
+		// contract worth defending is that the message still names the rule; a
+		// generic "requires approval" tells the user nothing they can act on.
+		const context = contextOf({ ...STRICT, "permissions.opaqueToolScan": "prompt" });
+		const message = await denialOf("bash", { command: "cat .env" }, context);
+		expect(message).toContain("requires approval but no interactive UI available");
+		expect(message).toContain('rule "**/.env"');
+		expect(message).toContain("permissions.opaqueToolScan");
+	});
+
+	it("leaves the task tool unscanned so a prompt may name a secret", async () => {
+		const params = { task: "audit config", context: "never touch .env" };
+		expect((await run("task", params, contextOf(STRICT))).calls).toHaveLength(1);
 	});
 });
 
@@ -236,6 +270,10 @@ describe("fail-closed edges", () => {
 			wrapper.execute("call-1", { path: "src/main.ts" } as never, undefined, undefined, context),
 		).rejects.toThrow(/no session/);
 		expect(recorder.calls).toEqual([]);
+	});
+
+	it("scans a structured tool whose payload is not the object its schema declares", async () => {
+		expect(await denialOf("read", [".env"], contextOf(STRICT))).toContain("**/.env");
 	});
 
 	it("denies a read named with a selector suffix, which the tool would peel", async () => {

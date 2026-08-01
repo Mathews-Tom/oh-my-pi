@@ -20,6 +20,7 @@
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { loadPermissionsConfig } from "./config";
 import { decideTarget } from "./resolve";
+import { scanDenialMessage, scanOpaqueArguments } from "./scan";
 import { classifyTool } from "./tool-path-targets";
 import type { PathTarget, PermissionPolicy, PermissionRoots } from "./types";
 
@@ -116,11 +117,28 @@ export function enforceResourcePermissions(
 		);
 	}
 
-	// Opaque tools are handled by the literal scan, which lands separately.
-	if (toolClass.kind === "opaque") return null;
+	// `opaqueToolScan` decides the outcome for both the opaque class and a
+	// structured tool whose payload is not the object its schema declares.
+	const scanOutcome = (scan: "shell" | "strings"): PermissionGateResult => {
+		if (policy.opaqueToolScan === "off") return null;
+		const hit = scanOpaqueArguments(params, scan, policy, roots);
+		if (!hit) return null;
+		const message = scanDenialMessage(toolName, hit);
+		if (policy.opaqueToolScan === "prompt") return message;
+		throw new PermissionDeniedError(toolName, hit.rule, message);
+	};
+
+	if (toolClass.kind === "opaque") return scanOutcome(toolClass.scan);
 
 	const args = toArgsRecord(params);
-	if (!args) return null;
+	if (!args) {
+		// A structured tool always takes an object, so a non-object payload
+		// means the declared shape does not apply — a tool with
+		// `lenientArgValidation` reaches `execute` unvalidated. Fall through to
+		// the literal scan rather than allowing something whose declared
+		// targets cannot be read.
+		return scanOutcome("strings");
+	}
 
 	const denial = checkStructuredTargets(toolClass.extract(args), policy, roots);
 	if (denial) throw new PermissionDeniedError(toolName, denial.rule, denial.reason);
