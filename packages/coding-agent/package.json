@@ -550,6 +550,14 @@
       "types": "./src/tools/index.ts",
       "import": "./src/tools/index.ts"
     },
+    "./tools/permissions": {
+      "types": "./src/tools/permissions/index.ts",
+      "import": "./src/tools/permissions/index.ts"
+    },
+    "./tools/permissions/*": {
+      "types": "./src/tools/permissions/*.ts",
+      "import": "./src/tools/permissions/*.ts"
+    },
     "./tools/hub": {
       "types": "./src/tools/hub/index.ts",
       "import": "./src/tools/hub/index.ts"

@@ -588,13 +588,22 @@ export function confineToWorkspace(filePath: string, cwd: string): string | null
 	}
 }
 
-/** Whether `target` is a strict descendant of `root`, ignoring symlinks. */
-function isUnderRootLexical(target: string, root: string): boolean {
+/**
+ * Whether `target` sits under `root`, ignoring symlinks.
+ *
+ * `includeRoot` decides whether `root` itself counts. {@link confineToWorkspace}
+ * needs a strict descendant — it guards a download, which always names a file,
+ * never the directory — while a general path guard must accept a target that
+ * *is* a workspace root (`glob path: "."`).
+ */
+export function isUnderRootLexical(target: string, root: string, options: { includeRoot?: boolean } = {}): boolean {
 	const relative = path.relative(root, target);
-	return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+	if (!relative) return options.includeRoot === true;
+	return !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
-function tryRealpath(target: string): string | null {
+/** `fs.realpathSync.native`, or `null` when the path cannot be resolved. */
+export function tryRealpath(target: string): string | null {
 	try {
 		return fs.realpathSync.native(target);
 	} catch {
