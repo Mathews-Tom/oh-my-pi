@@ -20,13 +20,21 @@ import { Patch } from "@oh-my-pi/hashline";
 import { LSP_READONLY_ACTIONS } from "../../lsp";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
 import { unwrapHashlineHeaderPath } from "../plan-mode-guard";
+import { isExemptPathArgument } from "./resolve";
 import type { PathAccess, PathTarget } from "./types";
 
 /** Pulls the declared path arguments out of one tool call's arguments. */
 export type PathTargetExtractor = (args: Record<string, unknown>) => PathTarget[];
 
-/** Pulls the files a tool actually touched out of its result details, for the post-execution recheck. */
-export type ResultPathTargetExtractor = (details: unknown) => PathTarget[];
+/**
+ * Pulls the files a tool actually touched out of its result details, for the
+ * post-execution recheck. `args` is the declared call arguments the
+ * pre-execution gate already evaluated — needed so a result extractor can
+ * tell whether the *original* target was already exempt (e.g. `local://`)
+ * before deciding whether a resolved absolute path needs rechecking; most
+ * extractors ignore it.
+ */
+export type ResultPathTargetExtractor = (args: Record<string, unknown>, details: unknown) => PathTarget[];
 
 export type ToolPathClass =
 	| {
@@ -339,10 +347,19 @@ function extractResultFiles(details: unknown, access: PathAccess): PathTarget[] 
  *   argument, then open a different resolved path — `details.resolvedPath`
  *   is that real target in every one of those branches.
  *
+ * Skipped entirely when the *original* declared `path` was already exempt
+ * (`local://`, `memory://`, `artifact://`, …): `isExemptPathArgument` let a
+ * `read({ path: "local://plan.md" })` pass the pre-execution gate under
+ * `strict`, and it resolves to a session-artifact path outside every
+ * workspace root by design — rechecking `resolvedPath` against
+ * `confineReads` here would reject a read that already succeeded and was
+ * never meant to be confined.
+ *
  * Rechecked here so `enforcePostExecutionResourcePermissions` (`gate.ts`)
  * catches a denied file before its content ever reaches the model.
  */
-function extractReadResultTargets(details: unknown): PathTarget[] {
+function extractReadResultTargets(args: Record<string, unknown>, details: unknown): PathTarget[] {
+	if (typeof args.path === "string" && isExemptPathArgument(args.path)) return [];
 	if (!details || typeof details !== "object") return [];
 	const record = details as Record<string, unknown>;
 	const out: PathTarget[] = [];
@@ -351,22 +368,6 @@ function extractReadResultTargets(details: unknown): PathTarget[] {
 		return out;
 	}
 	pushPath(out, record.resolvedPath, "read", "resolvedPath");
-	return out;
-}
-
-/**
- * The concrete file `write` actually wrote, from its own result
- * `details.resolvedPath`. Mirrors {@link extractReadResultTargets}'s
- * archive/SQLite case: `write({ path: "safe.zip:entry" })` authorizes the
- * logical `safe.zip:entry` spelling, but `#writeArchiveEntry`/`#writeSqliteRow`
- * realpath and mutate the archive/database's real backing file — which can
- * differ from the logical path's own containment when the archive itself is
- * a symlink pointing outside every workspace root.
- */
-function extractWriteResultTarget(details: unknown): PathTarget[] {
-	if (!details || typeof details !== "object") return [];
-	const out: PathTarget[] = [];
-	pushPath(out, (details as Record<string, unknown>).resolvedPath, "write", "resolvedPath");
 	return out;
 }
 
@@ -384,22 +385,18 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 		extract: singlePath("path", "read"),
 		resultTargets: extractReadResultTargets,
 	},
-	write: {
-		kind: "structured",
-		extract: writePath("path"),
-		resultTargets: extractWriteResultTarget,
-	},
+	write: { kind: "structured", extract: writePath("path") },
 	edit: { kind: "structured", extract: extractEditPaths },
 	glob: { kind: "structured", extract: delimitedPath("path", "read") },
 	grep: {
 		kind: "structured",
 		extract: delimitedPath("path", "read"),
-		resultTargets: details => extractResultFiles(details, "read"),
+		resultTargets: (_args, details) => extractResultFiles(details, "read"),
 	},
 	ast_grep: {
 		kind: "structured",
 		extract: delimitedPath("path", "read"),
-		resultTargets: details => extractResultFiles(details, "read"),
+		resultTargets: (_args, details) => extractResultFiles(details, "read"),
 	},
 	ast_edit: {
 		kind: "structured",
@@ -413,7 +410,10 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 		// so a touched file must clear `deny.read` as well as `deny.write`, not
 		// just the latter, or a read-denied source can still reach the model
 		// through the diff preview even though the eventual write is blocked.
-		resultTargets: details => [...extractResultFiles(details, "read"), ...extractResultFiles(details, "write")],
+		resultTargets: (_args, details) => [
+			...extractResultFiles(details, "read"),
+			...extractResultFiles(details, "write"),
+		],
 	},
 	lsp: { kind: "structured", extract: extractLspPaths },
 	debug: { kind: "structured", extract: extractDebugPaths },

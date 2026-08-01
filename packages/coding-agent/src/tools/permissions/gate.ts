@@ -163,6 +163,7 @@ export function enforceResourcePermissions(
  */
 export function enforcePostExecutionResourcePermissions(
 	toolName: string,
+	params: unknown,
 	details: unknown,
 	context: AgentToolContext | undefined,
 ): void {
@@ -183,6 +184,6 @@ export function enforcePostExecutionResourcePermissions(
 		);
 	}
 
-	const denial = checkStructuredTargets(toolClass.resultTargets(details), policy, roots);
+	const denial = checkStructuredTargets(toolClass.resultTargets(toArgsRecord(params) ?? {}, details), policy, roots);
 	if (denial) throw new PermissionDeniedError(toolName, denial.rule, denial.reason);
 }

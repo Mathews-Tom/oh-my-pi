@@ -633,6 +633,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	async #writeArchiveEntry(
 		content: string,
 		resolvedArchivePath: ResolvedArchiveWritePath,
+		context: AgentToolContext | undefined,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		// Resolve symlinks before the tmp+rename swap: renaming over a symlink
 		// replaces the link itself with a regular file instead of writing
@@ -640,6 +641,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const finalPath = resolvedArchivePath.exists
 			? await fs.realpath(resolvedArchivePath.absolutePath).catch(() => resolvedArchivePath.absolutePath)
 			: resolvedArchivePath.absolutePath;
+		// `write({ path: "safe.zip:entry" })` authorizes the logical
+		// `safe.zip:entry` spelling through the pre-execution gate, but a
+		// symlinked archive can realpath to a target outside every workspace
+		// root — authorize the real backing file here, before any archive
+		// I/O, not after (a post-execution recheck would run after the
+		// rewrite already landed).
+		this.#assertResolvedWriteAllowed(finalPath, context);
 		// A realpath swap can land on a name without an archive extension; a
 		// whole-archive rewrite then defaults to an uncompressed tar, matching the
 		// previous `isZip`/`isGzip`/else fallthrough.
@@ -744,6 +752,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		displayPath: string,
 		content: string,
 		resolvedSqlitePath: ResolvedSqliteWritePath,
+		context: AgentToolContext | undefined,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		let db: Database | null = null;
 		try {
@@ -751,6 +760,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				throw new ToolError(`SQLite database '${displayPath}' not found`);
 			}
 
+			// `write({ path: "db.sqlite:table:key" })` authorizes the logical
+			// compound spelling through the pre-execution gate; authorize the
+			// real backing database file here too, before opening it, not after
+			// a post-execution recheck would run once the row is already mutated.
+			this.#assertResolvedWriteAllowed(resolvedSqlitePath.absolutePath, context);
 			db = new Database(resolvedSqlitePath.absolutePath, { create: false, strict: true });
 			db.run("PRAGMA busy_timeout = 3000");
 
@@ -819,14 +833,19 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	}
 
 	/**
-	 * Authorize a conflict entry's *real* filesystem target as a write.
-	 * `path: "conflict://<id>"` (or `conflict://*`) is what the pre-execution
-	 * gate sees and resolves as a synthetic URI, not a real path — it names
-	 * nothing the deny/allow globs or confinement can act on. The actual
-	 * target only becomes known once the registered entry is looked up, so
-	 * this runs the same policy against `entry.absolutePath` here instead.
+	 * Authorize a resolved filesystem target as a write, for a call whose
+	 * declared `path` names something other than the real backing file: a
+	 * conflict entry (`path: "conflict://<id>"` resolves through the
+	 * pre-execution gate as the synthetic URI, not `entry.absolutePath`),
+	 * or an archive/SQLite compound path (`safe.zip:entry` authorizes the
+	 * logical spelling, but the real mutation lands on the archive/database's
+	 * resolved backing file, which can differ from the logical path's own
+	 * containment when the archive itself is a symlink pointing outside
+	 * every workspace root). Must run *before* the mutation, not after —
+	 * unlike a post-execution content-exposure recheck, a write's damage is
+	 * already done by the time a post-hoc check could throw.
 	 */
-	#assertConflictWriteAllowed(absolutePath: string, context: AgentToolContext | undefined): void {
+	#assertResolvedWriteAllowed(absolutePath: string, context: AgentToolContext | undefined): void {
 		const policy = loadPermissionsConfig(context?.settings);
 		if (!policy) return;
 		const roots = permissionRoots(context);
@@ -872,7 +891,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		// the synthetic URI string, not the registered entry's real
 		// filesystem target — authorize the actual target here, where it is
 		// known.
-		this.#assertConflictWriteAllowed(absolutePath, context);
+		this.#assertResolvedWriteAllowed(absolutePath, context);
 
 		const expanded = expandContentTokens(replacementContent, entry);
 		const originalText = await Bun.file(absolutePath).text();
@@ -1019,7 +1038,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			// synthetic URI, not the real per-file targets it splices — authorize
 			// each one here, where the registered entries' real paths are known.
 			try {
-				this.#assertConflictWriteAllowed(absolutePath, context);
+				this.#assertResolvedWriteAllowed(absolutePath, context);
 			} catch (error) {
 				failedFiles.push({
 					displayPath: sample.displayPath,
@@ -1270,7 +1289,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					}`,
 					resolvedArchivePath.absolutePath,
 				);
-				const archiveResult = await this.#writeArchiveEntry(cleanContent, resolvedArchivePath);
+				const archiveResult = await this.#writeArchiveEntry(cleanContent, resolvedArchivePath, context);
 				if (stripped) {
 					const firstText = archiveResult.content.find(
 						(block): block is { type: "text"; text: string } =>
@@ -1288,7 +1307,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update" });
 
 				emitWriteProgress(onUpdate, cleanContent, path, resolvedSqlitePath.absolutePath);
-				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath);
+				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath, context);
 				if (stripped) {
 					const firstText = sqliteResult.content.find(
 						(block): block is { type: "text"; text: string } =>

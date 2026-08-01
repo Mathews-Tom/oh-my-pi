@@ -393,7 +393,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// output, it propagates and blocks the call exactly as a synchronous
 		// permission denial would have.
 		if (!executionError) {
-			enforcePostExecutionResourcePermissions(this.tool.name, result.details, context);
+			enforcePostExecutionResourcePermissions(this.tool.name, effectiveParams, result.details, context);
 		}
 
 		// Emit tool_result event - extensions can modify the result and error status
