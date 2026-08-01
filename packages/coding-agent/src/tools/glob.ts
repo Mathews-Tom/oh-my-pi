@@ -29,6 +29,7 @@ import {
 	resolveToCwd,
 	toPathList,
 } from "./path-utils";
+import { decideTarget, loadPermissionsConfig, permissionRoots } from "./permissions";
 import {
 	createCachedComponent,
 	formatCount,
@@ -146,9 +147,30 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 		params: typeof findSchema.infer,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<GlobToolDetails>,
-		_context?: AgentToolContext,
+		context?: AgentToolContext,
 	): Promise<AgentToolResult<GlobToolDetails>> {
 		const { path: pathInput, limit, hidden, gitignore } = params;
+
+		// `glob` accepts a scope root but recurses beneath it, so the
+		// pre-execution gate (declared `path` argument only) cannot see the
+		// individual files a recursive walk actually returns. Filter every
+		// match — both the streamed preview and the final list — against the
+		// same policy, dropping (not failing the whole call on) a denied
+		// entry: unlike `grep`, a filename alone carries no file content, so
+		// omitting it is proportionate. `permissionsPolicy` is `null` under
+		// `permissions.profile: off`, so this is a single no-op settings read
+		// in the default configuration.
+		const permissionsPolicy = loadPermissionsConfig(context?.settings);
+		const permissionsRoots = permissionsPolicy ? permissionRoots(context) : null;
+		const isPathDenied = (relativePath: string): boolean => {
+			if (!permissionsPolicy) return false;
+			// An active profile with no resolvable session roots fails closed.
+			if (!permissionsRoots) return true;
+			return (
+				decideTarget({ raw: relativePath, access: "read", field: "path" }, permissionsPolicy, permissionsRoots)
+					.kind === "deny"
+			);
+		};
 
 		return untilAborted(signal, async () => {
 			const formatScopePath = (targetPath: string): string => formatPathRelativeToCwd(targetPath, this.session.cwd);
@@ -353,7 +375,9 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 							ignore: ["**/node_modules/**", "**/.git/**"],
 							limit: effectiveLimit,
 						});
-						return results.map(matchPath => formatMatchPath(matchPath, target.searchPath));
+						return results
+							.map(matchPath => formatMatchPath(matchPath, target.searchPath))
+							.filter(entry => !isPathDenied(entry));
 					}),
 				);
 				const seen = new Set<string>();
@@ -394,7 +418,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 				(err: Error | null, match: natives.GlobMatch | null): void => {
 					if (err || combinedSignal.aborted || !match?.path) return;
 					const relativePath = formatMatchPath(match.path, base, match.fileType);
-					if (streamed.has(relativePath)) return;
+					if (streamed.has(relativePath) || isPathDenied(relativePath)) return;
 					streamed.add(relativePath);
 					onUpdateMatches.push(relativePath);
 					onUpdateMtimes.push(match.mtime ?? 0);
@@ -447,10 +471,9 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 					const out: Array<{ path: string; mtime: number }> = [];
 					for (const match of result.matches) {
 						if (!match.path) continue;
-						out.push({
-							path: formatMatchPath(match.path, target.searchPath, match.fileType),
-							mtime: match.mtime ?? 0,
-						});
+						const formatted = formatMatchPath(match.path, target.searchPath, match.fileType);
+						if (isPathDenied(formatted)) continue;
+						out.push({ path: formatted, mtime: match.mtime ?? 0 });
 					}
 					return out;
 				} catch (error) {
