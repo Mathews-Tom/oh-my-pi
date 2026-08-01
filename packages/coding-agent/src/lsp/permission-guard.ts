@@ -19,7 +19,7 @@ import { checkStructuredTargets, PermissionDeniedError, permissionRoots } from "
 import { decideTarget } from "../tools/permissions/resolve";
 import { scanDenialMessage, scanOpaqueArguments } from "../tools/permissions/scan";
 import type { PathTarget, PermissionRoots } from "../tools/permissions/types";
-import type { Command, Location, WorkspaceEdit } from "./types";
+import type { Command, Location, SymbolInformation, WorkspaceEdit } from "./types";
 import { uriToFile } from "./utils";
 
 function collectWorkspaceEditUris(edit: WorkspaceEdit): string[] {
@@ -151,6 +151,32 @@ export function filterAuthorizedLocations(
 		location =>
 			decideTarget({ raw: uriToFile(location.uri), access: "read", field: "location" }, policy, roots).kind !==
 			"deny",
+	);
+}
+
+/**
+ * Filter workspace-symbol (`action: "symbols"` with `file: "*"` or omitted)
+ * results down to ones the resource permission policy allows reading. The
+ * declared `file`/`*` argument is checked before the request goes out, but
+ * `workspace/symbol` returns server-provided symbols from arbitrary files
+ * across the project - `formatSymbolInformation` surfaces each result's
+ * `location.uri`, so a symbol defined in a file matching
+ * `permissions.deny.read` (e.g. `private.ts`) would otherwise be surfaced
+ * despite the read rule. Filtered rather than denying the whole call,
+ * matching {@link filterAuthorizedLocations}.
+ */
+export function filterAuthorizedSymbols(
+	symbols: readonly SymbolInformation[],
+	context: AgentToolContext | undefined,
+	toolName: string,
+): SymbolInformation[] {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy) return [...symbols];
+	const roots = requireRootsOrDeny(toolName, policy.profile, permissionRoots(context));
+	return symbols.filter(
+		symbol =>
+			decideTarget({ raw: uriToFile(symbol.location.uri), access: "read", field: "location" }, policy, roots)
+				.kind !== "deny",
 	);
 }
 

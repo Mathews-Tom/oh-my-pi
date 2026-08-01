@@ -84,6 +84,19 @@ describe("string scan", () => {
 	});
 });
 
+describe("Windows path normalization", () => {
+	// Simulates the Windows spelling of a directory-scoped deny rule's target
+	// without needing an actual Windows runner: a POSIX filename may itself
+	// contain a literal backslash, so `sub\.ssh\config` here is exactly the
+	// same bytes the literal would carry on Windows (and what `path.relative`
+	// would emit there too) - before normalizing every candidate to `/`, this
+	// never matched `**/.ssh/**` because `Bun.Glob` never treated `\` as a
+	// path separator.
+	it("normalizes a backslash-separated literal before glob matching", () => {
+		expect(scanOpaqueArguments({ code: "sub\\.ssh\\config" }, "strings", STRICT, roots)?.rule).toBe("**/.ssh/**");
+	});
+});
+
 describe("policy interaction", () => {
 	it("honours an allow carve-out", () => {
 		const relaxed = buildPermissionPolicy("strict", { allowRead: ["**/.env"], allowWrite: ["**/.env"] });

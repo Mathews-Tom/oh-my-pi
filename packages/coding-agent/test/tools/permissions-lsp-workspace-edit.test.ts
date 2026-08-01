@@ -10,8 +10,9 @@ import {
 	assertWorkspaceDiagnosticsAllowed,
 	assertWorkspaceEditAllowed,
 	filterAuthorizedLocations,
+	filterAuthorizedSymbols,
 } from "@oh-my-pi/pi-coding-agent/lsp/permission-guard";
-import type { Command, Location, WorkspaceEdit } from "@oh-my-pi/pi-coding-agent/lsp/types";
+import type { Command, Location, SymbolInformation, WorkspaceEdit } from "@oh-my-pi/pi-coding-agent/lsp/types";
 import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { PermissionDeniedError } from "@oh-my-pi/pi-coding-agent/tools/permissions";
 
@@ -210,6 +211,38 @@ describe("filterAuthorizedLocations", () => {
 	it("no-ops entirely under permissions.profile: off", () => {
 		const locations = [loc(".env")];
 		const filtered = filterAuthorizedLocations(locations, contextOf({ "permissions.profile": "off" }), "lsp");
+		expect(filtered).toHaveLength(1);
+	});
+});
+
+describe("filterAuthorizedSymbols", () => {
+	function symbolAt(...segments: string[]): SymbolInformation {
+		return {
+			name: "example",
+			kind: 12,
+			location: {
+				uri: fileUri(...segments),
+				range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+			},
+		};
+	}
+
+	it("drops a workspace-symbol result whose file matches a deny rule", () => {
+		const symbols = [symbolAt("src", "main.ts"), symbolAt("private.ts")];
+		const context = contextOf({ ...WORKSPACE, "permissions.deny.read": ["**/private.ts"] });
+		const filtered = filterAuthorizedSymbols(symbols, context, "lsp");
+		expect(filtered.map(s => s.location.uri)).toEqual([fileUri("src", "main.ts")]);
+	});
+
+	it("keeps every symbol when none is denied", () => {
+		const symbols = [symbolAt("src", "main.ts"), symbolAt("src", "other.ts")];
+		const filtered = filterAuthorizedSymbols(symbols, contextOf(STRICT), "lsp");
+		expect(filtered).toHaveLength(2);
+	});
+
+	it("no-ops entirely under permissions.profile: off", () => {
+		const symbols = [symbolAt(".env")];
+		const filtered = filterAuthorizedSymbols(symbols, contextOf({ "permissions.profile": "off" }), "lsp");
 		expect(filtered).toHaveLength(1);
 	});
 });

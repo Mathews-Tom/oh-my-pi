@@ -155,7 +155,14 @@ export function scanOpaqueArguments(
 		if (!absolute) continue;
 
 		const relatives = relativeToRoots(absolute, rootList);
-		const candidates = [...relatives, absolute, path.basename(absolute), literal];
+		// Same normalization `decidePathTarget` applies (`resolve.ts`) - permission
+		// globs are written with `/`, but `path.relative`/an absolute path (and
+		// the literal itself, when it is a Windows-spelled path the caller typed
+		// verbatim, e.g. `C:\Users\me\.ssh\config`) use `\` on Windows, which
+		// `Bun.Glob` treats as a distinct, non-equivalent character.
+		const candidates = [...relatives, absolute, path.basename(absolute), literal].map(candidate =>
+			candidate.replaceAll("\\", "/"),
+		);
 
 		for (const access of ["read", "write"] as const) {
 			if (matchGlob(policy.allow[access], candidates)) continue;

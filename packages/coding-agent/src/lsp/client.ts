@@ -729,7 +729,14 @@ export async function getOrCreateClient(
 	const existingClient = clients.get(key);
 	if (existingClient) {
 		existingClient.lastActivity = Date.now();
-		existingClient.permissionsContext = context;
+		// A caller that omits `context` (an internal helper call, not a direct
+		// tool dispatch) must not clear an already-stamped context - a server
+		// push arriving right after such a call would then reach
+		// `assertWorkspaceEditAllowed` with `undefined`, which treats
+		// permissions as off and applies the edit unchecked. Only a caller
+		// that actually supplies a context updates the stamp; every call site
+		// that dispatches on behalf of a tool call is expected to pass its own.
+		if (context !== undefined) existingClient.permissionsContext = context;
 		return existingClient;
 	}
 

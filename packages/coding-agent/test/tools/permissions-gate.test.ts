@@ -154,6 +154,28 @@ describe("profile strict", () => {
 		expect(message).toContain("**/.env");
 	});
 
+	it("denies updating an existing file under a deny.read rule with no matching deny.write rule", async () => {
+		// `edit`'s update/delete ops read the target's current content to
+		// compute the diff and surface it in the result - a `deny.read`-only
+		// rule must still block them, even though nothing denies `write`.
+		const context = contextOf({ ...WORKSPACE, "permissions.deny.read": ["**/private.ts"] });
+		const message = await denialOf(
+			"edit",
+			{ path: "src/private.ts", edits: [{ old_text: "a", new_text: "b" }] },
+			context,
+		);
+		expect(message).toContain('resource permission rule "**/private.ts"');
+	});
+
+	it("still allows a pure create under a deny.read rule with no matching deny.write rule", async () => {
+		// An `op: "create"` edit never reads pre-existing content - it should
+		// clear a read-only deny rule that a same-named update would not.
+		const context = contextOf({ ...WORKSPACE, "permissions.deny.read": ["**/private.ts"] });
+		expect(
+			(await run("edit", { path: "src/private.ts", edits: [{ op: "create", diff: "+new" }] }, context)).calls,
+		).toHaveLength(1);
+	});
+
 	it("still runs ordinary workspace calls", async () => {
 		expect((await run("read", { path: "src/main.ts" }, contextOf(STRICT))).calls).toHaveLength(1);
 	});

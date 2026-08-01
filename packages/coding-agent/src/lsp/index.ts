@@ -54,6 +54,7 @@ import {
 	assertWorkspaceDiagnosticsAllowed,
 	assertWorkspaceEditAllowed,
 	filterAuthorizedLocations,
+	filterAuthorizedSymbols,
 } from "./permission-guard";
 import {
 	type CodeAction,
@@ -2373,12 +2374,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			for (const [workspaceServerName, workspaceServerConfig] of servers) {
 				throwIfAborted(signal);
 				try {
-					const workspaceClient = await getOrCreateClient(
-						workspaceServerConfig,
-						this.session.cwd,
-						undefined,
-						signal,
-					);
+					const workspaceClient = await this.#resolveClient(workspaceServerConfig, undefined, signal, context);
 					const workspaceResult = (await sendRequest(
 						workspaceClient,
 						"workspace/symbol",
@@ -2396,7 +2392,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					}
 				}
 			}
-			const dedupedSymbols = dedupeWorkspaceSymbols(aggregatedSymbols);
+			const dedupedSymbols = filterAuthorizedSymbols(dedupeWorkspaceSymbols(aggregatedSymbols), context, this.name);
 			if (dedupedSymbols.length === 0) {
 				return {
 					content: [{ type: "text", text: `No symbols matching "${normalizedQuery}"` }],
@@ -2450,12 +2446,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				throwIfAborted(signal);
 				clearInitializationFailure(workspaceServerConfig, this.session.cwd);
 				try {
-					const workspaceClient = await getOrCreateClient(
-						workspaceServerConfig,
-						this.session.cwd,
-						undefined,
-						signal,
-					);
+					const workspaceClient = await this.#resolveClient(workspaceServerConfig, undefined, signal, context);
 					outputs.push(await reloadServer(workspaceClient, workspaceServerName, signal));
 				} catch (err) {
 					if (err instanceof ToolAbortError || signal?.aborted) {

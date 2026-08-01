@@ -85,7 +85,8 @@ function delimitedPath(field: string, access: PathAccess): PathTargetExtractor {
 	};
 }
 
-const APPLY_PATCH_FILE_RE = /^\*\*\* (?:Add|Delete|Update) File: (.+)$/;
+const APPLY_PATCH_ADD_FILE_RE = /^\*\*\* Add File: (.+)$/;
+const APPLY_PATCH_EXISTING_FILE_RE = /^\*\*\* (?:Delete|Update) File: (.+)$/;
 const APPLY_PATCH_MOVE_RE = /^\*\*\* Move to: (.+)$/;
 // `MV DEST` is hashline's file-level move op (`HL_MOVE_KEYWORD`,
 // `packages/hashline/src/format.ts`): the section's final content is written at
@@ -105,10 +106,10 @@ function stripQuotes(value: string): string {
  * Paths embedded in an `edit` payload that has no top-level `path`.
  *
  * The hashline and `apply_patch` modes carry their targets inside `input`, as
- * `[path#TAG]` section headers, `MV DEST` move ops, and
- * `*** Update File: path` markers. All three are strict, line-anchored
- * grammars and a mode cannot touch a file it does not name, so extracting them
- * is sound rather than best-effort.
+ * `[path#TAG]` section headers, `MV DEST` move ops, and `*** Add/Delete/Update
+ * File: path` markers. All three are strict, line-anchored grammars and a
+ * mode cannot touch a file it does not name, so extracting them is sound
+ * rather than best-effort.
  *
  * Section headers are parsed with `Patch.parse` — the same splitter
  * `Patcher.apply` uses — rather than a hand-rolled `[.+]` regex, so a
@@ -124,7 +125,15 @@ export function extractEmbeddedEditPaths(input: string): PathTarget[] {
 	const out: PathTarget[] = [];
 	try {
 		for (const section of Patch.parse(input).sections) {
+			// A hashline section header always carries a `fileHash` snapshot tag
+			// (`assertSectionHashPresent` in `@oh-my-pi/hashline`'s patcher rejects
+			// a section without one), which can only have come from a prior read
+			// of that exact file - hashline has no "create a new file" op, unlike
+			// `apply_patch`'s `*** Add File`. Every section therefore reads the
+			// file's existing content (and can surface it back through a mismatch
+			// error or the applied diff), so it needs `read` in addition to `write`.
 			pushPath(out, section.path, "write", "input");
+			pushPath(out, section.path, "read", "input");
 		}
 	} catch {
 		// Not hashline-shaped input, or a section body parse error the real
@@ -133,13 +142,29 @@ export function extractEmbeddedEditPaths(input: string): PathTarget[] {
 	for (const line of input.split("\n")) {
 		const trimmed = line.trim();
 		if (!trimmed) continue;
-		const applyPatch = APPLY_PATCH_FILE_RE.exec(trimmed) ?? APPLY_PATCH_MOVE_RE.exec(trimmed);
-		if (applyPatch) {
-			pushPath(out, applyPatch[1], "write", "input");
+		// `*** Add File` creates a file with no pre-existing content to read -
+		// write-only. `*** Update File` and `*** Delete File` both read the
+		// current file (`modes/patch.ts` populates `oldContent` for either) and
+		// can surface it back through the diff or a context-mismatch error, so
+		// both need `read` too.
+		const addFile = APPLY_PATCH_ADD_FILE_RE.exec(trimmed);
+		if (addFile) {
+			pushPath(out, addFile[1], "write", "input");
 			continue;
 		}
-		const move = HASHLINE_MOVE_RE.exec(trimmed);
-		if (move) pushPath(out, stripQuotes(move[1]), "write", "input");
+		const existingFile = APPLY_PATCH_EXISTING_FILE_RE.exec(trimmed);
+		if (existingFile) {
+			pushPath(out, existingFile[1], "write", "input");
+			pushPath(out, existingFile[1], "read", "input");
+			continue;
+		}
+		const move = APPLY_PATCH_MOVE_RE.exec(trimmed);
+		if (move) {
+			pushPath(out, move[1], "write", "input");
+			continue;
+		}
+		const hashlineMove = HASHLINE_MOVE_RE.exec(trimmed);
+		if (hashlineMove) pushPath(out, stripQuotes(hashlineMove[1]), "write", "input");
 	}
 	return out;
 }
@@ -147,7 +172,23 @@ export function extractEmbeddedEditPaths(input: string): PathTarget[] {
 const extractEditPaths: PathTargetExtractor = args => {
 	const out: PathTarget[] = [];
 	// patch/replace modes: one top-level target plus per-edit rename destinations.
+	//
+	// `edits[]` entries carry an optional `op` (JSON `patch` mode only;
+	// `replace` mode entries never set one, and an omitted `op` on a `patch`
+	// entry defaults to "update" - see `modes/patch.ts`'s `rawOp === "create"
+	// || rawOp === "delete" ? rawOp : "update"`). Only when every entry is an
+	// explicit `op: "create"` does the call need no pre-existing content: a
+	// "create" edit's result never includes `oldContent` (`modes/patch.ts`:
+	// `oldText = result.change.type !== "create" ? result.change.oldContent :
+	// undefined`), but "update" and "delete" both read the file and surface
+	// its prior content through the returned diff - so a `deny.read` rule
+	// with no matching `deny.write` must still block them.
+	const edits = Array.isArray(args.edits) ? args.edits : [];
+	const pureCreate =
+		edits.length > 0 &&
+		edits.every(edit => edit && typeof edit === "object" && (edit as Record<string, unknown>).op === "create");
 	pushPath(out, args.path, "write", "path");
+	if (!pureCreate) pushPath(out, args.path, "read", "path");
 	if (Array.isArray(args.edits)) {
 		for (const edit of args.edits) {
 			if (edit && typeof edit === "object") {
