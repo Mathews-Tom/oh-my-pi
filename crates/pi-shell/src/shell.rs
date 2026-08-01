@@ -3782,6 +3782,11 @@ impl KillSignal {
 impl builtins::Command for KillCommand {
 	type Error = brush_core::Error;
 
+	#[allow(unknown_lints, reason = "unused_async_trait_impl is unknown to the pinned CI nightly")]
+	#[allow(
+		clippy::unused_async_trait_impl,
+		reason = "the builtin Command trait declares execute as async"
+	)]
 	async fn execute<SE: brush_core::ShellExtensions>(
 		&self,
 		context: ExecutionContext<'_, SE>,
