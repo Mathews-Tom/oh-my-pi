@@ -19,7 +19,7 @@ import { checkStructuredTargets, PermissionDeniedError, permissionRoots } from "
 import { decideTarget } from "../tools/permissions/resolve";
 import { scanDenialMessage, scanOpaqueArguments } from "../tools/permissions/scan";
 import type { PathTarget, PermissionRoots } from "../tools/permissions/types";
-import type { Command, Location, SymbolInformation, WorkspaceEdit } from "./types";
+import type { Command, DocumentChange, Location, SymbolInformation, TextEdit, WorkspaceEdit } from "./types";
 import { uriToFile } from "./utils";
 
 function collectWorkspaceEditUris(edit: WorkspaceEdit): string[] {
@@ -178,6 +178,53 @@ export function filterAuthorizedSymbols(
 			decideTarget({ raw: uriToFile(symbol.location.uri), access: "read", field: "location" }, policy, roots)
 				.kind !== "deny",
 	);
+}
+
+/**
+ * Filter a server-returned `WorkspaceEdit`'s entries down to ones the
+ * resource permission policy allows reading, for use only when
+ * *previewing* (`apply: false`) rather than applying it. `formatWorkspaceEdit`
+ * renders every entry's path directly into the model-visible output, so a
+ * `rename`/`rename_file` preview would otherwise expose a path matching
+ * `permissions.deny.read` even though {@link assertWorkspaceEditAllowed}
+ * blocks the same edit from actually being applied. Filtered rather than
+ * denying the whole preview, matching {@link filterAuthorizedLocations}. A
+ * `rename`/`create`/`delete` resource op is dropped unless every URI it
+ * names is allowed, since a partial preview of a paired rename would
+ * misrepresent what applying it does.
+ */
+export function filterAuthorizedWorkspaceEditForPreview(
+	edit: WorkspaceEdit,
+	context: AgentToolContext | undefined,
+	toolName: string,
+): WorkspaceEdit {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy) return edit;
+	const roots = requireRootsOrDeny(toolName, policy.profile, permissionRoots(context));
+	const isAllowed = (uri: string): boolean =>
+		decideTarget({ raw: uriToFile(uri), access: "read", field: "workspaceEdit" }, policy, roots).kind !== "deny";
+
+	const filtered: WorkspaceEdit = {};
+	if (edit.changes) {
+		const changes: Record<string, TextEdit[]> = {};
+		for (const [uri, edits] of Object.entries(edit.changes)) {
+			if (isAllowed(uri)) changes[uri] = edits;
+		}
+		filtered.changes = changes;
+	}
+	if (edit.documentChanges) {
+		filtered.documentChanges = edit.documentChanges.filter((change: DocumentChange) => {
+			if ("textDocument" in change && change.textDocument) return isAllowed(change.textDocument.uri);
+			if ("kind" in change && change.kind) {
+				if (change.kind === "create") return isAllowed(change.uri);
+				if (change.kind === "rename") return isAllowed(change.oldUri) && isAllowed(change.newUri);
+				if (change.kind === "delete") return isAllowed(change.uri);
+			}
+			return true;
+		});
+	}
+	if (edit.changeAnnotations) filtered.changeAnnotations = edit.changeAnnotations;
+	return filtered;
 }
 
 /**

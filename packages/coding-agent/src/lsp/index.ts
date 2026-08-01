@@ -14,6 +14,7 @@ import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { truncateForPrompt } from "../tools/approval";
 import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
+import { loadPermissionsConfig } from "../tools/permissions/config";
 import { PermissionDeniedError } from "../tools/permissions/gate";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
@@ -55,6 +56,7 @@ import {
 	assertWorkspaceEditAllowed,
 	filterAuthorizedLocations,
 	filterAuthorizedSymbols,
+	filterAuthorizedWorkspaceEditForPreview,
 } from "./permission-guard";
 import {
 	type CodeAction,
@@ -176,10 +178,30 @@ export async function warmupLspServers(cwd: string, options?: LspWarmupOptions):
 		options.onConnecting(lspServers.map(([name]) => name));
 	}
 
+	// A read-restricting permissions policy (deny.read rules or
+	// confineReads) means a project-aware server (tsserver, rust-analyzer,
+	// …) must not be eagerly started here: initializing it indexes the
+	// whole project — including files a deny rule or confinement would
+	// refuse to `read` — via project references before any gated `lsp`
+	// call has a chance to check anything. Fails closed the same way
+	// `assertWorkspaceDiagnosticsAllowed` does for workspace-wide
+	// diagnostics; the server still starts lazily on its first real
+	// (permission-gated) tool call, just not during warmup.
+	const warmupPolicy = loadPermissionsConfig(options?.context?.settings);
+	const readsRestricted = !!warmupPolicy && (warmupPolicy.deny.read.length > 0 || warmupPolicy.confineReads);
+
 	// Start all detected servers in parallel with a short timeout
 	// Servers that don't respond quickly will be initialized lazily on first use
 	const results = await Promise.allSettled(
 		lspServers.map(async ([name, serverConfig]) => {
+			if (readsRestricted && isProjectAwareLspServer(serverConfig)) {
+				throw new Error(
+					"Warmup skipped: a resource permission policy with active read restrictions " +
+						"(permissions.deny.read or permissions.confineReads) is set, and this project-aware server " +
+						"would index the whole project before any gated read. It starts lazily on its first " +
+						"authorized `lsp` call instead.",
+				);
+			}
 			// Passed through to getOrCreateClient so a brand-new client's
 			// permissionsContext is set before its message reader starts —
 			// see the parameter doc on getOrCreateClient. A post-hoc
@@ -2039,7 +2061,8 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					lines.push("  No LSP edits would be applied");
 				} else {
 					for (const { serverName, edit } of perServerEdits) {
-						const edits = formatWorkspaceEdit(edit, this.session.cwd);
+						const previewEdit = filterAuthorizedWorkspaceEditForPreview(edit, context, this.name);
+						const edits = formatWorkspaceEdit(previewEdit, this.session.cwd);
 						if (edits.length === 0) continue;
 						lines.push(`  ${serverName}:`);
 						for (const e of edits) {
@@ -2824,7 +2847,8 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							const applied = await applyWorkspaceEdit(result, this.session.cwd);
 							output = `Applied rename:\n${applied.map(a => `  ${a}`).join("\n")}`;
 						} else {
-							const preview = formatWorkspaceEdit(result, this.session.cwd);
+							const previewResult = filterAuthorizedWorkspaceEditForPreview(result, context, this.name);
+							const preview = formatWorkspaceEdit(previewResult, this.session.cwd);
 							output = `Rename preview:\n${preview.map(p => `  ${p}`).join("\n")}`;
 						}
 					}

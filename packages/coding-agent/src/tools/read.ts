@@ -112,6 +112,7 @@ import {
 	splitPathAndSel,
 	splitPathAndSelPreferringLiteral,
 } from "./path-utils";
+import { decideTarget, loadPermissionsConfig, PermissionDeniedError, permissionRoots } from "./permissions";
 import { formatBytes, replaceTabs, shortenPath, wrapBrackets } from "./render-utils";
 import { REPORT_ISSUE_DEVICE_NAME, reportIssueDeviceUsage } from "./report-tool-issue";
 import { isResolutionDeviceName, resolutionDeviceUsage } from "./resolve";
@@ -2247,7 +2248,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		params: ReadParams,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<ReadToolDetails>,
-		_toolContext?: AgentToolContext,
+		toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		let { path: readPath } = params;
 		if (readPath.startsWith("file://")) {
@@ -2261,7 +2262,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					"Reading `conflict://*` is not supported — wildcards are write-only. Use the `<path>:conflicts` read selector for the full list of conflicts in a file, or read `conflict://<N>` to inspect a single block.",
 				);
 			}
-			return this.#readConflictRegion(conflictUri.id, conflictUri.scope);
+			return this.#readConflictRegion(conflictUri.id, conflictUri.scope, toolContext);
 		}
 		const displayMode = resolveFileDisplayMode(this.session);
 
@@ -2988,18 +2989,55 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	}
 
 	/**
+	 * Authorize a conflict entry's *real* filesystem target as a read.
+	 * `path: "conflict://<id>"` is what the pre-execution gate sees and
+	 * resolves as a synthetic URI, not a real path — it names nothing the
+	 * deny/allow globs or confinement can act on. The actual target only
+	 * becomes known once the registered entry is looked up, so this runs
+	 * the same policy against `entry.absolutePath` here instead, mirroring
+	 * `WriteTool#assertConflictWriteAllowed`.
+	 */
+	#assertConflictReadAllowed(absolutePath: string, context: AgentToolContext | undefined): void {
+		const policy = loadPermissionsConfig(context?.settings);
+		if (!policy) return;
+		const roots = permissionRoots(context);
+		if (!roots) {
+			throw new PermissionDeniedError(
+				"read",
+				"permissions.profile",
+				`Tool "read" is blocked: permissions.profile is "${policy.profile}" but this call has no session, ` +
+					`so the workspace roots the rules are measured against cannot be determined.\n` +
+					`To allow it: set permissions.profile: off.`,
+			);
+		}
+		const decision = decideTarget({ raw: absolutePath, access: "read", field: "path" }, policy, roots);
+		if (decision.kind === "deny") {
+			throw new PermissionDeniedError("read", decision.rule, decision.reason);
+		}
+	}
+
+	/**
 	 * Render a `conflict://<N>` (or `conflict://<N>/<scope>`) region as
 	 * regular file content. The lines are emitted with their original
 	 * file line numbers so hashline anchors line up with the source
 	 * file, and no truncation footer is appended.
 	 */
-	async #readConflictRegion(id: number, scope: ConflictScope | undefined): Promise<AgentToolResult<ReadToolDetails>> {
+	async #readConflictRegion(
+		id: number,
+		scope: ConflictScope | undefined,
+		context: AgentToolContext | undefined,
+	): Promise<AgentToolResult<ReadToolDetails>> {
 		const entry: ConflictEntry | undefined = getConflictHistory(this.session).get(id);
 		if (!entry) {
 			throw new ToolError(
 				`Conflict #${id} not found. Conflict ids are registered when \`read\` surfaces a marker block; re-read the file to get a current id.`,
 			);
 		}
+		// `path: "conflict://<id>"` resolves through the pre-execution gate as
+		// the synthetic URI string, not the registered entry's real
+		// filesystem target — authorize the actual target here, where it is
+		// known.
+		this.#assertConflictReadAllowed(entry.absolutePath, context);
 
 		const region = renderConflictRegion(entry, scope);
 		const displayMode = resolveFileDisplayMode(this.session);
