@@ -3186,14 +3186,18 @@ function joinSections(sections: string[]): string[] {
 }
 
 /**
- * Authorize `pr_checkout`'s effective worktree path before creating or
- * populating it. `github` is classified `pathless` in the resource
- * permission layer - a `pr_checkout` call names no path argument the gate
- * can act on - but the worktree it creates always lands under `getWorktreeDir`
- * (`~/.omp/wt/...`), outside every session root, so `permissions.confineWrites`
- * would otherwise silently never apply to it.
+ * Authorize a filesystem target `pr_checkout` is about to write. `github` is
+ * classified `pathless` in the resource permission layer - a `pr_checkout`
+ * call names no path argument the gate can act on - but it writes two
+ * targets outside anything the gate saw: `repoRoot` (the `.git` metadata a
+ * remote add, fetch, branch create/force, and every `config.setBranch` all
+ * mutate, even when reusing an existing worktree) and, when creating a new
+ * worktree, the worktree path itself, which always lands under
+ * `getWorktreeDir` (`~/.omp/wt/...`), outside every session root. Both must
+ * be checked before the first Git mutation runs, or `permissions.confineWrites`
+ * silently never applies to either.
  */
-function assertWorktreeWriteAllowed(worktreePath: string, context: AgentToolContext | undefined): void {
+function assertGitWriteAllowed(targetPath: string, context: AgentToolContext | undefined): void {
 	const policy = loadPermissionsConfig(context?.settings);
 	if (!policy) return;
 	const roots = permissionRoots(context);
@@ -3206,7 +3210,7 @@ function assertWorktreeWriteAllowed(worktreePath: string, context: AgentToolCont
 				`To allow it: set permissions.profile: off.`,
 		);
 	}
-	const decision = decideTarget({ raw: worktreePath, access: "write", field: "op" }, policy, roots);
+	const decision = decideTarget({ raw: targetPath, access: "write", field: "op" }, policy, roots);
 	if (decision.kind === "deny") throw new PermissionDeniedError("github", decision.rule, decision.reason);
 }
 
@@ -3339,6 +3343,19 @@ async function checkoutPullRequest(
 			const existingWorktrees = await git.worktree.list(repoRoot, signal);
 			const existingWorktree = existingWorktrees.find(entry => entry.branch === toLocalBranchRef(localBranch));
 
+			// Authorize before the first Git mutation below: `ensurePrRemote` can
+			// call `git.remote.add`, and `git.fetch`/`git.branch.*`/every
+			// `git.config.setBranch` write into `repoRoot/.git` regardless of
+			// whether a new worktree is created, so `repoRoot` needs the same
+			// check a new worktree gets. The eventual worktree path is resolved
+			// here too (moved up from after the mutations) so it can be
+			// authorized before anything runs, not after.
+			assertGitWriteAllowed(repoRoot, context);
+			const finalWorktreePath = existingWorktree
+				? existingWorktree.path
+				: await resolveAvailableWorktreePath(worktreePath, existingWorktrees);
+			if (!existingWorktree) assertGitWriteAllowed(finalWorktreePath, context);
+
 			const remote = await ensurePrRemote(repoRoot, data, signal);
 			await git.fetch(
 				repoRoot,
@@ -3387,10 +3404,7 @@ async function checkoutPullRequest(
 				signal,
 			);
 
-			let finalWorktreePath = existingWorktree?.path ?? worktreePath;
 			if (!existingWorktree) {
-				finalWorktreePath = await resolveAvailableWorktreePath(worktreePath, existingWorktrees);
-				assertWorktreeWriteAllowed(finalWorktreePath, context);
 				await fs.mkdir(path.dirname(finalWorktreePath), { recursive: true });
 				await git.worktree.add(repoRoot, finalWorktreePath, localBranch, { signal });
 			}

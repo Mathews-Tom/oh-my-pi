@@ -19,6 +19,7 @@
 import { Patch } from "@oh-my-pi/hashline";
 import { LSP_READONLY_ACTIONS } from "../../lsp";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
+import { unwrapHashlineHeaderPath } from "../plan-mode-guard";
 import type { PathAccess, PathTarget } from "./types";
 
 /** Pulls the declared path arguments out of one tool call's arguments. */
@@ -72,6 +73,22 @@ function singlePath(field: string, access: PathAccess): PathTargetExtractor {
 	return args => {
 		const out: PathTarget[] = [];
 		pushPath(out, args[field], access, field);
+		return out;
+	};
+}
+
+/**
+ * `write`'s top-level `path`, unwrapped exactly as `WriteTool` unwraps it
+ * before resolving: a copied hashline header (`[../secret#ABCD]`) passed as
+ * `path` executes against the unwrapped target, so authorizing the raw
+ * bracketed literal instead would check a different path than the one that
+ * actually gets written.
+ */
+function writePath(field: string): PathTargetExtractor {
+	return args => {
+		const out: PathTarget[] = [];
+		const raw = args[field];
+		pushPath(out, typeof raw === "string" ? unwrapHashlineHeaderPath(raw) : raw, "write", field);
 		return out;
 	};
 }
@@ -187,8 +204,14 @@ const extractEditPaths: PathTargetExtractor = args => {
 	const pureCreate =
 		edits.length > 0 &&
 		edits.every(edit => edit && typeof edit === "object" && (edit as Record<string, unknown>).op === "create");
-	pushPath(out, args.path, "write", "path");
-	if (!pureCreate) pushPath(out, args.path, "read", "path");
+	// Unwrapped before authorization for the same reason as `write`'s path
+	// (see {@link writePath}): `EditTool` resolves the top-level target via
+	// `resolvePlanPath`, which calls `unwrapHashlineHeaderPath` first, so a
+	// copied hashline header (`[../secret#ABCD]`) must be checked against
+	// that same unwrapped path, not the literal bracketed string.
+	const editPath = typeof args.path === "string" ? unwrapHashlineHeaderPath(args.path) : args.path;
+	pushPath(out, editPath, "write", "path");
+	if (!pureCreate) pushPath(out, editPath, "read", "path");
 	if (Array.isArray(args.edits)) {
 		for (const edit of args.edits) {
 			if (edit && typeof edit === "object") {
@@ -303,7 +326,7 @@ function extractResultFiles(details: unknown, access: PathAccess): PathTarget[] 
 export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	// ── Class A: structured path arguments ────────────────────────────────
 	read: { kind: "structured", extract: singlePath("path", "read") },
-	write: { kind: "structured", extract: singlePath("path", "write") },
+	write: { kind: "structured", extract: writePath("path") },
 	edit: { kind: "structured", extract: extractEditPaths },
 	glob: { kind: "structured", extract: delimitedPath("path", "read") },
 	grep: {
