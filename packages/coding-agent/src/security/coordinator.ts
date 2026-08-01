@@ -15,6 +15,9 @@ import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
 import { loadPermissionsConfig } from "../tools/permissions/config";
+import { PermissionDeniedError } from "../tools/permissions/gate";
+import { decideTarget } from "../tools/permissions/resolve";
+import type { PermissionRoots } from "../tools/permissions/types";
 import * as git from "../utils/git";
 import { createExactSecurityOAuthResolver, selectSecurityAccount } from "./auth";
 import type {
@@ -169,6 +172,28 @@ function securityConfigSnapshot(settings: Settings): Record<string, boolean> {
 function securityPathPolicy(settings: Settings): SecurityPathPolicy {
 	const policy = loadPermissionsConfig(settings);
 	return { deny: policy?.deny.read ?? [], allow: policy?.allow.read ?? [] };
+}
+
+/**
+ * Authorize the *effective* security-scan output path — whether it was
+ * given explicitly or defaulted (`preflight()` below) — as a write target.
+ * `output_root` is checked as a declared write argument at the tool gate
+ * (`extractSecurityScanPaths`, `tool-path-targets.ts`) only when the model
+ * supplies it; an omitted `output_root` is defaulted to a path under the
+ * store's own work directory, which `normalizeOutput` (`preflight.ts`)
+ * always requires to sit *outside* the scanned repository — exactly the
+ * shape `permissions.confineWrites` exists to catch. `SecurityCoordinatorHost`
+ * carries only `cwd` (no `workspace.additionalDirectories`), so this fails
+ * closed for anything outside it rather than risk under-checking.
+ */
+function assertSecurityWriteAllowed(absolutePath: string, host: SecurityCoordinatorHost, field: string): void {
+	const policy = loadPermissionsConfig(host.settings);
+	if (!policy) return;
+	const roots: PermissionRoots = { cwd: host.cwd, additionalDirectories: [] };
+	const decision = decideTarget({ raw: absolutePath, access: "write", field }, policy, roots);
+	if (decision.kind === "deny") {
+		throw new PermissionDeniedError("security_scan", decision.rule, decision.reason);
+	}
 }
 
 function createOperationId(): string {
@@ -452,12 +477,14 @@ export class SecurityCoordinator {
 		if (process.platform !== "win32") await fs.chmod(workRoot, 0o700);
 		const modelRef: SecurityModelRef = { provider: model.provider, modelId: model.id };
 		if (input.thinkingLevel !== undefined) modelRef.thinkingLevel = input.thinkingLevel;
+		const outputRoot = input.outputRoot ?? path.join(workRoot, Bun.randomUUIDv7());
+		assertSecurityWriteAllowed(path.resolve(this.#host.cwd, outputRoot), this.#host, "output_root");
 		const plan = await createSecurityScanPlan(
 			{
 				cwd: this.#host.cwd,
 				target: input.target ?? { kind: "repository" },
 				knowledgeBasePaths: input.knowledgeBasePaths,
-				outputRoot: input.outputRoot ?? path.join(workRoot, Bun.randomUUIDv7()),
+				outputRoot,
 				archiveExisting: input.archiveExisting,
 				model: modelRef,
 				account,

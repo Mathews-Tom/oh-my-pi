@@ -17,6 +17,7 @@ import {
 	SecurityStore,
 } from "../../src/security";
 import { SessionManager } from "../../src/session/session-manager";
+import { PermissionDeniedError } from "../../src/tools/permissions/gate";
 
 const MOCK_SOURCE_ID = "security-coordinator-test";
 let temporaryRoot = "";
@@ -171,6 +172,42 @@ describe("native security coordinator", () => {
 			phase: "failed",
 			error: "security store unavailable",
 		});
+	});
+
+	test("denies preflight when the defaulted output directory is outside every workspace root", async () => {
+		const restrictiveSettings = Settings.isolated({ "security.enabled": true, "permissions.profile": "workspace" });
+		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+		const coordinator = new SecurityCoordinator(
+			{
+				cwd: repositoryRoot,
+				settings: restrictiveSettings,
+				authStorage,
+				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
+				activeModel: mock.model,
+			},
+			{ openStore: storeFactory, gitAdapter },
+		);
+		// No `outputRoot` supplied - the coordinator defaults it to a directory
+		// beneath `SecurityStore.projectDirectory`, which lives outside every
+		// workspace root the `workspace` profile confines writes to.
+		await expect(coordinator.preflight({ credentialId, model: mock.model })).rejects.toThrow(PermissionDeniedError);
+	});
+
+	test("permits preflight's defaulted output directory when permissions are off", async () => {
+		const openSettings = Settings.isolated({ "security.enabled": true, "permissions.profile": "off" });
+		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+		const coordinator = new SecurityCoordinator(
+			{
+				cwd: repositoryRoot,
+				settings: openSettings,
+				authStorage,
+				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
+				activeModel: mock.model,
+			},
+			{ openStore: storeFactory, gitAdapter },
+		);
+		const plan = await coordinator.preflight({ credentialId, model: mock.model });
+		expect(plan.output.root).toBeTruthy();
 	});
 
 	test("cancellation before session launch has no inference side effects", async () => {
