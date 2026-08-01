@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { matchGlob } from "../tools/permissions/matcher";
 import * as git from "../utils/git";
 import type {
 	SecurityAccountRef,
@@ -132,18 +133,26 @@ async function validateScopePaths(repositoryRoot: string, paths: readonly string
 	}
 }
 
+/**
+ * `denyGlobs` (from the resource-permission policy's `permissions.deny.read`)
+ * is a transient, settings-derived input, not part of the persisted request —
+ * see the {@link createSecurityScanPlan} doc comment for why it does not need
+ * to round-trip through the stored plan.
+ */
 async function digestWorkingTree(
 	repositoryRoot: string,
 	includePaths: readonly string[],
 	excludePaths: readonly string[],
 	adapter: SecurityGitAdapter,
-	signal?: AbortSignal,
+	signal: AbortSignal | undefined,
+	denyGlobs: readonly string[],
 ): Promise<string> {
 	const tracked = await adapter.files(repositoryRoot, signal);
 	const untracked = await adapter.untracked(repositoryRoot, signal);
 	const files = [...new Set([...tracked, ...untracked])]
 		.map(normalizeRelativePath)
 		.filter(candidate => pathMatchesSecurityScope(candidate, includePaths, excludePaths))
+		.filter(candidate => matchGlob(denyGlobs, [candidate, path.basename(candidate)]) === null)
 		.sort();
 	const hasher = new Bun.CryptoHasher("sha256");
 	for (const relativePath of files) {
@@ -177,7 +186,8 @@ async function normalizeTarget(
 	repositoryRoot: string,
 	request: SecurityTargetRequest,
 	adapter: SecurityGitAdapter,
-	signal?: AbortSignal,
+	signal: AbortSignal | undefined,
+	denyGlobs: readonly string[],
 ): Promise<SecurityTarget> {
 	if (request.kind === "scoped_path" && !request.includePaths?.some(value => value.trim().length > 0)) {
 		throw new Error("scoped_path security scans require at least one include path");
@@ -214,7 +224,7 @@ async function normalizeTarget(
 		displayName,
 		includePaths,
 		excludePaths,
-		treeDigest: await digestWorkingTree(repositoryRoot, includePaths, excludePaths, adapter, signal),
+		treeDigest: await digestWorkingTree(repositoryRoot, includePaths, excludePaths, adapter, signal, denyGlobs),
 	};
 	if (revision !== null) target.revision = revision;
 	return target;
@@ -311,11 +321,12 @@ interface SecurityPlanMaterial {
 async function buildPlanMaterial(
 	request: SecurityPlanRequest,
 	adapter: SecurityGitAdapter,
+	denyGlobs: readonly string[],
 ): Promise<SecurityPlanMaterial> {
 	const repositoryRoot = await adapter.root(path.resolve(request.cwd), request.signal);
 	if (!repositoryRoot) throw new Error(`Security scans require a Git repository: ${request.cwd}`);
 	const canonicalRoot = await fs.realpath(repositoryRoot);
-	const target = await normalizeTarget(canonicalRoot, request.target, adapter, request.signal);
+	const target = await normalizeTarget(canonicalRoot, request.target, adapter, request.signal, denyGlobs);
 	const knowledgeBases = await normalizeKnowledgeBases(request.knowledgeBasePaths, canonicalRoot);
 	const output = await normalizeOutput(canonicalRoot, request.outputRoot, request.archiveExisting ?? false);
 	const model: SecurityModelRef = {
@@ -343,11 +354,23 @@ async function buildPlanMaterial(
 	};
 }
 
+/**
+ * `denyGlobs` is the resource-permission policy's `permissions.deny.read`
+ * list, evaluated fresh from live settings by every caller (`coordinator.ts`)
+ * rather than stored on the plan/request — it filters which files
+ * contribute to the working-tree digest (see `digestWorkingTree`), not the
+ * request shape itself, so it needs no persisted schema slot and no round
+ * trip through {@link requestFromPlan}. `assertSecurityScanPlanFresh` passes
+ * its own freshly-derived list, computed the same way at the same call site
+ * (`coordinator.ts`'s `start()`), so a plan built under one set of deny
+ * rules and re-verified under the same live settings digests identically.
+ */
 export async function createSecurityScanPlan(
 	request: SecurityPlanRequest,
 	adapter: SecurityGitAdapter = DEFAULT_SECURITY_GIT_ADAPTER,
+	denyGlobs: readonly string[] = [],
 ): Promise<SecurityScanPlan> {
-	const material = await buildPlanMaterial(request, adapter);
+	const material = await buildPlanMaterial(request, adapter, denyGlobs);
 	const fingerprint = `omp-security-plan/v1:sha256:${Bun.SHA256.hash(canonicalSecurityJson(material), "hex")}`;
 	return parseSecurityScanPlan({
 		documentType: "omp-security.scan-plan",
@@ -397,8 +420,9 @@ export async function assertSecurityScanPlanFresh(
 	plan: SecurityScanPlan,
 	freshness: SecurityPlanFreshnessInput,
 	adapter: SecurityGitAdapter = DEFAULT_SECURITY_GIT_ADAPTER,
+	denyGlobs: readonly string[] = [],
 ): Promise<void> {
-	const current = await createSecurityScanPlan(requestFromPlan(plan, freshness), adapter);
+	const current = await createSecurityScanPlan(requestFromPlan(plan, freshness), adapter, denyGlobs);
 	if (current.fingerprint !== plan.fingerprint) {
 		throw new StaleSecurityScanPlanError(plan.fingerprint, current.fingerprint);
 	}

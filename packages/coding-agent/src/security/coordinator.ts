@@ -14,6 +14,7 @@ import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
+import { loadPermissionsConfig } from "../tools/permissions/config";
 import * as git from "../utils/git";
 import { createExactSecurityOAuthResolver, selectSecurityAccount } from "./auth";
 import type {
@@ -152,6 +153,18 @@ function toIsoTimestamp(now: () => Date): string {
 
 function securityConfigSnapshot(settings: Settings): Record<string, boolean> {
 	return { securityEnabled: settings.get("security.enabled") };
+}
+
+/**
+ * The resource-permission policy's `permissions.deny.read` globs, live from
+ * settings — `digestWorkingTree` (`preflight.ts`) excludes any matching file
+ * from the working-tree digest so a `strict`-profile secret (`.env`,
+ * `id_rsa`, …) never contributes to what a preflight/start pair fingerprints
+ * or a scan session's working tree ultimately covers. `[]` under
+ * `permissions.profile: off`, matching the gate's own short-circuit.
+ */
+function securityDenyReadGlobs(settings: Settings): readonly string[] {
+	return loadPermissionsConfig(settings)?.deny.read ?? [];
 }
 
 function createOperationId(): string {
@@ -441,6 +454,7 @@ export class SecurityCoordinator {
 				signal: input.signal,
 			},
 			this.#gitAdapter,
+			securityDenyReadGlobs(this.#host.settings),
 		);
 		await store.putPlan(plan);
 		return plan;
@@ -461,6 +475,7 @@ export class SecurityCoordinator {
 				workflowFingerprint: SECURITY_WORKFLOW_FINGERPRINT,
 			},
 			this.#gitAdapter,
+			securityDenyReadGlobs(this.#host.settings),
 		);
 		const operationId = this.#createOperationId();
 		const scanId = createSecurityScanId();

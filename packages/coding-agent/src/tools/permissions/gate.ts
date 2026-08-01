@@ -103,7 +103,8 @@ export function enforceResourcePermissions(
 	const policy = loadPermissionsConfig(context?.settings);
 	if (!policy) return null;
 
-	const toolClass = classifyTool(toolName);
+	const args = toArgsRecord(params);
+	const toolClass = classifyTool(toolName, args);
 	if (toolClass.kind === "pathless") return null;
 
 	const roots = permissionRoots(context);
@@ -130,7 +131,6 @@ export function enforceResourcePermissions(
 
 	if (toolClass.kind === "opaque") return scanOutcome(toolClass.scan);
 
-	const args = toArgsRecord(params);
 	if (!args) {
 		// A structured tool always takes an object, so a non-object payload
 		// means the declared shape does not apply — a tool with
@@ -143,4 +143,46 @@ export function enforceResourcePermissions(
 	const denial = checkStructuredTargets(toolClass.extract(args), policy, roots);
 	if (denial) throw new PermissionDeniedError(toolName, denial.rule, denial.reason);
 	return null;
+}
+
+/**
+ * Recheck the files a recursive search/edit tool actually touched, after it
+ * executes, against the same policy the declared-argument gate already
+ * evaluated before the call.
+ *
+ * `grep`/`ast_grep`/`ast_edit` accept a scope root but then recurse beneath
+ * it, so `enforceResourcePermissions`'s pre-execution check only ever sees
+ * that root — `grep({ path: ".", gitignore: false })` passes it and can
+ * still surface `.env` contents. `TOOL_PATH_CLASSES[tool].resultTargets`
+ * re-derives the real file set from what the tool reports it visited
+ * (`details.files`); this evaluates that set the same way `enforceResourcePermissions`
+ * evaluates declared targets and throws before the result is handed back to
+ * the caller, so a denied file the tool already opened locally never reaches
+ * the model. No-ops for a tool with no `resultTargets` extractor and, like
+ * the pre-execution gate, short-circuits entirely under `permissions.profile: off`.
+ */
+export function enforcePostExecutionResourcePermissions(
+	toolName: string,
+	details: unknown,
+	context: AgentToolContext | undefined,
+): void {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy) return;
+
+	const toolClass = classifyTool(toolName);
+	if (toolClass.kind !== "structured" || !toolClass.resultTargets) return;
+
+	const roots = permissionRoots(context);
+	if (!roots) {
+		throw new PermissionDeniedError(
+			toolName,
+			"permissions.profile",
+			`Tool "${toolName}" is blocked: permissions.profile is "${policy.profile}" but this call has no ` +
+				`session, so the workspace roots the rules are measured against cannot be determined.\n` +
+				`To allow it: set permissions.profile: off.`,
+		);
+	}
+
+	const denial = checkStructuredTargets(toolClass.resultTargets(details), policy, roots);
+	if (denial) throw new PermissionDeniedError(toolName, denial.rule, denial.reason);
 }

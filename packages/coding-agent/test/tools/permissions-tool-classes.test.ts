@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Patch } from "@oh-my-pi/hashline";
 import {
 	CLASSIFIED_TOOL_NAMES,
 	classifyTool,
@@ -23,6 +24,28 @@ describe("classification coverage", () => {
 	it("resolves the legacy tool aliases to their structured classification", () => {
 		expect(classifyTool("search")).toBe(TOOL_PATH_CLASSES.grep);
 		expect(classifyTool("find")).toBe(TOOL_PATH_CLASSES.glob);
+	});
+});
+
+describe("debug action-aware classification", () => {
+	it("classifies exec/evaluate-shaped debug actions as opaque", () => {
+		for (const action of ["launch", "attach", "evaluate", "write_memory", "custom_request"]) {
+			expect(classifyTool("debug", { action }).kind).toBe("opaque");
+		}
+	});
+
+	it("keeps breakpoint and inspection debug actions structured", () => {
+		for (const action of ["set_breakpoint", "remove_breakpoint", "stack_trace", "variables"]) {
+			expect(classifyTool("debug", { action }).kind).toBe("structured");
+		}
+	});
+
+	it("falls back to structured when no action is known", () => {
+		expect(classifyTool("debug").kind).toBe("structured");
+	});
+
+	it("leaves the base TOOL_PATH_CLASSES.debug entry structured for direct use", () => {
+		expect(TOOL_PATH_CLASSES.debug?.kind).toBe("structured");
 	});
 });
 
@@ -101,5 +124,22 @@ describe("embedded edit payload paths", () => {
 
 	it("unquotes an MV destination containing spaces", () => {
 		expect(extractEmbeddedEditPaths('MV "dir with spaces/a.ts"').map(t => t.raw)).toEqual(["dir with spaces/a.ts"]);
+	});
+
+	// A hand-rolled `[.+]` header regex could disagree with the real hashline
+	// grammar about how a header is interpreted; deriving the target through
+	// `Patch.parse` (the same section splitter `Patcher.apply` uses) rules
+	// that divergence out by construction, including for a `..` traversal
+	// path inside the header.
+	it("extracts a `..` traversal path from a header exactly as the real parser resolves it", () => {
+		const input = "[../../outside/escaped.ts#1A2B]\nPUT 1.=1:\n+x";
+		expect(extractEmbeddedEditPaths(input).map(t => t.raw)).toEqual(["../../outside/escaped.ts"]);
+	});
+
+	it("matches the real hashline Patch.parse section set exactly, including a multi-section input", () => {
+		const input = "[a/one.ts#1A2B]\nPUT 1.=1:\n+x\n[b/two.ts#3C4D]\nPUT 1.=1:\n+y";
+		const patch = Patch.parse(input);
+		expect(patch.sections.map(s => s.path)).toEqual(["a/one.ts", "b/two.ts"]);
+		expect(extractEmbeddedEditPaths(input).map(t => t.raw)).toEqual(patch.sections.map(s => s.path));
 	});
 });

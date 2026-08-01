@@ -232,4 +232,34 @@ describe("security preflight", () => {
 			await expect(plan({ kind: "scoped_path", includePaths: [candidate] })).rejects.toThrow("repository-relative");
 		}
 	});
+
+	test("denyGlobs excludes a matching file from the working-tree digest", async () => {
+		await Bun.write(path.join(repositoryRoot, ".env"), "SECRET=1\n");
+		const secretAwareAdapter: SecurityGitAdapter = {
+			...adapter,
+			files: async () => ["src/a.ts", "src/b.ts", ".env"],
+		};
+		const request = {
+			cwd: repositoryRoot,
+			target: { kind: "repository" as const },
+			outputRoot: stateRoot,
+			model: { provider: "openai-codex", modelId: "fixture" },
+			account: { provider: "openai-codex", credentialId: 1 },
+			config: {},
+			workflowFingerprint: "fixture",
+		};
+		const withoutDenyGlobs = await createSecurityScanPlan(request, secretAwareAdapter);
+		const withDenyGlobs = await createSecurityScanPlan(request, secretAwareAdapter, ["**/.env"]);
+		expect(withDenyGlobs.target.treeDigest).not.toBe(withoutDenyGlobs.target.treeDigest);
+
+		// Mutating .env changes the digest without denyGlobs but not with them —
+		// proof the excluded file never contributed to the digest at all, not
+		// merely that its content happened to hash the same.
+		await Bun.write(path.join(repositoryRoot, ".env"), "SECRET=2\n");
+		const afterMutationWithDenyGlobs = await createSecurityScanPlan(request, secretAwareAdapter, ["**/.env"]);
+		expect(afterMutationWithDenyGlobs.target.treeDigest).toBe(withDenyGlobs.target.treeDigest);
+
+		const afterMutationWithoutDenyGlobs = await createSecurityScanPlan(request, secretAwareAdapter);
+		expect(afterMutationWithoutDenyGlobs.target.treeDigest).not.toBe(withoutDenyGlobs.target.treeDigest);
+	});
 });

@@ -69,6 +69,23 @@ function recordingTool(name: string): Recorder {
 	return { tool, calls };
 }
 
+/** Like {@link recordingTool}, but the execution result carries caller-supplied `details` — used to simulate a recursive search/edit tool reporting the files it actually touched. */
+function recordingToolWithDetails(name: string, details: unknown): Recorder {
+	const calls: unknown[] = [];
+	const tool = {
+		name,
+		description: name,
+		parameters: {},
+		label: name,
+		strict: false,
+		execute: async (_id: string, params: unknown): Promise<AgentToolResult> => {
+			calls.push(params);
+			return { content: [{ type: "text", text: "ok" }], details };
+		},
+	} as unknown as AgentTool;
+	return { tool, calls };
+}
+
 async function run(toolName: string, params: unknown, context: AgentToolContext): Promise<Recorder> {
 	const recorder = recordingTool(toolName);
 	const wrapper = new ExtensionToolWrapper(recorder.tool, runner);
@@ -305,5 +322,142 @@ describe("write-side settings reach the policy", () => {
 		expect(await denialOf("write", { path: "svc/.env" }, denied)).toContain("**/.env");
 		const allowed = contextOf({ "permissions.profile": "strict", "permissions.allow.write": ["svc/.env"] });
 		expect((await run("write", { path: "svc/.env" }, allowed)).calls).toHaveLength(1);
+	});
+});
+
+describe("post-execution recheck for recursive tools", () => {
+	// `grep`/`ast_grep`/`ast_edit` recurse beneath their declared scope root, so
+	// the pre-execution gate only ever sees that root. This recheck evaluates
+	// the files the tool actually reports it touched (`result.details.files`)
+	// after execution, before the result reaches the caller.
+	it("denies a grep result whose reported files include a path the declared scope never named", async () => {
+		const recorder = recordingToolWithDetails("grep", { files: [".env"] });
+		const wrapper = new ExtensionToolWrapper(recorder.tool, runner);
+		let message: string | undefined;
+		try {
+			await wrapper.execute(
+				"call-1",
+				{ pattern: "SECRET", path: ".", gitignore: false } as never,
+				undefined,
+				undefined,
+				contextOf(STRICT),
+			);
+		} catch (err) {
+			message = err instanceof Error ? err.message : String(err);
+		}
+		// The tool DID run — it already read `.env` locally — the gate's job is
+		// keeping that result from reaching the caller, not preventing the call.
+		expect(recorder.calls).toHaveLength(1);
+		expect(message).toContain("**/.env");
+	});
+
+	it("denies an ast_edit result whose reported files include a denied write target", async () => {
+		const recorder = recordingToolWithDetails("ast_edit", { files: [".env"] });
+		const wrapper = new ExtensionToolWrapper(recorder.tool, runner);
+		let message: string | undefined;
+		try {
+			await wrapper.execute(
+				"call-1",
+				{ paths: ["."], pat: "$A", out: "$A" } as never,
+				undefined,
+				undefined,
+				contextOf(STRICT),
+			);
+		} catch (err) {
+			message = err instanceof Error ? err.message : String(err);
+		}
+		expect(recorder.calls).toHaveLength(1);
+		expect(message).toContain("**/.env");
+	});
+
+	it("permits a recursive-tool result whose reported files are all in bounds", async () => {
+		const recorder = recordingToolWithDetails("grep", { files: ["src/main.ts"] });
+		const wrapper = new ExtensionToolWrapper(recorder.tool, runner);
+		await wrapper.execute("call-1", { pattern: "x", path: "src" } as never, undefined, undefined, contextOf(STRICT));
+		expect(recorder.calls).toHaveLength(1);
+	});
+
+	it("does not recheck a tool with no resultTargets extractor", async () => {
+		const recorder = recordingToolWithDetails("read", { files: [".env"] });
+		const wrapper = new ExtensionToolWrapper(recorder.tool, runner);
+		await wrapper.execute("call-1", { path: "src/main.ts" } as never, undefined, undefined, contextOf(STRICT));
+		expect(recorder.calls).toHaveLength(1);
+	});
+});
+
+describe("debug action-aware classification", () => {
+	// `launch`/`attach`/`evaluate`/`write_memory`/`custom_request` reach
+	// arbitrary execution beyond the declared `program`/`file`/`cwd` fields, so
+	// they get the opaque literal scan instead of a false sense of structured
+	// soundness (see `DEBUG_OPAQUE_ACTIONS`, `tool-path-targets.ts`).
+	it("denies a launch whose args reference a denied path the declared program field never named", async () => {
+		const message = await denialOf(
+			"debug",
+			{ action: "launch", program: "/bin/sh", args: ["-c", "cat .env"] },
+			contextOf(STRICT),
+		);
+		expect(message).toContain("**/.env");
+	});
+
+	it("denies an evaluate expression referencing a denied path", async () => {
+		const message = await denialOf(
+			"debug",
+			{ action: "evaluate", expression: "system('cat .env')" },
+			contextOf(STRICT),
+		);
+		expect(message).toContain("**/.env");
+	});
+
+	it("still enforces the declared file field for a structured (breakpoint) action", async () => {
+		const message = await denialOf("debug", { action: "set_breakpoint", file: ".env" }, contextOf(STRICT));
+		expect(message).toContain("**/.env");
+	});
+
+	it("lets an ordinary launch through", async () => {
+		const params = { action: "launch", program: "./my_app", args: ["--flag"] };
+		expect((await run("debug", params, contextOf(STRICT))).calls).toHaveLength(1);
+	});
+});
+
+describe("confinement cannot be bypassed by a built-in allow glob", () => {
+	// The `.env.example`/`.env.sample` allow carve-out exists to override the
+	// secret deny-by-name rule, not to also bypass workspace confinement.
+	it("still confines a write matching the .env.example allow glob", async () => {
+		const message = await denialOf("write", { path: path.join(outside, ".env.example") }, contextOf(STRICT));
+		expect(message).toContain("permissions.confineWrites");
+	});
+
+	it("still permits the same allow glob inside the workspace", async () => {
+		expect((await run("write", { path: "svc/.env.example" }, contextOf(STRICT))).calls).toHaveLength(1);
+	});
+});
+
+describe("headless recovery guidance", () => {
+	it("offers permission-specific recovery options for a permission-layer prompt, not the approval-tier ones", async () => {
+		const context = contextOf({ ...STRICT, "permissions.opaqueToolScan": "prompt" });
+		const message = await denialOf("bash", { command: "cat .env" }, context);
+		expect(message).toContain("permissions.allow.read");
+		expect(message).toContain("permissions.opaqueToolScan");
+		expect(message).not.toContain("tools.approvalMode: yolo");
+		expect(message).not.toContain("tools.approval.bash: allow");
+	});
+
+	it("keeps the approval-tier options for an ordinary tools.approval prompt with no permission layer involved", async () => {
+		const context = contextOf({ "permissions.profile": "off", "tools.approval": { read: "prompt" } });
+		const message = await denialOf("read", { path: "src/main.ts" }, context);
+		expect(message).toContain("tools.approvalMode: yolo");
+		expect(message).toContain("tools.approval.read: allow");
+	});
+});
+
+describe("malformed glob patterns fail closed at settings load", () => {
+	it("throws a clear error naming the setting instead of silently matching nothing", async () => {
+		const context = contextOf({ "permissions.profile": "strict", "permissions.deny.read": ["[a-"] });
+		await expect(run("read", { path: "src/main.ts" }, context)).rejects.toThrow(/invalid glob pattern/);
+	});
+
+	it("does not affect a policy with only well-formed patterns", async () => {
+		const context = contextOf({ "permissions.profile": "strict", "permissions.deny.read": ["**/*.secret"] });
+		expect((await run("read", { path: "src/main.ts" }, context)).calls).toHaveLength(1);
 	});
 });

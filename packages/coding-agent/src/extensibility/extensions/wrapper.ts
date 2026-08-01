@@ -14,7 +14,7 @@ import type { Settings } from "../../config/settings";
 import type { Theme } from "../../modes/theme/theme";
 import { type ApprovalMode, formatApprovalPrompt, resolveApproval, truncateForPrompt } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
-import { enforceResourcePermissions } from "../../tools/permissions/gate";
+import { enforcePostExecutionResourcePermissions, enforceResourcePermissions } from "../../tools/permissions/gate";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
@@ -318,15 +318,30 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					);
 				}
 				// Carry the reason through. Headless runs — subagents, RPC, ACP,
-				// `-p` — all land here, and the generic options below name
-				// nothing that clears a resource permission rule.
+				// `-p` — all land here. A permission-layer denial and an
+				// approval-tier prompt clear through different settings, so the
+				// recovery options must match whichever one(s) actually fired —
+				// `tools.approvalMode: yolo` does not clear a resource
+				// permission rule, and naming it as if it did leaves a headless
+				// caller with instructions that cannot work.
+				const recoveryOptions: string[] = [];
+				if (permissionPrompt !== null) {
+					recoveryOptions.push(
+						"Add the path to permissions.allow.read / permissions.allow.write in config",
+						'Relax permissions.opaqueToolScan (set to "off") or permissions.profile (set to "off") in config',
+					);
+				}
+				if (resolved.policy === "prompt") {
+					recoveryOptions.push(
+						"Set tools.approvalMode: yolo in /settings",
+						`Add tools.approval.${this.tool.name}: allow to config`,
+					);
+				}
+				recoveryOptions.push("Use an interactive UI to approve the tool call");
 				throw new Error(
 					`Tool "${this.tool.name}" requires approval but no interactive UI available.\n` +
 						(approvalCheck.reason ? `Reason: ${approvalCheck.reason}\n` : "") +
-						`Options:\n` +
-						`  1. Set tools.approvalMode: yolo in /settings\n` +
-						`  2. Add tools.approval.${this.tool.name}: allow to config\n` +
-						`  3. Use an interactive UI to approve the tool call`,
+						`Options:\n${recoveryOptions.map((option, index) => `  ${index + 1}. ${option}`).join("\n")}`,
 				);
 			}
 
@@ -366,6 +381,19 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				content: [{ type: "text", text: executionError.message }],
 				details: undefined as TDetails,
 			};
+		}
+
+		// Post-execution resource-permission recheck. `grep`/`ast_grep`/
+		// `ast_edit` recurse beneath their declared scope root, so the
+		// pre-execution gate above (step 3) only ever verified that root — this
+		// rechecks the files the tool actually reports it touched
+		// (`result.details`) before they ever reach the model or the caller.
+		// Deliberately outside the try/catch above: like the pre-execution
+		// gate, a denial here is not an execution error to render as tool
+		// output, it propagates and blocks the call exactly as a synchronous
+		// permission denial would have.
+		if (!executionError) {
+			enforcePostExecutionResourcePermissions(this.tool.name, result.details, context);
 		}
 
 		// Emit tool_result event - extensions can modify the result and error status
