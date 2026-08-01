@@ -3676,6 +3676,135 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	// ────────────────────────────────────────────────────────────────────────
+	// Resource permissions
+	//
+	// A path-scoped layer orthogonal to the approval axes above: approval asks
+	// "may this tool run", these keys ask "may it touch this path". They can
+	// only subtract — a path they permit still faces `tools.approvalMode` and
+	// `tools.approval.<tool>` exactly as before.
+	//
+	// Path globs, not command globs: `*` does not cross `/`, so a secrets rule
+	// is written `**` + `/.env`, never `*.env`.
+	// ────────────────────────────────────────────────────────────────────────
+
+	"permissions.profile": {
+		type: "enum",
+		values: ["off", "workspace", "strict"] as const,
+		default: "off",
+		ui: {
+			tab: "interaction",
+			group: "Permissions",
+			label: "Resource Permissions",
+			description:
+				"Path-scoped deny layer enforced for every tool call, independent of approval mode. 'Off' disables it entirely. 'Workspace' confines writes to the workspace roots. 'Strict' adds built-in secret deny rules on top. Enforcement is sound only for tools that take structured path arguments; bash, eval, and MCP tools get a best-effort literal scan.",
+			options: [
+				{ value: "off", label: "Off", description: "No path enforcement (default; behaviour is unchanged)." },
+				{
+					value: "workspace",
+					label: "Workspace",
+					description: "Writes must land under cwd or a workspace.additionalDirectories root.",
+				},
+				{
+					value: "strict",
+					label: "Strict",
+					description:
+						"Workspace confinement plus built-in deny rules for .env files, SSH keys, and certificates.",
+				},
+			],
+		},
+	},
+
+	"permissions.confineWrites": {
+		type: "boolean",
+		default: undefined,
+		ui: {
+			tab: "interaction",
+			group: "Permissions",
+			label: "Confine Writes",
+			description:
+				"Require every write to land under a workspace root. Unset follows the profile: off for 'off', on for 'workspace' and 'strict'.",
+		},
+	},
+
+	"permissions.confineReads": {
+		type: "boolean",
+		default: undefined,
+		ui: {
+			tab: "interaction",
+			group: "Permissions",
+			label: "Confine Reads",
+			description:
+				"Require every read to land under a workspace root. Off in every profile by default: reading /var/log or ~/.gitconfig is routine, whereas an escaping write is destructive.",
+		},
+	},
+
+	"permissions.deny.read": {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		ui: {
+			tab: "interaction",
+			group: "Permissions",
+			label: "Deny Read Globs",
+			description:
+				"Path globs whose contents no tool may read. Merged onto the active profile's rules; the profile's list is a floor this cannot lower. Matched against the workspace-relative path, the absolute path, and the basename.",
+		},
+	},
+
+	"permissions.deny.write": {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		ui: {
+			tab: "interaction",
+			group: "Permissions",
+			label: "Deny Write Globs",
+			description:
+				"Path globs no tool may write. Merged onto the active profile's rules; the profile's list is a floor this cannot lower.",
+		},
+	},
+
+	"permissions.allow.read": {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		ui: {
+			tab: "interaction",
+			group: "Permissions",
+			label: "Allow Read Globs",
+			description:
+				"Carve-outs evaluated before any deny rule or confinement check, so a specific path can be exempted from a broad rule. Relaxes this layer only — it never auto-approves a tool call.",
+		},
+	},
+
+	"permissions.allow.write": {
+		type: "array",
+		default: EMPTY_STRING_ARRAY,
+		ui: {
+			tab: "interaction",
+			group: "Permissions",
+			label: "Allow Write Globs",
+			description:
+				"Carve-outs evaluated before any deny rule or confinement check. Relaxes this layer only — it never auto-approves a tool call.",
+		},
+	},
+
+	"permissions.opaqueToolScan": {
+		type: "enum",
+		values: ["deny", "prompt", "off"] as const,
+		default: "deny",
+		ui: {
+			tab: "interaction",
+			group: "Permissions",
+			label: "Opaque Tool Scan",
+			description:
+				"What to do when bash, eval, or an MCP tool mentions a denied path literally. This is a best-effort scan over tokenized arguments, not a sandbox: the real boundary for arbitrary code is tools.approval.bash: deny.",
+			options: [
+				{ value: "deny", label: "Deny", description: "Refuse the call and name the rule that matched." },
+				{ value: "prompt", label: "Prompt", description: "Require interactive confirmation instead of refusing." },
+				{ value: "off", label: "Off", description: "Do not scan opaque tool arguments at all." },
+			],
+		},
+	},
+
 	// Todo tool
 	"todo.enabled": {
 		type: "boolean",
