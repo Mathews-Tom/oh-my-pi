@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.2.4] - 2026-08-01
+
 ### Added
 
 - Added `getSecretPlaceholderKeyPath()`, `getDaemonRuntimeDir()`, `getProviderInFlightRoot()`, and `getMarketplacesRegistryPath()` to resolve secret key, daemon runtime, provider in-flight, and marketplace registry paths under their respective XDG categories (state, data) instead of the config root.

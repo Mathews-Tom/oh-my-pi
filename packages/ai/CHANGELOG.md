@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.2.4] - 2026-08-01
+
 ### Fixed
 
 - Fixed Codex WebSocket tool-result turns replaying full history when the preceding tool-call ID required Responses API normalization ([#7279](https://github.com/can1357/oh-my-pi/issues/7279)).

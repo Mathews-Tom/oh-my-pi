@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [17.2.4] - 2026-08-01
+
 ### Added
 
 - Added `AnthropicCompat.streamIdleTimeoutMs` and propagated it through `buildAnthropicCompat` so direct Anthropic provider streams can configure their inter-event idle watchdog.
