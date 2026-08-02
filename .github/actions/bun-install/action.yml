@@ -55,12 +55,11 @@ runs:
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
            path: ~/.bun/install/cache
-           key: bun-${{ runner.os }}-${{ hashFiles('bun.lock', 'patches/**/*.patch') }}
+           key: bun-${{ runner.os }}-${{ hashFiles('patches/**/*.patch') }}-${{ hashFiles('bun.lock') }}
            # Lockfile and patch changes both seed a new store. Bun caches patched
-           # packages separately, so reusing a lockfile-only store can retain an
-           # older patch payload after its source file changes.
+           # packages separately, so reuse only a store with the same patch payload.
            restore-keys: |
-              bun-${{ runner.os }}-
+              bun-${{ runner.os }}-${{ hashFiles('patches/**/*.patch') }}-
 
       # On-infra (omp-kata): the pod mounts a shared PVC at bun's store path.
       - name: Prepare mounted bun store
@@ -95,4 +94,4 @@ runs:
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
            path: ~/.bun/install/cache
-           key: bun-${{ runner.os }}-${{ hashFiles('bun.lock', 'patches/**/*.patch') }}
+           key: bun-${{ runner.os }}-${{ hashFiles('patches/**/*.patch') }}-${{ hashFiles('bun.lock') }}
