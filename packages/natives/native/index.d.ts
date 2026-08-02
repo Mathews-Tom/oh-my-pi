@@ -455,6 +455,11 @@ export interface AstReplaceOptions {
   path?: string
   /** Optional glob filter within the search root. */
   glob?: string
+  /**
+   * Exact normalized paths relative to a directory root that may be opened.
+   * When present, every other candidate is excluded before source is read.
+   */
+  allowedPaths?: Array<string>
   /** Rule selector for multi-rule configurations. */
   selector?: string
   /** Pattern strictness for rewrites. */

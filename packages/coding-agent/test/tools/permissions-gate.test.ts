@@ -163,6 +163,12 @@ describe("profile strict", () => {
 
 		expect(allowedPaths).toEqual(["src/main.ts"]);
 	});
+
+	it("denies an explicit restricted search target before native search opens it", async () => {
+		await expect(
+			collectPermittedSearchPaths(path.join(workspace, ".env"), undefined, true, true, contextOf(STRICT)),
+		).rejects.toThrow("resource permission rule");
+	});
 });
 
 describe("subagent bypass is closed", () => {

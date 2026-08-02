@@ -890,6 +890,17 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		};
 	}
 
+	#enforceConflictResourcePermissions(entries: readonly ConflictEntry[], context: AgentToolContext | undefined): void {
+		enforceResourcePathTargets(
+			"write",
+			entries.flatMap(entry => [
+				{ raw: entry.absolutePath, access: "read" as const, field: "conflict" },
+				{ raw: entry.absolutePath, access: "write" as const, field: "conflict" },
+			]),
+			context,
+		);
+	}
+
 	/**
 	 * Look up a single conflict entry by id and dispatch to {@link #resolveConflict}.
 	 * Throws a clear `not found` error when the id has been invalidated.
@@ -1195,6 +1206,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						`Conflict URI scope '/${conflictUri.scope}' is read-only — read \`conflict://${conflictUri.id}/${conflictUri.scope}\` to inspect that side. To write, drop the scope (\`conflict://${conflictUri.id}\`) and put the chosen content (or shorthand like \`@${conflictUri.scope}\`) in \`content\`.`,
 					);
 				}
+				const history = getConflictHistory(this.session);
+				const entries =
+					conflictUri.id === "*"
+						? history.entries()
+						: [history.get(conflictUri.id)].filter((entry): entry is ConflictEntry => entry !== undefined);
+				this.#enforceConflictResourcePermissions(entries, context);
 				emitWriteProgress(onUpdate, cleanContent, path);
 				const result =
 					conflictUri.id === "*"
@@ -1213,13 +1230,16 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				enforcePlanModeWrite(this.session, resolvedArchivePath.archivePath, {
 					op: resolvedArchivePath.exists ? "update" : "create",
 				});
-				if (resolvedArchivePath.exists) {
-					enforceResourcePathTargets(
-						"write",
-						[{ raw: resolvedArchivePath.archivePath, access: "read", field: "path" }],
-						context,
-					);
-				}
+				enforceResourcePathTargets(
+					"write",
+					[
+						{ raw: resolvedArchivePath.archivePath, access: "write", field: "path" },
+						...(resolvedArchivePath.exists
+							? [{ raw: resolvedArchivePath.archivePath, access: "read" as const, field: "path" }]
+							: []),
+					],
+					context,
+				);
 				emitWriteProgress(
 					onUpdate,
 					cleanContent,
@@ -1244,13 +1264,16 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			const resolvedSqlitePath = await this.#resolveSqliteWritePath(path);
 			if (resolvedSqlitePath) {
 				enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update" });
-				if (resolvedSqlitePath.exists) {
-					enforceResourcePathTargets(
-						"write",
-						[{ raw: resolvedSqlitePath.sqlitePath, access: "read", field: "path" }],
-						context,
-					);
-				}
+				enforceResourcePathTargets(
+					"write",
+					[
+						{ raw: resolvedSqlitePath.sqlitePath, access: "write", field: "path" },
+						...(resolvedSqlitePath.exists
+							? [{ raw: resolvedSqlitePath.sqlitePath, access: "read" as const, field: "path" }]
+							: []),
+					],
+					context,
+				);
 
 				emitWriteProgress(onUpdate, cleanContent, path, resolvedSqlitePath.absolutePath);
 				const sqliteResult = await this.#writeSqliteRow(path, cleanContent, resolvedSqlitePath);

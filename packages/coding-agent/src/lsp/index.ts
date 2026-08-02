@@ -1957,6 +1957,14 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				};
 			}
 			const { pairs } = enumerated;
+			enforceResourcePathTargets(
+				"lsp",
+				pairs.flatMap(pair => [
+					{ raw: uriToFile(pair.oldUri), access: "write" as const, field: "rename_file source" },
+					{ raw: uriToFile(pair.newUri), access: "write" as const, field: "rename_file destination" },
+				]),
+				toolContext,
+			);
 			if (pairs.length === 0) {
 				return {
 					content: [{ type: "text", text: "Error: no files to rename" }],

@@ -24,7 +24,7 @@ import { loadPermissionsConfig } from "./config";
 import { decideTarget } from "./resolve";
 import { scanDenialMessage, scanOpaqueArguments } from "./scan";
 import { classifyTool } from "./tool-path-targets";
-import type { PathTarget, PermissionPolicy, PermissionRoots } from "./types";
+import type { PathAccess, PathTarget, PermissionPolicy, PermissionRoots } from "./types";
 
 /** Raised when a tool call is refused by a resource permission rule. */
 export class PermissionDeniedError extends Error {
@@ -95,6 +95,7 @@ export async function collectPermittedSearchPaths(
 	useGitignore: boolean,
 	context: AgentToolContext | undefined,
 	signal?: AbortSignal,
+	accesses: readonly PathAccess[] = ["read"],
 ): Promise<string[] | undefined> {
 	const policy = loadPermissionsConfig(context?.settings);
 	if (!policy) return undefined;
@@ -110,7 +111,15 @@ export async function collectPermittedSearchPaths(
 		);
 	}
 	const metadata = await Bun.file(searchPath).stat();
-	if (!metadata.isDirectory()) return undefined;
+	if (!metadata.isDirectory()) {
+		enforceTargets(
+			"search",
+			accesses.map(access => ({ raw: searchPath, access, field: "path" })),
+			policy,
+			context,
+		);
+		return undefined;
+	}
 
 	const candidates = await glob({
 		pattern: globFilter ?? "**/*",
@@ -123,14 +132,16 @@ export async function collectPermittedSearchPaths(
 		signal,
 	});
 	return candidates.matches
-		.filter(candidate => {
-			const target: PathTarget = {
-				raw: path.resolve(searchPath, candidate.path),
-				access: "read",
-				field: "path",
-			};
-			return decideTarget(target, policy, roots).kind === "allow";
-		})
+		.filter(candidate =>
+			accesses.every(access => {
+				const target: PathTarget = {
+					raw: path.resolve(searchPath, candidate.path),
+					access,
+					field: "path",
+				};
+				return decideTarget(target, policy, roots).kind === "allow";
+			}),
+		)
 		.map(candidate => candidate.path);
 }
 
@@ -252,6 +263,29 @@ export function enforceResourcePathTargets(
 	const policy = loadPermissionsConfig(context?.settings);
 	if (!policy) return;
 	enforceTargets(toolName, targets, policy, context);
+}
+
+/**
+ * Return whether a dynamically discovered path may be exposed to the caller.
+ *
+ * Recursive tools use this while streaming results: a denied descendant must
+ * be omitted before it can reach either a live preview or the final result.
+ */
+export function isResourcePathPermitted(target: PathTarget, context: AgentToolContext | undefined): boolean {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy) return true;
+
+	const roots = permissionRoots(context);
+	if (!roots) {
+		throw new PermissionDeniedError(
+			"resource",
+			"permissions.profile",
+			`Resource is blocked: permissions.profile is "${policy.profile}" but this call has no session, so the ` +
+				`workspace roots the rules are measured against cannot be determined.\n` +
+				`To allow it: set permissions.profile: off.`,
+		);
+	}
+	return decideTarget(target, policy, roots).kind === "allow";
 }
 
 /** Resolve the roots (failing closed without a session) and evaluate `targets`. */

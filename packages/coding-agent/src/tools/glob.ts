@@ -29,6 +29,7 @@ import {
 	resolveToCwd,
 	toPathList,
 } from "./path-utils";
+import { isResourcePathPermitted } from "./permissions/gate";
 import {
 	createCachedComponent,
 	formatCount,
@@ -146,7 +147,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 		params: typeof findSchema.infer,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<GlobToolDetails>,
-		_context?: AgentToolContext,
+		toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<GlobToolDetails>> {
 		const { path: pathInput, limit, hidden, gitignore } = params;
 
@@ -272,6 +273,15 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 					trailingSlash: fileType === natives.FileType.Dir || hadTrailingSlash,
 				});
 			};
+			const isPermittedMatch = (matchPath: string, base: string): boolean =>
+				isResourcePathPermitted(
+					{
+						raw: path.isAbsolute(matchPath) ? matchPath : path.resolve(base, matchPath),
+						access: "read",
+						field: "match",
+					},
+					toolContext,
+				);
 
 			const missingPathsNote =
 				missingPaths.length > 0 ? `Skipped missing paths: ${missingPaths.join(", ")}` : undefined;
@@ -347,13 +357,19 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 						}
 						if (!target.hasGlob && customOps.stat) {
 							const stat = await customOps.stat(target.searchPath);
-							if (stat.isFile()) return [formatScopePath(target.searchPath)];
+							if (stat.isFile()) {
+								return isPermittedMatch(target.searchPath, target.searchPath)
+									? [formatScopePath(target.searchPath)]
+									: [];
+							}
 						}
 						const results = await customOps.glob(target.globPattern, target.searchPath, {
 							ignore: ["**/node_modules/**", "**/.git/**"],
 							limit: effectiveLimit,
 						});
-						return results.map(matchPath => formatMatchPath(matchPath, target.searchPath));
+						return results
+							.filter(matchPath => isPermittedMatch(matchPath, target.searchPath))
+							.map(matchPath => formatMatchPath(matchPath, target.searchPath));
 					}),
 				);
 				const seen = new Set<string>();
@@ -393,6 +409,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 				(base: string) =>
 				(err: Error | null, match: natives.GlobMatch | null): void => {
 					if (err || combinedSignal.aborted || !match?.path) return;
+					if (!isPermittedMatch(match.path, base)) return;
 					const relativePath = formatMatchPath(match.path, base, match.fileType);
 					if (streamed.has(relativePath)) return;
 					streamed.add(relativePath);
@@ -415,7 +432,9 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 					throw err;
 				}
 				if (!target.hasGlob && stat.isFile()) {
-					return [{ path: formatScopePath(target.searchPath), mtime: stat.mtimeMs }];
+					return isPermittedMatch(target.searchPath, target.searchPath)
+						? [{ path: formatScopePath(target.searchPath), mtime: stat.mtimeMs }]
+						: [];
 				}
 				if (!stat.isDirectory()) {
 					if (isSingle) throw new ToolError(`Path is not a directory: ${target.searchPath}`);
@@ -446,7 +465,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 					throwIfAborted(signal);
 					const out: Array<{ path: string; mtime: number }> = [];
 					for (const match of result.matches) {
-						if (!match.path) continue;
+						if (!match.path || !isPermittedMatch(match.path, target.searchPath)) continue;
 						out.push({
 							path: formatMatchPath(match.path, target.searchPath, match.fileType),
 							mtime: match.mtime ?? 0,

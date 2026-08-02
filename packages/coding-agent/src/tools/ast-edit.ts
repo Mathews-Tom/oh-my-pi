@@ -28,6 +28,7 @@ import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { classifyGroupedLines, formatGroupedFiles, groupLineIndicesByBlank } from "./grouped-file-output";
 import type { OutputMeta } from "./output-meta";
 import { isInternalUrlPath, resolveToolSearchScope } from "./path-utils";
+import { collectPermittedSearchPaths } from "./permissions/gate";
 import {
 	appendParseErrorsBulletList,
 	capParseErrors,
@@ -62,6 +63,7 @@ interface AstEditCallOptions {
 	dryRun: boolean;
 	maxFiles: number;
 	failOnParseError: boolean;
+	allowedPaths?: string[];
 	signal?: AbortSignal;
 }
 
@@ -76,8 +78,14 @@ interface AstEditAggregatedResult {
 	parseErrors?: string[];
 }
 
+interface AstEditTarget {
+	basePath: string;
+	glob?: string;
+	allowedPaths?: string[];
+}
+
 async function runAstEditTargets(
-	targets: Array<{ basePath: string; glob?: string }>,
+	targets: AstEditTarget[],
 	commonBasePath: string,
 	options: AstEditCallOptions,
 ): Promise<AstEditAggregatedResult> {
@@ -97,6 +105,7 @@ async function runAstEditTargets(
 			maxFiles: options.maxFiles,
 			failOnParseError: options.failOnParseError,
 			signal: options.signal,
+			allowedPaths: target.allowedPaths,
 		});
 		totalReplacements += targetResult.totalReplacements;
 		filesSearched += targetResult.filesSearched;
@@ -131,7 +140,7 @@ async function runAstEditTargets(
 }
 
 function runAstEditOnce(
-	targets: Array<{ basePath: string; glob?: string }> | undefined,
+	targets: AstEditTarget[] | undefined,
 	resolvedSearchPath: string,
 	globFilter: string | undefined,
 	options: AstEditCallOptions,
@@ -144,6 +153,7 @@ function runAstEditOnce(
 		path: resolvedSearchPath,
 		glob: globFilter,
 		dryRun: options.dryRun,
+		allowedPaths: options.allowedPaths,
 		maxFiles: options.maxFiles,
 		failOnParseError: options.failOnParseError,
 		signal: options.signal,
@@ -262,7 +272,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 		params: AstEditSchemaInfer,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<AstEditToolDetails>,
-		_context?: AgentToolContext,
+		toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<AstEditToolDetails>> {
 		return untilAborted(signal, async () => {
 			const ops = params.ops.map((entry, index) => {
@@ -300,14 +310,47 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				},
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
-
-			const result = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
-				rewrites: normalizedRewrites,
-				dryRun: true,
-				maxFiles,
-				failOnParseError: false,
-				signal,
-			});
+			const runGuardedAstEdit = async (
+				dryRun: boolean,
+				callSignal?: AbortSignal,
+			): Promise<AstEditAggregatedResult> => {
+				const targets = multiTargets
+					? await Promise.all(
+							multiTargets.map(async target => ({
+								...target,
+								allowedPaths: await collectPermittedSearchPaths(
+									target.basePath,
+									target.glob,
+									true,
+									true,
+									toolContext,
+									callSignal,
+									["read", "write"],
+								),
+							})),
+						)
+					: undefined;
+				const allowedPaths = multiTargets
+					? undefined
+					: await collectPermittedSearchPaths(
+							resolvedSearchPath,
+							globFilter,
+							true,
+							true,
+							toolContext,
+							callSignal,
+							["read", "write"],
+						);
+				return runAstEditOnce(targets, resolvedSearchPath, globFilter, {
+					rewrites: normalizedRewrites,
+					dryRun,
+					maxFiles,
+					failOnParseError: false,
+					allowedPaths,
+					signal: callSignal,
+				});
+			};
+			const result = await runGuardedAstEdit(true, signal);
 
 			const { errors: cappedParseErrors, total: parseErrorsTotal } = capParseErrors(result.parseErrors);
 			const formatPath = (filePath: string): string =>
@@ -444,12 +487,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 					label: `AST Edit: ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}`,
 					sourceToolName: this.name,
 					apply: async (_reason: string) => {
-						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
-							rewrites: normalizedRewrites,
-							dryRun: false,
-							maxFiles,
-							failOnParseError: false,
-						});
+						const applyResult = await runGuardedAstEdit(false);
 						const { errors: cappedApplyParseErrors, total: applyParseErrorsTotal } = capParseErrors(
 							applyResult.parseErrors,
 						);

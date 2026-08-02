@@ -303,6 +303,9 @@ pub struct AstReplaceOptions<'env> {
 	pub path:                Option<String>,
 	/// Optional glob filter within the search root.
 	pub glob:                Option<String>,
+	/// Exact normalized paths relative to a directory root that may be opened.
+	/// When present, every other candidate is excluded before source is read.
+	pub allowed_paths:       Option<Vec<String>>,
 	/// Rule selector for multi-rule configurations.
 	pub selector:            Option<String>,
 	/// Pattern strictness for rewrites.
@@ -436,6 +439,9 @@ fn collect_candidates(
 	let metadata = std::fs::metadata(&search_path)
 		.map_err(|err| Error::from_reason(format!("Path not found: {err}")))?;
 	if metadata.is_file() {
+		if allowed_paths.is_some_and(|paths| !paths.contains("")) {
+			return Ok(Vec::new());
+		}
 		let display_path = search_path
 			.file_name()
 			.and_then(|name| name.to_str())
@@ -919,6 +925,7 @@ pub fn ast_edit(options: AstReplaceOptions<'_>) -> task::Promise<AstReplaceResul
 		lang,
 		path,
 		glob,
+		allowed_paths,
 		selector,
 		strictness,
 		dry_run,
@@ -937,6 +944,7 @@ pub fn ast_edit(options: AstReplaceOptions<'_>) -> task::Promise<AstReplaceResul
 			lang,
 			path,
 			glob,
+			allowed_paths,
 			selector,
 			strictness,
 			dry_run,
@@ -957,6 +965,7 @@ fn ast_edit_blocking(
 	lang: Option<String>,
 	path: Option<String>,
 	glob: Option<String>,
+	allowed_paths: Option<Vec<String>>,
 	selector: Option<String>,
 	strictness: Option<AstMatchStrictness>,
 	dry_run: Option<bool>,
@@ -972,7 +981,8 @@ fn ast_edit_blocking(
 	let fail_on_parse_error = fail_on_parse_error.unwrap_or(false);
 
 	let lang_str = lang.as_deref().map(str::trim).filter(|v| !v.is_empty());
-	let candidates: Vec<_> = collect_candidates(path, glob.as_deref(), None, &ct)?
+	let allowed_paths = allowed_paths.map(|paths| paths.into_iter().collect());
+	let candidates: Vec<_> = collect_candidates(path, glob.as_deref(), allowed_paths.as_ref(), &ct)?
 		.into_iter()
 		.filter(|candidate| is_supported_file(&candidate.absolute_path, lang_str))
 		.collect();
@@ -1379,6 +1389,7 @@ mod tests {
 			None,
 			None,
 			None,
+			None,
 			Some(false),
 			None,
 			None,
@@ -1476,6 +1487,7 @@ mod tests {
 			None,
 			None,
 			None,
+			None,
 			Some(false),
 			None,
 			None,
@@ -1524,6 +1536,7 @@ mod tests {
 			Some(rewrites),
 			Some("ts".to_string()),
 			Some(tree.root.to_string_lossy().into_owned()),
+			None,
 			None,
 			None,
 			None,
