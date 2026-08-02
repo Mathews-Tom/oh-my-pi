@@ -32,7 +32,7 @@ import {
 	MarketplaceManager,
 } from "../extensibility/plugins/marketplace";
 import { readMCPConfigFile } from "../mcp/config-writer";
-import { resolveMemoryBackend } from "../memory-backend";
+import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../memory-backend";
 import { runPauseScreen } from "../modes/components/pause-screen";
 import { collectMcpServerNames, MCPCommandController } from "../modes/controllers/mcp-command-controller";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
@@ -1947,7 +1947,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				case "diagnose": {
 					const hook = verb === "stats" ? backend.stats : backend.diagnose;
 					const payload = await hook?.(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
-					await runtime.output(payload ?? `Memory ${verb} is not available for the ${backend.id} backend.`);
+					await runtime.output(payload ?? memoryStatsUnavailableMessage(backend.id, verb));
 					return commandConsumed();
 				}
 				case "mm":

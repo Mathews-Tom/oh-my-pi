@@ -2715,9 +2715,9 @@ dependencies = [
 
 [[package]]
 name = "html-escape"
-version = "0.2.14"
+version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46c1ff2d1cbf39efe5af0900ced8a069b5e61557a17544eb0c4a50239937389e"
+checksum = "c9356095b4b41197bba32173600e1582792cda618f65d12f68e2e77d273413c5"
 
 [[package]]
 name = "html-to-markdown-rs"
@@ -3666,18 +3666,18 @@ dependencies = [
 
 [[package]]
 name = "maudio"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6ab2d47a7b24f4cf6ab85d335b4a6cc932f650080dfe0819b22bc553aada602"
+checksum = "48e217394a7296752e7f248b491cddcd39a988ff09035884fcfa8a327db62b9d"
 dependencies = [
  "maudio-sys",
 ]
 
 [[package]]
 name = "maudio-sys"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce19c16dbabd0e3db47e88c4ef9d1071236ae66d625647ccd26b5f7570832e05"
+checksum = "f984a71f300c76c0ec77f3571426f5335959f59bca016bdf2d7f4b310ba23d96"
 dependencies = [
  "bindgen",
  "cc",
@@ -4790,7 +4790,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ast"
-version = "17.2.3"
+version = "17.2.4"
 dependencies = [
  "anyhow",
  "ast-grep-core",
@@ -4859,7 +4859,7 @@ dependencies = [
 
 [[package]]
 name = "pi-iso"
-version = "17.2.3"
+version = "17.2.4"
 dependencies = [
  "async-trait",
  "libc",
@@ -4871,7 +4871,7 @@ dependencies = [
 
 [[package]]
 name = "pi-natives"
-version = "17.2.3"
+version = "17.2.4"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4930,7 +4930,7 @@ dependencies = [
 
 [[package]]
 name = "pi-shell"
-version = "17.2.3"
+version = "17.2.4"
 dependencies = [
  "anyhow",
  "brush-builtins",
@@ -5017,7 +5017,7 @@ dependencies = [
 
 [[package]]
 name = "pi-voice"
-version = "17.2.3"
+version = "17.2.4"
 dependencies = [
  "audiopus_sys",
  "bytes",
@@ -5031,7 +5031,7 @@ dependencies = [
 
 [[package]]
 name = "pi-walker"
-version = "17.2.3"
+version = "17.2.4"
 dependencies = [
  "dashmap",
  "globset",
@@ -6499,9 +6499,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.54"
+version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e1d5e639ff6bab73cb6885cc7e7b1de96c3f32c68ec55f3952614bec1092244"
+checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
 dependencies = [
  "deranged",
  "num-conv",
