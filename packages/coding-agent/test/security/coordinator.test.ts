@@ -31,6 +31,7 @@ const gitAdapter: SecurityGitAdapter = {
 	root: async () => repositoryRoot,
 	headSha: async () => "a".repeat(40),
 	resolveRef: async (_cwd, refName) => (refName === "base" ? "b".repeat(40) : "c".repeat(40)),
+	diffTreeFiles: async () => ["src/app.ts"],
 	diffTree: async () => "fixture-diff",
 	status: async () => "",
 	files: async () => ["src/app.ts"],
@@ -142,6 +143,39 @@ describe("native security coordinator", () => {
 			initialCwd: repositoryRoot,
 		});
 		expect(reopened.getSessionId()).toBeTruthy();
+	});
+
+	test("rechecks a saved plan's live scope, knowledge base, and output root before starting", async () => {
+		const { coordinator, mock } = coordinatorWithMockSession([]);
+		const knowledgeBase = path.join(repositoryRoot, "policy.md");
+		await Bun.write(knowledgeBase, "scan policy");
+		const plan = await coordinator.preflight({
+			credentialId,
+			model: mock.model,
+			knowledgeBasePaths: [knowledgeBase],
+		});
+		const scopedFiles: string[][] = [];
+		const knowledgeBases: string[] = [];
+		const outputRoots: string[] = [];
+
+		await expect(
+			coordinator.start({
+				planId: plan.id,
+				guard: {
+					scope: files => scopedFiles.push([...files]),
+					knowledgeBase: file => knowledgeBases.push(file),
+					outputRoot: root => {
+						outputRoots.push(root);
+						throw new Error("resource permission denied");
+					},
+				},
+			}),
+		).rejects.toThrow("resource permission denied");
+
+		expect(scopedFiles).toEqual([["src/app.ts"]]);
+		expect(knowledgeBases).toEqual([plan.knowledgeBases[0]?.path]);
+		expect(outputRoots).toEqual([plan.output.root]);
+		expect(mock.calls).toEqual([]);
 	});
 
 	test("records a terminal failure when initial scan persistence fails", async () => {
@@ -296,7 +330,11 @@ describe("native security coordinator", () => {
 			model: mock.model,
 			target: { kind: "ref_diff", baseRevision, headRevision },
 		});
-		const started = await coordinator.start({ planId: plan.id });
+		const authorized: string[][] = [];
+		const started = await coordinator.start({
+			planId: plan.id,
+			guard: { scope: files => authorized.push([...files]) },
+		});
 		const terminal = await coordinator.wait(started.operationId);
 		expect(terminal.phase).toBe("partial");
 		expect(executionRoot).not.toBe(repositoryRoot);
@@ -304,6 +342,7 @@ describe("native security coordinator", () => {
 		expect(request).toContain("Requested base-to-head diff");
 		expect(request).toContain("+export const app = 'head';");
 		await expect(fs.stat(executionRoot)).rejects.toThrow();
+		expect(authorized).toEqual([["src/app.ts"], ["src/app.ts"]]);
 	});
 
 	test("restart recovery reconciles an interrupted persisted operation", async () => {

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import * as path from "node:path";
 import { getManagedSkillsDir } from "@oh-my-pi/pi-coding-agent/autolearn/managed-skills";
 import {
 	CLASSIFIED_TOOL_NAMES,
@@ -75,9 +76,9 @@ describe("structured extraction", () => {
 		expect(extract("ast_edit", { paths: "not-an-array" })).toEqual([]);
 	});
 
-	it("keeps security_scan exclude_paths out — a filter is never opened", () => {
+	it("leaves security_scan scope filters to its canonical-root guard", () => {
 		const targets = extract("security_scan", { include_paths: ["src"], exclude_paths: [".env"], output_root: "out" });
-		expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual(["read:src", "write:out"]);
+		expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual(["write:out"]);
 	});
 
 	it("treats managed-skill storage as a write target", () => {
@@ -86,6 +87,35 @@ describe("structured extraction", () => {
 				raw: `${getManagedSkillsDir()}/persistent-instruction/SKILL.md`,
 				access: "write",
 				field: "name",
+			},
+		]);
+	});
+
+	it("treats an optional learn skill as the managed write it performs", () => {
+		expect(
+			extract("learn", {
+				skill: { action: "create", name: "persistent-instruction", description: "test", body: "body" },
+			}),
+		).toEqual([
+			{
+				raw: `${getManagedSkillsDir()}/persistent-instruction/SKILL.md`,
+				access: "write",
+				field: "skill.name",
+			},
+		]);
+		expect(extract("learn", {})).toEqual([]);
+	});
+
+	it("keeps invalid managed-skill names inside the permission gate", () => {
+		expect(
+			extract("learn", {
+				skill: { action: "create", name: "../outside", description: "test", body: "body" },
+			}),
+		).toEqual([
+			{
+				raw: path.join(getManagedSkillsDir(), "..", "outside", "SKILL.md"),
+				access: "write",
+				field: "skill.name",
 			},
 		]);
 	});

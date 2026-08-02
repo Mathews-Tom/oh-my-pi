@@ -93,6 +93,13 @@ function resourcePermissionGuard(context: AgentToolContext | undefined): Securit
 				context,
 			);
 		},
+		knowledgeBase: absolutePath => {
+			enforceResourcePathTargets(
+				"security_scan",
+				[{ raw: absolutePath, access: "read", field: "knowledge_base_paths" }],
+				context,
+			);
+		},
 		outputRoot: absolutePath => {
 			enforceResourcePathTargets(
 				"security_scan",
@@ -211,6 +218,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 			case "start": {
 				const operation = await coordinatorForSession().start({
 					planId: requireValue(params.plan_id, "plan_id"),
+					guard: resourcePermissionGuard(context),
 				});
 				return textResult(`Security scan ${operation.scanId} started as ${operation.operationId}.`, {
 					action: params.action,

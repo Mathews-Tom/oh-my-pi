@@ -37,6 +37,8 @@ function settingsOf(overrides: Record<string, unknown>): Settings {
 		get(key: string): unknown {
 			return Object.hasOwn(overrides, key) ? overrides[key] : undefined;
 		},
+		getAgentDir: () => path.join(outside, "agent"),
+		getCwd: () => workspace,
 	} as unknown as Settings;
 }
 
@@ -266,6 +268,27 @@ describe("worktree subagent roots", () => {
 			contextOf(WORKSPACE),
 		);
 		expect(message).toContain("permissions.confineWrites");
+	});
+
+	it("denies learn when its optional skill would write outside the workspace", async () => {
+		const message = await denialOf(
+			"learn",
+			{
+				skill: { action: "create", name: "persistent-instruction", description: "test", body: "body" },
+			},
+			contextOf(WORKSPACE),
+		);
+		expect(message).toContain("permissions.confineWrites");
+	});
+
+	it("denies local lesson persistence outside the workspace", async () => {
+		const message = await denialOf(
+			"learn",
+			{ memory: "persist this lesson" },
+			contextOf({ ...WORKSPACE, "memory.backend": "local" }),
+		);
+		expect(message).toContain("permissions.confineWrites");
+		expect(message).toContain("learned.md");
 	});
 });
 

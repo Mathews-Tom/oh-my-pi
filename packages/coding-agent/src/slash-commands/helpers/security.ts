@@ -121,6 +121,8 @@ function parsePlanOptions(rest: string): SecurityPlanCliOptions {
 	return { target, knowledgeBasePaths, outputRoot, archiveExisting, credentialId };
 }
 
+// Slash commands are user-initiated CLI actions, not model tool calls, so they
+// deliberately have no AgentToolContext-derived resource permission guard.
 async function preflight(runtime: SlashCommandRuntime, rest: string) {
 	const options = parsePlanOptions(rest);
 	const input: SecurityPreflightInput = {
@@ -367,6 +369,7 @@ export async function handleSecurityCommand(
 			case "scan": {
 				const coordinator = coordinatorFor(runtime);
 				const planId = rest.trim().startsWith("secplan_") ? rest.trim() : (await preflight(runtime, rest)).id;
+				// A saved plan follows the same user-initiated boundary as `preflight`.
 				const operation = await coordinator.start({ planId });
 				await runtime.output(`Security scan ${operation.scanId} started as ${operation.operationId}.`);
 				return commandConsumed();

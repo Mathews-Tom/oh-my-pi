@@ -31,6 +31,7 @@ import {
 	createSecurityScanPlan,
 	DEFAULT_SECURITY_GIT_ADAPTER,
 	prepareSecurityOutputDirectory,
+	securityRefDiffPathspecs,
 } from "./preflight";
 import {
 	createNativeSecurityProducer,
@@ -97,6 +98,8 @@ export interface SecurityPreflightInput {
 
 export interface SecurityStartInput {
 	planId: string;
+	/** Rechecks the saved plan's live filesystem surface before execution. */
+	guard?: SecurityScanGuard;
 }
 
 export interface SecurityScanSession {
@@ -324,6 +327,7 @@ async function prepareSecurityExecutionTarget(
 	scanId: string,
 	adapter: SecurityGitAdapter,
 	signal: AbortSignal,
+	guard?: SecurityScanGuard,
 ): Promise<PreparedSecurityExecutionTarget> {
 	if (plan.target.kind !== "ref_diff") {
 		return { cwd: plan.repositoryRoot, cleanup: async () => undefined };
@@ -339,7 +343,14 @@ async function prepareSecurityExecutionTarget(
 	try {
 		await git.worktree.add(plan.repositoryRoot, cwd, headRevision, { detach: true, signal });
 		added = true;
-		const diffText = await adapter.diffTree(plan.repositoryRoot, baseRevision, headRevision, signal);
+		const paths = securityRefDiffPathspecs(plan.target.includePaths, plan.target.excludePaths);
+		const changedFiles = [
+			...new Set(await adapter.diffTreeFiles(plan.repositoryRoot, baseRevision, headRevision, { paths, signal })),
+		]
+			.map(file => file.replaceAll("\\", "/"))
+			.sort();
+		guard?.scope?.(changedFiles, plan.repositoryRoot);
+		const diffText = await adapter.diffTree(plan.repositoryRoot, baseRevision, headRevision, { paths, signal });
 		return {
 			cwd,
 			diffText,
@@ -462,6 +473,7 @@ export class SecurityCoordinator {
 			{
 				config: securityConfigSnapshot(this.#host.settings),
 				workflowFingerprint: SECURITY_WORKFLOW_FINGERPRINT,
+				guard: input.guard,
 			},
 			this.#gitAdapter,
 		);
@@ -481,7 +493,7 @@ export class SecurityCoordinator {
 		this.#operations.set(operationId, record);
 		ACTIVE_SECURITY_OPERATIONS.add(operationId);
 		const run = async (signal: AbortSignal, reportProgress?: (text: string) => Promise<void>): Promise<void> => {
-			await this.#run(record, plan, store, signal, reportProgress);
+			await this.#run(record, plan, store, signal, reportProgress, input.guard);
 		};
 		const manager = this.#host.asyncJobManager;
 		if (manager) {
@@ -555,6 +567,7 @@ export class SecurityCoordinator {
 		store: SecurityStore,
 		signal: AbortSignal,
 		reportProgress?: (text: string) => Promise<void>,
+		guard?: SecurityScanGuard,
 	): Promise<void> {
 		const startedAt = toIsoTimestamp(this.#now);
 		let session: SecurityScanSession | undefined;
@@ -574,6 +587,7 @@ export class SecurityCoordinator {
 				record.snapshot.scanId,
 				this.#gitAdapter,
 				signal,
+				guard,
 			);
 			const activeModel = this.#host.activeModel;
 			const model =

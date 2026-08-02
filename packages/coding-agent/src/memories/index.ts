@@ -1279,7 +1279,7 @@ export function getMemoryRoot(agentDir: string, cwd: string): string {
  * consolidation artifacts (`MEMORY.md`, `memory_summary.md`, `skills/`) so a
  * consolidation pass never clobbers manually captured lessons.
  */
-const LEARNED_LESSONS_FILE = "learned.md";
+export const LEARNED_LESSONS_FILE = "learned.md";
 /** Newest-first cap on retained lessons, bounding file growth by entry count. */
 const MAX_LEARNED_LESSONS = 100;
 /** Per-field char caps so a single huge capture can't bloat learned.md. */

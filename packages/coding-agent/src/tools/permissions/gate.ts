@@ -196,7 +196,7 @@ export function enforceResourcePermissions(
 		return scanOutcome("strings");
 	}
 
-	const denial = checkStructuredTargets(toolClass.extract(args), policy, roots);
+	const denial = checkStructuredTargets(toolClass.extract(args, context), policy, roots);
 	if (denial) throw new PermissionDeniedError(toolName, denial.rule, denial.reason);
 	return null;
 }

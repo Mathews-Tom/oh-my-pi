@@ -18,17 +18,19 @@
  */
 import * as path from "node:path";
 import { Patch } from "@oh-my-pi/hashline";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { getManagedSkillsDir, sanitizeSkillName } from "../../autolearn/managed-skills";
 // The leaf module, not the `../../lsp` barrel: `lsp/index.ts` imports the
 // permission gate to validate server-supplied workspace edits, so pulling the
 // barrel in here would close an import cycle.
 import { LSP_READONLY_ACTIONS } from "../../lsp/actions";
+import { getMemoryRoot, LEARNED_LESSONS_FILE } from "../../memories";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
 import { unwrapHashlineHeaderPath } from "../plan-mode-guard";
 import type { PathAccess, PathTarget } from "./types";
 
-/** Pulls the declared path arguments out of one tool call's arguments. */
-export type PathTargetExtractor = (args: Record<string, unknown>) => PathTarget[];
+/** Pulls filesystem paths out of one tool call and its execution context. */
+export type PathTargetExtractor = (args: Record<string, unknown>, context?: AgentToolContext) => PathTarget[];
 
 /** Pulls the files a tool actually touched out of its result details, for the post-execution recheck. */
 export type ResultPathTargetExtractor = (details: unknown) => PathTarget[];
@@ -280,20 +282,27 @@ const extractLspPaths: PathTargetExtractor = args => {
  * is not caller supplied. Resolve the exact regular-file path the executor
  * uses so workspace/strict confinement applies to create, update, and delete.
  */
-const extractManagedSkillPaths: PathTargetExtractor = args => {
+const extractManagedSkillPaths = (args: Record<string, unknown>, field: string = "name"): PathTarget[] => {
 	const out: PathTarget[] = [];
 	if (typeof args.name !== "string") return out;
-	const name = sanitizeSkillName(args.name);
-	pushPath(out, path.join(getManagedSkillsDir(), name, "SKILL.md"), "write", "name");
+	let name = args.name;
+	try {
+		name = sanitizeSkillName(name);
+	} catch {
+		// Let ManageSkillTool/LearnTool report invalid names after the gate; this
+		// conservative candidate still prevents a traversal-shaped name escaping.
+	}
+	pushPath(out, path.join(getManagedSkillsDir(), name, "SKILL.md"), "write", field);
 	return out;
 };
 
 const extractSecurityScanPaths: PathTargetExtractor = args => {
 	const out: PathTarget[] = [];
-	pushArray(out, args.include_paths, "read", "include_paths");
-	pushArray(out, args.knowledge_base_paths, "read", "knowledge_base_paths");
 	pushPath(out, args.output_root, "write", "output_root");
-	// `exclude_paths` only narrows a scan; it is never opened.
+	// `include_paths` and `exclude_paths` are repository-relative scan filters.
+	// The preflight guard authorizes the resulting paths from the canonical Git
+	// root, which is the only resolution that matches execution. Knowledge-base
+	// paths use the same late guard before they are read.
 	return out;
 };
 
@@ -366,12 +375,30 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	computer: { kind: "opaque", scan: "strings" },
 	hub: { kind: "opaque", scan: "strings" },
 
-	// ── No filesystem surface ─────────────────────────────────────────────
 	ask: { kind: "pathless" },
 	checkpoint: { kind: "pathless" },
 	github: { kind: "pathless" },
-	learn: { kind: "pathless" },
-	manage_skill: { kind: "structured", extract: extractManagedSkillPaths },
+	learn: {
+		kind: "structured",
+		extract: (args, context) => {
+			const out: PathTarget[] = [];
+			const settings = context?.settings;
+			if (settings?.get("memory.backend") === "local") {
+				pushPath(
+					out,
+					path.join(getMemoryRoot(settings.getAgentDir(), settings.getCwd()), LEARNED_LESSONS_FILE),
+					"write",
+					"memory",
+				);
+			}
+			const skill = args.skill;
+			if (skill && typeof skill === "object") {
+				out.push(...extractManagedSkillPaths(skill as Record<string, unknown>, "skill.name"));
+			}
+			return out;
+		},
+	},
+	manage_skill: { kind: "structured", extract: args => extractManagedSkillPaths(args) },
 	memory_edit: { kind: "pathless" },
 	recall: { kind: "pathless" },
 	reflect: { kind: "pathless" },

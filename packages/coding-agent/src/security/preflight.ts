@@ -18,20 +18,22 @@ export type SecurityTargetRequest =
 	| { kind: "working_tree"; includePaths?: string[]; excludePaths?: string[] };
 
 /**
- * Resource-permission hooks for the two surfaces a scan reaches that its tool
- * arguments never name.
+ * Resource-permission hooks for the implicit filesystem surfaces a scan
+ * reaches beyond its direct path arguments.
  *
- * A default `target_kind: "repository"` scan declares no path yet reads every
- * tracked and untracked in-scope file, and an omitted `output_root` is
- * defaulted to a directory under the security state root and created there.
- * The permission gate classifies `security_scan` from its declared arguments,
- * so without these it authorizes both against nothing at all. Each throws to
- * refuse; supplied by `tools/security-scan.ts`, which is the layer that has
- * the session context, and absent everywhere else (tests, importers).
+ * A repository or working-tree scan enumerates files; a ref-diff scan reads
+ * the changed-file patch; and an omitted `output_root` is defaulted under the
+ * security state root and created there. The permission gate classifies
+ * `security_scan` from its declared arguments, so these hooks authorize the
+ * effective surfaces before they can reach the model or filesystem. Each
+ * throws to refuse; `tools/security-scan.ts` supplies them where session
+ * context exists, while tests and importers leave them absent.
  */
 export interface SecurityScanGuard {
 	/** Every in-scope file the scan enumerated, workspace-relative to `repositoryRoot`. */
 	scope?(relativePaths: readonly string[], repositoryRoot: string): void;
+	/** A canonical knowledge-base file, before its metadata or contents are read. */
+	knowledgeBase?(absolutePath: string): void;
 	/** The effective output directory, resolved and absolute, before it is created. */
 	outputRoot?(absolutePath: string): void;
 }
@@ -55,13 +57,21 @@ export interface SecurityPlanFreshnessInput {
 	config: unknown;
 	workflowFingerprint: string;
 	signal?: AbortSignal;
+	/** Re-applied while reconstructing a saved plan before execution. */
+	guard?: SecurityScanGuard;
+}
+
+export interface SecurityGitDiffOptions {
+	readonly paths?: readonly string[];
+	readonly signal?: AbortSignal;
 }
 
 export interface SecurityGitAdapter {
 	root(cwd: string, signal?: AbortSignal): Promise<string | null>;
 	headSha(cwd: string, signal?: AbortSignal): Promise<string | null>;
 	resolveRef(cwd: string, refName: string, signal?: AbortSignal): Promise<string | null>;
-	diffTree(cwd: string, base: string, head: string, signal?: AbortSignal): Promise<string>;
+	diffTreeFiles(cwd: string, base: string, head: string, options?: SecurityGitDiffOptions): Promise<string[]>;
+	diffTree(cwd: string, base: string, head: string, options?: SecurityGitDiffOptions): Promise<string>;
 	status(cwd: string, signal?: AbortSignal): Promise<string>;
 	files(cwd: string, signal?: AbortSignal): Promise<string[]>;
 	untracked(cwd: string, signal?: AbortSignal): Promise<string[]>;
@@ -71,7 +81,10 @@ export const DEFAULT_SECURITY_GIT_ADAPTER: SecurityGitAdapter = {
 	root: (cwd, signal) => git.repo.root(cwd, signal),
 	headSha: (cwd, signal) => git.head.sha(cwd, signal),
 	resolveRef: (cwd, refName, signal) => git.ref.resolve(cwd, refName, signal),
-	diffTree: (cwd, base, head, signal) => git.diff.tree(cwd, base, head, { signal }),
+	diffTreeFiles: (cwd, base, head, options = {}) =>
+		git.diff.treeNames(cwd, base, head, { files: options.paths, signal: options.signal }),
+	diffTree: (cwd, base, head, options = {}) =>
+		git.diff.tree(cwd, base, head, { files: options.paths, signal: options.signal }),
 	status: (cwd, signal) => git.status(cwd, { porcelainV1: true, untrackedFiles: "all", signal }),
 	files: (cwd, signal) => git.ls.files(cwd, { signal }),
 	untracked: (cwd, signal) => git.ls.untracked(cwd, signal),
@@ -116,7 +129,7 @@ function normalizeRelativePath(input: string): string {
 }
 
 function normalizeScopePaths(values: readonly string[] | undefined): string[] {
-	return [...new Set((values ?? []).map(normalizeRelativePath))].sort();
+	return [...new Set((values ?? []).map(normalizeRelativePath).filter(Boolean))].sort();
 }
 
 function scopeContainsPath(candidate: string, normalizedPath: string): boolean {
@@ -198,6 +211,14 @@ async function digestWorkingTree(
 	return `omp-security-tree/v1:sha256:${hasher.digest("hex")}`;
 }
 
+export function securityRefDiffPathspecs(includePaths: readonly string[], excludePaths: readonly string[]): string[] {
+	const included = includePaths.length > 0 ? includePaths : ["."];
+	return [
+		...included.map(relative => `:(literal)${relative}`),
+		...excludePaths.map(relative => `:(exclude,literal)${relative}`),
+	];
+}
+
 async function normalizeTarget(
 	repositoryRoot: string,
 	request: SecurityTargetRequest,
@@ -218,7 +239,14 @@ async function normalizeTarget(
 		const headRevision = await adapter.resolveRef(repositoryRoot, request.headRevision, signal);
 		if (!baseRevision) throw new Error(`Unknown security scan base revision: ${request.baseRevision}`);
 		if (!headRevision) throw new Error(`Unknown security scan head revision: ${request.headRevision}`);
-		const rawDiff = await adapter.diffTree(repositoryRoot, baseRevision, headRevision, signal);
+		const paths = securityRefDiffPathspecs(includePaths, excludePaths);
+		const changedFiles = [
+			...new Set(await adapter.diffTreeFiles(repositoryRoot, baseRevision, headRevision, { paths, signal })),
+		]
+			.map(normalizeRelativePath)
+			.sort();
+		guard?.scope?.(changedFiles, repositoryRoot);
+		const rawDiff = await adapter.diffTree(repositoryRoot, baseRevision, headRevision, { paths, signal });
 		return {
 			kind: "ref_diff",
 			repositoryRoot,
@@ -227,7 +255,7 @@ async function normalizeTarget(
 			headRevision,
 			includePaths,
 			excludePaths,
-			treeDigest: `omp-security-diff/v1:sha256:${Bun.SHA256.hash(
+			treeDigest: `omp-security-diff/v2:sha256:${Bun.SHA256.hash(
 				canonicalSecurityJson({ baseRevision, headRevision, includePaths, excludePaths, rawDiff }),
 				"hex",
 			)}`,
@@ -249,10 +277,12 @@ async function normalizeTarget(
 async function normalizeKnowledgeBases(
 	paths: readonly string[] | undefined,
 	baseDirectory: string,
+	guard?: SecurityScanGuard,
 ): Promise<SecurityKnowledgeBaseRef[]> {
 	const results: SecurityKnowledgeBaseRef[] = [];
 	for (const input of paths ?? []) {
 		const canonical = await fs.realpath(path.resolve(baseDirectory, input));
+		guard?.knowledgeBase?.(canonical);
 		const stats = await fs.stat(canonical);
 		if (!stats.isFile()) throw new Error(`Security knowledge base is not a file: ${input}`);
 		const digest = await hashFile(canonical);
@@ -348,7 +378,7 @@ async function buildPlanMaterial(
 	if (!repositoryRoot) throw new Error(`Security scans require a Git repository: ${request.cwd}`);
 	const canonicalRoot = await fs.realpath(repositoryRoot);
 	const target = await normalizeTarget(canonicalRoot, request.target, adapter, request.signal, request.guard);
-	const knowledgeBases = await normalizeKnowledgeBases(request.knowledgeBasePaths, canonicalRoot);
+	const knowledgeBases = await normalizeKnowledgeBases(request.knowledgeBasePaths, canonicalRoot, request.guard);
 	const output = await normalizeOutput(
 		canonicalRoot,
 		request.outputRoot,
@@ -427,6 +457,7 @@ function requestFromPlan(plan: SecurityScanPlan, freshness: SecurityPlanFreshnes
 		workflowFingerprint: freshness.workflowFingerprint,
 		signal: freshness.signal,
 		createdAt: plan.createdAt,
+		guard: freshness.guard,
 	};
 }
 

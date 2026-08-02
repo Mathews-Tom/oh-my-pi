@@ -9,6 +9,7 @@ import {
 	type SecurityGitAdapter,
 	type SecurityTargetRequest,
 	StaleSecurityScanPlanError,
+	securityRefDiffPathspecs,
 } from "../../src/security";
 
 let temporaryRoot = "";
@@ -17,12 +18,14 @@ let stateRoot = "";
 let headSha = "a".repeat(40);
 let statusText = "";
 let refs = new Map<string, string>();
-
+let diffFiles: string[] = [];
+let diffText = "";
 const adapter: SecurityGitAdapter = {
 	root: async () => repositoryRoot,
 	headSha: async () => headSha,
 	resolveRef: async (_cwd, refName) => refs.get(refName) ?? null,
-	diffTree: async (_cwd, base, head) => `diff:${base}:${head}`,
+	diffTreeFiles: async () => diffFiles,
+	diffTree: async (_cwd, base, head) => diffText || `diff:${base}:${head}`,
 	status: async () => statusText,
 	files: async () => ["src/a.ts", "src/b.ts"],
 	untracked: async () => [],
@@ -41,6 +44,8 @@ beforeEach(async () => {
 		["base", "b".repeat(40)],
 		["head", "c".repeat(40)],
 	]);
+	diffText = "";
+	diffFiles = [];
 });
 
 afterEach(async () => {
@@ -124,6 +129,30 @@ describe("security preflight", () => {
 		expect(created.knowledgeBases[0]?.path).toBe(await fs.realpath(path.join(repositoryRoot, "policy.md")));
 	});
 
+	test("authorizes a repository-relative knowledge base at its canonical execution path", async () => {
+		const relativePath = "policy.md";
+		const canonical = path.join(repositoryRoot, relativePath);
+		await Bun.write(canonical, "policy v1\n");
+		const authorized: string[] = [];
+
+		await createSecurityScanPlan(
+			{
+				cwd: repositoryRoot,
+				target: { kind: "repository" },
+				knowledgeBasePaths: [relativePath],
+				outputRoot: stateRoot,
+				model: { provider: "openai-codex", modelId: "fixture" },
+				account: { provider: "openai-codex", credentialId: 17 },
+				config: {},
+				workflowFingerprint: "fixture",
+				guard: { knowledgeBase: file => authorized.push(file) },
+			},
+			adapter,
+		);
+
+		expect(authorized).toEqual([await fs.realpath(canonical)]);
+	});
+
 	test("symlink target mutation makes a plan stale", async () => {
 		if (process.platform === "win32") return;
 		const linkedPath = path.join(repositoryRoot, "src", "a.ts");
@@ -157,6 +186,87 @@ describe("security preflight", () => {
 		const created = await plan({ kind: "ref_diff", baseRevision: "base", headRevision: "head" });
 		expect(created.target.baseRevision).toBe("b".repeat(40));
 		expect(created.target.headRevision).toBe("c".repeat(40));
+	});
+
+	test("authorizes changed ref-diff files before their patch is retained", async () => {
+		const authorized: string[][] = [];
+		diffFiles = [".env"];
+		diffText = [
+			"diff --git a/.env b/.env",
+			"index 0000000..1111111 100644",
+			"--- a/.env",
+			"+++ b/.env",
+			"@@ -0,0 +1 @@",
+			"+SECRET=value",
+		].join("\n");
+
+		await createSecurityScanPlan(
+			{
+				cwd: repositoryRoot,
+				target: { kind: "ref_diff", baseRevision: "base", headRevision: "head" },
+				outputRoot: stateRoot,
+				model: { provider: "openai-codex", modelId: "fixture" },
+				account: { provider: "openai-codex", credentialId: 17 },
+				config: {},
+				workflowFingerprint: "fixture",
+				guard: { scope: files => authorized.push([...files]) },
+			},
+			adapter,
+		);
+
+		expect(authorized).toEqual([[".env"]]);
+	});
+
+	test("refuses a changed ref-diff path before its patch is loaded", async () => {
+		let patchLoads = 0;
+		diffFiles = [".env"];
+		diffText = "must not be loaded";
+		const originalDiffTree = adapter.diffTree;
+		adapter.diffTree = async () => {
+			patchLoads += 1;
+			return diffText;
+		};
+
+		let received: unknown;
+		try {
+			await createSecurityScanPlan(
+				{
+					cwd: repositoryRoot,
+					target: { kind: "ref_diff", baseRevision: "base", headRevision: "head" },
+					outputRoot: stateRoot,
+					model: { provider: "openai-codex", modelId: "fixture" },
+					account: { provider: "openai-codex", credentialId: 17 },
+					config: {},
+					workflowFingerprint: "fixture",
+					guard: {
+						scope: () => {
+							throw new Error("resource permission denied");
+						},
+					},
+				},
+				adapter,
+			);
+		} catch (error) {
+			received = error;
+		}
+		expect(received).toBeInstanceOf(Error);
+		expect((received as Error).message).toBe("resource permission denied");
+		expect(patchLoads).toBe(0);
+		adapter.diffTree = originalDiffTree;
+	});
+
+	test("uses literal git pathspecs and ignores blank scope entries", async () => {
+		expect(securityRefDiffPathspecs(["src"], ["docs"])).toEqual([":(literal)src", ":(exclude,literal)docs"]);
+
+		const created = await plan({
+			kind: "ref_diff",
+			baseRevision: "base",
+			headRevision: "head",
+			includePaths: [""],
+			excludePaths: [""],
+		});
+		expect(created.target.includePaths).toEqual([]);
+		expect(created.target.excludePaths).toEqual([]);
 	});
 
 	test("output inside repository is rejected", async () => {
