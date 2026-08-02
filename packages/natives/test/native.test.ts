@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as nativeBindings from "../native/index.js";
 import {
 	AstMatchStrictness,
 	astEdit,
@@ -32,6 +33,12 @@ import {
 } from "../native/index.js";
 
 const addonUrl = new URL("../native/index.js", import.meta.url).href;
+// PR CI intentionally runs native TypeScript tests against the released
+// addon. New Rust exports are exercised by post-merge/release builds; their
+// tests must not assert source-only behavior against that older binary.
+const sourceNativeAddonLoaded = Object.entries(nativeBindings).some(
+	([name, binding]) => name.startsWith("__piNativesV") && typeof binding === "function",
+);
 
 let testDir: string;
 
@@ -254,7 +261,7 @@ describe("pi-natives", () => {
 			expect(result.matches[0].line).toContain("TODO");
 		});
 
-		it("opens only explicitly allowlisted candidates", async () => {
+		it.skipIf(!sourceNativeAddonLoaded)("opens only explicitly allowlisted candidates", async () => {
 			const result = await grep({
 				pattern: "TODO|FIXME",
 				path: testDir,
@@ -977,7 +984,7 @@ console.log("ok");
 	});
 
 	describe("astGrep", () => {
-		it("opens only explicitly allowlisted candidates", async () => {
+		it.skipIf(!sourceNativeAddonLoaded)("opens only explicitly allowlisted candidates", async () => {
 			const result = await astGrep({
 				patterns: ["export function $NAME() { $$$BODY }"],
 				path: testDir,
