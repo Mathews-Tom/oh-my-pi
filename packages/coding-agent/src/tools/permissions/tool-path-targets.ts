@@ -50,7 +50,22 @@ export type ToolPathClass =
 			 */
 			readonly resultTargets?: ResultPathTargetExtractor;
 	  }
-	| { readonly kind: "opaque"; readonly scan: "shell" | "strings" }
+	| {
+			readonly kind: "opaque";
+			readonly scan: "shell" | "strings";
+			/**
+			 * For an action whose real surface is a caller-chosen payload
+			 * (needs the opaque scan) but which *also* declares a real
+			 * structured path argument — `lsp`'s `request` sends an arbitrary
+			 * JSON-RPC method/payload, but still takes a `file` the server
+			 * opens before the request goes out. Dropping straight to opaque
+			 * loses that field's confinement/deny check entirely (the opaque
+			 * scan only matches denied literals, never `confineReads`), so
+			 * this runs the declared extractor first, in addition to the
+			 * scan, rather than instead of it.
+			 */
+			readonly alsoExtract?: PathTargetExtractor;
+	  }
 	| { readonly kind: "pathless" };
 
 /**
@@ -332,6 +347,39 @@ function extractResultFiles(details: unknown, access: PathAccess): PathTarget[] 
 }
 
 /**
+ * The fixed suffix `crates/pi-natives/src/ast.rs` appends to a per-file
+ * "syntax tree contains error nodes" parse-error entry, after the file's
+ * `display_path`: `format!("{}: parse error (syntax tree contains error
+ * nodes)", display_path)`. Other parse-error shapes (pattern compile
+ * failures, file-read errors) interleave the pattern and path in a way that
+ * cannot be split apart reliably, so only this one — the shape a read-denied
+ * file with a syntax error actually produces — is extracted.
+ */
+const AST_SYNTAX_PARSE_ERROR_SUFFIX = ": parse error (syntax tree contains error nodes)";
+
+/**
+ * The file `ast_grep`/`ast_edit` reports as unparseable, from its own
+ * result `details.parseErrors`. A file with a syntax error produces no
+ * match/replacement — so it never appears in `details.files`, the target
+ * {@link extractResultFiles} checks — but its path and the diagnostic text
+ * naming it still reach the model through this field, so a read-denied
+ * file's path would otherwise leak here even though the tool's real content
+ * never does.
+ */
+function extractAstParseErrorTargets(details: unknown): PathTarget[] {
+	if (!details || typeof details !== "object" || !("parseErrors" in details)) return [];
+	const { parseErrors } = details;
+	if (!Array.isArray(parseErrors)) return [];
+	const out: PathTarget[] = [];
+	for (const entry of parseErrors) {
+		if (typeof entry !== "string" || !entry.endsWith(AST_SYNTAX_PARSE_ERROR_SUFFIX)) continue;
+		const path = entry.slice(0, -AST_SYNTAX_PARSE_ERROR_SUFFIX.length);
+		pushPath(out, path, "read", "parseErrors");
+	}
+	return out;
+}
+
+/**
  * The concrete file `read` actually opened, from its own result
  * `details.resolvedPath` (or `details.displayReadTargets` for the
  * delimited multi-path recovery branch). The declared-argument extractor
@@ -396,7 +444,10 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	ast_grep: {
 		kind: "structured",
 		extract: delimitedPath("path", "read"),
-		resultTargets: (_args, details) => extractResultFiles(details, "read"),
+		resultTargets: (_args, details) => [
+			...extractResultFiles(details, "read"),
+			...extractAstParseErrorTargets(details),
+		],
 	},
 	ast_edit: {
 		kind: "structured",
@@ -413,6 +464,7 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 		resultTargets: (_args, details) => [
 			...extractResultFiles(details, "read"),
 			...extractResultFiles(details, "write"),
+			...extractAstParseErrorTargets(details),
 		],
 	},
 	lsp: { kind: "structured", extract: extractLspPaths },
@@ -477,7 +529,9 @@ export function classifyTool(toolName: string, args?: Record<string, unknown> | 
 	}
 	if (normalized === "lsp") {
 		const action = args && typeof args.action === "string" ? args.action : undefined;
-		if (action && LSP_OPAQUE_ACTIONS.has(action)) return { kind: "opaque", scan: "strings" };
+		if (action && LSP_OPAQUE_ACTIONS.has(action)) {
+			return { kind: "opaque", scan: "strings", alsoExtract: extractLspPaths };
+		}
 	}
 	return TOOL_PATH_CLASSES[normalized] ?? UNKNOWN_TOOL_CLASS;
 }

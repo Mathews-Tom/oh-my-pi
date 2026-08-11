@@ -129,7 +129,13 @@ export function enforceResourcePermissions(
 		throw new PermissionDeniedError(toolName, hit.rule, message);
 	};
 
-	if (toolClass.kind === "opaque") return scanOutcome(toolClass.scan);
+	if (toolClass.kind === "opaque") {
+		if (toolClass.alsoExtract && args) {
+			const denial = checkStructuredTargets(toolClass.alsoExtract(args), policy, roots);
+			if (denial) throw new PermissionDeniedError(toolName, denial.rule, denial.reason);
+		}
+		return scanOutcome(toolClass.scan);
+	}
 
 	if (!args) {
 		// A structured tool always takes an object, so a non-object payload

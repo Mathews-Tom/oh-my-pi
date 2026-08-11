@@ -650,8 +650,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		// symlinked archive can realpath to a target outside every workspace
 		// root — authorize the real backing file here, before any archive
 		// I/O, not after (a post-execution recheck would run after the
-		// rewrite already landed).
+		// rewrite already landed). A rewrite reads the complete existing
+		// archive below (to preserve every unrelated entry), so this target
+		// needs `read` authorized too, not just `write`.
 		this.#assertResolvedWriteAllowed(finalPath, context);
+		if (resolvedArchivePath.exists) this.#assertResolvedReadAllowed(finalPath, context);
 		// A realpath swap can land on a name without an archive extension; a
 		// whole-archive rewrite then defaults to an uncompressed tar, matching the
 		// previous `isZip`/`isGzip`/else fallthrough.
@@ -850,6 +853,30 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	 * already done by the time a post-hoc check could throw.
 	 */
 	#assertResolvedWriteAllowed(absolutePath: string, context: AgentToolContext | undefined): void {
+		this.#assertResolvedAccessAllowed(absolutePath, "write", context);
+	}
+
+	/**
+	 * Authorize a resolved filesystem target as a read, for a write call that
+	 * reads the target's *existing* content before overwriting it: a plain
+	 * overwrite's `assertEditableFile` reads the file prefix to detect a
+	 * generated header, and an archive/conflict rewrite reads the complete
+	 * backing file (to preserve unrelated entries or splice a marker block)
+	 * before writing it back. `write`'s pre-execution gate only ever
+	 * authorizes the declared target as a write — a `deny.read` rule with no
+	 * matching `deny.write` would otherwise let its content leak through
+	 * either read path even though `write` itself never surfaces it back to
+	 * the model on success.
+	 */
+	#assertResolvedReadAllowed(absolutePath: string, context: AgentToolContext | undefined): void {
+		this.#assertResolvedAccessAllowed(absolutePath, "read", context);
+	}
+
+	#assertResolvedAccessAllowed(
+		absolutePath: string,
+		access: "read" | "write",
+		context: AgentToolContext | undefined,
+	): void {
 		const policy = loadPermissionsConfig(context?.settings);
 		if (!policy) return;
 		const roots = permissionRoots(context);
@@ -862,7 +889,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					`To allow it: set permissions.profile: off.`,
 			);
 		}
-		const decision = decideTarget({ raw: absolutePath, access: "write", field: "path" }, policy, roots);
+		const decision = decideTarget({ raw: absolutePath, access, field: "path" }, policy, roots);
 		if (decision.kind === "deny") {
 			throw new PermissionDeniedError("write", decision.rule, decision.reason);
 		}
@@ -894,8 +921,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		// `path: "conflict://<id>"` resolves through the pre-execution gate as
 		// the synthetic URI string, not the registered entry's real
 		// filesystem target — authorize the actual target here, where it is
-		// known.
+		// known. Splicing a marker block reads the whole file first, so this
+		// target needs `read` authorized too, not just `write`.
 		this.#assertResolvedWriteAllowed(absolutePath, context);
+		this.#assertResolvedReadAllowed(absolutePath, context);
 
 		const expanded = expandContentTokens(replacementContent, entry);
 		const originalText = await Bun.file(absolutePath).text();
@@ -1329,8 +1358,12 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			const absolutePath = resolvePlanPath(this.session, path);
 			const batchRequest = getLspBatchRequest(context?.toolCall);
 
-			// Check if file exists and is auto-generated before overwriting
+			// Check if file exists and is auto-generated before overwriting.
+			// `assertEditableFile` reads the file's prefix to detect a generated
+			// header — the pre-execution gate only ever authorized `path` as a
+			// write, so an existing target needs `read` authorized here too.
 			if (await fs.exists(absolutePath)) {
+				this.#assertResolvedReadAllowed(absolutePath, context);
 				await assertEditableFile(absolutePath, path, this.session.settings);
 			}
 
