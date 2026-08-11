@@ -103,6 +103,18 @@ export function assertDiagnosticTargetsAllowed(
 }
 
 /**
+ * Whether an active resource permission policy has read restrictions
+ * (`permissions.deny.read` rules or `permissions.confineReads`) that a
+ * project-aware LSP server (tsserver, rust-analyzer, …) must not be exposed
+ * to via eager/lazy indexing — see every warmup/sync helper that lazily
+ * creates a client mid-write or at startup.
+ */
+export function isLspReadRestricted(context: AgentToolContext | undefined): boolean {
+	const policy = loadPermissionsConfig(context?.settings);
+	return !!policy && (policy.deny.read.length > 0 || policy.confineReads);
+}
+
+/**
  * Refuse to run workspace-wide `diagnostics` (`file: "*"`) under a policy
  * that denies specific paths from being read. This branch spawns an actual
  * compiler (`tsc`, `cargo check`, `go build`, `pyright`, …) over the whole

@@ -24,7 +24,7 @@ const BUNDLED_PACKAGES: readonly BundledPackage[] = [
 ];
 
 const TYPEBOX_MODULE_KEY = "typebox";
-const TYPEBOX_SHIM = "typebox.ts";
+const TYPEBOX_COMPAT_MODULE = "legacy-typebox.ts";
 const SKIPPED_WILDCARD_BASENAMES = new Set(["index"]);
 const MAIN_THREAD_UNSAFE_WILDCARD_BASENAMES = new Set(["worker-entry"]);
 
@@ -151,7 +151,10 @@ export async function collectBundledPiEntries(): Promise<BundledPiEntry[]> {
 				const glob = new Bun.Glob(`**/*${pattern.sourceSuffix}`);
 				const matches: string[] = [];
 				for await (const match of glob.scan({ cwd: sourceDir, onlyFiles: true })) {
-					matches.push(match);
+					// Bun.Glob yields host separators; the export keys and generated
+					// identifiers below are `/`-shaped. Same normalization as
+					// `generate-docs-index.ts`.
+					matches.push(match.split(path.sep).join("/"));
 				}
 				matches.sort();
 				for (const match of matches) {
@@ -172,7 +175,7 @@ export async function collectBundledPiEntries(): Promise<BundledPiEntry[]> {
 		}
 	}
 
-	addEntry(TYPEBOX_MODULE_KEY, "bundledTypeBoxShim", shimSpecifier(TYPEBOX_SHIM));
+	addEntry(TYPEBOX_MODULE_KEY, "bundledTypeBoxShim", shimSpecifier(TYPEBOX_COMPAT_MODULE));
 	return entries;
 }
 

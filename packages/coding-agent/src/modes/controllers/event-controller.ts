@@ -72,6 +72,12 @@ function exposesRawPartialJson(toolName: string, rawInput: boolean, tool: unknow
 type AgentSessionEventHandlers = {
 	[E in AgentSessionEventKind]: (event: Extract<AgentSessionEvent, { type: E }>) => Promise<void>;
 };
+interface ApprovalPreviewGate {
+	promise: Promise<void>;
+	resolve(): void;
+	reject(reason?: unknown): void;
+	started: boolean;
+}
 
 export class EventController {
 	#lastReadGroup: ReadToolGroupComponent | undefined = undefined;
@@ -88,6 +94,8 @@ export class EventController {
 	/** Tool calls whose approval prompt drove the title into `attention`; cleared
 	 *  at their tool_execution_end so the title returns to `working`. */
 	#approvalAttentionToolCallIds = new Set<string>();
+	#approvalPreviewGates = new Map<string, ApprovalPreviewGate>();
+	#detachToolApprovalPreviewWaiter: (() => void) | undefined;
 	#readToolCallArgs = new Map<string, Record<string, unknown>>();
 	#readToolCallAssistantComponents = new Map<string, AssistantMessageComponent>();
 	#toolTimelineComponents = new Map<string, Component>();
@@ -170,6 +178,26 @@ export class EventController {
 	#prevHideThinking = false;
 	#handlers: AgentSessionEventHandlers;
 	#terminalProgressActive = false;
+	// Coalescing window for `message_update` events at the subscription boundary.
+	// `message_update` carries the CUMULATIVE assistant message (every update
+	// re-lists all content blocks), so when a burst of deltas arrives faster than
+	// this window only the latest snapshot needs to rebuild streaming state — the
+	// intermediate rebuilds are redundant work. The TUI already caps the paint
+	// rate via its own render cadence; this caps the per-token handler work that
+	// feeds it. Speech stays intact: `#vocalizeDelta` runs at ARRIVAL for every
+	// delta before the snapshot is coalesced away.
+	#pendingMessageUpdate: Extract<AgentSessionEvent, { type: "message_update" }> | undefined = undefined;
+	#messageUpdateTimer: NodeJS.Timeout | undefined = undefined;
+	/** Tail of the serialized dispatch chain; see #runSerialized. */
+	#dispatchTail: Promise<void> = Promise.resolve();
+	/** Whether a chained run is currently in flight (awaiting its own awaits). */
+	#dispatchInFlight = false;
+	// Deltas already fed to speech at arrival by the coalescer. `#handleMessageUpdate`
+	// also vocalizes so the direct `handleEvent` path (tests, session focus replay)
+	// keeps working — the WeakSet makes the coalesced path speak each delta exactly
+	// once instead of twice.
+	#vocalizedMessageUpdates = new WeakSet<object>();
+	static readonly #MESSAGE_UPDATE_COALESCE_MS = 33;
 
 	constructor(private ctx: InteractiveModeContext) {
 		// Enhanced speech (`speech.enhanced`) rewrites blocks through the
@@ -177,6 +205,9 @@ export class EventController {
 		// vocalizer falls back to mechanical cleanup when unset. Tolerates
 		// partial contexts (tests, minimal embeddings) by wiring null.
 		const session = ctx.session;
+		this.#detachToolApprovalPreviewWaiter = session?.extensionRunner?.setToolApprovalPreviewWaiter(toolCallId =>
+			this.#waitForToolApprovalPreview(toolCallId),
+		);
 		vocalizer.setEnhancer(
 			session?.modelRegistry && session.agent && session.settings
 				? new SpeechEnhancer({
@@ -253,6 +284,14 @@ export class EventController {
 	}
 
 	dispose(): void {
+		this.#detachToolApprovalPreviewWaiter?.();
+		this.#detachToolApprovalPreviewWaiter = undefined;
+		this.#clearApprovalPreviewGates();
+		if (this.#messageUpdateTimer) {
+			clearTimeout(this.#messageUpdateTimer);
+			this.#messageUpdateTimer = undefined;
+		}
+		this.#pendingMessageUpdate = undefined;
 		this.#streamingReveal.stop();
 		this.#toolArgsReveal.stop();
 		this.#cancelIdleCompaction();
@@ -269,6 +308,36 @@ export class EventController {
 		this.#lastReadGroup?.finalize();
 		this.#lastReadGroup = undefined;
 	}
+	#approvalPreviewGate(toolCallId: string): ApprovalPreviewGate {
+		let gate = this.#approvalPreviewGates.get(toolCallId);
+		if (!gate) {
+			const deferred = Promise.withResolvers<void>();
+			gate = { ...deferred, started: false };
+			this.#approvalPreviewGates.set(toolCallId, gate);
+		}
+		return gate;
+	}
+
+	async #waitForToolApprovalPreview(toolCallId: string): Promise<void> {
+		await this.#approvalPreviewGate(toolCallId).promise;
+	}
+
+	#startToolApprovalPreview(toolCallId: string): void {
+		const gate = this.#approvalPreviewGate(toolCallId);
+		if (gate.started) return;
+		gate.started = true;
+		const component = this.ctx.pendingTools.get(toolCallId);
+		const ready = component instanceof ToolExecutionComponent ? component.whenPreviewSettled() : Promise.resolve();
+		void ready.then(() => {
+			this.ctx.ui.requestRender();
+			gate.resolve();
+		}, gate.reject);
+	}
+
+	#clearApprovalPreviewGates(): void {
+		for (const gate of this.#approvalPreviewGates.values()) gate.resolve();
+		this.#approvalPreviewGates.clear();
+	}
 
 	#getReadGroup(): ReadToolGroupComponent {
 		if (!this.#lastReadGroup) {
@@ -276,6 +345,7 @@ export class EventController {
 				showContentPreview: this.ctx.settings.get("read.toolResultPreview"),
 			});
 			group.setExpanded(this.ctx.toolOutputExpanded);
+			group.setToolActivityVisible(!this.ctx.hideToolActivity);
 			this.ctx.chatContainer.addChild(group);
 			this.#lastReadGroup = group;
 		}
@@ -424,9 +494,134 @@ export class EventController {
 	}
 
 	subscribeToAgent(): void {
+		// Serialize non-update dispatch behind any in-flight handler run:
+		// AgentSession.#emit fires listeners fire-and-forget (it does not await
+		// listener promises), so without this a rapid stream tail
+		// (message_update → message_end → agent_end) could let a later callback
+		// overtake the coalesced flush's handler mid-await — agent_end removing
+		// `streamingComponent` before #handleMessageEnd finalizes and records
+		// the final message (issue #7443 follow-up). When the tail has settled,
+		// dispatch stays synchronous: the flush's streaming rebuild runs before
+		// the listener's first await, preserving the timing the coalescing
+		// tests assert on. `message_update` enqueue is itself synchronous and
+		// needs no serialization.
 		this.ctx.unsubscribe = this.ctx.session.subscribe(async (event: AgentSessionEvent) => {
-			await this.handleEvent(event);
+			// Coalesce the cumulative `message_update` deltas of a streaming turn
+			// into at most one handler run per window. `#handleMessageUpdate` is
+			// synchronous, so without this every token re-runs the whole
+			// streaming rebuild (splitAssistantMessageToolTimeline, reveal
+			// setTarget, per-block tool-call reconciliation) even though the TUI
+			// paints at most ~30fps — at 40-100 tps the handler work then
+			// dominates the CPU profile of an idle-looking streaming session
+			// (issue #7443). Only the latest snapshot is meaningful; non-update
+			// events flush the pending snapshot first so ordering is preserved.
+			if (event.type === "message_update") {
+				this.#enqueueMessageUpdate(event);
+				return;
+			}
+			await this.#runSerialized(async () => {
+				await this.#flushPendingMessageUpdate();
+				await this.handleEvent(event);
+			});
 		});
+	}
+
+	/**
+	 * Run `run` in the serialized dispatch chain: every run is its own link on
+	 * the tail, so a burst of events queued behind an in-flight run start one
+	 * after the other, never concurrently. This closes two races (issue #7443
+	 * follow-up): a rapid stream tail (message_update → message_end →
+	 * agent_end) cannot overtake the coalesced flush mid-await — agent_end
+	 * removing `streamingComponent` before #handleMessageEnd finalizes and
+	 * records the final message — and two+ events landing in the same window
+	 * cannot all resume from one shared await and dispatch in parallel. When
+	 * the chain is drained, `run` starts synchronously (no intermediate
+	 * microtask), preserving the synchronous-flush timing the coalescing
+	 * tests assert on. A rejection propagates to the caller (the session's
+	 * fire-and-forget emit) and the next event starts a fresh chain link
+	 * instead of being dropped.
+	 */
+	async #runSerialized(run: () => Promise<void>): Promise<void> {
+		if (this.#dispatchInFlight) {
+			// Queue behind the CURRENT tail: the next run starts only after
+			// the previous one settles. Each waiter gets its own link, so a
+			// burst cannot fan out from the same shared await.
+			const link = this.#dispatchTail.then(
+				() => run(),
+				() => run(),
+			);
+			this.#dispatchTail = link;
+			void link.then(
+				() => {
+					// Only the tail owner clears the flag: a later chained
+					// link clears it when it settles as the tail.
+					if (this.#dispatchTail === link) this.#dispatchInFlight = false;
+				},
+				() => {
+					if (this.#dispatchTail === link) this.#dispatchInFlight = false;
+				},
+			);
+			await link;
+			return;
+		}
+		this.#dispatchInFlight = true;
+		const link = run();
+		this.#dispatchTail = link;
+		void link.then(
+			() => {
+				if (this.#dispatchTail === link) this.#dispatchInFlight = false;
+			},
+			() => {
+				if (this.#dispatchTail === link) this.#dispatchInFlight = false;
+			},
+		);
+		await link;
+	}
+
+	/**
+	 * Queue a streaming `message_update` for the next coalesced handler run.
+	 * Speech is per-delta, so the delta is vocalized at arrival before the
+	 * snapshot is (possibly) superseded by a newer one.
+	 */
+	#enqueueMessageUpdate(event: Extract<AgentSessionEvent, { type: "message_update" }>): void {
+		// Speech is per-delta: every delta is spoken at arrival even when its
+		// cumulative snapshot is later superseded and never rebuilt.
+		this.#vocalizeDelta(event);
+		this.#vocalizedMessageUpdates.add(event);
+		this.#pendingMessageUpdate = event;
+		if (this.#messageUpdateTimer) return;
+		this.#messageUpdateTimer = setTimeout(() => {
+			this.#messageUpdateTimer = undefined;
+			// Mirror AgentSession.#emit: attach a catch so a streaming rebuild
+			// failure surfaces as a logged warning instead of a process-level
+			// unhandled rejection (the timer path has no listener to attach one).
+			// Runs inside the serialized dispatch chain so a message_end /
+			// agent_end landing mid-window cannot overtake this flush (issue
+			// #7443 follow-up).
+			void this.#runSerialized(async () => {
+				await this.#flushPendingMessageUpdate();
+			}).catch(err => {
+				logger.warn("Message update flush rejected", {
+					error: err instanceof Error ? err.message : String(err),
+				});
+			});
+		}, EventController.#MESSAGE_UPDATE_COALESCE_MS);
+	}
+
+	/**
+	 * Run the coalesced `message_update` handler on the latest pending snapshot
+	 * (dropping any superseded intermediates) and clear the queue. Safe to call
+	 * more than once; no-ops when nothing is pending.
+	 */
+	async #flushPendingMessageUpdate(): Promise<void> {
+		if (this.#messageUpdateTimer) {
+			clearTimeout(this.#messageUpdateTimer);
+			this.#messageUpdateTimer = undefined;
+		}
+		const event = this.#pendingMessageUpdate;
+		if (!event) return;
+		this.#pendingMessageUpdate = undefined;
+		await this.handleEvent(event);
 	}
 	/**
 	 * Clear every transcript-anchored/turn-scoped piece of state. Used by the
@@ -435,6 +630,11 @@ export class EventController {
 	 * session's transcript and must not bleed into the new one.
 	 */
 	resetTranscriptAnchors(): void {
+		if (this.#messageUpdateTimer) {
+			clearTimeout(this.#messageUpdateTimer);
+			this.#messageUpdateTimer = undefined;
+		}
+		this.#pendingMessageUpdate = undefined;
 		this.#resetReadGroup();
 		this.#lastVisibleBlockCount = 0;
 		this.#renderedCustomMessages.clear();
@@ -531,6 +731,7 @@ export class EventController {
 	}
 
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
+		this.#clearApprovalPreviewGates();
 		this.#toolTimelineComponents.clear();
 		this.#streamedToolCallIdByIndex.clear();
 		this.#retractedToolCallIds.clear();
@@ -813,7 +1014,9 @@ export class EventController {
 
 	async #handleMessageUpdate(event: Extract<AgentSessionEvent, { type: "message_update" }>): Promise<void> {
 		this.#ensureWorkingLoaderWhileStreaming();
-		this.#vocalizeDelta(event);
+		if (!this.#vocalizedMessageUpdates.delete(event)) {
+			this.#vocalizeDelta(event);
+		}
 		if (this.ctx.streamingComponent && event.message.role === "assistant") {
 			const unlockedThinkingVisibility = this.ctx.noteDisplayableThinkingContent(event.message);
 			if (unlockedThinkingVisibility) {
@@ -915,6 +1118,7 @@ export class EventController {
 						content.name,
 						renderArgs,
 						{
+							useBuiltInRenderer: this.ctx.viewSession.hasBuiltInTool(content.name),
 							snapshots: getFileSnapshotStore(this.ctx.viewSession),
 							clipboard: getEditClipboard(this.ctx.viewSession),
 							showImages: settings.get("terminal.showImages"),
@@ -927,6 +1131,7 @@ export class EventController {
 						content.id,
 					);
 					component.setExpanded(this.ctx.toolOutputExpanded);
+					component.setToolActivityVisible(!this.ctx.hideToolActivity);
 					this.ctx.chatContainer.addChild(component);
 					this.ctx.pendingTools.set(content.id, component);
 					this.#toolTimelineComponents.set(content.id, component);
@@ -1153,6 +1358,7 @@ export class EventController {
 					this.ctx.pendingTools.set(event.toolCallId, group);
 					this.#toolTimelineComponents.set(event.toolCallId, group);
 				}
+				this.#startToolApprovalPreview(event.toolCallId);
 				this.ctx.ui.requestRender();
 				return;
 			}
@@ -1163,6 +1369,7 @@ export class EventController {
 				event.toolName,
 				event.args,
 				{
+					useBuiltInRenderer: this.ctx.viewSession.hasBuiltInTool(event.toolName),
 					snapshots: getFileSnapshotStore(this.ctx.viewSession),
 					clipboard: getEditClipboard(this.ctx.viewSession),
 					showImages: settings.get("terminal.showImages"),
@@ -1175,7 +1382,9 @@ export class EventController {
 				this.ctx.sessionManager.getCwd(),
 				event.toolCallId,
 			);
+			component.setArgsComplete(event.toolCallId);
 			component.setExpanded(this.ctx.toolOutputExpanded);
+			component.setToolActivityVisible(!this.ctx.hideToolActivity);
 			this.ctx.chatContainer.addChild(component);
 			this.ctx.pendingTools.set(event.toolCallId, component);
 			this.#toolTimelineComponents.set(event.toolCallId, component);
@@ -1201,6 +1410,7 @@ export class EventController {
 				this.ctx.ui.requestRender();
 			}
 		}
+		this.#startToolApprovalPreview(event.toolCallId);
 	}
 
 	/**
@@ -1445,11 +1655,29 @@ export class EventController {
 				typeof details.title === "string" &&
 				typeof details.planExists === "boolean"
 			) {
-				await this.ctx.handlePlanApproval({
-					planFilePath: details.planFilePath,
-					title: details.title,
-					planExists: details.planExists,
-				});
+				// Dispatch the approval WITHOUT blocking the serialized event
+				// dispatch chain. `handlePlanApproval` -> `#approvePlan` awaits
+				// `session.prompt` for the ENTIRE approved-execution turn; awaiting
+				// it here (this handler runs inside `#runSerialized`) would hold the
+				// single dispatch link for the whole run, so the run's own
+				// agent_start / message_start / tool / coalesced message_update
+				// events queue behind it on `#dispatchTail` and the chat stays blank
+				// until execution finishes (issue #7684, follow-up to #5688 which
+				// only closed the overlay). Detaching frees the link the moment this
+				// handler returns; the approval overlay and the turn's live events
+				// then render. The approval flow surfaces its own failures via
+				// `showError`, so only an unexpected rejection is logged here.
+				void this.ctx
+					.handlePlanApproval({
+						planFilePath: details.planFilePath,
+						title: details.title,
+						planExists: details.planExists,
+					})
+					.catch(err => {
+						logger.warn("Plan approval dispatch failed", {
+							error: err instanceof Error ? err.message : String(err),
+						});
+					});
 			}
 		}
 	}
@@ -1464,6 +1692,26 @@ export class EventController {
 		// the loader and finalizes it at its own agent_end (isStreaming === false by
 		// then). Mirrors the collab guest's !isStreaming loader reconciler.
 		if (this.ctx.session.isStreaming) return;
+		// A non-terminal settle (`isTerminal: false`) is a scheduling pause, not the
+		// end of the run: an unsuppressed async job (a `/vibe` worker turn, a bash
+		// `async` job, etc.) will re-wake the loop when its result is delivered.
+		// `AgentSession` tags this on the deferred event (see `#hasPendingAsyncWake`
+		// in agent-session.ts). Skip the idle title/loader teardown so the tab keeps
+		// reading "working"; the later terminal `agent_end` performs it. Still flush
+		// a deferred model switch — the plan-mode reconciler queues it to apply once
+		// the current stream ends, and `#finishAgentEnd` is otherwise its only flush
+		// site, so the automatic continuation would otherwise run on the old
+		// model/thinking level until the terminal settle.
+		if (event.isTerminal === false) {
+			await this.ctx.flushPendingModelSwitch();
+			// Reaching here means the first guard passed, so `isStreaming` is already
+			// false: a command issued from now on mounts immediately. Leaving earlier
+			// panels queued would render them out of order, minutes later, after the
+			// user was told they were only waiting for the turn. The transcript is
+			// quiescent at a settle, which is the condition #4806 wanted.
+			this.ctx.flushPendingCommandOutput();
+			return;
+		}
 		setTerminalTitleState("idle");
 
 		await this.#finishAgentEnd(event);
@@ -1722,21 +1970,19 @@ export class EventController {
 			this.ctx.retryLoader = undefined;
 			this.ctx.statusContainer.disposeChildren();
 		}
-		if (event.success) {
-			let appliedRecovered = false;
-			for (const recovered of event.recoveredErrors ?? []) {
-				const component = this.#takeRetrySupersededAssistantComponent(recovered.persistenceKey);
-				if (!component) continue;
-				component.applyRetryRecovery(recovered.retryRecovery);
-				if (this.#pinnedErrorComponent === component) this.#pinnedErrorComponent = undefined;
-				appliedRecovered = true;
-			}
-			if (appliedRecovered || (event.recoveredErrors?.length ?? 0) > 0) {
-				this.ctx.clearPinnedError();
-			}
-			this.#clearRetrySupersededAssistantComponents();
-		} else {
-			this.#clearRetrySupersededAssistantComponents();
+		let appliedRetryUpdate = false;
+		for (const retryError of event.retryErrors ?? []) {
+			const component = this.#takeRetrySupersededAssistantComponent(retryError.persistenceKey);
+			if (!component) continue;
+			component.applyRetryRecovery(retryError.retryRecovery);
+			if (this.#pinnedErrorComponent === component) this.#pinnedErrorComponent = undefined;
+			appliedRetryUpdate = true;
+		}
+		if (appliedRetryUpdate || (event.retryErrors?.length ?? 0) > 0) {
+			this.ctx.clearPinnedError();
+		}
+		this.#clearRetrySupersededAssistantComponents();
+		if (!event.success) {
 			this.ctx.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
 		}
 		this.#ensureWorkingLoaderWhileStreaming();

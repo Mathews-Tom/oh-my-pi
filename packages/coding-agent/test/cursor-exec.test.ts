@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { create, fromBinary } from "@bufbuild/protobuf";
+import { type } from "@oh-my-pi/omptype";
 import type { AgentEvent, AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { type BlockState, handleServerMessage, type ToolCallState } from "@oh-my-pi/pi-ai/providers/cursor";
 import { buildPiLsResult, piTruncation } from "@oh-my-pi/pi-ai/providers/cursor/exec-modern";
@@ -31,7 +32,6 @@ import { BUILTIN_TOOLS, GrepTool, ReadTool, type Tool, type ToolSession } from "
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import type { TruncationMeta } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 import { AdviseTool } from "../src/advisor/advise-tool";
 
 function createTestSession(cwd: string, overrides: Partial<ToolSession> = {}): ToolSession {
@@ -372,8 +372,7 @@ describe("bridge tool resolution beyond the model-facing registry", () => {
 	it("substitutes a replace-mode edit into a granted advisor tool map", async () => {
 		// The advisor roster hands the bridge the instances it built for the
 		// advisor's own loop — default `hashline` mode, whose schema is a single
-		// `input` string. A `pi_edit` frame's `old_text`/`new_text` pairs fail
-		// validation against it, so the file goes unmodified. This is the
+		// `input` string. A `pi_edit` frame's `old_string`/`new_string` args fail
 		// substitution the advisor path applies before constructing handlers.
 		const target = path.join(cwd, "sample.txt");
 		await Bun.write(target, "alpha\nbeta\n");
@@ -699,6 +698,68 @@ describe("CursorExecHandlers error results", () => {
 		expect(stdout).toEqual(["Enriched recovery guidance"]);
 		const end = events.find(event => event.type === "tool_execution_end");
 		expect(end?.isError).toBe(true);
+	});
+
+	it("omits unset optional kwargs from shellStream start events and execute args", async () => {
+		// shellStream bypasses executeTool(), so omitUndefinedArgs must be
+		// applied here directly — otherwise absent cwd/timeout become
+		// present-undefined and ArkType rejects the bash call.
+		const events: AgentEvent[] = [];
+		const executeArgs: Record<string, unknown>[] = [];
+		const bashSchema = type({ command: "string", "cwd?": "string", "timeout?": "number" });
+		const bashTool: AgentTool<typeof bashSchema> = {
+			name: "bash",
+			label: "bash",
+			description: "records args",
+			parameters: bashSchema,
+			execute: async (_id, args) => {
+				executeArgs.push({ ...args });
+				return { content: [{ type: "text", text: "ok" }], details: {} };
+			},
+		};
+		const handlers = new CursorExecHandlers({
+			cwd: ".",
+			tools: new Map([["bash", bashTool]]),
+			emitEvent: event => events.push(event),
+		});
+
+		await handlers.shellStream(
+			create(ShellArgsSchema, {
+				toolCallId: "call-shell-omit",
+				command: "echo hi",
+				// Proto string defaults to ""; the bridge maps that to undefined.
+				workingDirectory: "",
+			}),
+			{ onStdout: () => {}, onStderr: () => {} },
+		);
+
+		const start = events.find(event => event.type === "tool_execution_start");
+		expect(start?.type).toBe("tool_execution_start");
+		if (start?.type !== "tool_execution_start") throw new Error("expected tool_execution_start");
+		expect(start.args).toEqual({ command: "echo hi" });
+		expect(Object.hasOwn(start.args, "cwd")).toBe(false);
+		expect(Object.hasOwn(start.args, "timeout")).toBe(false);
+		expect(executeArgs).toHaveLength(1);
+		expect(executeArgs[0]).toEqual({ command: "echo hi" });
+		expect(Object.hasOwn(executeArgs[0]!, "cwd")).toBe(false);
+		expect(Object.hasOwn(executeArgs[0]!, "timeout")).toBe(false);
+
+		executeArgs.length = 0;
+		events.length = 0;
+		await handlers.shellStream(
+			create(ShellArgsSchema, {
+				toolCallId: "call-shell-keep",
+				command: "pwd",
+				workingDirectory: "/tmp",
+				timeout: 12,
+			}),
+			{ onStdout: () => {}, onStderr: () => {} },
+		);
+		const keepStart = events.find(event => event.type === "tool_execution_start");
+		expect(keepStart?.type).toBe("tool_execution_start");
+		if (keepStart?.type !== "tool_execution_start") throw new Error("expected tool_execution_start");
+		expect(keepStart.args).toEqual({ command: "pwd", cwd: "/tmp", timeout: 12 });
+		expect(executeArgs[0]).toEqual({ command: "pwd", cwd: "/tmp", timeout: 12 });
 	});
 });
 
@@ -1538,9 +1599,9 @@ describe("CursorExecHandlers Pi frame translation", () => {
 
 		expect(calls).toEqual([
 			{ pattern: "x", path: ".", case: false },
-			// Case-sensitive is the local default, so `false` maps to "unset",
-			// not to `case: true`.
-			{ pattern: "x", path: ".", case: undefined },
+			// Case-sensitive is the local default, so `false` maps to unset —
+			// the key is omitted rather than written as `case: undefined`.
+			{ pattern: "x", path: "." },
 		]);
 	});
 
@@ -1695,7 +1756,36 @@ describe("CursorExecHandlers Pi frame translation", () => {
 			args: { path: "a.ts", edits: [{ oldText: "before", newText: "after" }] },
 		} as never);
 
-		expect(calls[0]).toEqual({ path: "a.ts", edits: [{ old_text: "before", new_text: "after" }] });
+		expect(calls[0]).toEqual({ path: "a.ts", old_string: "before", new_string: "after" });
+	});
+
+	it("sends a multi-replacement pi_edit frame as one batched tool call", async () => {
+		// One frame must stay one tool lifecycle: looping per replacement would
+		// emit duplicate start/end events under the same toolCallId and return
+		// only the last replacement's diff. Multi-replacement frames therefore
+		// ride the internal `edits` batch form, in frame order.
+		const { handlers, calls } = recordingHandlers("edit");
+
+		await handlers.piEdit({
+			toolCallId: "c1",
+			args: {
+				path: "a.ts",
+				edits: [
+					{ oldText: "one", newText: "ONE" },
+					{ oldText: "two", newText: "TWO" },
+				],
+			},
+		} as never);
+
+		expect(calls).toEqual([
+			{
+				path: "a.ts",
+				edits: [
+					{ old_string: "one", new_string: "ONE" },
+					{ old_string: "two", new_string: "TWO" },
+				],
+			},
+		]);
 	});
 
 	it("lists directories for pi_ls through read, defaulting an empty path to cwd", async () => {

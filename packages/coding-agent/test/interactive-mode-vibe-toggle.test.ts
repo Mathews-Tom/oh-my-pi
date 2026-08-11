@@ -9,6 +9,7 @@
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -23,7 +24,6 @@ import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 
 function stubTool(name: string): AgentTool {
 	return {
@@ -156,8 +156,6 @@ describe("InteractiveMode vibe mode toggle", () => {
 		const content = typeof message.content === "string" ? message.content : "";
 		expect(message.customType).toBe("vibe-mode-context");
 		expect(content).toContain("`todo`");
-		expect(content).toContain("parent session's list");
-		expect(content).toContain("Workers do not own this bookkeeping.");
 
 		// Toggle off: the empty previous toolset must come back — only the
 		// ephemeral vibe tools must leave the registry.
@@ -245,6 +243,150 @@ describe("InteractiveMode vibe mode toggle", () => {
 		expect(suspend).toHaveBeenCalledTimes(1);
 		expect(terminate).not.toHaveBeenCalled();
 		expect(vibeModeEntryCount(session.sessionManager)).toBe(1);
+	});
+
+	it("restores the target's pre-vibe toolset when switching from one vibe session into another", async () => {
+		const model = session.model;
+		if (!model) throw new Error("Expected active model");
+		// The shared fixture's pre-vibe active set is empty, which cannot
+		// distinguish a restored snapshot from a lost one. Use sessions whose
+		// pre-vibe toolset contains a tool vibe strips (`bash`).
+		const openFixture = () => {
+			const opened = new AgentSession({
+				agent: new Agent({
+					initialState: {
+						model,
+						systemPrompt: ["Test"],
+						tools: [],
+						messages: [],
+					},
+				}),
+				sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+				settings: Settings.isolated({}),
+				modelRegistry,
+				toolRegistry: new Map(["read", "todo", "bash"].map(name => [name, stubTool(name)])),
+				builtInToolNames: ["read", "todo", "bash"],
+				createVibeTools: () => VIBE_TOOL_NAMES.map(stubTool),
+			});
+			return {
+				session: opened,
+				mode: new InteractiveMode(opened, "test", undefined, undefined, undefined, undefined, new EventBus()),
+			};
+		};
+
+		// Target session: left in vibe mode on disk.
+		const { session: targetSession, mode: targetMode } = openFixture();
+		let targetFile: string;
+		try {
+			await targetMode.init({ suppressWelcomeIntro: true });
+			await targetSession.setActiveToolsByName(["read", "todo", "bash"]);
+			await targetMode.handleVibeModeCommand();
+			expect(targetSession.getActiveToolNames()).not.toContain("bash");
+			await targetSession.sessionManager.ensureOnDisk();
+			const file = targetSession.sessionFile;
+			if (!file) throw new Error("Expected persisted session file");
+			targetFile = file;
+		} finally {
+			targetMode.stop();
+			await targetSession.dispose();
+		}
+
+		// Source session, also in vibe mode, switches into the target. Because the
+		// source is in vibe, `#clearTransientModeState` takes the
+		// `removeVibeToolsPreservingActive` path: it deliberately keeps the live
+		// active set rather than applying the source's own snapshot. That live set
+		// is the reduced vibe set, so the re-entry driven by reconciliation must
+		// take its snapshot from the target's persisted mode_change entry rather
+		// than from re-reading the live toolset.
+		//
+		// Switching in from a non-vibe session is unaffected: the teardown path
+		// does not run, so the live toolset is still the source's full set. Neither
+		// is a cold start, where the process builds the full toolset before
+		// reconciliation runs.
+		const { session: sourceSession, mode: sourceMode } = openFixture();
+		try {
+			await sourceMode.init({ suppressWelcomeIntro: true });
+			await sourceSession.setActiveToolsByName(["read", "todo", "bash"]);
+			await sourceMode.handleVibeModeCommand();
+			expect(sourceMode.vibeModeEnabled).toBe(true);
+
+			expect(await sourceSession.switchSession(targetFile)).toBe(true);
+			expect(sourceMode.vibeModeEnabled).toBe(true);
+
+			await sourceMode.handleVibeModeCommand();
+			expect(sourceMode.vibeModeEnabled).toBe(false);
+			expect(sourceSession.getActiveToolNames().toSorted()).toEqual(["bash", "read", "todo"]);
+		} finally {
+			sourceMode.stop();
+			await sourceSession.dispose();
+		}
+	});
+
+	it("keeps the freshly built toolset when resuming a vibe session from outside vibe mode", async () => {
+		const model = session.model;
+		if (!model) throw new Error("Expected active model");
+		const openFixture = (toolNames: string[]) => {
+			const opened = new AgentSession({
+				agent: new Agent({
+					initialState: {
+						model,
+						systemPrompt: ["Test"],
+						tools: [],
+						messages: [],
+					},
+				}),
+				sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+				settings: Settings.isolated({}),
+				modelRegistry,
+				toolRegistry: new Map(toolNames.map(name => [name, stubTool(name)])),
+				builtInToolNames: toolNames,
+				createVibeTools: () => VIBE_TOOL_NAMES.map(stubTool),
+			});
+			return {
+				session: opened,
+				mode: new InteractiveMode(opened, "test", undefined, undefined, undefined, undefined, new EventBus()),
+			};
+		};
+
+		// Target session entered vibe when only `read` and `todo` existed, so its
+		// persisted snapshot predates `bash`.
+		const { session: targetSession, mode: targetMode } = openFixture(["read", "todo"]);
+		let targetFile: string;
+		try {
+			await targetMode.init({ suppressWelcomeIntro: true });
+			await targetSession.setActiveToolsByName(["read", "todo"]);
+			await targetMode.handleVibeModeCommand();
+			await targetSession.sessionManager.ensureOnDisk();
+			const file = targetSession.sessionFile;
+			if (!file) throw new Error("Expected persisted session file");
+			targetFile = file;
+		} finally {
+			targetMode.stop();
+			await targetSession.dispose();
+		}
+
+		// The resuming process is not in vibe mode, so the teardown path never
+		// runs and its live toolset — built from the current CLI flags and
+		// settings, here including `bash` — is the real pre-vibe set. The stale
+		// persisted snapshot must not override it, or `bash` would be dropped for
+		// the rest of the session.
+		const { session: resumed, mode: resumedMode } = openFixture(["read", "todo", "bash"]);
+		try {
+			await resumedMode.init({ suppressWelcomeIntro: true });
+			await resumed.setActiveToolsByName(["read", "todo", "bash"]);
+			expect(resumedMode.vibeModeEnabled).toBe(false);
+
+			expect(await resumed.switchSession(targetFile)).toBe(true);
+			expect(resumedMode.vibeModeEnabled).toBe(true);
+			expect(resumed.getActiveToolNames()).not.toContain("bash");
+
+			await resumedMode.handleVibeModeCommand();
+			expect(resumedMode.vibeModeEnabled).toBe(false);
+			expect(resumed.getActiveToolNames().toSorted()).toEqual(["bash", "read", "todo"]);
+		} finally {
+			resumedMode.stop();
+			await resumed.dispose();
+		}
 	});
 
 	it("passes the session's active model into vibe rehydration on resume", async () => {

@@ -12,7 +12,7 @@ import { ToolExecutionComponent } from "@oh-my-pi/pi-coding-agent/modes/componen
 import * as themeModule from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { Text, type TUI, visibleWidth } from "@oh-my-pi/pi-tui";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
-import chalk from "chalk";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 
 beforeAll(async () => {
 	resetSettingsForTest();
@@ -46,8 +46,7 @@ describe("editToolRenderer", () => {
 		const uiTheme = await getUiTheme();
 		const component = editToolRenderer.renderCall(
 			{
-				edits: [{}],
-				__partialJson: '{"edits":[{"path":"packages/coding-agent/src/edit/renderer.ts","old_text":"before',
+				__partialJson: '{"path":"packages/coding-agent/src/edit/renderer.ts","old_string":"before',
 			},
 			{ expanded: false, isPartial: true, spinnerFrame: 0, renderContext: { editMode: "replace" } },
 			uiTheme,

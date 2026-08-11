@@ -998,7 +998,7 @@ describe("AgentSession message pipeline", () => {
 				name: "bash",
 				label: "Bash",
 				description: "wrapped bash",
-				parameters: pi.zod.object({ command: pi.zod.string() }),
+				parameters: pi.arktype({ command: pi.arktype("string") }),
 				async execute(
 					_toolCallId: string,
 					_params: unknown,
@@ -1404,9 +1404,10 @@ describe("AgentSession message pipeline", () => {
 			expect(getConvertedUserText(lastMessage)).toBe("Side Question?");
 
 			expect(secondToLast?.role).toBe("developer");
-			expect(secondToLast?.content).toBeDefined();
-			const textContent = secondToLast?.content as { text?: string }[];
-			expect(textContent[0].text).toContain("tool catalog stays attached");
+			const textContent = secondToLast?.content as TextContent[];
+			expect(textContent).toHaveLength(1);
+			expect(textContent[0]?.type).toBe("text");
+			expect(textContent[0]?.text).toMatch(/^<system-reminder>\n[\s\S]+\n<\/system-reminder>\n?$/);
 
 			// Tool choice must be undefined (not "none") for cache hits
 			expect(capturedOptions?.toolChoice).toBeUndefined();

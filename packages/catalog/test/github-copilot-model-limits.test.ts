@@ -421,7 +421,12 @@ describe("github copilot model limits mapping", () => {
 			const { models } = await manager.refresh("online-if-uncached");
 
 			expect(fetchMock).toHaveBeenCalledTimes(1);
-			expect(models.find(candidate => candidate.id === "grok-4.5")).toBeUndefined();
+			// The bundled catalog now ships a responses-route grok-4.5, so the id
+			// resurfaces from the bundle after the failed refresh. The migration
+			// contract is that the stale cached COMPLETIONS route never comes
+			// back — and the cached long-context variant has no bundled entry,
+			// so it stays dropped.
+			expect(models.find(candidate => candidate.id === "grok-4.5")?.api).toBe("openai-responses");
 			expect(models.find(candidate => candidate.id === "grok-4.5-1m")).toBeUndefined();
 		} finally {
 			await fs.rm(tempDir, { recursive: true, force: true });
@@ -543,6 +548,28 @@ describe("github copilot tiered context windows", () => {
 		const variant = models.find(candidate => candidate.id === "gemini-9.9-pro-preview-1m");
 		expect(variant).toBeDefined();
 		expect(variant?.cost).toEqual({ input: 4, output: 18, cacheRead: 0.4, cacheWrite: 0 });
+	});
+
+	it("prices the base model from its default tier", async () => {
+		const { models } = await discoverCopilotModels({
+			data: [
+				tieredCopilotEntry({
+					id: "gpt-5.6-luna",
+					name: "GPT-5.6 Luna",
+					window: 1_050_000,
+					maxOutput: 50_000,
+					defaultContextMax: 200_000,
+					longContextMax: 1_000_000,
+					defaultPrices: { input: 20, output: 120, cache: 2 },
+					longPrices: { input: 40, output: 180, cache: 4 },
+				}),
+			],
+		});
+
+		const base = models.find(candidate => candidate.id === "gpt-5.6-luna");
+		expect(base?.cost).toMatchObject({ input: 0.2, output: 1.2, cacheRead: 0.02 });
+		const variant = models.find(candidate => candidate.id === "gpt-5.6-luna-1m");
+		expect(variant?.cost).toMatchObject({ input: 0.4, output: 1.8, cacheRead: 0.04 });
 	});
 
 	it("keeps legacy tier-capped responses unchanged and synthesizes no variant", async () => {

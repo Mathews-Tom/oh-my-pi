@@ -1,5 +1,5 @@
-import * as os from "node:os";
 import { scheduler } from "node:timers/promises";
+import { type } from "@oh-my-pi/omptype";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
 	CODEX_BASE_URL,
@@ -18,9 +18,8 @@ import {
 	parseStreamingJson,
 	readSseJson,
 	structuredCloneJSON,
+	USER_AGENT,
 } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
-import packageJson from "../../package.json" with { type: "json" };
 import * as AIError from "../error";
 import { getEnvApiKey, isOfficialCodexApiUrl } from "../stream";
 import type {
@@ -84,6 +83,7 @@ import type {
 	ResponseFunctionToolCall,
 	ResponseInput,
 	ResponseInputContent,
+	ResponseOutputItem,
 	ResponseOutputMessage,
 	ResponseReasoningItem,
 	ResponseStatus,
@@ -96,6 +96,7 @@ import {
 	appendReasoningSummaryPart,
 	appendReasoningSummaryPartDone,
 	appendReasoningSummaryTextDelta,
+	appendResponsesImageResult,
 	appendResponsesToolResultMessages,
 	applyOpenAIServiceTier,
 	applyReasoningSummaryDone,
@@ -106,7 +107,7 @@ import {
 	createSequentialCutoffSummaryState,
 	encodeResponsesToolCallId,
 	encodeTextSignatureV1,
-	escapeReplayedClientText,
+	escapeReplayedControlTokens,
 	finalizeCustomToolCallInputDone,
 	finalizeMessageText,
 	finalizePendingResponsesToolCalls,
@@ -126,7 +127,7 @@ import { redactSensitiveInObject, transformMessages } from "./transform-messages
 export interface OpenAICodexResponsesOptions extends StreamOptions {
 	reasoning?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	reasoningSummary?: "auto" | "concise" | "detailed" | null;
-	/** `reasoning.context` replay scope; defaults to `all_turns` when unset. The `all_turns` value is gated to gpt-5.4+ Codex models — older ids reject it, so it is suppressed and `context` omitted. */
+	/** Explicit `reasoning.context` replay scope. Omitted by default so Codex applies its native request policy. */
 	reasoningContext?: CodexReasoningContext;
 	textVerbosity?: "low" | "medium" | "high";
 	codexMode?: boolean;
@@ -371,7 +372,8 @@ type CodexEventItem =
 	| ResponseOutputMessage
 	| ResponseFunctionToolCall
 	| ResponseCustomToolCall
-	| ResponseComputerToolCall;
+	| ResponseComputerToolCall
+	| ResponseOutputItem.ImageGenerationCall;
 type CodexOutputBlock =
 	| ThinkingContent
 	| TextContent
@@ -1527,7 +1529,8 @@ export async function buildTransformedCodexRequestBody(
 	}
 	const codexOptions: CodexRequestOptions = {
 		reasoningEffort: options?.reasoning,
-		reasoningSummary: options?.reasoningSummary === undefined ? "auto" : options.reasoningSummary,
+		reasoningOff: options?.forceReasoningOff,
+		reasoningSummary: options?.reasoningSummary,
 		reasoningContext: options?.reasoningContext,
 		textVerbosity: options?.textVerbosity,
 		include: options?.include,
@@ -2289,6 +2292,7 @@ class CodexStreamProcessor {
 		const rawItem = rawEvent.item;
 		if (!rawItem || typeof rawItem !== "object") return;
 		const item = structuredCloneJSON(rawItem) as CodexEventItem;
+		if (item.type === "image_generation_call" && item.result) item.status = "completed";
 		runtime.nativeOutputItems.push(item as unknown as Record<string, unknown>);
 
 		// Match the finalization to the OPEN ITEM that started this block, not the
@@ -2300,6 +2304,12 @@ class CodexStreamProcessor {
 		const entry = (itemId ? runtime.openItems.get(itemId) : null) ?? runtime.openItemForEvent(rawEvent);
 		const block = entry?.block ?? null;
 		const contentIndex = entry?.contentIndex ?? output.content.length - 1;
+
+		if (item.type === "image_generation_call" && item.result) {
+			appendResponsesImageResult(output, stream, item.result);
+			runtime.closeOpenItem(entry);
+			return;
+		}
 
 		if (item.type === "reasoning" && block?.type === "thinking") {
 			this.#flushSummaryDeltas(entry);
@@ -4240,7 +4250,7 @@ function createCodexHeaders(
 	headers.set(OPENAI_HEADERS.BETA, betaHeader);
 	headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
 	headers.set(OPENAI_HEADERS.VERSION, codexClientVersion);
-	headers.set("User-Agent", `pi/${packageJson.version} (${os.platform()} ${os.release()}; ${os.arch()})`);
+	headers.set("User-Agent", USER_AGENT);
 	if (sessionId) {
 		headers.set(OPENAI_HEADERS.CONVERSATION_ID, sessionId);
 		headers.set(OPENAI_HEADERS.SESSION_ID, sessionId);
@@ -4339,6 +4349,9 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 	};
 
 	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
+	// gpt-5.x reject raw Harmony control-token spellings anywhere in replayed
+	// input, including the model's own tool-call arguments (#6913).
+	const escapeControlTokens = isHarmonyDialectModel(model);
 	let msgIndex = 0;
 	// Track call_ids that originated as custom tool calls so paired tool-result
 	// messages can be replayed as `custom_tool_call_output` rather than
@@ -4368,7 +4381,7 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 						knownCallIds.add(item.call_id);
 					}
 				}
-				messages.push(...(isHarmonyDialectModel(model) ? escapeReplayedClientText(replayItems) : replayItems));
+				messages.push(...(escapeControlTokens ? escapeReplayedControlTokens(replayItems) : replayItems));
 				msgIndex += 1;
 				continue;
 			}
@@ -4394,10 +4407,11 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 			if (historyItems) {
 				const sanitizedHistoryItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(historyItems);
 				if (sanitizedHistoryItems) {
-					const replayItems =
+					const rawReplayItems =
 						model.supportsComputerUse === true
 							? sanitizedHistoryItems
 							: unrollCodexComputerItems(sanitizedHistoryItems, model.compat.supportsImageDetailOriginal);
+					const replayItems = escapeControlTokens ? escapeReplayedControlTokens(rawReplayItems) : rawReplayItems;
 					for (const item of replayItems) {
 						if (item.type === "custom_tool_call") {
 							customCallIds.add(item.call_id);
@@ -4435,7 +4449,7 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 				? sanitizeOpenAIResponsesAssistantFallbackItemsForReplay(convertedOutputItems)
 				: convertedOutputItems;
 			if (outputItems.length > 0) {
-				messages.push(...outputItems);
+				messages.push(...(escapeControlTokens ? escapeReplayedControlTokens(outputItems) : outputItems));
 			}
 			msgIndex += 1;
 			continue;

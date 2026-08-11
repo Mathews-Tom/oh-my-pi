@@ -26,8 +26,10 @@ import {
 	DEFAULT_SHAKE_CONFIG,
 	effectiveReserveTokens,
 	estimateTokens,
+	hasContextTokenUsage,
 	NativeCompactionError,
 	prepareCompaction,
+	RESCUE_SHAKE_CONFIG,
 	resolveBudgetReserveTokens,
 	resolveThresholdTokens,
 	type ShakeConfig,
@@ -74,7 +76,7 @@ import {
 	resolveRoleModelFull,
 } from "./role-models";
 import type { SessionContext } from "./session-context";
-import { getLatestCompactionEntry } from "./session-context";
+import { getLatestCompactionEntry, getOpenAiRemoteCompactionPayload } from "./session-context";
 import type { CompactionEntry, SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 import type { ShakeMode, ShakeResult } from "./shake-types";
@@ -233,8 +235,9 @@ export interface SessionMaintenanceHost {
 	resetCodexProviderAfterCompaction(compaction: CodexCompactionContext): void;
 	resetPlanReference(): void;
 	syncTodoPhasesFromBranch(): void;
-	resetAdvisorRuntimes(): void;
+	resetAdvisorRuntimes(reason?: string): void;
 	rebaseAfterCompaction(): void;
+	recordAnchoredHistoryRewrite(tokensRemoved: number): void;
 	getContextBreakdown(options?: {
 		contextWindow?: number;
 		pendingMessages?: AgentMessage[];
@@ -342,7 +345,7 @@ export class SessionMaintenance {
 		await this.#host.sessionManager.rewriteEntries();
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
-		this.#host.resetAdvisorRuntimes();
+		this.#host.resetAdvisorRuntimes("prune-tool-outputs");
 		this.#host.syncTodoPhasesFromBranch();
 		this.#host.closeCodexProviderSessionsForHistoryRewrite();
 		return result;
@@ -385,7 +388,7 @@ export class SessionMaintenance {
 		await this.#host.sessionManager.rewriteEntries();
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
-		this.#host.resetAdvisorRuntimes();
+		this.#host.resetAdvisorRuntimes("prune-stale-tool-results");
 		this.#host.syncTodoPhasesFromBranch();
 		this.#host.closeCodexProviderSessionsForHistoryRewrite();
 		return result;
@@ -436,7 +439,7 @@ export class SessionMaintenance {
 		await this.#host.sessionManager.rewriteEntries();
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
-		this.#host.resetAdvisorRuntimes();
+		this.#host.resetAdvisorRuntimes("drop-images");
 		this.#host.closeCodexProviderSessionsForHistoryRewrite();
 		return { removed };
 	}
@@ -461,11 +464,12 @@ export class SessionMaintenance {
 		}
 
 		const branchEntries = this.#host.sessionManager.getBranch();
+		const latestCompaction = getLatestCompactionEntry(branchEntries);
 		const config = this.#withPlanProtection({
 			...(opts.config ?? AGGRESSIVE_SHAKE_CONFIG),
 			// Skip entries summarized away by the latest compaction — shaking them
 			// only churns persisted history with no prompt/cache effect.
-			keepBoundaryId: getLatestCompactionEntry(branchEntries)?.firstKeptEntryId,
+			keepBoundaryId: latestCompaction?.firstKeptEntryId,
 		});
 		const regions = collectShakeRegions(branchEntries, config);
 		if (regions.length === 0) {
@@ -475,25 +479,55 @@ export class SessionMaintenance {
 		const artifactId = await this.#saveShakeArtifact(regions);
 		const replacements = regions.map((region, index) => this.#shakeElidePlaceholder(region, index, artifactId));
 
+		const hasRemoteReplacementHistory = getOpenAiRemoteCompactionPayload(latestCompaction) !== undefined;
+		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
+		let anchorIndex = -1;
+		for (let index = branchEntries.length - 1; index > compactionIndex; index--) {
+			const entry = branchEntries[index];
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const assistant = entry.message;
+			if (
+				assistant.stopReason !== "aborted" &&
+				assistant.stopReason !== "error" &&
+				assistant.usage &&
+				hasContextTokenUsage(assistant.usage)
+			) {
+				anchorIndex = index;
+				break;
+			}
+		}
+		const entryIndexes = new Map(branchEntries.map((entry, index) => [entry, index]));
+
 		let toolResultsDropped = 0;
 		let blocksDropped = 0;
 		let originalTokens = 0;
 		let replacementTokens = 0;
+		let anchoredTokensRemoved = 0;
 		const items = regions.map((region, index) => {
 			if (region.kind === "toolResult") toolResultsDropped++;
 			else blocksDropped++;
 			originalTokens += region.tokens;
 			const replacement = replacements[index];
-			if (replacement.length > 0) replacementTokens += countTokens(replacement);
+			const replacementTokenCount = replacement.length > 0 ? countTokens(replacement) : 0;
+			replacementTokens += replacementTokenCount;
+			const entryIndex = entryIndexes.get(region.entry) ?? -1;
+			if (
+				entryIndex >= 0 &&
+				entryIndex < anchorIndex &&
+				(!hasRemoteReplacementHistory || entryIndex > compactionIndex)
+			) {
+				anchoredTokensRemoved += Math.max(0, region.tokens - replacementTokenCount);
+			}
 			return { region, replacement };
 		});
 
 		applyShakeRegions(items);
+		this.#host.recordAnchoredHistoryRewrite(anchoredTokensRemoved);
 
 		await this.#host.sessionManager.rewriteEntries();
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
-		this.#host.resetAdvisorRuntimes();
+		this.#host.resetAdvisorRuntimes("shake");
 		this.#host.closeCodexProviderSessionsForHistoryRewrite();
 
 		return {
@@ -845,7 +879,7 @@ export class SessionMaintenance {
 			// plan reference. Clear the sent-flag so #buildPlanReferenceMessage re-reads
 			// the plan from disk and re-injects it on the next turn (issue #1246).
 			this.#host.resetPlanReference();
-			this.#host.resetAdvisorRuntimes();
+			this.#host.resetAdvisorRuntimes("compact");
 			this.#host.syncTodoPhasesFromBranch();
 			if (codexCompaction) {
 				this.#host.resetCodexProviderAfterCompaction(codexCompaction);
@@ -1859,7 +1893,7 @@ export class SessionMaintenance {
 		let elideSink = "placeholders";
 		if (!options.skipElide) {
 			try {
-				const result = await this.#host.shake("elide", { signal });
+				const result = await this.#host.shake("elide", { config: RESCUE_SHAKE_CONFIG, signal });
 				elided = result.toolResultsDropped + result.blocksDropped;
 				elidedTokens = result.tokensFreed;
 				if (result.artifactId) elideSink = "an artifact";
@@ -2060,7 +2094,7 @@ export class SessionMaintenance {
 		// and advisor cursors / todo phases were derived from the replaced
 		// history.
 		this.#host.resetPlanReference();
-		this.#host.resetAdvisorRuntimes();
+		this.#host.resetAdvisorRuntimes("compaction-rescue");
 		this.#host.syncTodoPhasesFromBranch();
 		this.#host.closeCodexProviderSessionsForHistoryRewrite();
 		// Extensions must see the entry that is now active, not (only) the one
@@ -2729,7 +2763,7 @@ export class SessionMaintenance {
 			// plan reference. Clear the sent-flag so #buildPlanReferenceMessage re-reads
 			// the plan from disk and re-injects it on the next turn (issue #1246).
 			this.#host.resetPlanReference();
-			this.#host.resetAdvisorRuntimes();
+			this.#host.resetAdvisorRuntimes("auto-compaction");
 			this.#host.syncTodoPhasesFromBranch();
 			if (codexCompaction) {
 				this.#host.resetCodexProviderAfterCompaction(codexCompaction);

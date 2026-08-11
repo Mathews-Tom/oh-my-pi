@@ -1231,11 +1231,11 @@ describe("Cursor modern exec frames: Pi tools", () => {
 		expect(answer.value.result.value.diff).toBe("-before\n+after");
 		expect(answer.value.result.value.patch).toBe("@@");
 
-		// The synthesized display block must use the local edit tool's snake_case
-		// replace schema, or the rebuilt transcript renders empty edits.
+		// The synthesized display block must use the local edit tool's replace
+		// schema, or the rebuilt transcript renders empty edits.
 		const block = output.content.find((b): b is ToolCallState => b.type === "toolCall");
 		expect(block?.name).toBe("edit");
-		expect(block?.arguments).toEqual({ path: "/repo/a.ts", edits: [{ old_text: "before", new_text: "after" }] });
+		expect(block?.arguments).toEqual({ path: "/repo/a.ts", old_string: "before", new_string: "after" });
 	});
 
 	it("answers each remaining Pi frame with a populated success payload", async () => {
@@ -1679,6 +1679,31 @@ describe("Cursor legacy read frame: range reporting", () => {
 		if (wholeAnswer.case !== "readResult") throw new Error(`got ${wholeAnswer.case}`);
 		if (wholeAnswer.value.result.case !== "success") throw new Error(`got ${wholeAnswer.value.result.case}`);
 		expect(wholeAnswer.value.result.value.rangeApplied).toBe(false);
+	});
+	it("treats a path-embedded selector as ranged without reporting the slice as the file total", async () => {
+		const slice = Array.from({ length: 55 }, (_, index) => `line ${index + 301}`).join("\n");
+		const { frames } = await dispatchExec(
+			buildExecMessage({
+				case: "readArgs",
+				value: create(ReadArgsSchema, {
+					path: "/repo/plan.md:raw:301-",
+					toolCallId: "c-inline",
+				}),
+			}),
+			{
+				execHandlers: {
+					async read() {
+						return toolResult(slice, { details: { fileSize: 21_015 } });
+					},
+				},
+			},
+		);
+		const answer = soleResult(frames);
+		if (answer.case !== "readResult") throw new Error(`got ${answer.case}`);
+		if (answer.value.result.case !== "success") throw new Error(`got ${answer.value.result.case}`);
+		expect(answer.value.result.value.totalLines).toBe(0);
+		expect(answer.value.result.value.rangeApplied).toBe(true);
+		expect(answer.value.result.value.fileSize).toBe(21_015n);
 	});
 
 	it("carries the composed selector into the synthesized call", async () => {

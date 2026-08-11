@@ -19,6 +19,7 @@ import type {
 } from "@oh-my-pi/pi-ai/types";
 import { __resetProxyCache } from "@oh-my-pi/pi-ai/utils/proxy";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { withEnv } from "./helpers";
 
@@ -409,7 +410,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				this.emitCodexResponse({ messageId: "msg_opaque", responseId: "resp_opaque", text: "pong" });
 			}
 		}
@@ -501,6 +502,32 @@ describe("openai-codex streaming", () => {
 		expect(capturedText).toEqual({ verbosity: "low" });
 	});
 
+	it("omits optional response controls from default SimpleStreamOptions", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const context = createCodexTestContext();
+		const model = { ...createCodexTestModel("https://chatgpt.com/backend-api"), preferWebsockets: false };
+		let capturedBody: Record<string, unknown> | undefined;
+		const fetchMock: FetchImpl = async (_input, init) => {
+			capturedBody = JSON.parse(decodeCodexRequestBody(init?.body)) as Record<string, unknown>;
+			return new Response(createCompletedCodexSse("Hello"), {
+				status: 200,
+				headers: { "content-type": "text/event-stream" },
+			});
+		};
+
+		const result = await streamSimple(model, context, {
+			apiKey: token,
+			fetch: fetchMock,
+			reasoning: Effort.Medium,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(capturedBody?.reasoning).toEqual({ effort: "medium" });
+		expect(capturedBody?.text).toBeUndefined();
+	});
+
 	async function runCodexSseEvents(events: unknown[]) {
 		const token = createCodexTestToken();
 		const context = createCodexTestContext();
@@ -509,6 +536,7 @@ describe("openai-codex streaming", () => {
 		const fetchMock: FetchImpl = async () =>
 			new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
 		const textEndContents: string[] = [];
+		const eventTypes: string[] = [];
 
 		const stream = streamOpenAICodexResponses(model, context, {
 			apiKey: token,
@@ -516,14 +544,35 @@ describe("openai-codex streaming", () => {
 		});
 		const readPromise = (async () => {
 			for await (const event of stream) {
+				eventTypes.push(event.type);
 				if (event.type === "text_end") textEndContents.push(event.content);
 			}
 		})();
 		const result = await stream.result();
 		await readPromise;
 
-		return { result, textEndContents };
+		return { result, textEndContents, eventTypes };
 	}
+
+	it("surfaces result-bearing native images with stale generating status", async () => {
+		const data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+		const { result, eventTypes } = await runCodexSseEvents([
+			{
+				type: "response.output_item.added",
+				output_index: 0,
+				item: { type: "image_generation_call", id: "ig_1", status: "generating", result: null },
+			},
+			{
+				type: "response.output_item.done",
+				output_index: 0,
+				item: { type: "image_generation_call", id: "ig_1", status: "generating", result: data },
+			},
+			{ type: "response.completed", response: { id: "resp_image", status: "completed" } },
+		]);
+
+		expect(result.content).toEqual([{ type: "image", data, mimeType: "image/png" }]);
+		expect(eventTypes).toContain("image_end");
+	});
 
 	for (const testCase of [
 		{
@@ -1294,7 +1343,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				const added = encodeWebSocketMessage({
 					type: "response.output_item.added",
 					item: { type: "message", id: "msg_ws", role: "assistant", status: "in_progress", content: [] },
@@ -1352,7 +1401,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				this.emitCodexResponse({ messageId: "msg_obs", responseId: "resp_obs", text: "Observed" });
 			}
 		}
@@ -1409,7 +1458,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				this.sendJson({
 					type: "response.done",
 					response: {
@@ -1462,7 +1511,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				this.sendJson({
 					type: "response.done",
 					response: {
@@ -1616,7 +1665,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(data: string): void {
+			override send(data: string): void {
 				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
 				this.emitCodexResponse({ messageId: "msg_lite", responseId: "resp_lite", text: "Hi" });
 			}
@@ -1808,7 +1857,7 @@ describe("openai-codex streaming", () => {
 		expect(sawDone).toBe(true);
 	});
 
-	it("includes service_tier in SSE payloads when requested", async () => {
+	it("includes the default service_tier in SSE payloads when requested", async () => {
 		const tempDir = TempDir.createSync("@pi-codex-stream-");
 		setAgentDir(tempDir.path());
 
@@ -1855,10 +1904,10 @@ describe("openai-codex streaming", () => {
 		const result = await streamOpenAICodexResponses(model, context, {
 			fetch: fetchMock as FetchImpl,
 			apiKey: token,
-			serviceTier: "priority",
+			serviceTier: "default",
 		}).result();
 		expect(result.stopReason).toBe("stop");
-		expect(capturedBody?.service_tier).toBe("priority");
+		expect(capturedBody?.service_tier).toBe("default");
 		expect(result.usage.cost.input).toBeCloseTo(0.00001);
 		expect(result.usage.cost.output).toBeCloseTo(0.000012);
 		expect(result.usage.cost.total).toBeCloseTo(0.000022);
@@ -2854,7 +2903,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(data: string): void {
+			override send(data: string): void {
 				websocketRequestCount += 1;
 				const body: unknown = JSON.parse(data);
 				if (websocketRequestCount === 1) {
@@ -3042,7 +3091,7 @@ describe("openai-codex streaming", () => {
 				});
 			}
 
-			send(_data: string): void {
+			override send(_data: string): void {
 				websocketRequestCount += 1;
 				this.emitCodexResponse({
 					messageId: `msg_pre_turn_${websocketRequestCount}`,
@@ -3162,7 +3211,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(data: string): void {
+			override send(data: string): void {
 				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
 				this.sendJson({
 					type: "response.output_item.added",
@@ -3247,7 +3296,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(data: string): void {
+			override send(data: string): void {
 				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
 				const responseIndex = sentRequests.length;
 				this.emitCodexResponse({
@@ -3387,7 +3436,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(data: string): void {
+			override send(data: string): void {
 				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
 				if (sentRequests.length === 1) {
 					this.sendJson({
@@ -3486,7 +3535,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				this.sendJson({
 					type: "response.completed",
 					response: {
@@ -3542,7 +3591,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				this.#sendCount += 1;
 				if (this.#sendCount === 1) {
 					this.emitCodexResponse({
@@ -3631,7 +3680,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(data: string): void {
+			override send(data: string): void {
 				sentRequests.push(JSON.parse(data) as Record<string, unknown>);
 				const responseIndex = sentRequests.length;
 				this.emitCodexResponse({
@@ -3748,7 +3797,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(data: string): void {
+			override send(data: string): void {
 				const request = JSON.parse(data) as Record<string, unknown>;
 				sentRequests.push(request);
 				const requestIndex = sentRequests.length;
@@ -3856,7 +3905,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(data: string): void {
+			override send(data: string): void {
 				const request = JSON.parse(data) as Record<string, unknown>;
 				sentRequests.push(request);
 				const requestIndex = sentRequests.length;
@@ -3974,7 +4023,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				this.emitCodexResponse({ messageId: "msg_v2", responseId: "resp_v2", text: "Hello v2" });
 			}
 		}
@@ -4031,7 +4080,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				sendCount += 1;
 			}
 		}
@@ -4091,7 +4140,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				sendCount += 1;
 				this.sendJson({
 					type: "response.output_item.added",
@@ -4121,7 +4170,7 @@ describe("openai-codex streaming", () => {
 				}, 2);
 			}
 
-			close(): void {
+			override close(): void {
 				if (interval) clearInterval(interval);
 				super.close();
 			}
@@ -4168,7 +4217,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				sendCount += 1;
 				this.sendJson({
 					type: "response.output_item.added",
@@ -4191,7 +4240,7 @@ describe("openai-codex streaming", () => {
 				}
 			}
 
-			close(): void {
+			override close(): void {
 				closeCount += 1;
 				super.close();
 			}
@@ -4235,7 +4284,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				if (this.#index === 0) {
 					// First attempt: a function call whose arguments are only whitespace.
 					// A completed reasoning item lands in nativeOutputItems before the
@@ -4291,7 +4340,7 @@ describe("openai-codex streaming", () => {
 				});
 			}
 
-			close(): void {
+			override close(): void {
 				closeCount += 1;
 				super.close();
 			}
@@ -4362,7 +4411,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				sendCount += 1;
 				this.sendJson({
 					type: "response.output_item.added",
@@ -4414,7 +4463,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				// Every frame lands in the connection queue synchronously, before the
 				// consumer microtask drains any of them; the close event used to wipe
 				// the queued terminal event and turn success into a transport error.
@@ -4457,7 +4506,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				this.sendJson({
 					type: "response.output_item.added",
 					item: { type: "function_call", id: "fc_limit", call_id: "call_limit", name: "todo", arguments: "" },
@@ -4512,13 +4561,13 @@ describe("openai-codex streaming", () => {
 				this.emit("open", new Event("open"));
 			}
 
-			close(): void {
+			override close(): void {
 				const wasPending = this.readyState === MockWebSocket.CONNECTING;
 				super.close();
 				if (wasPending) this.emit("close", { code: 1000 } as unknown as Event);
 			}
 
-			send(): void {
+			override send(): void {
 				this.emitCodexResponse({ messageId: "msg_join", responseId: "resp_join", text: "Joined" });
 			}
 		}
@@ -4575,7 +4624,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				sendCount += 1;
 				this.sendJson({
 					type: "response.output_item.added",
@@ -4647,7 +4696,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(data: string): void {
+			override send(data: string): void {
 				const request = JSON.parse(data) as { type?: string };
 				const requestType = typeof request.type === "string" ? request.type : "";
 				sentTypesByConnection[this.#connectionIndex]?.push(requestType);
@@ -4774,7 +4823,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(): void {
+			override send(): void {
 				this.sendJson({
 					type: "response.output_item.added",
 					item: {
@@ -4864,7 +4913,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(data: string): void {
+			override send(data: string): void {
 				this.#sendCount += 1;
 				const request = JSON.parse(data) as { type?: string };
 				requestTypes.push(typeof request.type === "string" ? request.type : "");
@@ -4957,7 +5006,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(data: string): void {
+			override send(data: string): void {
 				sendCount += 1;
 				const request = JSON.parse(data) as Record<string, unknown>;
 				expect(typeof request.type).toBe("string");
@@ -5250,7 +5299,7 @@ describe("openai-codex streaming", () => {
 				this.scheduleOpen();
 			}
 
-			send(_data: string): void {
+			override send(_data: string): void {
 				sendCount += 1;
 				if (sendCount === 1) {
 					this.emitCodexResponse({
