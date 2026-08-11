@@ -501,8 +501,18 @@ export class SecurityCoordinator {
 		const workRoot = await this.#deriveOutputWorkRoot(this.#host.cwd);
 		const modelRef: SecurityModelRef = { provider: model.provider, modelId: model.id };
 		if (input.thinkingLevel !== undefined) modelRef.thinkingLevel = input.thinkingLevel;
-		const outputRoot = input.outputRoot ?? path.join(workRoot, Bun.randomUUIDv7());
-		assertSecurityWriteAllowed(path.resolve(this.#host.cwd, outputRoot), this.#host, "output_root");
+		// Resolved once, against the session's cwd (which can differ from
+		// `process.cwd()` for an SDK-created session) - authorize this exact
+		// absolute value and pass it through unchanged. `normalizeOutput`
+		// (`preflight.ts`) later calls the bare `path.resolve(outputRoot)` with
+		// no cwd argument, so re-passing the original relative `outputRoot`
+		// here would let it land somewhere else entirely, one `confineWrites`
+		// never re-checked.
+		const resolvedOutputRoot = path.resolve(
+			this.#host.cwd,
+			input.outputRoot ?? path.join(workRoot, Bun.randomUUIDv7()),
+		);
+		assertSecurityWriteAllowed(resolvedOutputRoot, this.#host, "output_root");
 		const store = await this.#openStore(this.#host.cwd);
 		await fs.mkdir(workRoot, { recursive: true, mode: 0o700 });
 		if (process.platform !== "win32") await fs.chmod(workRoot, 0o700);
@@ -511,7 +521,7 @@ export class SecurityCoordinator {
 				cwd: this.#host.cwd,
 				target: input.target ?? { kind: "repository" },
 				knowledgeBasePaths: input.knowledgeBasePaths,
-				outputRoot,
+				outputRoot: resolvedOutputRoot,
 				archiveExisting: input.archiveExisting,
 				model: modelRef,
 				account,

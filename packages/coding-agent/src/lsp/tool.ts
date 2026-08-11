@@ -55,6 +55,7 @@ import {
 	filterAuthorizedLocations,
 	filterAuthorizedSymbols,
 	filterAuthorizedWorkspaceEditForPreview,
+	isLspReadRestricted,
 } from "./permission-guard";
 import {
 	configCache,
@@ -192,6 +193,15 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 	 * context, not the one from whichever earlier action first created the
 	 * client. Every `execute()` branch that touches a client MUST go
 	 * through this instead of calling `getOrCreateClient` directly.
+	 *
+	 * Also the single choke point for the project-aware-under-read-restriction
+	 * check: an ordinary scoped call (`definition`, `hover`, single-file
+	 * `diagnostics`, …) authorizes its declared `file` argument, but starting
+	 * a project-aware server for it still indexes the whole project - the
+	 * same unsound-to-scope surface `warmupLspServers`/`syncFileContent`
+	 * already refuse to touch under an active `permissions.deny.read` rule
+	 * or `permissions.confineReads`. Authorizing one file never authorizes
+	 * that.
 	 */
 	async #resolveClient(
 		config: ServerConfig,
@@ -199,6 +209,16 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		signal: AbortSignal | undefined,
 		context: AgentToolContext | undefined,
 	): Promise<LspClient> {
+		if (isLspReadRestricted(context) && isProjectAwareLspServer(config)) {
+			throw new PermissionDeniedError(
+				this.name,
+				"permissions.deny.read",
+				`Tool "${this.name}" is blocked: this action starts a project-aware server, whose real read ` +
+					`surface (workspace indexing via project references) cannot be limited to authorized paths, and ` +
+					`an active permissions.deny.read rule or permissions.confineReads is set.\n` +
+					`To allow it: set permissions.profile: off.`,
+			);
+		}
 		return getOrCreateClient(config, this.session.cwd, initTimeoutMs, signal, context);
 	}
 
