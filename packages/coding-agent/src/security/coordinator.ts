@@ -36,6 +36,7 @@ import {
 	DEFAULT_SECURITY_GIT_ADAPTER,
 	filterDiffByPermissionPolicy,
 	prepareSecurityOutputDirectory,
+	securityArchivePath,
 } from "./preflight";
 import {
 	createNativeSecurityProducer,
@@ -658,6 +659,18 @@ export class SecurityCoordinator {
 				initialBundle(store, plan, record.snapshot.scanId, record.snapshot.operationId, startedAt),
 			);
 			if (signal.aborted) throw signal.reason ?? new Error("Security scan cancelled");
+			// `plan.output.root` was authorized at preflight time, but a
+			// nonempty root with `archiveExisting` renames it to this generated
+			// sibling below — a write-deny glob can match the sibling suffix
+			// while allowing the root itself, and the rename would still create
+			// it unless this is checked first.
+			if (plan.output.archiveExisting) {
+				assertSecurityWriteAllowed(
+					securityArchivePath(plan.output.root, record.snapshot.scanId),
+					this.#host,
+					"output_root",
+				);
+			}
 			await prepareSecurityOutputDirectory(plan.output, record.snapshot.scanId);
 			this.#update(record, "preparing");
 			await reportProgress?.("Preparing OMP-native security scan");

@@ -23,7 +23,14 @@ import { formatShortSha } from "./gh-format";
 import type { GhPrViewData, GhRepoViewData, GithubInput } from "./gh-types";
 import { GH_PR_FIELDS_NO_COMMENTS } from "./gh-view";
 import { invalidateAllForNumber } from "./github-cache";
-import { decideTarget, loadPermissionsConfig, PermissionDeniedError, permissionRoots } from "./permissions";
+import {
+	checkStructuredTargets,
+	decideTarget,
+	loadPermissionsConfig,
+	type PathTarget,
+	PermissionDeniedError,
+	permissionRoots,
+} from "./permissions";
 import { ToolError, throwIfAborted } from "./tool-errors";
 
 /**
@@ -53,6 +60,46 @@ function assertGitWriteAllowed(targetPath: string, context: AgentToolContext | u
 	}
 	const decision = decideTarget({ raw: targetPath, access: "write", field: "op" }, policy, roots);
 	if (decision.kind === "deny") throw new PermissionDeniedError("github", decision.rule, decision.reason);
+}
+
+/**
+ * Authorize every file `git.worktree.add` is about to materialize under a
+ * *new* worktree. `assertGitWriteAllowed` only ever checked the worktree
+ * root itself - sound for confinement (the root either lands under an
+ * approved directory or it doesn't), but not for a descendant `deny.write`
+ * glob (`strict` with `confineWrites: false`, or the worktree root itself
+ * added as a workspace root): the root passing says nothing about whether
+ * `.env` or `id_rsa` inside the PR's tree does. Enumerated straight from the
+ * fetched remote ref (`git.ls.tree`), so nothing is materialized on disk
+ * before every path in it clears the policy.
+ */
+async function assertGitWorktreeTreeWriteAllowed(
+	repoRoot: string,
+	ref: string,
+	worktreePath: string,
+	context: AgentToolContext | undefined,
+	signal?: AbortSignal,
+): Promise<void> {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy) return;
+	const roots = permissionRoots(context);
+	if (!roots) {
+		throw new PermissionDeniedError(
+			"github",
+			"permissions.profile",
+			`Tool "github" is blocked: permissions.profile is "${policy.profile}" but this call has no session, ` +
+				`so the workspace roots the rules are measured against cannot be determined.\n` +
+				`To allow it: set permissions.profile: off.`,
+		);
+	}
+	const files = await git.ls.tree(repoRoot, ref, [], signal);
+	const targets: PathTarget[] = files.map(file => ({
+		raw: path.join(worktreePath, file),
+		access: "write",
+		field: "op",
+	}));
+	const denial = checkStructuredTargets(targets, policy, roots);
+	if (denial) throw new PermissionDeniedError("github", denial.rule, denial.reason);
 }
 
 export const GH_REPO_CLONE_FIELDS = ["nameWithOwner", "sshUrl", "url"];
@@ -517,6 +564,13 @@ export async function checkoutPullRequest(
 			);
 
 			if (!existingWorktree) {
+				await assertGitWorktreeTreeWriteAllowed(
+					repoRoot,
+					`refs/remotes/${remote.name}/${headRefName}`,
+					finalWorktreePath,
+					context,
+					signal,
+				);
 				await fs.mkdir(path.dirname(finalWorktreePath), { recursive: true });
 				await git.worktree.add(repoRoot, finalWorktreePath, localBranch, { signal });
 			}

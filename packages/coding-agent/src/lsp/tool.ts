@@ -694,6 +694,17 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 			}
 
+			// The pre-execution gate only ever checked the declared `file`/
+			// `new_name` (the directory itself); a directory rename moves every
+			// descendant, and `pairs` (from `enumerateRenamePairs`) is the
+			// concrete list of what actually moves. Reuse the same rename-op
+			// shape `assertWorkspaceEditAllowed` already authorizes write-only
+			// for the LSP-computed edits above.
+			assertWorkspaceEditAllowed(
+				{ documentChanges: pairs.map(pair => ({ kind: "rename", oldUri: pair.oldUri, newUri: pair.newUri })) },
+				context,
+				this.name,
+			);
 			await fs.promises.mkdir(path.dirname(dest), { recursive: true });
 			await fs.promises.rename(source, dest);
 			summary.push(`  Renamed ${sourceLabel} → ${destLabel}`);

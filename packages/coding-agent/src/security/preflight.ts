@@ -320,6 +320,19 @@ export interface PreparedSecurityOutput {
 	archivedTo?: string;
 }
 
+/**
+ * The sibling path {@link prepareSecurityOutputDirectory} archives a
+ * nonempty output directory to, before it exists. Exported (not just
+ * inlined there) so a caller can authorize this exact path against the
+ * resource permission policy before the rename runs — `root` passing
+ * `confineWrites`/`deny.write` says nothing about whether this generated
+ * sibling does too.
+ */
+export function securityArchivePath(root: string, archiveSuffix: string): string {
+	const safeSuffix = archiveSuffix.replace(/[^a-zA-Z0-9._-]/g, "-");
+	return `${path.resolve(root)}.archive-${safeSuffix}`;
+}
+
 export async function prepareSecurityOutputDirectory(
 	output: SecurityOutputPlan,
 	archiveSuffix: string = Bun.randomUUIDv7(),
@@ -336,8 +349,7 @@ export async function prepareSecurityOutputDirectory(
 		if (!output.archiveExisting) {
 			throw new Error("Security output directory is not empty; enable archiveExisting or choose another directory");
 		}
-		const safeSuffix = archiveSuffix.replace(/[^a-zA-Z0-9._-]/g, "-");
-		archivedTo = `${root}.archive-${safeSuffix}`;
+		archivedTo = securityArchivePath(root, archiveSuffix);
 		await fs.rename(root, archivedTo);
 		await fs.mkdir(root, { mode: 0o700 });
 	}
