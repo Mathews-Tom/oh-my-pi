@@ -15,16 +15,11 @@
  *   members compile to inline predicates
  */
 import { MISSING, OmpErrors } from "./errors";
-import { canRefineUnionFailure, unionFail, walk } from "./interp";
+import { canRefineUnionFailure, materializeDefault, unionFail, walk } from "./interp";
 import { expectedOf, hasMorph, type IR, type MorphContext, type PropIR, type TupleIR } from "./ir";
 
 const own = Object.prototype.hasOwnProperty;
-
 const IDENT = /^[A-Za-z_$][\w$]*$/;
-
-function access(base: string, key: string): string {
-	return IDENT.test(key) ? `${base}.${key}` : `${base}[${JSON.stringify(key)}]`;
-}
 
 /** Inline-able literal, else undefined (caller hoists into the refs pool). */
 function litSource(v: unknown): string | undefined {
@@ -42,6 +37,35 @@ function litSource(v: unknown): string | undefined {
 }
 
 type PathSeg = { s: PropertyKey } | { d: string };
+
+type LiteralIR = Extract<IR, { k: "lit" }>;
+
+function isPrimitiveLiteral(node: IR): node is LiteralIR {
+	return node.k === "lit" && (node.v === null || (typeof node.v !== "object" && typeof node.v !== "function"));
+}
+
+/** Whether `undefined` necessarily fails, allowing property-presence checks to be elided. */
+function rejectsUndefined(node: IR): boolean {
+	switch (node.k) {
+		case "unknown":
+		case "undefined":
+		case "alias":
+		case "sub":
+			return false;
+		case "lit":
+			return node.v !== undefined;
+		case "union":
+			return node.members.every(rejectsUndefined);
+		case "intersection":
+			return node.members.some(rejectsUndefined);
+		case "refine":
+			return rejectsUndefined(node.base);
+		case "morph":
+			return rejectsUndefined(node.input);
+		default:
+			return true;
+	}
+}
 
 class CompiledMorphContext implements MorphContext {
 	#path: PropertyKey[] | PropertyKey | undefined;
@@ -86,8 +110,12 @@ class Builder {
 		return litSource(v) ?? this.ref(v);
 	}
 
+	access(base: string, key: PropertyKey): string {
+		return typeof key === "string" && IDENT.test(key) ? `${base}.${key}` : `${base}[${this.lit(key)}]`;
+	}
+
 	pathExpr(segs: PathSeg[]): string {
-		const parts = segs.map(seg => ("s" in seg ? JSON.stringify(seg.s) : seg.d));
+		const parts = segs.map(seg => ("s" in seg ? this.lit(seg.s) : seg.d));
 		return `[${parts.join(",")}]`;
 	}
 
@@ -95,13 +123,26 @@ class Builder {
 		if (segs.length === 0) return "undefined";
 		if (segs.length === 1) {
 			const seg = segs[0];
-			return "s" in seg ? JSON.stringify(seg.s) : seg.d;
+			return "s" in seg ? this.lit(seg.s) : seg.d;
 		}
-		return this.pathExpr(segs);
+		const staticParts: PropertyKey[] = [];
+		for (const seg of segs) {
+			if ("d" in seg) return this.pathExpr(segs);
+			staticParts.push(seg.s);
+		}
+		return this.ref(staticParts);
+	}
+
+	error(segs: PathSeg[], expected: string, dataExpr: string): string {
+		return `new AE(${this.storedPathExpr(segs)},${JSON.stringify(expected)},${dataExpr})`;
 	}
 
 	fail(segs: PathSeg[], expected: string, dataExpr: string): string {
-		return `return new AE(${this.storedPathExpr(segs)},${JSON.stringify(expected)},${dataExpr})`;
+		return `return ${this.error(segs, expected, dataExpr)}`;
+	}
+
+	appendError(errors: string, error: string): string {
+		return `if(${errors}===undefined)${errors}=${error};else ${errors}.append(${error});`;
 	}
 
 	/** Pure boolean predicate for a morph-free subtree. */
@@ -144,11 +185,7 @@ class Builder {
 				return out;
 			}
 			case "union": {
-				const lits = node.members.filter(
-					(member): member is Extract<IR, { k: "lit" }> =>
-						member.k === "lit" &&
-						(member.v === null || (typeof member.v !== "object" && typeof member.v !== "function")),
-				);
+				const lits = node.members.filter(isPrimitiveLiteral);
 				if (lits.length > 8) {
 					const values = this.ref(new Set(lits.map(member => member.v)));
 					const literalNodes = new Set<IR>(lits);
@@ -162,34 +199,65 @@ class Builder {
 			case "intersection":
 				return `(${node.members.map(member => `(${this.predicate(member, v)})`).join("&&")})`;
 			case "array": {
-				const x = this.next("x");
+				const array = this.next("a");
+				const index = this.next("i");
 				let out = `Array.isArray(${v})`;
 				if (node.min !== undefined) out += `&&${v}.length>=${node.min}`;
 				if (node.max !== undefined) out += `&&${v}.length<=${node.max}`;
-				out += `&&${v}.every(${x}=>${this.predicate(node.el, x)})`;
+				const item = `${array}[${index}]`;
+				out += `&&((${array})=>{for(let ${index}=0;${index}<${array}.length;${index}++)if(!(${this.predicate(node.el, item)}))return false;return true})(${v})`;
 				return out;
 			}
 			case "object": {
-				const checks = [`typeof ${v}==="object"`, `${v}!==null`, `!Array.isArray(${v})`];
+				const checks = [`typeof ${v}==="object"`, `${v}!==null`];
 				for (const p of node.props) {
-					const av = access(v, p.key);
-					const present = `${JSON.stringify(p.key)} in ${v}`;
+					const av = this.access(v, p.key);
+					const present = `${this.lit(p.key)} in ${v}`;
+					const predicate = this.predicate(p.val, av);
 					checks.push(
 						p.opt || p.hasDefault
-							? `(!(${present})||(${this.predicate(p.val, av)}))`
-							: `((${present})&&(${this.predicate(p.val, av)}))`,
+							? rejectsUndefined(p.val)
+								? `((${av}!==undefined&&(${predicate}))||!(${present}))`
+								: `(!(${present})||(${predicate}))`
+							: rejectsUndefined(p.val)
+								? predicate
+								: `((${present})&&(${predicate}))`,
 					);
 				}
-				if (node.index) {
-					const k = this.next("k");
+				const stringKey = this.next("k");
+				if (node.index !== undefined) {
 					checks.push(
-						`(()=>{for(const ${k} in ${v})if(own.call(${v},${k})&&!(${this.predicate(node.index, `${v}[${k}]`)}))return false;return true})()`,
+						`(()=>{for(const ${stringKey} in ${v})if(own.call(${v},${stringKey})&&!(${this.predicate(node.index, `${v}[${stringKey}]`)}))return false;return true})()`,
 					);
-				} else if (node.extras === "reject") {
-					const k = this.next("k");
+				}
+				if (node.patternIndexes !== undefined) {
+					for (const pattern of node.patternIndexes) {
+						checks.push(
+							`(()=>{for(const ${stringKey} in ${v})if(own.call(${v},${stringKey})&&(${this.predicate(pattern.key, stringKey)})&&!(${this.predicate(pattern.val, `${v}[${stringKey}]`)}))return false;return true})()`,
+						);
+					}
+				}
+				if (node.symbolIndex !== undefined) {
+					const symbol = this.next("s");
 					checks.push(
-						`(()=>{for(const ${k} in ${v})if(own.call(${v},${k})&&!(${this.declaredCheck(node.props, k)}))return false;return true})()`,
+						`(()=>{for(const ${symbol} of Object.getOwnPropertySymbols(${v}))if(Object.prototype.propertyIsEnumerable.call(${v},${symbol})&&!(${this.predicate(node.symbolIndex, `${v}[${symbol}]`)}))return false;return true})()`,
 					);
+				}
+				if (node.extras === "reject") {
+					const patternMatch =
+						node.patternIndexes?.map(pattern => `(${this.predicate(pattern.key, stringKey)})`).join("||") ??
+						"false";
+					if (node.index === undefined) {
+						checks.push(
+							`(()=>{for(const ${stringKey} in ${v})if(own.call(${v},${stringKey})&&!(${this.declaredCheck(node.props, stringKey)})&&!(${patternMatch}))return false;return true})()`,
+						);
+					}
+					if (node.symbolIndex === undefined) {
+						const symbol = this.next("s");
+						checks.push(
+							`(()=>{for(const ${symbol} of Object.getOwnPropertySymbols(${v}))if(Object.prototype.propertyIsEnumerable.call(${v},${symbol})&&!(${this.declaredCheck(node.props, symbol)}))return false;return true})()`,
+						);
+					}
 				}
 				return `(${checks.join("&&")})`;
 			}
@@ -206,39 +274,341 @@ class Builder {
 			const set = this.ref(new Set(props.map(p => p.key)));
 			return `${set}.has(${keyVar})`;
 		}
-		return `(${props.map(p => `${keyVar}===${JSON.stringify(p.key)}`).join("||")})`;
+		return `(${props.map(p => `${keyVar}===${this.lit(p.key)}`).join("||")})`;
 	}
 
-	emitDelegate(node: IR, v: string, segs: PathSeg[], out?: string): void {
-		const runner = node.k === "sub" ? node.schema.run : boundWalk(node);
+	/**
+	 * Run a node through its interpreter/sub-schema runner, appending any
+	 * failure to `errors`. `brk` (when given) exits the enclosing block on
+	 * failure so dependent statements (output assignment, morph fns) are
+	 * skipped. Both runner kinds receive the absolute path so nested step
+	 * callbacks observe ctx.path; walk-produced errors are already absolute,
+	 * while sub runners return schema-relative errors that need prefixing.
+	 */
+	emitCollectDelegate(node: IR, v: string, segs: PathSeg[], errors: string, brk?: string, out?: string): void {
+		const sub = node.k === "sub";
+		const runner = sub ? node.schema.run : boundWalk(node);
 		const result = this.next("r");
-		this.push(`const ${result}=${this.ref(runner)}(${v});`);
+		const args = segs.length > 0 ? `${v},${this.pathExpr(segs)}` : v;
+		this.push(`const ${result}=${this.ref(runner)}(${args});`);
+		const failure = sub && segs.length > 0 ? `PF(${result},${this.pathExpr(segs)})` : result;
 		this.push(
-			segs.length === 0
-				? `if(${result} instanceof AE)return ${result};`
-				: `if(${result} instanceof AE)return PF(${result},${this.pathExpr(segs)});`,
+			`if(${result} instanceof AE){${this.appendError(errors, failure)}${brk === undefined ? "" : `break ${brk};`}}`,
 		);
 		if (out !== undefined) this.push(`${out}=${result};`);
+	}
+
+	/** Snapshot the error count so sequencing sites can detect soft failures. */
+	markErrors(errors: string): string {
+		const mark = this.next("n");
+		this.push(`const ${mark}=${errors}===void 0?0:${errors}.length;`);
+		return mark;
+	}
+
+	/** Exit `brk` when errors were appended since `mark` (interp's return-on-error). */
+	guardGrowth(errors: string, mark: string, brk: string): void {
+		this.push(`if((${errors}===void 0?0:${errors}.length)!==${mark})break ${brk};`);
+	}
+
+	/** Aggregate every independent failure in a morph-free subtree. */
+	emitCollectCheck(node: IR, v: string, segs: PathSeg[], errors: string, failureData = v): void {
+		if (node.cfg !== undefined || node.k === "refine") {
+			this.emitCollectDelegate(node, v, segs, errors);
+			return;
+		}
+		switch (node.k) {
+			case "unknown":
+				return;
+			case "array": {
+				this.push(
+					`if(!Array.isArray(${v})){${this.appendError(errors, this.error(segs, "an array", failureData))}}`,
+				);
+				if (node.min !== undefined) {
+					this.push(
+						`else if(${v}.length<${node.min}){${this.appendError(
+							errors,
+							this.error(segs, `at least length ${node.min}`, `${v}.length`),
+						)}}`,
+					);
+				}
+				if (node.max !== undefined) {
+					this.push(
+						`else if(${v}.length>${node.max}){${this.appendError(
+							errors,
+							this.error(segs, `at most length ${node.max}`, `${v}.length`),
+						)}}`,
+					);
+				}
+				this.push("else{");
+				const index = this.next("i");
+				this.push(`for(let ${index}=0;${index}<${v}.length;${index}++){`);
+				this.emitCollectCheck(node.el, `${v}[${index}]`, [...segs, { d: index }], errors);
+				this.push("}}");
+				return;
+			}
+			case "tuple": {
+				this.push(
+					`if(!Array.isArray(${v})){${this.appendError(errors, this.error(segs, "an array", failureData))}}else{`,
+				);
+				const requiredPrefix = node.prefix.filter(item => !item.opt && !item.hasDefault).length;
+				const minimum = requiredPrefix + node.postfix.length;
+				const maximum = node.prefix.length + node.postfix.length;
+				if (minimum > 0) {
+					this.push(
+						`if(${v}.length<${minimum}){${this.appendError(
+							errors,
+							this.error(segs, `an array of at least length ${minimum}`, failureData),
+						)}}else{`,
+					);
+				}
+				if (node.variadic === undefined) {
+					this.push(
+						`if(${v}.length>${maximum}){${this.appendError(
+							errors,
+							this.error(segs, `an array of at most length ${maximum}`, failureData),
+						)}}else{`,
+					);
+				}
+				let postfixStart = `${v}.length`;
+				if (node.postfix.length > 0) {
+					postfixStart = this.next("p");
+					this.push(`const ${postfixStart}=${v}.length-${node.postfix.length};`);
+				}
+				let prefixCount = String(node.prefix.length);
+				if (requiredPrefix !== node.prefix.length) {
+					prefixCount = this.next("n");
+					this.push(`const ${prefixCount}=Math.min(${node.prefix.length},${postfixStart});`);
+				}
+				for (let index = 0; index < node.prefix.length; index++) {
+					if (index >= requiredPrefix) this.push(`if(${index}<${prefixCount}){`);
+					this.emitCollectCheck(node.prefix[index].val, `${v}[${index}]`, [...segs, { d: String(index) }], errors);
+					if (index >= requiredPrefix) this.push("}");
+				}
+				if (node.variadic !== undefined) {
+					const index = this.next("i");
+					this.push(`for(let ${index}=${prefixCount};${index}<${postfixStart};${index}++){`);
+					this.emitCollectCheck(node.variadic, `${v}[${index}]`, [...segs, { d: index }], errors);
+					this.push("}");
+				}
+				for (let index = 0; index < node.postfix.length; index++) {
+					const inputIndex = index === 0 ? postfixStart : `${postfixStart}+${index}`;
+					this.emitCollectCheck(node.postfix[index], `${v}[${inputIndex}]`, [...segs, { d: inputIndex }], errors);
+				}
+				if (node.variadic === undefined) this.push("}");
+				if (minimum > 0) this.push("}");
+				this.push("}");
+				return;
+			}
+			case "object": {
+				if (
+					node.patternIndexes !== undefined ||
+					node.symbolIndex !== undefined ||
+					node.props.some(prop => typeof prop.key === "symbol")
+				) {
+					this.emitCollectDelegate(node, v, segs, errors);
+					return;
+				}
+				this.push(
+					`if(typeof ${v}!=="object"||${v}===null){${this.appendError(
+						errors,
+						this.error(segs, "an object", failureData),
+					)}}else{`,
+				);
+				for (const prop of node.props) {
+					const present = `${this.lit(prop.key)} in ${v}`;
+					const propSegs: PathSeg[] = [...segs, { s: prop.key }];
+					if (prop.opt || prop.hasDefault) {
+						this.push(`if(${present}){`);
+						this.emitCollectCheck(prop.val, this.access(v, prop.key), propSegs, errors);
+						this.push("}");
+					} else {
+						this.push(
+							`if(!(${present})){${this.appendError(
+								errors,
+								this.error(propSegs, expectedOf(prop.val), "M"),
+							)}}else{`,
+						);
+						this.emitCollectCheck(prop.val, this.access(v, prop.key), propSegs, errors);
+						this.push("}");
+					}
+				}
+				if (node.index !== undefined) {
+					const key = this.next("k");
+					this.push(`for(const ${key} in ${v})if(own.call(${v},${key})){`);
+					this.emitCollectCheck(node.index, `${v}[${key}]`, [...segs, { d: key }], errors);
+					this.push("}");
+				} else if (node.extras === "reject") {
+					const key = this.next("k");
+					this.push(
+						`for(const ${key} in ${v})if(own.call(${v},${key})&&!(${this.declaredCheck(node.props, key)})){`,
+					);
+					this.push(this.appendError(errors, this.error([...segs, { d: key }], "removed", `${v}[${key}]`)));
+					this.push("}");
+				}
+				if (node.extras === "reject") {
+					const symbol = this.next("s");
+					this.push(
+						`for(const ${symbol} of Object.getOwnPropertySymbols(${v}))if(Object.prototype.propertyIsEnumerable.call(${v},${symbol})&&!(${this.declaredCheck(node.props, symbol)})){${this.appendError(errors, this.error([...segs, { d: symbol }], "removed", `${v}[${symbol}]`))}}`,
+					);
+				}
+				this.push("}");
+				return;
+			}
+			case "union": {
+				const failure = node.members.some(canRefineUnionFailure)
+					? `UF(${this.ref(node)},${failureData},${this.pathExpr(segs)},${JSON.stringify(expectedOf(node))})`
+					: this.error(segs, expectedOf(node), failureData);
+				this.push(`if(!(${this.predicate(node, v)})){${this.appendError(errors, failure)}}`);
+				return;
+			}
+			case "string": {
+				this.push(
+					`if(typeof ${v}!=="string"){${this.appendError(errors, this.error(segs, "a string", failureData))}}`,
+				);
+				if (node.min !== undefined) {
+					this.push(
+						`else if(${v}.length<${node.min}){${this.appendError(
+							errors,
+							this.error(segs, `at least length ${node.min}`, `${v}.length`),
+						)}}`,
+					);
+				}
+				if (node.max !== undefined) {
+					this.push(
+						`else if(${v}.length>${node.max}){${this.appendError(
+							errors,
+							this.error(segs, `at most length ${node.max}`, `${v}.length`),
+						)}}`,
+					);
+				}
+				if (node.url) {
+					this.push(
+						`else if(!URL.canParse(${v})){${this.appendError(
+							errors,
+							this.error(segs, "a URL string", failureData),
+						)}}`,
+					);
+				}
+				return;
+			}
+			case "number": {
+				this.push(
+					`if(typeof ${v}!=="number"||!Number.isFinite(${v})){${this.appendError(
+						errors,
+						this.error(segs, node.int ? "an integer" : "a number", failureData),
+					)}}else{`,
+				);
+				if (node.int) {
+					this.push(
+						`if(!Number.isInteger(${v})){${this.appendError(errors, this.error(segs, "an integer", failureData))}}`,
+					);
+				}
+				if (node.divisor !== undefined) {
+					this.push(
+						`if(${v}%${node.divisor}!==0){${this.appendError(
+							errors,
+							this.error(segs, `a number divisible by ${node.divisor}`, failureData),
+						)}}`,
+					);
+				}
+				if (node.min !== undefined) {
+					const expected =
+						node.min === 0
+							? node.xmin
+								? "positive"
+								: "non-negative"
+							: `a number ${node.xmin ? "more than" : "at least"} ${node.min}`;
+					this.push(
+						`if(${v}${node.xmin ? "<=" : "<"}${node.min}){${this.appendError(
+							errors,
+							this.error(segs, expected, failureData),
+						)}}`,
+					);
+				}
+				if (node.max !== undefined) {
+					const expected =
+						node.max === 0
+							? node.xmax
+								? "negative"
+								: "non-positive"
+							: `a number ${node.xmax ? "less than" : "at most"} ${node.max}`;
+					this.push(
+						`if(${v}${node.xmax ? ">=" : ">"}${node.max}){${this.appendError(
+							errors,
+							this.error(segs, expected, failureData),
+						)}}`,
+					);
+				}
+				this.push("}");
+				return;
+			}
+			case "lit":
+				if (
+					(node.v !== null && typeof node.v === "object" && !(node.v instanceof Date)) ||
+					typeof node.v === "function"
+				) {
+					this.emitCollectDelegate(node, v, segs, errors);
+				} else {
+					this.push(
+						`if(!(${this.predicate(node, v)})){${this.appendError(
+							errors,
+							this.error(segs, expectedOf(node), failureData),
+						)}}`,
+					);
+				}
+				return;
+			case "intersection":
+			case "sub":
+				this.emitCollectDelegate(node, v, segs, errors);
+				return;
+			case "null":
+			case "undefined":
+			case "boolean":
+			case "bigint":
+			case "symbol":
+			case "never":
+			case "anyobject":
+			case "instance":
+				this.push(
+					`if(!(${this.predicate(node, v)})){${this.appendError(
+						errors,
+						this.error(segs, expectedOf(node), failureData),
+					)}}`,
+				);
+				return;
+			default:
+				this.emitCollectDelegate(node, v, segs, errors);
+		}
 	}
 
 	emitTupleShape(
 		node: TupleIR,
 		v: string,
 		segs: PathSeg[],
+		errors: string,
+		brk: string,
 		failureData: string,
 	): { postfixStart: string; prefixCount: string; requiredPrefix: number } {
-		this.push(`if(!Array.isArray(${v}))${this.fail(segs, "an array", failureData)};`);
+		this.push(
+			`if(!Array.isArray(${v})){${this.appendError(errors, this.error(segs, "an array", failureData))}break ${brk};}`,
+		);
 		const requiredPrefix = node.prefix.filter(item => !item.opt && !item.hasDefault).length;
 		const minimum = requiredPrefix + node.postfix.length;
 		if (minimum > 0) {
 			this.push(
-				`if(${v}.length<${minimum})${this.fail(segs, `an array of at least length ${minimum}`, failureData)};`,
+				`if(${v}.length<${minimum}){${this.appendError(
+					errors,
+					this.error(segs, `an array of at least length ${minimum}`, failureData),
+				)}break ${brk};}`,
 			);
 		}
 		if (node.variadic === undefined) {
 			const maximum = node.prefix.length + node.postfix.length;
 			this.push(
-				`if(${v}.length>${maximum})${this.fail(segs, `an array of at most length ${maximum}`, failureData)};`,
+				`if(${v}.length>${maximum}){${this.appendError(
+					errors,
+					this.error(segs, `an array of at most length ${maximum}`, failureData),
+				)}break ${brk};}`,
 			);
 		}
 		let postfixStart = `${v}.length`;
@@ -254,137 +624,63 @@ class Builder {
 		return { postfixStart, prefixCount, requiredPrefix };
 	}
 
-	/** Statement-form check for a morph-free subtree with precise error paths. */
-	emitCheck(node: IR, v: string, segs: PathSeg[], failureData = v): void {
-		switch (node.k) {
-			case "unknown":
-				return;
-			case "array": {
-				let head = `Array.isArray(${v})`;
-				if (node.min !== undefined) head += `&&${v}.length>=${node.min}`;
-				if (node.max !== undefined) head += `&&${v}.length<=${node.max}`;
-				this.push(`if(!(${head}))${this.fail(segs, expectedOf(node), failureData)};`);
-				const i = this.next("i");
-				const x = this.next("x");
-				this.push(`for(let ${i}=0;${i}<${v}.length;${i}++){const ${x}=${v}[${i}];`);
-				this.emitCheck(node.el, x, [...segs, { d: i }]);
-				this.push("}");
-				return;
-			}
-			case "tuple": {
-				const { postfixStart, prefixCount, requiredPrefix } = this.emitTupleShape(node, v, segs, failureData);
-				for (let index = 0; index < node.prefix.length; index++) {
-					if (index >= requiredPrefix) this.push(`if(${index}<${prefixCount}){`);
-					this.emitCheck(node.prefix[index].val, `${v}[${index}]`, [...segs, { d: String(index) }]);
-					if (index >= requiredPrefix) this.push("}");
-				}
-				if (node.variadic !== undefined) {
-					const index = this.next("i");
-					this.push(`for(let ${index}=${prefixCount};${index}<${postfixStart};${index}++){`);
-					this.emitCheck(node.variadic, `${v}[${index}]`, [...segs, { d: index }]);
-					this.push("}");
-				}
-				for (let index = 0; index < node.postfix.length; index++) {
-					const inputIndex = index === 0 ? postfixStart : `${postfixStart}+${index}`;
-					this.emitCheck(node.postfix[index], `${v}[${inputIndex}]`, [...segs, { d: inputIndex }]);
-				}
-				return;
-			}
-			case "object": {
-				this.push(
-					`if(typeof ${v}!=="object"||${v}===null||Array.isArray(${v}))${this.fail(segs, "an object", failureData)};`,
-				);
-				for (const p of node.props) {
-					const present = `${JSON.stringify(p.key)} in ${v}`;
-					const propSegs: PathSeg[] = [...segs, { s: p.key }];
-					if (p.opt || p.hasDefault) {
-						this.push(`if(${present}){`);
-						this.emitCheck(p.val, access(v, p.key), propSegs);
-						this.push("}");
-					} else {
-						this.push(`if(!(${present}))${this.fail(propSegs, expectedOf(p.val), "M")};`);
-						this.emitCheck(p.val, access(v, p.key), propSegs);
-					}
-				}
-				if (node.index) {
-					const k = this.next("k");
-					this.push(`for(const ${k} in ${v})if(own.call(${v},${k})){`);
-					this.emitCheck(node.index, `${v}[${k}]`, [...segs, { d: k }]);
-					this.push("}");
-				} else if (node.extras === "reject") {
-					const k = this.next("k");
-					this.push(
-						`for(const ${k} in ${v})if(own.call(${v},${k})&&!(${this.declaredCheck(node.props, k)}))${this.fail(
-							[...segs, { d: k }],
-							"removed (undeclared key)",
-							`${v}[${k}]`,
-						)};`,
-					);
-				}
-				return;
-			}
-			case "sub":
-				this.emitDelegate(node, v, segs);
-				return;
-			case "union": {
-				const failure = node.members.some(canRefineUnionFailure)
-					? `return UF(${this.ref(node)},${failureData},${this.pathExpr(segs)},${JSON.stringify(expectedOf(node))})`
-					: this.fail(segs, expectedOf(node), failureData);
-				this.push(`if(!(${this.predicate(node, v)}))${failure};`);
-				return;
-			}
-			case "null":
-			case "undefined":
-			case "boolean":
-			case "bigint":
-			case "symbol":
-			case "never":
-			case "anyobject":
-			case "lit":
-			case "string":
-			case "number":
-			case "instance":
-				this.push(`if(!(${this.predicate(node, v)}))${this.fail(segs, expectedOf(node), failureData)};`);
-				return;
-			case "refine": {
-				this.emitCheck(node.base, v, segs, failureData);
-				const failure = this.fail(segs, node.expected, v);
-				this.push(`try{if(!${this.ref(node.pred)}(${v}))${failure};}catch{${failure};}`);
-				return;
-			}
-			case "intersection":
-				for (const member of node.members) this.emitCheck(member, v, segs, failureData);
-				return;
-			default:
-				this.emitDelegate(node, v, segs);
+	/** Fill `target` with a validated default (factory output revalidated per call). */
+	emitDefaultFill(val: IR, def: unknown, isFactory: boolean, target: string, segs: PathSeg[], errors: string): void {
+		if (isFactory && typeof def === "function") {
+			const candidate = this.next("d");
+			const resolved = this.next("t");
+			const label = this.next("L");
+			this.push(`const ${candidate}=${this.ref(def)}();let ${resolved};${label}:{`);
+			this.emitCollectProduce(val, candidate, segs, resolved, errors, label);
+			this.push(`${target}=${resolved};}`);
+		} else {
+			// Static defaults were prevalidated at construction; MD clones
+			// mutable payloads so callers cannot alias the schema's copy.
+			this.push(`${target}=${litSource(def) ?? `MD(${this.ref(def)})`};`);
 		}
 	}
 
 	/**
 	 * Validate `v` against a morphing subtree and assign the produced output
-	 * to `out` (an already-declared `let`).
+	 * to `out` (an already-declared `let`). Failures append to `errors` and
+	 * `break ${brk}` (skipping the output assignment), mirroring interp: an
+	 * error in one child never suppresses sibling validation or morphs.
 	 */
-	emitProduce(node: IR, v: string, segs: PathSeg[], out: string, failureData = v): void {
+	emitCollectProduce(
+		node: IR,
+		v: string,
+		segs: PathSeg[],
+		out: string,
+		errors: string,
+		brk: string,
+		failureData = v,
+	): void {
+		if (node.cfg !== undefined || node.k === "refine") {
+			this.emitCollectDelegate(node, v, segs, errors, brk, out);
+			return;
+		}
 		if (!hasMorph(node)) {
-			this.emitCheck(node, v, segs, failureData);
+			this.emitCollectCheck(node, v, segs, errors, failureData);
 			this.push(`${out}=${v};`);
 			return;
 		}
 		switch (node.k) {
 			case "sub":
-				this.emitDelegate(node, v, segs, out);
+				this.emitCollectDelegate(node, v, segs, errors, brk, out);
 				return;
 			case "morph": {
 				const input = this.next("t");
 				this.push(`let ${input};`);
-				this.emitProduce(node.input, v, segs, input, failureData);
+				const mark = this.markErrors(errors);
+				this.emitCollectProduce(node.input, v, segs, input, errors, brk, failureData);
+				this.guardGrowth(errors, mark, brk);
 				const context = this.next("c");
 				const result = this.next("r");
 				this.push(`const ${context}=new MC(${this.storedPathExpr(segs)},${input});`);
 				this.push(`const ${result}=${this.ref(node.fn)}(${input},${context});`);
-				this.push(`if(${result} instanceof AE)return ${result};`);
+				this.push(`if(${result} instanceof AE){${this.appendError(errors, result)}break ${brk};}`);
 				if (node.out === undefined) this.push(`${out}=${result};`);
-				else this.emitProduce(node.out, result, segs, out);
+				else this.emitCollectProduce(node.out, result, segs, out, errors, brk);
 				return;
 			}
 			case "alias": {
@@ -394,12 +690,12 @@ class Builder {
 					this.#activeAliases = active;
 				}
 				if (active.has(node)) {
-					this.emitDelegate(node, v, segs, out);
+					this.emitCollectDelegate(node, v, segs, errors, brk, out);
 					return;
 				}
 				active.add(node);
 				try {
-					this.emitProduce(node.resolve(), v, segs, out, failureData);
+					this.emitCollectProduce(node.resolve(), v, segs, out, errors, brk, failureData);
 				} finally {
 					active.delete(node);
 				}
@@ -424,45 +720,77 @@ class Builder {
 					}
 				}
 				this.push("}");
-				this.push(
-					`if(!${ok})return UF(${this.ref(node)},${failureData},${this.pathExpr(segs)},${JSON.stringify(expectedOf(node))});`,
-				);
+				const failure = `UF(${this.ref(node)},${failureData},${this.pathExpr(segs)},${JSON.stringify(expectedOf(node))})`;
+				this.push(`if(!${ok}){${this.appendError(errors, failure)}break ${brk};}`);
 				return;
 			}
 			case "array": {
-				let head = `Array.isArray(${v})`;
-				if (node.min !== undefined) head += `&&${v}.length>=${node.min}`;
-				if (node.max !== undefined) head += `&&${v}.length<=${node.max}`;
-				this.push(`if(!(${head}))${this.fail(segs, expectedOf(node), failureData)};`);
-				const arr = this.next("a");
-				const i = this.next("i");
-				const x = this.next("x");
-				const el = this.next("t");
-				this.push(`const ${arr}=new Array(${v}.length);`);
-				this.push(`for(let ${i}=0;${i}<${v}.length;${i}++){const ${x}=${v}[${i}];let ${el};`);
-				this.emitProduce(node.el, x, [...segs, { d: i }], el);
-				this.push(`${arr}[${i}]=${el};}`);
-				this.push(`${out}=${arr};`);
+				this.push(
+					`if(!Array.isArray(${v})){${this.appendError(errors, this.error(segs, "an array", failureData))}break ${brk};}`,
+				);
+				if (node.min !== undefined) {
+					this.push(
+						`if(${v}.length<${node.min}){${this.appendError(
+							errors,
+							this.error(segs, `at least length ${node.min}`, `${v}.length`),
+						)}break ${brk};}`,
+					);
+				}
+				if (node.max !== undefined) {
+					this.push(
+						`if(${v}.length>${node.max}){${this.appendError(
+							errors,
+							this.error(segs, `at most length ${node.max}`, `${v}.length`),
+						)}break ${brk};}`,
+					);
+				}
+				const array = this.next("a");
+				const index = this.next("i");
+				const input = this.next("x");
+				const element = this.next("t");
+				const label = this.next("L");
+				this.push(`const ${array}=new Array(${v}.length);`);
+				this.push(
+					`for(let ${index}=0;${index}<${v}.length;${index}++){const ${input}=${v}[${index}];let ${element};${label}:{`,
+				);
+				this.emitCollectProduce(node.el, input, [...segs, { d: index }], element, errors, label);
+				this.push(`${array}[${index}]=${element};}}`);
+				this.push(`${out}=${array};`);
 				return;
 			}
 			case "tuple": {
-				const { postfixStart, prefixCount, requiredPrefix } = this.emitTupleShape(node, v, segs, failureData);
+				const { postfixStart, prefixCount, requiredPrefix } = this.emitTupleShape(
+					node,
+					v,
+					segs,
+					errors,
+					brk,
+					failureData,
+				);
 				const tuple = this.next("a");
 				this.push(`const ${tuple}=[...${v}];`);
 				for (let index = 0; index < node.prefix.length; index++) {
 					const item = node.prefix[index];
+					const itemSegs: PathSeg[] = [...segs, { s: index }];
 					const input = `${v}[${index}]`;
 					const output = `${tuple}[${index}]`;
+					const label = this.next("L");
 					if (index >= requiredPrefix) this.push(`if(${index}<${prefixCount}){`);
-					if (hasMorph(item.val)) this.emitProduce(item.val, input, [...segs, { d: String(index) }], output);
-					else {
-						this.emitCheck(item.val, input, [...segs, { d: String(index) }]);
-						this.push(`${output}=${input};`);
+					this.push(`${label}:{`);
+					if (hasMorph(item.val)) {
+						const temporary = this.next("t");
+						this.push(`let ${temporary};`);
+						this.emitCollectProduce(item.val, input, itemSegs, temporary, errors, label);
+						this.push(`${output}=${temporary};`);
+					} else {
+						this.emitCollectCheck(item.val, input, itemSegs, errors);
 					}
+					this.push("}");
 					if (index >= requiredPrefix) {
 						if (item.hasDefault) {
-							const defaultValue = item.defFactory ? `${this.ref(item.def)}()` : this.lit(item.def);
-							this.push(`}else{${output}=${defaultValue};}`);
+							this.push("}else{");
+							this.emitDefaultFill(item.val, item.def, item.defFactory === true, output, itemSegs, errors);
+							this.push("}");
 						} else {
 							this.push("}");
 						}
@@ -471,125 +799,147 @@ class Builder {
 				if (node.variadic !== undefined) {
 					const index = this.next("i");
 					const input = this.next("x");
+					const label = this.next("L");
 					this.push(
-						`for(let ${index}=${prefixCount};${index}<${postfixStart};${index}++){const ${input}=${v}[${index}];`,
+						`for(let ${index}=${prefixCount};${index}<${postfixStart};${index}++){const ${input}=${v}[${index}];${label}:{`,
 					);
 					if (hasMorph(node.variadic)) {
-						this.emitProduce(node.variadic, input, [...segs, { d: index }], `${tuple}[${index}]`);
+						const temporary = this.next("t");
+						this.push(`let ${temporary};`);
+						this.emitCollectProduce(node.variadic, input, [...segs, { d: index }], temporary, errors, label);
+						this.push(`${tuple}[${index}]=${temporary};`);
 					} else {
-						this.emitCheck(node.variadic, input, [...segs, { d: index }]);
-						this.push(`${tuple}[${index}]=${input};`);
+						this.emitCollectCheck(node.variadic, input, [...segs, { d: index }], errors);
 					}
-					this.push("}");
+					this.push("}}");
 				}
 				for (let index = 0; index < node.postfix.length; index++) {
 					const inputIndex = index === 0 ? postfixStart : `${postfixStart}+${index}`;
 					const input = `${v}[${inputIndex}]`;
-					const output = `${tuple}[${inputIndex}]`;
 					const item = node.postfix[index];
-					if (hasMorph(item)) this.emitProduce(item, input, [...segs, { d: inputIndex }], output);
-					else {
-						this.emitCheck(item, input, [...segs, { d: inputIndex }]);
-						this.push(`${output}=${input};`);
+					const label = this.next("L");
+					this.push(`${label}:{`);
+					if (hasMorph(item)) {
+						const temporary = this.next("t");
+						this.push(`let ${temporary};`);
+						this.emitCollectProduce(item, input, [...segs, { d: inputIndex }], temporary, errors, label);
+						this.push(`${tuple}[${inputIndex}]=${temporary};`);
+					} else {
+						this.emitCollectCheck(item, input, [...segs, { d: inputIndex }], errors);
 					}
+					this.push("}");
 				}
 				this.push(`${out}=${tuple};`);
 				return;
 			}
 			case "object": {
-				this.push(
-					`if(typeof ${v}!=="object"||${v}===null||Array.isArray(${v}))${this.fail(segs, "an object", failureData)};`,
-				);
-				const o = this.next("o");
-				const fresh = node.extras !== "keep" && !node.index;
-				this.push(fresh ? `const ${o}={};` : `const ${o}={...${v}};`);
-				for (const p of node.props) {
-					const present = `${JSON.stringify(p.key)} in ${v}`;
-					const propSegs: PathSeg[] = [...segs, { s: p.key }];
-					const av = access(v, p.key);
-					const ao = access(o, p.key);
-					const morphChild = hasMorph(p.val);
-					const missing: string[] = [];
-					if (p.hasDefault) {
-						const dflt = p.defFactory ? `${this.ref(p.def)}()` : this.lit(p.def);
-						missing.push(`${ao}=${dflt};`);
-					} else if (!p.opt) {
-						missing.push(`${this.fail(propSegs, expectedOf(p.val), "M")};`);
-					}
-					this.push(`if(!(${present})){${missing.join("")}}else{`);
-					if (morphChild) {
-						const t = this.next("t");
-						this.push(`let ${t};`);
-						this.emitProduce(p.val, av, propSegs, t);
-						this.push(`${ao}=${t};`);
-					} else {
-						this.emitCheck(p.val, av, propSegs);
-						if (fresh) this.push(`${ao}=${av};`);
-					}
-					this.push("}");
+				if (
+					node.patternIndexes !== undefined ||
+					node.symbolIndex !== undefined ||
+					node.props.some(prop => typeof prop.key === "symbol")
+				) {
+					this.emitCollectDelegate(node, v, segs, errors, brk, out);
+					return;
 				}
-				if (node.index) {
-					const k = this.next("k");
-					this.push(`for(const ${k} in ${v})if(own.call(${v},${k})){`);
-					if (hasMorph(node.index)) {
-						const t = this.next("t");
-						this.push(`let ${t};`);
-						this.emitProduce(node.index, `${v}[${k}]`, [...segs, { d: k }], t);
-						this.push(`${o}[${k}]=${t};`);
-					} else {
-						this.emitCheck(node.index, `${v}[${k}]`, [...segs, { d: k }]);
+				this.push(
+					`if(typeof ${v}!=="object"||${v}===null){${this.appendError(
+						errors,
+						this.error(segs, "an object", failureData),
+					)}break ${brk};}`,
+				);
+				const object = this.next("o");
+				const fresh = node.extras === "delete" && node.index === undefined;
+				this.push(fresh ? `const ${object}={};` : `const ${object}={...${v}};`);
+				for (const prop of node.props) {
+					const present = `${this.lit(prop.key)} in ${v}`;
+					const propSegs: PathSeg[] = [...segs, { s: prop.key }];
+					const input = this.access(v, prop.key);
+					const output = this.access(object, prop.key);
+					const label = this.next("L");
+					this.push(`if(!(${present})){`);
+					if (prop.hasDefault) {
+						this.emitDefaultFill(prop.val, prop.def, prop.defFactory === true, output, propSegs, errors);
+					} else if (!prop.opt) {
+						this.push(this.appendError(errors, this.error(propSegs, expectedOf(prop.val), "M")));
 					}
-					this.push("}");
+					this.push(`}else{${label}:{`);
+					if (hasMorph(prop.val)) {
+						const temporary = this.next("t");
+						this.push(`let ${temporary};`);
+						this.emitCollectProduce(prop.val, input, propSegs, temporary, errors, label);
+						this.push(`${output}=${temporary};`);
+					} else {
+						this.emitCollectCheck(prop.val, input, propSegs, errors);
+						if (fresh) this.push(`${output}=${input};`);
+					}
+					this.push("}}");
+				}
+				if (node.index !== undefined) {
+					const key = this.next("k");
+					const label = this.next("L");
+					this.push(`for(const ${key} in ${v})if(own.call(${v},${key})){${label}:{`);
+					if (hasMorph(node.index)) {
+						const temporary = this.next("t");
+						this.push(`let ${temporary};`);
+						this.emitCollectProduce(node.index, `${v}[${key}]`, [...segs, { d: key }], temporary, errors, label);
+						this.push(`${object}[${key}]=${temporary};`);
+					} else {
+						this.emitCollectCheck(node.index, `${v}[${key}]`, [...segs, { d: key }], errors);
+					}
+					this.push("}}");
 				} else if (node.extras === "reject") {
-					const k = this.next("k");
+					const key = this.next("k");
 					this.push(
-						`for(const ${k} in ${v})if(own.call(${v},${k})&&!(${this.declaredCheck(node.props, k)}))${this.fail(
-							[...segs, { d: k }],
-							"removed (undeclared key)",
-							`${v}[${k}]`,
-						)};`,
+						`for(const ${key} in ${v})if(own.call(${v},${key})&&!(${this.declaredCheck(node.props, key)})){${this.appendError(
+							errors,
+							this.error([...segs, { d: key }], "removed", `${v}[${key}]`),
+						)}}`,
 					);
 				}
-				this.push(`${out}=${o};`);
-				return;
-			}
-			case "refine": {
-				const refined = this.next("t");
-				this.push(`let ${refined};`);
-				this.emitProduce(node.base, v, segs, refined, failureData);
-				const failure = this.fail(segs, node.expected, refined);
-				this.push(`try{if(!${this.ref(node.pred)}(${refined}))${failure};}catch{${failure};}`);
-				this.push(`${out}=${refined};`);
+				if (node.extras === "reject") {
+					const symbol = this.next("s");
+					this.push(
+						`for(const ${symbol} of Object.getOwnPropertySymbols(${v}))if(Object.prototype.propertyIsEnumerable.call(${v},${symbol})&&!(${this.declaredCheck(node.props, symbol)})){${this.appendError(errors, this.error([...segs, { d: symbol }], "removed", `${v}[${symbol}]`))}}`,
+					);
+				}
+				this.push(`${out}=${object};`);
 				return;
 			}
 			case "intersection": {
 				const current = this.next("t");
 				this.push(`let ${current}=${v};`);
-				for (const member of node.members) {
-					if (hasMorph(member)) this.emitProduce(member, current, segs, current);
-					else this.emitCheck(member, current, segs);
+				const mark = this.markErrors(errors);
+				for (let index = 0; index < node.members.length; index++) {
+					if (index > 0) this.guardGrowth(errors, mark, brk);
+					const member = node.members[index];
+					if (hasMorph(member)) this.emitCollectProduce(member, current, segs, current, errors, brk);
+					else this.emitCollectCheck(member, current, segs, errors);
 				}
 				this.push(`${out}=${current};`);
 				return;
 			}
 			default:
-				this.emitDelegate(node, v, segs, out);
+				this.emitCollectDelegate(node, v, segs, errors, brk, out);
 		}
 	}
 
 	build(ir: IR): (value: unknown) => unknown {
+		const errors = this.next("e");
 		let ret: string;
 		if (hasMorph(ir)) {
-			this.push("let o;");
-			// body emitted below needs `o` declared first, so splice ordering:
-			this.emitProduce(ir, "v", [], "o");
+			const label = this.next("L");
+			this.push(`let ${errors};let o;${label}:{`);
+			this.emitCollectProduce(ir, "v", [], "o", errors, label);
+			this.push("}");
 			ret = "o";
 		} else {
-			this.emitCheck(ir, "v", []);
+			this.push(`let ${errors};`);
+			this.emitCollectCheck(ir, "v", [], errors);
 			ret = "v";
 		}
+		this.push(`if(${errors}!==undefined)return ${errors};`);
 		const src = `return function(v){${this.#lines.join("")}return ${ret}}`;
-		const make = new Function("R", "AE", "M", "PF", "UF", "MC", "own", src) as (
+		const make = new Function("R", "AE", "M", "PF", "UF", "MC", "own", "MD", src) as (
 			refs: unknown[],
 			ae: typeof OmpErrors,
 			m: typeof MISSING,
@@ -597,8 +947,125 @@ class Builder {
 			uf: typeof unionFail,
 			mc: typeof CompiledMorphContext,
 			ownFn: typeof own,
+			md: typeof materializeDefault,
 		) => (value: unknown) => unknown;
-		return make(this.#refs, OmpErrors, MISSING, prefixErrors, unionFail, CompiledMorphContext, own);
+		return make(
+			this.#refs,
+			OmpErrors,
+			MISSING,
+			prefixErrors,
+			unionFail,
+			CompiledMorphContext,
+			own,
+			materializeDefault,
+		);
+	}
+
+	emitAllows(node: IR, v: string): void {
+		switch (node.k) {
+			case "array": {
+				const array = this.next("a");
+				const index = this.next("i");
+				this.push(`const ${array}=${v};if(!Array.isArray(${array}))return false;`);
+				if (node.min !== undefined) this.push(`if(${array}.length<${node.min})return false;`);
+				if (node.max !== undefined) this.push(`if(${array}.length>${node.max})return false;`);
+				this.push(`for(let ${index}=0;${index}<${array}.length;${index}++){`);
+				this.emitAllows(node.el, `${array}[${index}]`);
+				this.push("}");
+				return;
+			}
+			case "object": {
+				const object = this.next("o");
+				this.push(`const ${object}=${v};if(typeof ${object}!=="object"||${object}===null)return false;`);
+				for (const prop of node.props) {
+					const value = this.next("p");
+					const present = `${this.lit(prop.key)} in ${object}`;
+					this.push(`const ${value}=${this.access(object, prop.key)};`);
+					if (prop.opt || prop.hasDefault) {
+						if (rejectsUndefined(prop.val)) {
+							this.push(`if(${value}!==undefined){`);
+							this.emitAllows(prop.val, value);
+							this.push(`}else if(${present})return false;`);
+						} else {
+							this.push(`if(${present}){`);
+							this.emitAllows(prop.val, value);
+							this.push("}");
+						}
+					} else {
+						if (!rejectsUndefined(prop.val)) this.push(`if(!(${present}))return false;`);
+						this.emitAllows(prop.val, value);
+					}
+				}
+				const stringKey = this.next("k");
+				if (node.index !== undefined) {
+					this.push(`for(const ${stringKey} in ${object}){if(!own.call(${object},${stringKey}))continue;`);
+					this.emitAllows(node.index, `${object}[${stringKey}]`);
+					this.push("}");
+				}
+				if (node.patternIndexes !== undefined) {
+					for (const pattern of node.patternIndexes) {
+						this.push(
+							`for(const ${stringKey} in ${object})if(own.call(${object},${stringKey})&&(${this.predicate(pattern.key, stringKey)})&&!(${this.predicate(pattern.val, `${object}[${stringKey}]`)}))return false;`,
+						);
+					}
+				}
+				if (node.symbolIndex !== undefined) {
+					const symbol = this.next("s");
+					this.push(
+						`for(const ${symbol} of Object.getOwnPropertySymbols(${object})){if(!Object.prototype.propertyIsEnumerable.call(${object},${symbol}))continue;`,
+					);
+					this.emitAllows(node.symbolIndex, `${object}[${symbol}]`);
+					this.push("}");
+				}
+				if (node.extras === "reject") {
+					const patternMatch =
+						node.patternIndexes?.map(pattern => `(${this.predicate(pattern.key, stringKey)})`).join("||") ??
+						"false";
+					if (node.index === undefined) {
+						this.push(
+							`for(const ${stringKey} in ${object})if(own.call(${object},${stringKey})&&!(${this.declaredCheck(node.props, stringKey)})&&!(${patternMatch}))return false;`,
+						);
+					}
+					if (node.symbolIndex === undefined) {
+						const symbol = this.next("s");
+						this.push(
+							`for(const ${symbol} of Object.getOwnPropertySymbols(${object}))if(Object.prototype.propertyIsEnumerable.call(${object},${symbol})&&!(${this.declaredCheck(node.props, symbol)}))return false;`,
+						);
+					}
+				}
+				return;
+			}
+			case "union": {
+				const sources: string[] = [];
+				for (const member of node.members) {
+					if (!isPrimitiveLiteral(member)) break;
+					const source = litSource(member.v);
+					if (source === undefined) break;
+					sources.push(source);
+				}
+				if (sources.length === node.members.length && sources.length >= 4) {
+					this.push(
+						`switch(${v}){${sources.map(source => `case ${source}:`).join("")}break;default:return false;}`,
+					);
+					return;
+				}
+				this.push(`if(!(${this.predicate(node, v)}))return false;`);
+				return;
+			}
+			default:
+				this.push(`if(!(${this.predicate(node, v)}))return false;`);
+		}
+	}
+
+	buildAllows(ir: IR): (value: unknown) => value is unknown {
+		this.emitAllows(ir, "v");
+		const src = `return function(v){${this.#lines.join("")}return true}`;
+		const make = new Function("R", "AE", "own", src) as (
+			refs: unknown[],
+			ae: typeof OmpErrors,
+			ownFn: typeof own,
+		) => (value: unknown) => value is unknown;
+		return make(this.#refs, OmpErrors, own);
 	}
 }
 
@@ -610,15 +1077,15 @@ function prefixErrors(errs: OmpErrors, parts: PropertyKey[]): OmpErrors {
 const kWalk = Symbol("omptype.boundWalk");
 
 interface WalkTagged {
-	[kWalk]?: (value: unknown) => unknown;
+	[kWalk]?: (value: unknown, path?: PropertyKey[]) => unknown;
 }
 
 /** Cached interpreter closure for recursive aliases and predicate-only fallbacks. */
-function boundWalk(node: IR): (value: unknown) => unknown {
+function boundWalk(node: IR): (value: unknown, path?: PropertyKey[]) => unknown {
 	const tagged = node as IR & WalkTagged;
 	let fn = tagged[kWalk];
 	if (!fn) {
-		fn = (value: unknown) => walk(node, value);
+		fn = (value: unknown, path?: PropertyKey[]) => walk(node, value, path);
 		tagged[kWalk] = fn;
 	}
 	return fn;
@@ -629,14 +1096,40 @@ function resolvedRoot(ir: IR): IR {
 }
 
 const compiledCache = new WeakMap<IR, (value: unknown) => unknown>();
+const allowsCache = new WeakMap<IR, (value: unknown) => value is unknown>();
 
 /** Compile `ir` into a specialized validator. */
 export function compile(ir: IR): (value: unknown) => unknown {
 	const root = resolvedRoot(ir);
-	let validator = compiledCache.get(root);
+	const validator = compiledCache.get(root);
 	if (validator === undefined) {
-		validator = new Builder().build(root);
-		compiledCache.set(root, validator);
+		// Publish a deferred wrapper before building: recursive schemas re-enter
+		// compile() for the same root mid-build (e.g. an alias element inside an
+		// array), and each re-entry must reuse this build instead of starting a
+		// fresh one forever. The wrapper resolves to the built validator by call
+		// time; the interpreter is a safety net that never triggers post-build.
+		let built: ((value: unknown) => unknown) | undefined;
+		compiledCache.set(root, value => (built === undefined ? walk(root, value) : built(value)));
+		built = new Builder().build(root);
+		compiledCache.set(root, built);
+		return built;
+	}
+	return validator;
+}
+
+/** Compile `ir` into an allocation-free boolean validator. */
+export function compileAllows(ir: IR): (value: unknown) => value is unknown {
+	const root = resolvedRoot(ir);
+	const validator = allowsCache.get(root);
+	if (validator === undefined) {
+		let built: ((value: unknown) => value is unknown) | undefined;
+		allowsCache.set(root, ((value: unknown) =>
+			built === undefined ? !(walk(root, value) instanceof OmpErrors) : built(value)) as (
+			value: unknown,
+		) => value is unknown);
+		built = new Builder().buildAllows(root);
+		allowsCache.set(root, built);
+		return built;
 	}
 	return validator;
 }
@@ -647,9 +1140,9 @@ export function compileToSource(ir: IR): string {
 	const builder = new Builder();
 	if (hasMorph(root)) {
 		builder.push("let o;");
-		builder.emitProduce(root, "v", [], "o");
+		builder.emitCollectProduce(root, "v", [], "o", "e", "L0");
 		return `function(v){/* refs elided */return o}`;
 	}
-	builder.emitCheck(root, "v", []);
+	builder.emitCollectCheck(root, "v", [], "e");
 	return `function(v){/* refs elided */return v}`;
 }

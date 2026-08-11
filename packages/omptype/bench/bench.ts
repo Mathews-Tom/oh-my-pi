@@ -6,11 +6,10 @@ import type { Candidate } from "./candidate";
 import { arktypeCandidate } from "./candidates/arktype";
 import { omptypeCandidate } from "./candidates/omptype";
 import { typeboxCandidate } from "./candidates/typebox";
-import { zodCandidate } from "./candidates/zod";
 import { FIXTURES, generateUniqueDefs } from "./fixtures";
 import type { Def } from "./ir";
 
-const registry: Candidate[] = [omptypeCandidate, arktypeCandidate, zodCandidate, typeboxCandidate];
+const registry: Candidate[] = [omptypeCandidate, arktypeCandidate, typeboxCandidate];
 const filter = process.argv.slice(2);
 const candidates = filter.length ? registry.filter(candidate => filter.includes(candidate.name)) : registry;
 
@@ -19,8 +18,10 @@ for (const candidate of candidates) {
 	let candidateFailed = false;
 	for (const fixture of FIXTURES) {
 		let schema: (value: unknown) => unknown;
+		let allows: ((value: unknown) => boolean) | undefined;
 		try {
 			schema = candidate.type(fixture.def);
+			allows = candidate.allows?.(fixture.def);
 		} catch (error) {
 			console.error(`✗ ${candidate.name}/${fixture.name}: type() threw: ${error}`);
 			candidateFailed = true;
@@ -34,11 +35,23 @@ for (const candidate of candidates) {
 				);
 				candidateFailed = true;
 			}
+			if (allows?.(structuredClone(value)) === false) {
+				console.error(
+					`✗ ${candidate.name}/${fixture.name}: allows() rejected valid input: ${JSON.stringify(value)}`,
+				);
+				candidateFailed = true;
+			}
 		}
 		for (const value of fixture.invalid) {
 			const result = schema(structuredClone(value));
 			if (!candidate.isErrors(result)) {
 				console.error(`✗ ${candidate.name}/${fixture.name}: invalid input accepted: ${JSON.stringify(value)}`);
+				candidateFailed = true;
+			}
+			if (allows?.(structuredClone(value))) {
+				console.error(
+					`✗ ${candidate.name}/${fixture.name}: allows() accepted invalid input: ${JSON.stringify(value)}`,
+				);
 				candidateFailed = true;
 			}
 		}
@@ -169,22 +182,25 @@ function rewriteUnique(
 }
 
 {
-	const iterations = 200_000;
+	const iterations = 2_000_000;
 	const rows: Row[] = [];
 	const fixture = FIXTURES[2];
 	for (const candidate of candidates) {
-		const schema = candidate.type(fixture.def);
-		for (let index = 0; index < 2_000; index++) schema(fixture.valid[index % fixture.valid.length]);
+		let validate = candidate.allows?.(fixture.def);
+		if (validate === undefined) {
+			const schema = candidate.type(fixture.def);
+			validate = (value: unknown) => !candidate.isErrors(schema(value));
+		}
+		for (let index = 0; index < 20_000; index++) validate(fixture.valid[index % fixture.valid.length]);
 		Bun.gc(true);
 		let sink = 0;
 		const start = Bun.nanoseconds();
 		for (let index = 0; index < iterations; index++) {
-			const result = schema(fixture.valid[index % fixture.valid.length]);
-			if (!candidate.isErrors(result)) sink++;
+			if (validate(fixture.valid[index % fixture.valid.length])) sink++;
 		}
 		const duration = Bun.nanoseconds() - start;
 		if (sink === 0) throw new Error("benchmark sink was not observed");
 		rows.push({ candidate: candidate.name, perOperation: duration / iterations });
 	}
-	report(`hot valid-only: ${fixture.name} × ${iterations}`, rows);
+	report(`hot allows/check valid-only: ${fixture.name} × ${iterations}`, rows);
 }

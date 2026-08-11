@@ -1,15 +1,28 @@
 /**
  * Pipeline: Type.Object builds each schema and TypeCompiler.Compile compiles
- * its hot `Check` path. Failures return TypeBox's lazy native error iterator.
+ * its hot `Check` path. Failures materialize TypeBox's native first error.
  * Default/delete fixtures clone first, then use the sanctioned
  * Value.Default/Value.Clean transforms before Check, preserving input.
  */
 import { type TSchema, Type } from "@sinclair/typebox";
 import { TypeCompiler } from "@sinclair/typebox/compiler";
-import { ValueErrorIterator } from "@sinclair/typebox/errors";
+import type { ValueError } from "@sinclair/typebox/errors";
 import { Value } from "@sinclair/typebox/value";
 import type { Candidate } from "../candidate";
 import type { Def } from "../ir";
+
+class TypeBoxErrors {
+	readonly first: ValueError;
+
+	constructor(first: ValueError) {
+		this.first = first;
+	}
+}
+
+function errorResult(first: ValueError | undefined): TypeBoxErrors {
+	if (first === undefined) throw new Error("TypeBox Check failed without an error");
+	return new TypeBoxErrors(first);
+}
 
 type Morph = "none" | "default" | "clean";
 interface BuiltSchema {
@@ -131,20 +144,29 @@ export const typeboxCandidate: Candidate = {
 			return (value: unknown) => {
 				const defaulted = Value.Default(schema, structuredClone(value));
 				// Reject extras before Clean; otherwise strict semantics would be weakened.
-				if (!compiled.Check(defaulted)) return compiled.Errors(defaulted);
+				if (!compiled.Check(defaulted)) return errorResult(compiled.Errors(defaulted).First());
 				const output = Value.Clean(schema, defaulted);
-				return compiled.Check(output) ? output : compiled.Errors(output);
+				return compiled.Check(output) ? output : errorResult(compiled.Errors(output).First());
 			};
 		}
 		if (morph === "clean") {
 			return (value: unknown) => {
 				const defaulted = Value.Default(schema, structuredClone(value));
 				const output = Value.Clean(schema, defaulted);
-				return compiled.Check(output) ? output : compiled.Errors(output);
+				return compiled.Check(output) ? output : errorResult(compiled.Errors(output).First());
 			};
 		}
-		return (value: unknown) => (compiled.Check(value) ? value : compiled.Errors(value));
+		return (value: unknown) => (compiled.Check(value) ? value : errorResult(compiled.Errors(value).First()));
 	},
-	isErrors: result => result instanceof ValueErrorIterator,
-	summary: result => (result instanceof ValueErrorIterator ? (result.First()?.message ?? "") : ""),
+	allows(definition) {
+		const { schema, morph } = buildSchema(definition);
+		if (morph === "none") {
+			const compiled = TypeCompiler.Compile(schema);
+			return (value: unknown) => compiled.Check(value);
+		}
+		const run = typeboxCandidate.type(definition);
+		return (value: unknown) => !typeboxCandidate.isErrors(run(value));
+	},
+	isErrors: result => result instanceof TypeBoxErrors,
+	summary: result => (result instanceof TypeBoxErrors ? result.first.message : ""),
 };

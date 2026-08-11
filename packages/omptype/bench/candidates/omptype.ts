@@ -9,6 +9,10 @@ export const omptypeCandidate: Candidate = {
 		// Runtime-generated benchmark definitions cannot preserve the const generic.
 		return type(def as never);
 	},
+	allows(def: Def) {
+		const schema = type(def as never);
+		return (value: unknown) => schema.allows(value);
+	},
 	isErrors: result => result instanceof OmpErrors,
 	summary: result => (result instanceof OmpErrors ? result.summary : ""),
 };

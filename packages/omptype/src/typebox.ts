@@ -1,6 +1,6 @@
 import { OmpTypeError } from "./errors";
-import type { Def } from "./ir";
-import { type NarrowContext, type Type as OmpType, type } from "./type";
+import type { Def, EmbeddableSchema } from "./ir";
+import { type NarrowContext, type Type as OmpType, type ToJsonSchemaOptions, type } from "./type";
 
 export interface Meta {
 	title?: string;
@@ -32,7 +32,7 @@ export interface ArrayOpts extends Meta {
 }
 
 export interface ObjectOpts extends Meta {
-	additionalProperties?: boolean | TSchema;
+	additionalProperties?: boolean | AnySchema;
 }
 const OPTIONAL_INNER = Symbol("omptype.typebox.optionalInner");
 const OBJECT_INFO = Symbol("omptype.typebox.objectInfo");
@@ -52,53 +52,84 @@ interface LegacyTypeBoxCompat<T> {
 	safeParse(input: unknown): TypeBoxSafeParseResult<T>;
 }
 
-export type TSchema<T = unknown> = OmpType<T> & LegacyTypeBoxCompat<T>;
-export type Static<T extends TSchema> = T["infer"];
-export type TAny = TSchema<unknown>;
-export type TUnknown = TSchema<unknown>;
-export type TNever = TSchema<never>;
-export type TNull = TSchema<null>;
-export type TString = TSchema<string>;
-export type TNumber = TSchema<number>;
-export type TInteger = TSchema<number>;
-export type TBoolean = TSchema<boolean>;
-export type TLiteral<V extends string | number | boolean | null> = TSchema<V>;
-export type TArray<E extends TSchema> = TSchema<Static<E>[]>;
-export type TTuple<E extends readonly TSchema[] = readonly TSchema[]> = TSchema<{
+/**
+ * Erased schema surface accepted anywhere this facade takes a schema, native
+ * omptype schemas included (those carry no legacy compat members).
+ *
+ * Members use method syntax so parameter positions stay bivariant: the typed
+ * {@link TTyped} form is invariant in its static type (its `in`/`out`
+ * validators are), so a concrete `TString` is not assignable to
+ * `TTyped<unknown>`. Erasing here is what keeps `TString`, `TObject<…>` and
+ * friends assignable to a plain schema annotation.
+ */
+export interface AnySchema extends EmbeddableSchema {
+	(data: unknown): unknown;
+	readonly infer: unknown;
+	readonly hasSteps: boolean;
+	toJsonSchema(options?: ToJsonSchemaOptions): Record<string, unknown>;
+}
+
+/**
+ * Every schema this facade returns: the TypeBox `TSchema` analog. Erased like
+ * {@link AnySchema}, plus the legacy compat members builder results carry.
+ */
+export interface TSchema extends AnySchema {
+	/** TypeBox compatibility validator used by legacy extension loaders. */
+	__validator(data: unknown): unknown;
+	/** Zod-style compatibility parser used by legacy extensions. */
+	safeParse(input: unknown): TypeBoxSafeParseResult<unknown>;
+}
+
+/** Schema carrying a statically known type; every `TXxx` alias resolves here. */
+export type TTyped<T> = OmpType<T> & LegacyTypeBoxCompat<T>;
+export type Static<T extends AnySchema> = T["infer"];
+export type TAny = TTyped<unknown>;
+export type TUnknown = TTyped<unknown>;
+export type TNever = TTyped<never>;
+export type TNull = TTyped<null>;
+export type TString = TTyped<string>;
+export type TNumber = TTyped<number>;
+export type TInteger = TTyped<number>;
+export type TBoolean = TTyped<boolean>;
+export type TLiteral<V extends string | number | boolean | null> = TTyped<V>;
+export type TArray<E extends AnySchema> = TTyped<Static<E>[]>;
+export type TTuple<E extends readonly AnySchema[] = readonly AnySchema[]> = TTyped<{
 	-readonly [K in keyof E]: Static<E[K]>;
 }>;
-export type TOptional<E extends TSchema> = TSchema<Static<E> | undefined> & { readonly [OPTIONAL_INNER]: E };
-export type TUnion<E extends readonly TSchema[] = readonly TSchema[]> = TSchema<Static<E[number]>>;
-export type TIntersect<E extends readonly TSchema[] = readonly TSchema[]> = TSchema<
+export type TOptional<E extends AnySchema> = TTyped<Static<E> | undefined> & { readonly [OPTIONAL_INNER]: E };
+export type TUnion<E extends readonly AnySchema[] = readonly AnySchema[]> = TTyped<Static<E[number]>>;
+export type TIntersect<E extends readonly AnySchema[] = readonly AnySchema[]> = TTyped<
 	UnionToIntersection<Static<E[number]>>
 >;
-export type TEnum<E extends readonly (string | number)[] = readonly (string | number)[]> = TSchema<E[number]>;
-export type TRecord<K extends TSchema, V extends TSchema> = TSchema<Record<Extract<Static<K>, PropertyKey>, Static<V>>>;
-export type TNullable<E extends TSchema> = TSchema<Static<E> | null>;
-export type TReadonly<E extends TSchema> = TSchema<Readonly<Static<E>>>;
-export type TUnsafe<T = unknown> = TSchema<T>;
+export type TEnum<E extends readonly (string | number)[] = readonly (string | number)[]> = TTyped<E[number]>;
+export type TRecord<K extends AnySchema, V extends AnySchema> = TTyped<
+	Record<Extract<Static<K>, PropertyKey>, Static<V>>
+>;
+export type TNullable<E extends AnySchema> = TTyped<Static<E> | null>;
+export type TReadonly<E extends AnySchema> = TTyped<Readonly<Static<E>>>;
+export type TUnsafe<T = unknown> = TTyped<T>;
 
-type OptionalKeys<P extends Record<string, TSchema>> = {
-	[K in keyof P]-?: P[K] extends { readonly [OPTIONAL_INNER]: TSchema } ? K : never;
+type OptionalKeys<P extends Record<string, AnySchema>> = {
+	[K in keyof P]-?: P[K] extends { readonly [OPTIONAL_INNER]: AnySchema } ? K : never;
 }[keyof P];
-type RequiredKeys<P extends Record<string, TSchema>> = Exclude<keyof P, OptionalKeys<P>>;
-type ObjectStatic<P extends Record<string, TSchema>> = {
+type RequiredKeys<P extends Record<string, AnySchema>> = Exclude<keyof P, OptionalKeys<P>>;
+type ObjectStatic<P extends Record<string, AnySchema>> = {
 	[K in RequiredKeys<P>]: Static<P[K]>;
 } & {
 	[K in OptionalKeys<P>]?: Exclude<Static<P[K]>, undefined>;
 };
-export type TObject<P extends Record<string, TSchema> = Record<string, TSchema>> = TSchema<ObjectStatic<P>>;
-type RequiredProps<P extends Record<string, TSchema>> = {
+export type TObject<P extends Record<string, AnySchema> = Record<string, AnySchema>> = TTyped<ObjectStatic<P>>;
+type RequiredProps<P extends Record<string, AnySchema>> = {
 	[K in keyof P]: P[K] extends TOptional<infer E> ? E : P[K];
 };
 
 interface RuntimeType<T> extends OmpType<T> {
-	[OPTIONAL_INNER]?: TSchema;
+	[OPTIONAL_INNER]?: AnySchema;
 	[OBJECT_INFO]?: ObjectInfo;
 	describe(description: string): RuntimeType<T>;
 	default(value: T | (() => T)): RuntimeType<T>;
-	or<R>(schema: OmpType<R>): RuntimeType<T | R>;
-	and<R>(schema: OmpType<R>): RuntimeType<T & R>;
+	or<schema extends AnySchema>(schema: schema): RuntimeType<T | Static<schema>>;
+	and<schema extends AnySchema>(schema: schema): RuntimeType<T & Static<schema>>;
 	array(): RuntimeType<T[]>;
 	atLeastLength(bound: number): RuntimeType<T>;
 	atMostLength(bound: number): RuntimeType<T>;
@@ -109,7 +140,18 @@ interface RuntimeType<T> extends OmpType<T> {
 }
 type CompatRuntime<T> = RuntimeType<T> & LegacyTypeBoxCompat<T>;
 
-type ObjectInfo = { props: Record<string, TSchema>; additionalProperties?: boolean | TSchema };
+type ObjectInfo = {
+	props: Record<string, AnySchema>;
+	additionalProperties?: boolean | AnySchema;
+};
+
+function asRuntime<T>(schema: AnySchema): RuntimeType<T> {
+	return schema as unknown as RuntimeType<T>;
+}
+
+function asSchema<T>(schema: AnySchema): TTyped<T> {
+	return schema as unknown as TTyped<T>;
+}
 
 function validationFailure(message: string): TypeBoxValidationFailure {
 	return { message };
@@ -149,7 +191,7 @@ function applyMeta<T>(schema: RuntimeType<T>, opts?: Meta): CompatRuntime<T> {
 }
 
 function withJsonSchemaKeywords<T>(schema: CompatRuntime<T>, keywords: Record<string, unknown>): CompatRuntime<T> {
-	const emitBase = schema.toJsonSchema;
+	const emitBase = schema.toJsonSchema.bind(schema);
 	schema.toJsonSchema = options => ({ ...emitBase(options), ...keywords });
 	return schema;
 }
@@ -161,9 +203,7 @@ function checkFiniteOption(name: string, value: number | undefined): void {
 function tString(opts?: StringOpts): TString {
 	checkFiniteOption("minLength", opts?.minLength);
 	checkFiniteOption("maxLength", opts?.maxLength);
-	let schema = type.raw(
-		opts?.format === "url" || opts?.format === "uri" ? "string.url" : "string",
-	) as RuntimeType<string>;
+	let schema = asRuntime<string>(type.raw(opts?.format === "url" || opts?.format === "uri" ? "string.url" : "string"));
 	if (opts?.minLength !== undefined) schema = schema.atLeastLength(opts.minLength);
 	if (opts?.maxLength !== undefined) schema = schema.atMostLength(opts.maxLength);
 	if (opts?.pattern !== undefined) {
@@ -227,9 +267,19 @@ function tNumber(opts?: NumberOpts, integer = false): TNumber {
 		upper = { value: opts.exclusiveMaximum, exclusive: true };
 	}
 	const keyword = integer ? "number.integer" : "number";
-	const lowerDsl = lower ? `${lower.value} ${lower.exclusive ? "<" : "<="} ` : "";
-	const upperDsl = upper ? ` ${upper.exclusive ? "<" : "<="} ${upper.value}` : "";
-	let schema = type.raw(`${lowerDsl}${keyword}${upperDsl}`) as RuntimeType<number>;
+	// The `LO <= TYPE <= HI` range spelling requires both bounds; a min-only
+	// bound must use the postfix `TYPE >= LO` form (see parseBounded in ir.ts).
+	let src: string;
+	if (lower && upper) {
+		src = `${lower.value} ${lower.exclusive ? "<" : "<="} ${keyword} ${upper.exclusive ? "<" : "<="} ${upper.value}`;
+	} else if (lower) {
+		src = `${keyword} ${lower.exclusive ? ">" : ">="} ${lower.value}`;
+	} else if (upper) {
+		src = `${keyword} ${upper.exclusive ? "<" : "<="} ${upper.value}`;
+	} else {
+		src = keyword;
+	}
+	let schema = asRuntime<number>(type.raw(src));
 	if (opts?.multipleOf !== undefined) {
 		const divisor = opts.multipleOf;
 		schema = schema.narrow((value, ctx) => {
@@ -244,33 +294,32 @@ function tNumber(opts?: NumberOpts, integer = false): TNumber {
 }
 
 function tLiteral<const V extends string | number | boolean | null>(value: V, opts?: Meta): TLiteral<V> {
-	return applyMeta(type.enumerated(value) as RuntimeType<V>, opts);
+	return applyMeta(asRuntime<V>(type.enumerated(value)), opts);
 }
 
 function tNever(opts?: Meta): TNever {
 	return applyMeta(
-		(type.raw("unknown") as RuntimeType<unknown>).narrow((_value, ctx): _value is never => ctx.mustBe("never")),
+		asRuntime<unknown>(type.raw("unknown")).narrow((_value, ctx): _value is never => ctx.mustBe("never")),
 		opts,
 	);
 }
 
-function tUnion<const E extends readonly TSchema[]>(schemas: E, opts?: Meta): TUnion<E> {
-	if (schemas.length === 0) return tNever(opts) as TUnion<E>;
-	let result = schemas[0] as unknown as RuntimeType<unknown>;
+function tUnion<const E extends readonly AnySchema[]>(schemas: E, opts?: Meta): TUnion<E> {
+	if (schemas.length === 0) return asSchema<Static<E[number]>>(tNever(opts));
+	let result = asRuntime<unknown>(schemas[0]);
 	for (let i = 1; i < schemas.length; i++) result = result.or(schemas[i]);
-	return applyMeta(result, opts) as TUnion<E>;
+	return asSchema<Static<E[number]>>(applyMeta(result, opts));
 }
 
-function tIntersect<const E extends readonly TSchema[]>(
+function tIntersect<const E extends readonly AnySchema[]>(
 	schemas: E,
 	opts?: Meta,
-): TSchema<UnionToIntersection<Static<E[number]>>> {
-	if (schemas.length === 0)
-		return applyMeta(type.raw("unknown") as RuntimeType<unknown>, opts) as TSchema<
-			UnionToIntersection<Static<E[number]>>
-		>;
+): TTyped<UnionToIntersection<Static<E[number]>>> {
+	if (schemas.length === 0) {
+		return applyMeta(asRuntime<UnionToIntersection<Static<E[number]>>>(type.raw("unknown")), opts);
+	}
 	const validateAll = (): RuntimeType<UnionToIntersection<Static<E[number]>>> => {
-		const base = type.raw("unknown") as RuntimeType<unknown>;
+		const base = asRuntime<unknown>(type.raw("unknown"));
 		return base.narrow((value, ctx): value is UnionToIntersection<Static<E[number]>> => {
 			for (const schema of schemas) {
 				if (schema(value) instanceof type.errors) return ctx.mustBe("a value satisfying every intersection member");
@@ -279,14 +328,14 @@ function tIntersect<const E extends readonly TSchema[]>(
 		});
 	};
 	if (schemas.some(schema => schema.hasSteps)) return applyMeta(validateAll(), opts);
-	let result = schemas[0] as unknown as RuntimeType<unknown>;
+	let result = asRuntime<unknown>(schemas[0]);
 	try {
 		for (let i = 1; i < schemas.length; i++) result = result.and(schemas[i]);
 	} catch (error) {
 		if (error instanceof OmpTypeError) return applyMeta(validateAll(), opts);
 		throw error;
 	}
-	return applyMeta(result, opts) as TSchema<UnionToIntersection<Static<E[number]>>>;
+	return asSchema<UnionToIntersection<Static<E[number]>>>(applyMeta(result, opts));
 }
 type UnionToIntersection<U> = (U extends unknown ? (value: U) => void : never) extends (value: infer I) => void
 	? I
@@ -306,16 +355,17 @@ function enumValues(values: Record<string, string | number> | readonly (string |
 function tEnum<const E extends Record<string, string | number> | readonly (string | number)[]>(
 	values: E,
 	opts?: Meta,
-): TSchema<E extends readonly (infer V)[] ? V : E[keyof E]> {
-	return applyMeta(type.enumerated(...enumValues(values)) as RuntimeType<string | number>, opts) as unknown as TSchema<
-		E extends readonly (infer V)[] ? V : E[keyof E]
-	>;
+): TTyped<E extends readonly (infer V)[] ? V : E[keyof E]> {
+	return applyMeta(
+		asRuntime<E extends readonly (infer V)[] ? V : E[keyof E]>(type.enumerated(...enumValues(values))),
+		opts,
+	);
 }
 
-function tArray<E extends TSchema>(item: E, opts?: ArrayOpts): TArray<E> {
+function tArray<E extends AnySchema>(item: E, opts?: ArrayOpts): TArray<E> {
 	checkFiniteOption("minItems", opts?.minItems);
 	checkFiniteOption("maxItems", opts?.maxItems);
-	let schema = (item as unknown as RuntimeType<Static<E>>).array();
+	let schema = asRuntime<Static<E>>(item).array();
 	if (opts?.minItems !== undefined) schema = schema.atLeastLength(opts.minItems);
 	if (opts?.maxItems !== undefined) schema = schema.atMostLength(opts.maxItems);
 	if (opts?.uniqueItems) {
@@ -342,8 +392,8 @@ function jsonEqual(left: unknown, right: unknown): boolean {
 	}
 }
 
-function tTuple<const E extends readonly TSchema[]>(items: E, opts?: Meta): TTuple<E> {
-	const schema = (type.raw("unknown") as RuntimeType<unknown>).narrow(
+function tTuple<const E extends readonly AnySchema[]>(items: E, opts?: Meta): TTuple<E> {
+	const schema = asRuntime<unknown>(type.raw("unknown")).narrow(
 		(value, ctx): value is { -readonly [K in keyof E]: Static<E[K]> } => {
 			if (!Array.isArray(value) || value.length !== items.length)
 				return ctx.mustBe(`a tuple of length ${items.length}`);
@@ -355,25 +405,29 @@ function tTuple<const E extends readonly TSchema[]>(items: E, opts?: Meta): TTup
 	return applyMeta(schema, opts);
 }
 
-function tObject<const P extends Record<string, TSchema>>(properties: P, opts?: ObjectOpts): TObject<P> {
+function tObject<const P extends Record<string, AnySchema>>(properties: P, opts?: ObjectOpts): TObject<P> {
 	const def: Record<string, Def> = {};
-	const props: Record<string, TSchema> = {};
+	const props: Record<string, AnySchema> = {};
 	for (const key in properties) {
 		const schema = properties[key];
-		const inner = (schema as unknown as RuntimeType<unknown>)[OPTIONAL_INNER];
-		def[inner ? `${key}?` : key] = (inner ?? schema) as Def;
+		const inner = asRuntime<unknown>(schema)[OPTIONAL_INNER];
+		// A defaulted `Type.Optional(...)` maps to a plain defaulted key:
+		// omptype (like ArkType) rejects `key?` with a default, and a default
+		// already makes the key omittable on input.
+		const optionalKey = inner !== undefined && !asRuntime<unknown>(inner).hasDefault;
+		def[optionalKey ? `${key}?` : key] = inner ?? schema;
 		props[key] = schema;
 	}
 	if (opts?.additionalProperties === false) def["+"] = "reject";
 	else if (opts?.additionalProperties && opts.additionalProperties !== true)
-		def["[string]"] = opts.additionalProperties as Def;
-	const schema = applyMeta(type.raw(def) as RuntimeType<ObjectStatic<P>>, opts);
+		def["[string]"] = opts.additionalProperties;
+	const schema = applyMeta(asRuntime<ObjectStatic<P>>(type.raw(def)), opts);
 	schema[OBJECT_INFO] = { props, additionalProperties: opts?.additionalProperties };
 	return schema;
 }
 
-function tRecord<K extends TSchema, V extends TSchema>(key: K, value: V, opts?: Meta): TRecord<K, V> {
-	const base = (type.raw({ "[string]": value }) as RuntimeType<Record<string, Static<V>>>).narrow((record, ctx) => {
+function tRecord<K extends AnySchema, V extends AnySchema>(key: K, value: V, opts?: Meta): TRecord<K, V> {
+	const base = asRuntime<Record<string, Static<V>>>(type.raw({ "[string]": value })).narrow((record, ctx) => {
 		for (const name in record)
 			if (key(name) instanceof type.errors) return ctx.mustBe("an object with valid record keys");
 		return true;
@@ -381,72 +435,70 @@ function tRecord<K extends TSchema, V extends TSchema>(key: K, value: V, opts?: 
 	return applyMeta(base, opts) as TRecord<K, V>;
 }
 
-function tOptional<E extends TSchema>(schema: E, opts?: Meta): TOptional<E> {
+function tOptional<E extends AnySchema>(schema: E, opts?: Meta): TOptional<E> {
 	const marker = applyMeta(
-		(schema as unknown as RuntimeType<Static<E>>).or(type.raw("undefined")),
+		asRuntime<Static<E>>(schema).or(asRuntime<undefined>(type.raw("undefined"))),
 		opts,
 	) as RuntimeType<Static<E> | undefined>;
 	marker[OPTIONAL_INNER] = schema;
 	return marker as unknown as TOptional<E>;
 }
 
-function tNullable<E extends TSchema>(schema: E, opts?: Meta): TSchema<Static<E> | null> {
-	return applyMeta((schema as unknown as RuntimeType<Static<E>>).or(type.raw("null")), opts);
+function tNullable<E extends AnySchema>(schema: E, opts?: Meta): TTyped<Static<E> | null> {
+	return applyMeta(asRuntime<Static<E>>(schema).or(asRuntime<null>(type.raw("null"))), opts);
 }
 
-function requireObject(schema: TSchema, operation: string): ObjectInfo {
-	const info = (schema as unknown as RuntimeType<unknown>)[OBJECT_INFO];
+function requireObject(schema: AnySchema, operation: string): ObjectInfo {
+	const info = asRuntime<unknown>(schema)[OBJECT_INFO];
 	if (!info) throw new OmpTypeError(`Type.${operation} requires a schema created by Type.Object`);
 	return info;
 }
 
-function tPartial<P extends Record<string, TSchema>>(schema: TObject<P>): TSchema<Partial<ObjectStatic<P>>> {
+function tPartial<P extends Record<string, AnySchema>>(schema: TObject<P>): TTyped<Partial<ObjectStatic<P>>> {
 	const info = requireObject(schema, "Partial");
-	const props: Record<string, TSchema> = {};
+	const props: Record<string, AnySchema> = {};
 	for (const key in info.props)
-		props[key] = (info.props[key] as unknown as RuntimeType<unknown>)[OPTIONAL_INNER]
-			? info.props[key]
-			: tOptional(info.props[key]);
-	return tObject(props, { additionalProperties: info.additionalProperties }) as TSchema<Partial<ObjectStatic<P>>>;
+		props[key] = asRuntime<unknown>(info.props[key])[OPTIONAL_INNER] ? info.props[key] : tOptional(info.props[key]);
+	return tObject(props, { additionalProperties: info.additionalProperties }) as TTyped<Partial<ObjectStatic<P>>>;
 }
 
-function tRequired<P extends Record<string, TSchema>>(schema: TObject<P>): TObject<RequiredProps<P>> {
+function tRequired<P extends Record<string, AnySchema>>(schema: TObject<P>): TObject<RequiredProps<P>> {
 	const info = requireObject(schema, "Required");
-	const props: Record<string, TSchema> = {};
+	const props: Record<string, AnySchema> = {};
 	for (const key in info.props) {
-		props[key] = (info.props[key] as unknown as RuntimeType<unknown>)[OPTIONAL_INNER] ?? info.props[key];
+		props[key] = asRuntime<unknown>(info.props[key])[OPTIONAL_INNER] ?? info.props[key];
 	}
 	return tObject(props, { additionalProperties: info.additionalProperties }) as TObject<RequiredProps<P>>;
 }
 
-function tPick<P extends Record<string, TSchema>, const K extends readonly (keyof P)[]>(
+function tPick<P extends Record<string, AnySchema>, const K extends readonly (keyof P)[]>(
 	schema: TObject<P>,
 	keys: K,
 ): TObject<Pick<P, K[number]>> {
 	const info = requireObject(schema, "Pick");
-	const props: Record<string, TSchema> = {};
+	const props: Record<string, AnySchema> = {};
 	for (const key of keys) if (typeof key === "string" && info.props[key]) props[key] = info.props[key];
 	return tObject(props, { additionalProperties: info.additionalProperties }) as TObject<Pick<P, K[number]>>;
 }
 
-function tOmit<P extends Record<string, TSchema>, const K extends readonly (keyof P)[]>(
+function tOmit<P extends Record<string, AnySchema>, const K extends readonly (keyof P)[]>(
 	schema: TObject<P>,
 	keys: K,
 ): TObject<Omit<P, K[number]>> {
 	const info = requireObject(schema, "Omit");
 	const omitted = new Set<PropertyKey>(keys);
-	const props: Record<string, TSchema> = {};
+	const props: Record<string, AnySchema> = {};
 	for (const key in info.props) if (!omitted.has(key)) props[key] = info.props[key];
 	return tObject(props, { additionalProperties: info.additionalProperties }) as TObject<Omit<P, K[number]>>;
 }
 
-function tComposite<const E extends readonly TObject<Record<string, TSchema>>[]>(
+function tComposite<const E extends readonly TObject<Record<string, AnySchema>>[]>(
 	schemas: E,
 	opts?: ObjectOpts,
-): TSchema<UnionToIntersection<Static<E[number]>>> {
-	const props: Record<string, TSchema> = {};
+): TTyped<UnionToIntersection<Static<E[number]>>> {
+	const props: Record<string, AnySchema> = {};
 	for (const schema of schemas) Object.assign(props, requireObject(schema, "Composite").props);
-	return tObject(props, opts) as TSchema<UnionToIntersection<Static<E[number]>>>;
+	return asSchema<UnionToIntersection<Static<E[number]>>>(tObject(props, opts));
 }
 
 function tUnsafe<T = unknown>(_jsonSchema: Record<string, unknown> = {}): TUnsafe<T> {
@@ -459,10 +511,10 @@ export const Type = {
 	String: tString,
 	Number: (opts?: NumberOpts) => tNumber(opts),
 	Integer: (opts?: NumberOpts) => tNumber(opts, true),
-	Boolean: (opts?: Meta) => applyMeta(type.raw("boolean") as RuntimeType<boolean>, opts),
-	Null: (opts?: Meta) => applyMeta(type.raw("null") as RuntimeType<null>, opts),
-	Any: (opts?: Meta) => applyMeta(type.raw("unknown") as RuntimeType<unknown>, opts),
-	Unknown: (opts?: Meta) => applyMeta(type.raw("unknown") as RuntimeType<unknown>, opts),
+	Boolean: (opts?: Meta) => applyMeta(asRuntime<boolean>(type.raw("boolean")), opts),
+	Null: (opts?: Meta) => applyMeta(asRuntime<null>(type.raw("null")), opts),
+	Any: (opts?: Meta) => applyMeta(asRuntime<unknown>(type.raw("unknown")), opts),
+	Unknown: (opts?: Meta) => applyMeta(asRuntime<unknown>(type.raw("unknown")), opts),
 	Never: tNever,
 	Literal: tLiteral,
 	Union: tUnion,
@@ -474,7 +526,8 @@ export const Type = {
 	Record: tRecord,
 	Optional: tOptional,
 	Nullable: tNullable,
-	Readonly: <E extends TSchema>(schema: E): E => withLegacyCompat(schema) as unknown as E,
+	Readonly: <E extends AnySchema>(schema: E): TReadonly<E> =>
+		asSchema<Readonly<Static<E>>>(withLegacyCompat(asRuntime<Readonly<Static<E>>>(schema))),
 	Partial: tPartial,
 	Required: tRequired,
 	Pick: tPick,

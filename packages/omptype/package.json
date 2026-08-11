@@ -1,7 +1,7 @@
 {
   "type": "module",
   "name": "@oh-my-pi/omptype",
-  "version": "17.2.6",
+  "version": "17.2.12",
   "description": "ArkType-compatible runtime schema validation with lazy JIT compilation",
   "homepage": "https://omp.sh",
   "author": "Can Boluk",
@@ -32,10 +32,13 @@
     "bench": "bun bench/bench.ts"
   },
   "devDependencies": {
+    "@ark/attest": "0.56.3",
+    "@ark/schema": "0.56.2",
+    "@ark/util": "0.56.2",
     "@sinclair/typebox": "^0.34.0",
     "@types/bun": "catalog:",
-    "arktype": "2.2.3",
-    "zod": "catalog:"
+    "arkregex": "0.0.8",
+    "arktype": "2.2.3"
   },
   "engines": {
     "node": ">=20",

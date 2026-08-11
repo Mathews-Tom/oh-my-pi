@@ -71,7 +71,7 @@ function restrictBase<Out>(source: Decoratable<Out>, ir: IR): Decoratable<Out> {
 	let next = source.hasSteps
 		? schemaFromIR<Out>({ k: "morph", input: ir, fn: value => source(value) })
 		: schemaFromIR<Out>(ir);
-	if (source.description !== undefined) next = next.describe(source.description);
+	if (source.ir.desc !== undefined) next = next.describe(source.ir.desc);
 	if (source.hasDefault) next = next.default(source.defaultValue as Out | (() => Out));
 	return next;
 }

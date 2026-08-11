@@ -9,15 +9,36 @@
  * - failure returns an `OmpErrors` with a single fast-fail entry
  */
 import { MISSING, OmpErrors } from "./errors";
-import { expectedOf, hasMorph, type IR } from "./ir";
+import { expectedOf, hasAlias, hasMorph, type IR } from "./ir";
 
 const own = Object.prototype.hasOwnProperty;
+/** Return an independent runtime value for a prevalidated static default. */
+export function materializeDefault(payload: unknown): unknown {
+	if (payload === null || typeof payload !== "object") return payload;
+	if (payload instanceof Date) return new Date(payload);
+	return structuredClone(payload);
+}
+let activeVisits: WeakMap<object, Set<IR>> | undefined;
+let activeChecks: WeakMap<object, Set<IR>> | undefined;
 
-/** Validate `value` against `ir`; returns output value or `OmpErrors`. */
-export function walk(ir: IR, value: unknown): unknown {
-	const path: PropertyKey[] = [];
-	const out = visit(ir, value, path);
-	return out;
+/**
+ * Validate `value` against `ir`; returns output value or `OmpErrors`.
+ * `path` seeds the traversal location so nested step callbacks observe
+ * absolute ctx.path values when a compiled parent delegates a subtree;
+ * resulting error paths are then already absolute.
+ */
+export function walk(ir: IR, value: unknown, path: PropertyKey[] = []): unknown {
+	const previousVisits = activeVisits;
+	const previousChecks = activeChecks;
+	// Created lazily by visit/checks only when a recursive-alias node is reached.
+	activeVisits = undefined;
+	activeChecks = undefined;
+	try {
+		return visit(ir, value, path);
+	} finally {
+		activeVisits = previousVisits;
+		activeChecks = previousChecks;
+	}
 }
 
 function fail(path: PropertyKey[], expected: string, data: unknown): OmpErrors {
@@ -27,6 +48,26 @@ function fail(path: PropertyKey[], expected: string, data: unknown): OmpErrors {
 
 /** Pure predicate used for union-member scanning (no morphs, no errors). */
 function checks(ir: IR, v: unknown): boolean {
+	// Cycle guards are only needed when the subtree can revisit nodes through
+	// recursive aliases; plain schemas skip the WeakMap bookkeeping entirely.
+	if (typeof v !== "object" || v === null || !hasAlias(ir)) return checkNode(ir, v);
+	activeChecks ??= new WeakMap();
+	const visits = activeChecks;
+	let visited = visits.get(v);
+	if (visited?.has(ir)) return true;
+	if (visited === undefined) {
+		visited = new Set();
+		visits.set(v, visited);
+	}
+	visited.add(ir);
+	try {
+		return checkNode(ir, v);
+	} finally {
+		visited.delete(ir);
+	}
+}
+
+function checkNode(ir: IR, v: unknown): boolean {
 	switch (ir.k) {
 		case "unknown":
 			return true;
@@ -69,7 +110,7 @@ function checks(ir: IR, v: unknown): boolean {
 			if (!Array.isArray(v)) return false;
 			if (ir.min !== undefined && v.length < ir.min) return false;
 			if (ir.max !== undefined && v.length > ir.max) return false;
-			for (const el of v) if (!checks(ir.el, el)) return false;
+			for (const element of v) if (!checks(ir.el, element)) return false;
 			return true;
 		}
 		case "tuple": {
@@ -98,8 +139,8 @@ function checks(ir: IR, v: unknown): boolean {
 			return true;
 		}
 		case "object": {
-			if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
-			const rec = v as Record<string, unknown>;
+			if (typeof v !== "object" || v === null) return false;
+			const rec = v as Record<PropertyKey, unknown>;
 			for (const p of ir.props) {
 				const present = p.key in rec;
 				if (!present) {
@@ -108,21 +149,31 @@ function checks(ir: IR, v: unknown): boolean {
 				}
 				if (!checks(p.val, rec[p.key])) return false;
 			}
-			if (ir.index) {
-				for (const key in rec) {
-					if (own.call(rec, key) && !checks(ir.index, rec[key])) return false;
-				}
-			} else if (ir.extras === "reject") {
-				for (const key in rec) {
-					if (!own.call(rec, key)) continue;
-					let declared = false;
-					for (const p of ir.props) {
-						if (p.key === key) {
-							declared = true;
-							break;
-						}
+			for (const key in rec) {
+				if (!own.call(rec, key)) continue;
+				if (ir.index !== undefined && !checks(ir.index, rec[key])) return false;
+				let patternMatched = false;
+				if (ir.patternIndexes !== undefined) {
+					for (const pattern of ir.patternIndexes) {
+						if (!checks(pattern.key, key)) continue;
+						patternMatched = true;
+						if (!checks(pattern.val, rec[key])) return false;
 					}
-					if (!declared) return false;
+				}
+				if (
+					ir.extras === "reject" &&
+					ir.index === undefined &&
+					!patternMatched &&
+					!ir.props.some(prop => prop.key === key)
+				) {
+					return false;
+				}
+			}
+			for (const key of Object.getOwnPropertySymbols(rec)) {
+				if (!Object.prototype.propertyIsEnumerable.call(rec, key)) continue;
+				if (ir.symbolIndex !== undefined && !checks(ir.symbolIndex, rec[key])) return false;
+				if (ir.extras === "reject" && ir.symbolIndex === undefined && !ir.props.some(prop => prop.key === key)) {
+					return false;
 				}
 			}
 			return true;
@@ -132,7 +183,7 @@ function checks(ir: IR, v: unknown): boolean {
 		case "refine":
 			if (!checks(ir.base, v)) return false;
 			try {
-				return ir.pred(v);
+				return ir.pred(v) === true;
 			} catch {
 				return false;
 			}
@@ -146,6 +197,34 @@ function checks(ir: IR, v: unknown): boolean {
 }
 
 function visit(ir: IR, v: unknown, path: PropertyKey[]): unknown {
+	if (typeof v !== "object" || v === null || !hasAlias(ir)) return visitFinish(ir, v, path);
+	activeVisits ??= new WeakMap();
+	const visits = activeVisits;
+	let visited = visits.get(v);
+	if (visited?.has(ir)) return v;
+	if (visited === undefined) {
+		visited = new Set();
+		visits.set(v, visited);
+	}
+	visited.add(ir);
+	try {
+		return visitFinish(ir, v, path);
+	} finally {
+		visited.delete(ir);
+	}
+}
+
+/** Run the node visitor, then apply node-local error configuration. */
+function visitFinish(ir: IR, v: unknown, path: PropertyKey[]): unknown {
+	const out = visitNode(ir, v, path);
+	if (!(out instanceof OmpErrors) || ir.cfg === undefined) return out;
+	for (const error of out) {
+		if (error.path.length !== path.length) return out;
+	}
+	return out.configure(ir.cfg);
+}
+
+function visitNode(ir: IR, v: unknown, path: PropertyKey[]): unknown {
 	switch (ir.k) {
 		case "alias":
 			return visit(ir.resolve(), v, path);
@@ -153,7 +232,9 @@ function visit(ir: IR, v: unknown, path: PropertyKey[]): unknown {
 			const base = visit(ir.base, v, path);
 			if (base instanceof OmpErrors) return base;
 			try {
-				return ir.pred(base) ? base : fail(path, ir.expected, base);
+				const result = ir.pred(base);
+				if (result instanceof OmpErrors) return path.length === 0 ? result : prefixAll(result, path);
+				return result ? base : fail(path, ir.expected, base);
 			} catch {
 				return fail(path, ir.expected, base);
 			}
@@ -178,7 +259,7 @@ function visit(ir: IR, v: unknown, path: PropertyKey[]): unknown {
 			return output;
 		}
 		case "sub": {
-			const out = ir.schema.run(v);
+			const out = ir.schema.run(v, path);
 			if (out instanceof OmpErrors) {
 				return path.length === 0 ? out : prefixAll(out, path);
 			}
@@ -192,38 +273,40 @@ function visit(ir: IR, v: unknown, path: PropertyKey[]): unknown {
 					return v;
 				}
 			}
-			for (const m of ir.members) {
-				if (m.k === "sub" || hasMorph(m)) {
-					const out = visit(m, v, path);
+			let targeted: OmpErrors | undefined;
+			let targetCount = 0;
+			for (const member of ir.members) {
+				if (member.k === "sub" || hasMorph(member)) {
+					const out = visit(member, v, path);
 					if (!(out instanceof OmpErrors)) return out;
+					if (kindMatches(unwrapBase(member), v)) {
+						targetCount++;
+						targeted ??= out;
+					}
 				}
 			}
+			if (targetCount === 1 && targeted !== undefined) return targeted;
 			return ir.members.some(canRefineUnionFailure) ? unionFail(ir, v, path) : fail(path, expectedOf(ir), v);
 		}
 		case "array": {
 			if (!Array.isArray(v)) return fail(path, "an array", v);
-			if (ir.min !== undefined && v.length < ir.min) return fail(path, `at least length ${ir.min}`, v);
-			if (ir.max !== undefined && v.length > ir.max) return fail(path, `at most length ${ir.max}`, v);
-			if (!hasMorph(ir.el)) {
-				for (let i = 0; i < v.length; i++) {
-					if (!checks(ir.el, v[i])) {
-						path.push(i);
-						const err = visit(ir.el, v[i], path);
-						path.pop();
-						return err instanceof OmpErrors ? err : fail([...path, i], expectedOf(ir.el), v[i]);
-					}
-				}
-				return v;
-			}
-			const out = new Array<unknown>(v.length);
-			for (let i = 0; i < v.length; i++) {
-				path.push(i);
-				const el = visit(ir.el, v[i], path);
+			if (ir.min !== undefined && v.length < ir.min) return fail(path, `at least length ${ir.min}`, v.length);
+			if (ir.max !== undefined && v.length > ir.max) return fail(path, `at most length ${ir.max}`, v.length);
+			const morph = hasMorph(ir.el);
+			const out = morph ? new Array<unknown>(v.length) : v;
+			let errors: OmpErrors | undefined;
+			for (let index = 0; index < v.length; index++) {
+				path.push(index);
+				const element = visit(ir.el, v[index], path);
 				path.pop();
-				if (el instanceof OmpErrors) return el;
-				out[i] = el;
+				if (element instanceof OmpErrors) {
+					if (errors) errors.append(element);
+					else errors = element;
+				} else if (morph) {
+					out[index] = element;
+				}
 			}
-			return out;
+			return errors ?? out;
 		}
 		case "tuple": {
 			if (!Array.isArray(v)) return fail(path, "an array", v);
@@ -238,23 +321,41 @@ function visit(ir: IR, v: unknown, path: PropertyKey[]): unknown {
 			const prefixCount = Math.min(ir.prefix.length, postfixStart);
 			const morph = hasMorph(ir);
 			const output = morph ? [...v] : v;
+			let errors: OmpErrors | undefined;
 			for (let index = 0; index < prefixCount; index++) {
 				path.push(index);
 				const item = visit(ir.prefix[index].val, v[index], path);
 				path.pop();
-				if (item instanceof OmpErrors) return item;
-				if (morph) output[index] = item;
+				if (item instanceof OmpErrors) {
+					if (errors) errors.append(item);
+					else errors = item;
+				} else if (morph) {
+					output[index] = item;
+				}
 			}
 			for (let index = prefixCount; index < ir.prefix.length; index++) {
 				const item = ir.prefix[index];
 				if (item.hasDefault && morph) {
 					const payload = item.def;
-					output[index] = item.defFactory && typeof payload === "function" ? payload() : payload;
+					if (item.defFactory && typeof payload === "function") {
+						path.push(index);
+						const resolved = visit(item.val, payload(), path);
+						path.pop();
+						if (resolved instanceof OmpErrors) {
+							if (errors) errors.append(resolved);
+							else errors = resolved;
+						} else {
+							output[index] = resolved;
+						}
+					} else {
+						output[index] = materializeDefault(payload);
+					}
 				} else if (!item.opt) {
 					path.push(index);
 					const error = fail(path, expectedOf(item.val), MISSING);
 					path.pop();
-					return error;
+					if (errors) errors.append(error);
+					else errors = error;
 				}
 			}
 			if (ir.variadic !== undefined) {
@@ -262,8 +363,12 @@ function visit(ir: IR, v: unknown, path: PropertyKey[]): unknown {
 					path.push(index);
 					const item = visit(ir.variadic, v[index], path);
 					path.pop();
-					if (item instanceof OmpErrors) return item;
-					if (morph) output[index] = item;
+					if (item instanceof OmpErrors) {
+						if (errors) errors.append(item);
+						else errors = item;
+					} else if (morph) {
+						output[index] = item;
+					}
 				}
 			}
 			for (let index = 0; index < ir.postfix.length; index++) {
@@ -271,18 +376,28 @@ function visit(ir: IR, v: unknown, path: PropertyKey[]): unknown {
 				path.push(inputIndex);
 				const item = visit(ir.postfix[index], v[inputIndex], path);
 				path.pop();
-				if (item instanceof OmpErrors) return item;
-				if (morph) output[inputIndex] = item;
+				if (item instanceof OmpErrors) {
+					if (errors) errors.append(item);
+					else errors = item;
+				} else if (morph) {
+					output[inputIndex] = item;
+				}
 			}
-			return output;
+			return errors ?? output;
 		}
 		case "object": {
-			if (typeof v !== "object" || v === null || Array.isArray(v)) return fail(path, "an object", v);
-			const rec = v as Record<string, unknown>;
+			if (typeof v !== "object" || v === null) return fail(path, "an object", v);
+			const rec = v as Record<PropertyKey, unknown>;
 			const morph = hasMorph(ir);
-			let out: Record<string, unknown> | undefined;
+			let out: Record<PropertyKey, unknown> | undefined;
+			let errors: OmpErrors | undefined;
 			if (morph) {
-				if (ir.extras === "delete" && !ir.index) {
+				if (
+					ir.extras === "delete" &&
+					ir.index === undefined &&
+					ir.symbolIndex === undefined &&
+					ir.patternIndexes === undefined
+				) {
 					out = {};
 				} else {
 					out = { ...rec };
@@ -291,51 +406,155 @@ function visit(ir: IR, v: unknown, path: PropertyKey[]): unknown {
 			for (const p of ir.props) {
 				if (!(p.key in rec)) {
 					if (p.hasDefault && out) {
-						// defFactory guarantees a callable default payload
 						const payload = p.def;
-						out[p.key] = p.defFactory && typeof payload === "function" ? payload() : payload;
+						if (p.defFactory && typeof payload === "function") {
+							path.push(p.key);
+							const resolved = visit(p.val, payload(), path);
+							path.pop();
+							if (resolved instanceof OmpErrors) {
+								if (errors) errors.append(resolved);
+								else errors = resolved;
+							} else {
+								out[p.key] = resolved;
+							}
+						} else {
+							out[p.key] = materializeDefault(payload);
+						}
 						continue;
 					}
 					if (p.opt || p.hasDefault) continue;
 					path.push(p.key);
-					const err = fail(path, expectedOf(p.val), MISSING);
+					const error = fail(path, expectedOf(p.val), MISSING);
 					path.pop();
-					return err;
+					if (errors) errors.append(error);
+					else errors = error;
+					continue;
 				}
 				path.push(p.key);
-				const res = visit(p.val, rec[p.key], path);
+				const result = visit(p.val, rec[p.key], path);
 				path.pop();
-				if (res instanceof OmpErrors) return res;
-				if (out) out[p.key] = res;
-			}
-			if (ir.index) {
-				for (const key in rec) {
-					if (!own.call(rec, key)) continue;
-					path.push(key);
-					const res = visit(ir.index, rec[key], path);
-					path.pop();
-					if (res instanceof OmpErrors) return res;
-					if (out) out[key] = res;
+				if (result instanceof OmpErrors) {
+					if (errors) errors.append(result);
+					else errors = result;
+				} else if (out) {
+					out[p.key] = result;
 				}
-			} else if (ir.extras === "reject") {
-				for (const key in rec) {
-					if (!own.call(rec, key)) continue;
-					let declared = false;
-					for (const p of ir.props) {
-						if (p.key === key) {
-							declared = true;
-							break;
+			}
+			for (const key in rec) {
+				if (!own.call(rec, key)) continue;
+				let indexed = false;
+				if (ir.index !== undefined) {
+					indexed = true;
+					path.push(key);
+					const result = visit(ir.index, rec[key], path);
+					path.pop();
+					if (result instanceof OmpErrors) {
+						if (errors) errors.append(result);
+						else errors = result;
+					} else if (out) {
+						out[key] = result;
+					}
+				}
+				if (ir.patternIndexes !== undefined) {
+					for (const pattern of ir.patternIndexes) {
+						if (!checks(pattern.key, key)) continue;
+						indexed = true;
+						path.push(key);
+						const result = visit(pattern.val, rec[key], path);
+						path.pop();
+						if (result instanceof OmpErrors) {
+							if (errors) errors.append(result);
+							else errors = result;
+						} else if (out) {
+							out[key] = result;
 						}
 					}
-					if (!declared) {
-						path.push(key);
-						const err = fail(path, "removed (undeclared key)", rec[key]);
-						path.pop();
-						return err;
-					}
+				}
+				if (ir.extras === "reject" && !indexed && !ir.props.some(prop => prop.key === key)) {
+					path.push(key);
+					const error = fail(path, "removed", rec[key]);
+					path.pop();
+					if (errors) errors.append(error);
+					else errors = error;
 				}
 			}
-			return out ?? v;
+			for (const key of Object.getOwnPropertySymbols(rec)) {
+				if (!Object.prototype.propertyIsEnumerable.call(rec, key)) continue;
+				if (ir.symbolIndex !== undefined) {
+					path.push(key);
+					const result = visit(ir.symbolIndex, rec[key], path);
+					path.pop();
+					if (result instanceof OmpErrors) {
+						if (errors) errors.append(result);
+						else errors = result;
+					} else if (out) {
+						out[key] = result;
+					}
+				} else if (ir.extras === "reject" && !ir.props.some(prop => prop.key === key)) {
+					path.push(key);
+					const error = fail(path, "removed", rec[key]);
+					path.pop();
+					if (errors) errors.append(error);
+					else errors = error;
+				}
+			}
+			return errors ?? out ?? v;
+		}
+		case "string": {
+			if (typeof v !== "string") return fail(path, "a string", v);
+			if (ir.min !== undefined && v.length < ir.min) return fail(path, `at least length ${ir.min}`, v.length);
+			if (ir.max !== undefined && v.length > ir.max) return fail(path, `at most length ${ir.max}`, v.length);
+			if (ir.url && !URL.canParse(v)) return fail(path, "a URL string", v);
+			return v;
+		}
+		case "number": {
+			if (typeof v !== "number" || !Number.isFinite(v)) return fail(path, ir.int ? "an integer" : "a number", v);
+			let errors: OmpErrors | undefined;
+			const add = (expected: string): void => {
+				const error = fail(path, expected, v);
+				if (errors) errors.append(error);
+				else errors = error;
+			};
+			if (ir.int && !Number.isInteger(v)) add("an integer");
+			if (ir.divisor !== undefined && v % ir.divisor !== 0) add(`a number divisible by ${ir.divisor}`);
+			if (ir.min !== undefined && (ir.xmin ? v <= ir.min : v < ir.min)) {
+				add(
+					ir.min === 0
+						? ir.xmin
+							? "positive"
+							: "non-negative"
+						: `a number ${ir.xmin ? "more than" : "at least"} ${ir.min}`,
+				);
+			}
+			if (ir.max !== undefined && (ir.xmax ? v >= ir.max : v > ir.max)) {
+				add(
+					ir.max === 0
+						? ir.xmax
+							? "negative"
+							: "non-positive"
+						: `a number ${ir.xmax ? "less than" : "at most"} ${ir.max}`,
+				);
+			}
+			return errors ?? v;
+		}
+		case "lit": {
+			if (checks(ir, v)) return v;
+			if ((typeof ir.v === "object" && ir.v !== null) || typeof ir.v === "function") {
+				let expected = "the specified reference";
+				try {
+					const serialized = JSON.stringify(ir.v);
+					if (serialized !== undefined) {
+						expected = `reference equal to ${serialized}`;
+						if (typeof v === "object" && v !== null && JSON.stringify(v) === serialized) {
+							expected += " (serialized to the same value)";
+						}
+					}
+				} catch {
+					// Cyclic values still get a useful reference-identity expectation.
+				}
+				return fail(path, expected, v);
+			}
+			return fail(path, expectedOf(ir), v);
 		}
 		default:
 			return checks(ir, v) ? v : fail(path, expectedOf(ir), v);
@@ -349,16 +568,7 @@ function prefixAll(errs: OmpErrors, path: PropertyKey[]): OmpErrors {
 
 /** True when a union failure can be replaced with a more specific nested error. */
 export function canRefineUnionFailure(member: IR): boolean {
-	const base = member.k === "sub" ? member.schema.ir : member;
-	if (member.k === "sub") {
-		return (
-			base.k === "array" ||
-			base.k === "object" ||
-			base.k === "anyobject" ||
-			base.k === "string" ||
-			base.k === "number"
-		);
-	}
+	const base = unwrapBase(member);
 	if (base.k === "array" || base.k === "object") return true;
 	if (base.k === "string") return base.min !== undefined || base.max !== undefined || base.url === true;
 	return base.k === "number" && (base.int === true || base.min !== undefined || base.max !== undefined);
@@ -373,39 +583,168 @@ export function canRefineUnionFailure(member: IR): boolean {
  */
 export function unionFail(ir: IR & { k: "union" }, v: unknown, path: PropertyKey[], expected?: string): OmpErrors {
 	let best: IR | undefined;
-	for (const m of ir.members) {
-		const base = m.k === "sub" ? m.schema.ir : m;
+	for (const member of ir.members) {
+		const base = unwrapBase(member);
 		if (!kindMatches(base, v)) continue;
 		if (best !== undefined) {
 			best = undefined;
 			break;
 		}
-		best = m;
+		best = member;
 	}
-	if (best === undefined) best = discriminate(ir.members, v);
-	if (best) {
+	if (best === undefined) {
+		const discriminated = discriminateFailure(ir.members, v, path);
+		if (discriminated !== undefined) return discriminated;
+	}
+	if (best !== undefined) {
 		const out = visit(best, v, path);
 		if (out instanceof OmpErrors) return out;
+	}
+	if (ir.members.every(member => unwrapBase(member).k === "object")) {
+		const branches = ir.members.flatMap(member => {
+			const result = visit(member, v, path);
+			return result instanceof OmpErrors ? [[...result]] : [];
+		});
+		if (branches.length !== 0) {
+			const common = branches[0].filter(
+				(entry, index, first) =>
+					first.findIndex(candidate => pathsEqual(candidate.path, entry.path)) === index &&
+					branches.every(branch => branch.some(candidate => pathsEqual(candidate.path, entry.path))),
+			);
+			const alternatives: OmpErrors[] = [];
+			if (common.length !== 0) {
+				for (const entry of common) {
+					const expectations = new Set<string>();
+					for (const branch of branches) {
+						for (const candidate of branch) {
+							if (pathsEqual(candidate.path, entry.path)) {
+								expectations.add(candidate.expected.endsWith(" instance") ? "an object" : candidate.expected);
+							}
+						}
+					}
+					alternatives.push(
+						new OmpErrors(entry.path, [...expectations].join(" or "), entry.data, { preserveActual: true }),
+					);
+				}
+			} else {
+				for (const branch of branches) {
+					for (const entry of branch) {
+						alternatives.push(
+							new OmpErrors(
+								entry.path,
+								entry.expected.endsWith(" instance") ? "an object" : entry.expected,
+								entry.data,
+								{ preserveActual: true },
+							),
+						);
+					}
+				}
+			}
+			const combined = alternatives[0];
+			for (let index = 1; index < alternatives.length; index++) combined.append(alternatives[index]);
+			return alternatives.length === 1 ? combined : combined.asAlternatives();
+		}
 	}
 	return fail(path, expected ?? expectedOf(ir), v);
 }
 
-/** Pick the sole object member whose literal-typed property matches the value's. */
-function discriminate(members: IR[], v: unknown): IR | undefined {
-	if (typeof v !== "object" || v === null || Array.isArray(v)) return undefined;
-	const rec = v as Record<string, unknown>;
-	let match: IR | undefined;
-	for (const m of members) {
-		const base = m.k === "sub" ? m.schema.ir : m;
-		if (base.k !== "object") continue;
-		for (const p of base.props) {
-			if (p.val.k !== "lit" || rec[p.key] !== p.val.v) continue;
-			if (match !== undefined) return undefined; // ambiguous
-			match = m;
-			break;
+interface LiteralDiscriminant {
+	path: PropertyKey[];
+	value: unknown;
+}
+
+function unwrapBase(member: IR, seen = new Set<IR>()): IR {
+	if (seen.has(member)) return member;
+	seen.add(member);
+	if (member.k === "sub") return unwrapBase(member.schema.ir, seen);
+	if (member.k === "alias") return unwrapBase(member.resolve(), seen);
+	if (member.k === "refine") return unwrapBase(member.base, seen);
+	return member;
+}
+
+function collectDiscriminants(member: IR, prefix: PropertyKey[] = [], seen = new Set<IR>()): LiteralDiscriminant[] {
+	if (seen.has(member)) return [];
+	seen.add(member);
+	if (member.k === "alias") return collectDiscriminants(member.resolve(), prefix, seen);
+	if (member.k === "sub") return collectDiscriminants(member.schema.ir, prefix, seen);
+	if (member.k === "refine") return collectDiscriminants(member.base, prefix, seen);
+	if (member.k !== "object") return [];
+	const result: LiteralDiscriminant[] = [];
+	for (const property of member.props) {
+		const propertyPath = [...prefix, property.key];
+		const value = unwrapBase(property.val);
+		if (value.k === "lit") result.push({ path: propertyPath, value: value.v });
+		else result.push(...collectDiscriminants(property.val, propertyPath, new Set(seen)));
+	}
+	return result;
+}
+
+function pathsEqual(left: readonly PropertyKey[], right: readonly PropertyKey[]): boolean {
+	return left.length === right.length && left.every((key, index) => key === right[index]);
+}
+
+function valueAtPath(value: unknown, path: readonly PropertyKey[]): { present: boolean; value?: unknown } {
+	let cursor = value;
+	for (const key of path) {
+		if ((typeof cursor !== "object" && typeof cursor !== "function") || cursor === null || !(key in cursor)) {
+			return { present: false };
+		}
+		cursor = (cursor as Record<PropertyKey, unknown>)[key];
+	}
+	return { present: true, value: cursor };
+}
+
+function discriminateFailure(members: IR[], value: unknown, path: PropertyKey[]): OmpErrors | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const byMember = members.map(member => collectDiscriminants(member));
+	const candidates: { path: PropertyKey[]; distinct: number; declared: number }[] = [];
+	for (const discriminants of byMember) {
+		for (const discriminant of discriminants) {
+			if (candidates.some(candidate => pathsEqual(candidate.path, discriminant.path))) continue;
+			const values: unknown[] = [];
+			let declared = 0;
+			for (const branch of byMember) {
+				const match = branch.find(candidate => pathsEqual(candidate.path, discriminant.path));
+				if (match === undefined) continue;
+				declared++;
+				if (!values.some(candidate => Object.is(candidate, match.value))) values.push(match.value);
+			}
+			if (values.length > 1) candidates.push({ path: discriminant.path, distinct: values.length, declared });
 		}
 	}
-	return match;
+	candidates.sort((left, right) => right.distinct - left.distinct || right.declared - left.declared);
+	for (const candidate of candidates) {
+		const actual = valueAtPath(value, candidate.path);
+		const exact: IR[] = [];
+		const defaults: IR[] = [];
+		const expectedMembers: IR[] = [];
+		for (let index = 0; index < members.length; index++) {
+			const discriminant = byMember[index].find(item => pathsEqual(item.path, candidate.path));
+			if (discriminant === undefined) {
+				defaults.push(members[index]);
+				continue;
+			}
+			expectedMembers.push({ k: "lit", v: discriminant.value });
+			if (actual.present && Object.is(actual.value, discriminant.value)) exact.push(members[index]);
+		}
+		if (!actual.present) {
+			if (defaults.length !== 0 && defaults.length < members.length) {
+				return discriminateFailure(defaults, value, path);
+			}
+			return fail([...path, ...candidate.path], expectedOf({ k: "union", members: expectedMembers }), undefined);
+		}
+		if (exact.length === 0) {
+			if (defaults.length !== 0) return discriminateFailure(defaults, value, path);
+			return fail([...path, ...candidate.path], expectedOf({ k: "union", members: expectedMembers }), actual.value);
+		}
+		if (exact.length === 1) {
+			const result = visit(exact[0], value, path);
+			return result instanceof OmpErrors ? result : undefined;
+		}
+		const nested = discriminateFailure(exact, value, path);
+		if (nested !== undefined) return nested;
+	}
+	return undefined;
 }
 
 /** True when a value's runtime shape could only be aimed at this member. */

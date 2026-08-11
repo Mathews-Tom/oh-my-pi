@@ -7,11 +7,17 @@
  */
 import type { Def } from "./ir";
 
+/** Callable validation result contract used by timed candidates. */
 export type SchemaFn = (value: unknown) => unknown;
+/** Boolean-only validation contract used by timed candidates. */
+export type CheckFn = (value: unknown) => boolean;
 
+/** One library implementation exercised by the benchmark harness. */
 export interface Candidate {
 	name: string;
 	type(def: Def): SchemaFn;
+	/** Native boolean-only validation path, when the library exposes one. */
+	allows?(def: Def): CheckFn;
 	isErrors(result: unknown): boolean;
 	/** Optional error summary string for correctness diagnostics. */
 	summary?(result: unknown): string;

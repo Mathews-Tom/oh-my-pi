@@ -2,9 +2,17 @@
 
 ## [Unreleased]
 
-### Changed
+## [17.2.10] - 2026-08-06
 
-- Replaced arktype with `@oh-my-pi/omptype` in tests and test utilities.
+### Fixed
+
+- Fixed an issue in remote OpenAI response compaction replay where output-only `status` fields were incorrectly sent back as input, affecting persisted native and V1/V2 replacement history.
+
+## [17.2.9] - 2026-08-05
+
+### Fixed
+
+- Preserved queued steering and follow-up messages when a continuation is cancelled before or during pre-dequeue hooks, and propagated the caller's cancellation signal through every continuation model-call loop.
 
 ## [17.2.6] - 2026-08-03
 

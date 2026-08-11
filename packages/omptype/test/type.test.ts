@@ -211,6 +211,17 @@ describe("methods", () => {
 		expect(piped).toBe(0);
 	});
 
+	it(".allows() preserves nested and optional-property validation", () => {
+		const s = type({
+			context: "string",
+			tasks: [{ "name?": "1 <= string <= 32", task: "string" }, "[]"],
+		});
+		expect(s.allows({ context: "goal", tasks: [{ task: "run" }] })).toBe(true);
+		expect(s.allows({ context: "goal", tasks: [{ name: "", task: "run" }] })).toBe(false);
+		expect(s.allows({ context: "goal", tasks: [{ name: undefined, task: "run" }] })).toBe(false);
+		expect(s.allows({ context: "goal", tasks: [{ task: 1 }] })).toBe(false);
+	});
+
 	it(".assert() returns output or throws with the summary", () => {
 		const s = type({ a: "string" });
 		expect(s.assert({ a: "x" })).toEqual({ a: "x" });
@@ -399,7 +410,7 @@ describe("advanced ArkType compatibility", () => {
 		const and = Reflect.get(stringSchema, "and");
 		if (typeof and !== "function") throw new Error("schema is missing and()");
 		expect(() => Reflect.apply(and, stringSchema, ["number"])).toThrow("unsatisfiable");
-		expect(type("0 < number").equals("number > 0")).toBe(true);
+		expect(type("0 < number <= 3600").equals(type("number > 0").and("number <= 3600"))).toBe(true);
 		expect(type("number.integer > 0").extends("number")).toBe(true);
 		expect(type("'a' | 'b'").overlaps("'b' | 'c'")).toBe(true);
 		expect(type("string").overlaps("number")).toBe(false);
@@ -430,9 +441,15 @@ describe("advanced ArkType compatibility", () => {
 		expect(type.string.date.iso.parse("2024-01-02")).toBeInstanceOf(Date);
 		expect(type.parse.url("https://omp.sh")).toBeInstanceOf(URL);
 
-		const configured = type({ user: { age: "number >= 18" } }).configure({
-			expected: context => `expected:${context.code}`,
-			message: context => `${context.path.join("/")}: ${context.problem}`,
+		// ArkType applies `.configure()` to the node it is called on (and its shallow
+		// descendants), so the constraint that should carry the config owns it here.
+		const configured = type({
+			user: {
+				age: type("number >= 18").configure({
+					expected: context => `expected:${context.code}`,
+					message: context => `${context.path.join("/")}: ${context.problem}`,
+				}),
+			},
 		});
 		for (let index = 0; index < JIT; index++) {
 			const out = configured({ user: { age: 10 } });
@@ -443,5 +460,34 @@ describe("advanced ArkType compatibility", () => {
 				expect(Object.keys(out.byPath)).toEqual(["user.age"]);
 			}
 		}
+	});
+});
+
+describe("Standard Schema V1", () => {
+	it("validates synchronously with morphs and path-aware issues", () => {
+		const s = type({ port: "string.integer.parse", name: "string" });
+		const std = s["~standard"];
+		expect(std.version).toBe(1);
+		expect(std.vendor).toBe("omptype");
+		expect(std.validate({ port: "8080", name: "api" })).toEqual({ value: { port: 8080, name: "api" } });
+		const failed = std.validate({ port: "8080", name: 42 });
+		if (failed instanceof Promise || failed.issues === undefined) throw new Error("expected sync failure");
+		expect(failed.issues[0].path).toEqual(["name"]);
+		expect(failed.issues[0].message).toContain("a string");
+	});
+
+	it("materializes root defaults for undefined input at the standard boundary", () => {
+		const staticDefault = type.string.default("dev");
+		expect(staticDefault["~standard"].validate(undefined)).toEqual({ value: "dev" });
+		expect(staticDefault(undefined)).toBe("dev");
+		expect(staticDefault("prod")).toBe("prod");
+		expect(staticDefault(5)).toBeInstanceOf(OmpErrors);
+
+		// Factory defaults run per call — distinct instances each time.
+		const factoryDefault = type("string[]").default(() => []);
+		const first = factoryDefault(undefined);
+		const second = factoryDefault(undefined);
+		expect(first).toEqual([]);
+		expect(first).not.toBe(second);
 	});
 });

@@ -1212,7 +1212,14 @@ function resolveAnthropicBaseUrl(model: Model<"anthropic-messages">, apiKey?: st
 		}
 	}
 	if (model.provider === "anthropic") {
-		return normalizeAnthropicBaseUrl(model.baseUrl) ?? "https://api.anthropic.com";
+		const configured = normalizeAnthropicBaseUrl(model.baseUrl);
+		// An explicitly configured non-official baseUrl (e.g. a models.yml provider
+		// override) is more specific than the generic env fallback and wins.
+		if (configured && !isOfficialAnthropicApiUrl(configured)) return configured;
+		// Otherwise ANTHROPIC_BASE_URL routes chat through an enterprise gateway
+		// (docs/environment-variables.md), ahead of the official default. The
+		// Foundry redirect is already handled above.
+		return normalizeAnthropicBaseUrl($env.ANTHROPIC_BASE_URL) ?? configured ?? "https://api.anthropic.com";
 	}
 	return normalizeAnthropicBaseUrl(model.baseUrl);
 }
@@ -1272,9 +1279,12 @@ export function resolveAnthropicCustomHeadersForBaseUrl(
 	return parseAnthropicCustomHeaders($env.ANTHROPIC_CUSTOM_HEADERS);
 }
 
-function resolveAnthropicCustomHeaders(model: Model<"anthropic-messages">): Record<string, string> | undefined {
+function resolveAnthropicCustomHeaders(
+	model: Model<"anthropic-messages">,
+	baseUrl: string | undefined,
+): Record<string, string> | undefined {
 	if (model.provider !== "anthropic") return undefined;
-	return resolveAnthropicCustomHeadersForBaseUrl(model.baseUrl);
+	return resolveAnthropicCustomHeadersForBaseUrl(baseUrl);
 }
 
 function looksLikeFilePath(value: string): boolean {
@@ -1532,6 +1542,13 @@ async function* observeDecodedAnthropicSdkEvents(
 const PROVIDER_MAX_RETRIES = 10;
 
 /**
+ * Flat delay between attempts when Copilot 400s a model its own `/models`
+ * catalog advertises. Part of the fleet carries the model and part doesn't, so
+ * the retry is a reroll rather than a wait for capacity to free up.
+ */
+const COPILOT_MODEL_FLAP_RETRY_DELAY_MS = 400;
+
+/**
  * How long `ping` keepalives may keep extending the idle deadline without any
  * semantic stream progress, as a multiple of the idle timeout. Anthropic pings
  * across legitimate generation gaps, so pings count as liveness — but a wedged
@@ -1561,8 +1578,8 @@ function shouldIgnoreAnthropicPreambleEvent(eventType: unknown): boolean {
 /**
  * Whether an Anthropic (or Copilot-over-Anthropic) stream error should be
  * retried. The classification lives in {@link AIError.isProviderRetryableError};
- * this wrapper injects the Copilot-specific `model_not_supported` transient
- * check, which the error module must not import directly.
+ * this wrapper injects the Copilot-specific model-availability transient check,
+ * which the error module must not import directly.
  */
 export function isProviderRetryableError(error: unknown, provider?: string): boolean {
 	return AIError.isProviderRetryableError(error, {
@@ -2709,7 +2726,12 @@ const streamAnthropicOnce = (
 						throw streamFailure;
 					}
 					providerRetryAttempt++;
-					const backoffDelayMs = calculateAnthropicRetryDelayMs(providerRetryAttempt - 1);
+					// Copilot's model-availability 400 is a per-request replica reroll, not
+					// upstream backpressure — the exponential curve would just add dead
+					// time to a coin flip that the next attempt is as likely to win.
+					const backoffDelayMs = AIError.isCopilotTransientModelError(streamFailure)
+						? COPILOT_MODEL_FLAP_RETRY_DELAY_MS
+						: calculateAnthropicRetryDelayMs(providerRetryAttempt - 1);
 					// Honor the server's retry hint (`retry-after-ms`/`retry-after`) on
 					// 429/529-style failures: retrying sooner than the server asked is a
 					// guaranteed failure that just burns the retry budget.
@@ -2932,7 +2954,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	const supportsEagerToolInputStreaming = resolveEagerToolInputStreamingSupport(model, baseUrl);
 	const needsFineGrainedToolStreamingBeta =
 		hasTools && isOfficialAnthropicApiUrl(baseUrl) && !supportsEagerToolInputStreaming;
-	const foundryCustomHeaders = resolveAnthropicCustomHeaders(model);
+	const foundryCustomHeaders = resolveAnthropicCustomHeaders(model, baseUrl);
 	const tlsFetchOptions = buildCoworkTlsFetchOptions(model, baseUrl);
 	// Disable Bun's native ~300s pre-response fetch timeout (issue #2422).
 	// `AnthropicMessagesClient` already arms its own DEFAULT_TIMEOUT_MS timer

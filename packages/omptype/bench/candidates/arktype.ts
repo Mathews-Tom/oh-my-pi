@@ -9,6 +9,9 @@ export const arktypeCandidate: Candidate = {
 		// Runtime-generated benchmark definitions cannot preserve arktype's const generic.
 		return type(def as never);
 	},
+	allows(def: Def) {
+		return type(def as never).allows;
+	},
 	isErrors: result => result instanceof type.errors,
 	summary: result => (result instanceof type.errors ? result.summary : ""),
 };

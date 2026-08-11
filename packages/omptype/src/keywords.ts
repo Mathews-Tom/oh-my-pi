@@ -1,6 +1,6 @@
 import type { IR, MorphContext } from "./ir";
 
-const NUMERIC = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+const NUMERIC = /^(?:(?!^-0\.?0*$)(?:-?(?:(?:0|[1-9]\d*)(?:\.\d+)?)|\.\d+?))$/;
 const INTEGER = /^[+-]?(?:0|[1-9]\d*)$/;
 const EMAIL = /^[\w%+.-]+@[\d.A-Za-z-]+\.[A-Za-z]{2,}$/;
 const SEMVER =
@@ -106,8 +106,118 @@ function isLuhnValid(input: string): boolean {
 	return value.length > 0 && sum % 10 === 0;
 }
 
+function finiteNumber(expected = "a number"): IR {
+	return {
+		k: "refine",
+		base: { k: "unknown" },
+		pred: value => typeof value === "number" && !Number.isNaN(value),
+		expected,
+	};
+}
+
+function jsonObject(): IR {
+	let value: IR;
+	const resolveValue = (): IR => value;
+	const object: IR = {
+		k: "object",
+		props: [],
+		index: { k: "alias", name: "$jsonValue", resolve: resolveValue },
+		extras: "keep",
+	};
+	const array: IR = {
+		k: "array",
+		el: { k: "alias", name: "$jsonValue", resolve: resolveValue },
+		desc: "an object",
+	};
+	value = {
+		k: "union",
+		members: [
+			object,
+			array,
+			{ k: "number" },
+			{ k: "string" },
+			{ k: "lit", v: false },
+			{ k: "null" },
+			{ k: "lit", v: true },
+		],
+	};
+	return object;
+}
+
+function instance(ctor: new (...args: never[]) => object, name: string): IR {
+	return { k: "instance", ctor, expected: `${/^[AEIOU]/.test(name) ? "an" : "a"} ${name} instance` };
+}
+
 const keywordFactories: Record<string, () => IR> = {
 	string: () => ({ k: "string" }),
+	Key: () => ({ k: "union", members: [{ k: "string" }, { k: "symbol" }] }),
+	"unknown.any": () => ({ k: "unknown" }),
+	Array: () => ({ k: "array", el: { k: "unknown" } }),
+	Function: () => instance(Function as unknown as new (...args: never[]) => object, "Function"),
+	RegExp: () => instance(RegExp, "RegExp"),
+	File: () => instance(File, "File"),
+	Error: () => instance(Error, "Error"),
+	Set: () => instance(Set, "Set"),
+	Map: () => instance(Map, "Map"),
+	WeakSet: () => instance(WeakSet, "WeakSet"),
+	WeakMap: () => instance(WeakMap, "WeakMap"),
+	Promise: () => instance(Promise, "Promise"),
+	FormData: () => instance(FormData, "FormData"),
+	"FormData.parse": () => ({
+		k: "morph",
+		input: instance(FormData, "FormData"),
+		fn: value => {
+			const out: Record<string, Bun.FormDataEntryValue | Bun.FormDataEntryValue[]> = {};
+			for (const [key, entry] of (value as FormData).entries()) {
+				const current = out[key];
+				out[key] = current === undefined ? entry : Array.isArray(current) ? [...current, entry] : [current, entry];
+			}
+			return out;
+		},
+		out: { k: "object", props: [], index: { k: "unknown" }, extras: "keep" },
+	}),
+	"object.json": jsonObject,
+	"object.json.stringify": () => ({
+		k: "morph",
+		input: jsonObject(),
+		fn: value => JSON.stringify(value),
+		out: { k: "string" },
+	}),
+	"number.epoch": () => ({
+		k: "refine",
+		base: {
+			k: "refine",
+			base: {
+				k: "refine",
+				base: finiteNumber("a number representing a Unix timestamp"),
+				pred: value => Number.isInteger(value),
+				expected: "an integer representing a Unix timestamp",
+			},
+			pred: value => (value as number) >= -8_640_000_000_000_000,
+			expected: "a Unix timestamp after -8640000000000000",
+		},
+		pred: value => (value as number) <= 8_640_000_000_000_000,
+		expected: "a Unix timestamp before 8640000000000000",
+	}),
+	"number.safe": () => ({
+		k: "refine",
+		base: {
+			k: "refine",
+			base: finiteNumber(),
+			pred: value => (value as number) >= Number.MIN_SAFE_INTEGER,
+			expected: `at least ${Number.MIN_SAFE_INTEGER}`,
+		},
+		pred: value => (value as number) <= Number.MAX_SAFE_INTEGER,
+		expected: `at most ${Number.MAX_SAFE_INTEGER}`,
+	}),
+	"number.NaN": () => ({
+		k: "refine",
+		base: { k: "unknown" },
+		pred: Number.isNaN,
+		expected: "NaN",
+	}),
+	"number.Infinity": () => ({ k: "lit", v: Number.POSITIVE_INFINITY }),
+	"number.NegativeInfinity": () => ({ k: "lit", v: Number.NEGATIVE_INFINITY }),
 	"string.alpha": () => pattern(/^[A-Za-z]*$/, "only letters"),
 	"string.alphanumeric": () => pattern(/^[\dA-Za-z]*$/, "only letters and digits 0-9"),
 	"string.hex": () => pattern(/^[\dA-Fa-f]+$/, "hex characters only"),

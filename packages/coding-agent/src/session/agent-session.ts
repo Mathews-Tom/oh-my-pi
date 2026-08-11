@@ -58,7 +58,6 @@ import type {
 	ImageContent,
 	Message,
 	Model,
-	ModelUsageHealth,
 	OAuthAccountIdentity,
 	ProviderSessionState,
 	ResetCreditAccountStatus,
@@ -83,6 +82,7 @@ import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { MacOSPowerAssertion } from "@oh-my-pi/pi-natives";
 import {
 	$env,
+	APP_NAME,
 	escapeXmlText,
 	formatDuration,
 	getAgentDbPath,
@@ -101,7 +101,7 @@ import { type AdvisorConfig, type AdvisorRuntimeStatus, loadAdvisorTranscriptCos
 import { type AsyncJob, AsyncJobManager } from "../async";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
 import type { ModelRegistry } from "../config/model-registry";
-import { type ResolvedModelRoleValue, resolveModelOverride } from "../config/model-resolver";
+import type { ResolvedModelRoleValue } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
 import { buildServiceTierByFamily } from "../config/service-tier";
 import type { Settings, SkillsSettings } from "../config/settings";
@@ -127,6 +127,7 @@ import type {
 	ToolExecutionEndEvent,
 	ToolExecutionStartEvent,
 	ToolExecutionUpdateEvent,
+	ToolInfo,
 	TreePreparation,
 	TurnEndEvent,
 	TurnStartEvent,
@@ -173,8 +174,8 @@ import {
 	deobfuscateSessionContext,
 	deobfuscateToolArguments,
 	obfuscateProviderContext,
-	type SecretObfuscator,
-} from "../secrets/obfuscator";
+} from "../secrets/message-transform";
+import type { SecretObfuscator } from "../secrets/obfuscator";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -230,7 +231,7 @@ import type {
 	SessionHandoffOptions,
 	SessionOAuthAccountList,
 	SessionStats,
-	UsageFallbackConfirmation,
+	UsageFallbackConfirmer,
 } from "./agent-session-types";
 import {
 	ASYNC_INLINE_RESULT_MAX_CHARS,
@@ -303,7 +304,7 @@ import {
 	USER_INTERRUPT_LABEL,
 } from "./messages";
 import { ModelControls, type ModelControlsHost } from "./model-controls";
-import { PrewalkCoordinator, type PrewalkCoordinatorHost } from "./prewalk";
+import { isPrewalkPlanNudge, PrewalkCoordinator, type PrewalkCoordinatorHost } from "./prewalk";
 import {
 	isAdvisorCard,
 	isDisplayableQueuedMessage,
@@ -312,7 +313,6 @@ import {
 	queueChipText,
 	toRestoredQueuedMessage,
 } from "./queued-messages";
-import { formatRetryFallbackSelector, type RetryFallbackSelector } from "./retry-fallback-chains";
 import { type AdvisorStats, SessionAdvisors, type SessionAdvisorsHost } from "./session-advisors";
 import type { BuildSessionContextOptions, SessionContext } from "./session-context";
 import { getRestorableSessionModels } from "./session-context";
@@ -447,6 +447,7 @@ export class AgentSession {
 	// Event subscription state
 	#unsubscribeAgent?: () => void;
 	#cancelExitRecorder?: () => void;
+	#cancelFatalRecoveryHint?: () => void;
 	#exitRecorded = false;
 	#unsubscribeAppendOnly?: () => void;
 	#unsubscribeModelRoles?: () => void;
@@ -485,6 +486,7 @@ export class AgentSession {
 
 	// Retry state
 	readonly #recovery: TurnRecovery;
+	#textOutputCommitted = true;
 	#planModeReminderCount = 0;
 	#planModeReminderAwaitingProgress = false;
 	readonly #todo: TodoTracker;
@@ -558,9 +560,13 @@ export class AgentSession {
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
-	#usageFallbackConfirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined;
-	#usageReserveApprovedSelector: string | undefined;
+	#usageFallbackConfirmer: UsageFallbackConfirmer | undefined;
 	#usagePreflightAbortControllers = new Set<AbortController>();
+	#queuedMessageDrainBlocked = false;
+	#usagePreflightReadyForNextModelCall = false;
+	#usagePreflightReadyModel: Model | undefined;
+	#detachUsageBeforeQueueDequeue: (() => void) | undefined;
+	#detachUsageBeforeModelCall: (() => void) | undefined;
 
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
@@ -768,8 +774,10 @@ export class AgentSession {
 			!this.#canAutoContinueForFollowUp()
 				? [...this.agent.peekFollowUpQueue()]
 				: [];
+		const parkedQueueDrainBlocked = parkedFollowUps.length > 0 && this.#queuedMessageDrainBlocked;
 		if (parkedFollowUps.length > 0) {
 			this.agent.replaceQueues([...this.agent.peekSteeringQueue()], []);
+			if (parkedQueueDrainBlocked) this.#queuedMessageDrainBlocked = false;
 		}
 		let finishObservation: ((error?: unknown) => void | Promise<void>) | undefined;
 		try {
@@ -805,6 +813,7 @@ export class AgentSession {
 						[...this.agent.peekSteeringQueue()],
 						[...parkedFollowUps, ...this.agent.peekFollowUpQueue()],
 					);
+					this.#queuedMessageDrainBlocked ||= parkedQueueDrainBlocked;
 				}
 				this.#endInFlight(async () => {
 					try {
@@ -830,6 +839,7 @@ export class AgentSession {
 			steering.filter(m => !isAdvisorCard(m)),
 			followUp.filter(m => !isAdvisorCard(m)),
 		);
+		this.#reconcileQueuedMessageDrain();
 		return cards;
 	}
 
@@ -871,8 +881,8 @@ export class AgentSession {
 	/**
 	 * Arm prewalk outside the normal startup path so an explicit slash command starts immediately.
 	 */
-	armPrewalk(target: Model, thinkingLevel?: ConfiguredThinkingLevel): void {
-		this.#prewalk.arm(target, thinkingLevel);
+	armPrewalk(target: Model, thinkingLevel?: ConfiguredThinkingLevel): boolean {
+		return this.#prewalk.arm(target, thinkingLevel);
 	}
 
 	/** Validate the active plan artifact and shape an `xd://propose` result for review-mode hosts. */
@@ -1025,6 +1035,7 @@ export class AgentSession {
 			modelRegistry: this.#modelRegistry,
 			configWarnings: this.configWarnings,
 			model: () => this.model,
+			textOutputCommitted: () => this.#textOutputCommitted,
 			thinkingLevel: () => this.thinkingLevel,
 			configuredThinkingLevel: () => this.configuredThinkingLevel(),
 			setThinkingLevel: level => this.setThinkingLevel(level),
@@ -1050,6 +1061,31 @@ export class AgentSession {
 			withBashBranchTransition: operation => this.#bash.withBranchTransition(operation),
 		};
 		this.#recovery = new TurnRecovery(recoveryHost, { initialRetryFallback: config.initialRetryFallback });
+		this.#detachUsageBeforeQueueDequeue = this.agent.addBeforeQueuedMessageDequeueHook(async signal => {
+			if (
+				!this.settings.get("retry.usageAwareFallback") ||
+				(this.#usagePreflightReadyForNextModelCall && this.#usagePreflightReadyModel === this.model)
+			) {
+				return;
+			}
+			if (!(await this.#runQueuedUsageAwarePreflight(signal))) {
+				signal?.throwIfAborted();
+				throw new DOMException("Usage preflight cancelled", "AbortError");
+			}
+		});
+		this.#detachUsageBeforeModelCall = this.agent.addBeforeModelCallHook(async signal => {
+			if (!this.settings.get("retry.usageAwareFallback")) return;
+			if (this.#usagePreflightReadyForNextModelCall) {
+				const checkedModel = this.#usagePreflightReadyModel;
+				this.#usagePreflightReadyForNextModelCall = false;
+				this.#usagePreflightReadyModel = undefined;
+				if (checkedModel === this.model) return;
+			}
+			if (!(await this.#runUsageAwarePreflight(signal))) {
+				signal?.throwIfAborted();
+				throw new DOMException("Usage preflight cancelled", "AbortError");
+			}
+		});
 		const statsHost: SessionStatsTrackerHost = {
 			session: this,
 			agent: this.agent,
@@ -1342,6 +1378,14 @@ export class AgentSession {
 		});
 		this.#cancelExitRecorder = postmortem.register(`agent-session:${this.sessionManager.getSessionId()}`, reason => {
 			this.#recordSessionExit(reason);
+		});
+		this.#cancelFatalRecoveryHint = postmortem.registerFatalRecoveryHint(() => {
+			const sessionId = this.sessionManager.getSessionId();
+			if (!sessionId || !this.sessionManager.getSessionFile()) return undefined;
+			return {
+				label: this.#agentId ?? (this.#agentKind === "main" ? "Main" : "Agent"),
+				command: `${APP_NAME} --resume ${sessionId}`,
+			};
 		});
 
 		const advisorsHost: SessionAdvisorsHost = {
@@ -2012,6 +2056,41 @@ export class AgentSession {
 	 */
 	#prunedTerminalRefusal: AssistantMessage | undefined = undefined;
 
+	/**
+	 * In-flight {@link #dispatchAgentEvent} promises. agent-core invokes the
+	 * event subscriber fire-and-forget, so a `message_end`/`agent_end` handler
+	 * can still be awaiting extension/subscriber/maintenance work — and thus its
+	 * `sessionManager`/`agent.state` append — after `agent.waitForIdle()`
+	 * resolves. Dispose drains this set so the late append lands *before* the
+	 * memory release, never after it.
+	 */
+	#inFlightEventHandlers = new Set<Promise<void>>();
+
+	/**
+	 * Subscriber entry point. Delegates to {@link #dispatchAgentEvent} and
+	 * records the dispatch in {@link #inFlightEventHandlers} until it settles so
+	 * {@link #drainInFlightEventHandlers} can await the session's async
+	 * event/persistence pipeline during teardown.
+	 */
+	#handleAgentEvent = (event: AgentEvent): Promise<void> => {
+		const processing = this.#dispatchAgentEvent(event);
+		this.#inFlightEventHandlers.add(processing);
+		void processing.finally(() => this.#inFlightEventHandlers.delete(processing)).catch(() => {});
+		return processing;
+	};
+
+	/**
+	 * Await every in-flight event handler (and any it chains into) so a late
+	 * message/entry append cannot land after the caller clears session memory.
+	 * The agent must already be idle — otherwise new events keep arriving and
+	 * this never drains.
+	 */
+	async #drainInFlightEventHandlers(): Promise<void> {
+		while (this.#inFlightEventHandlers.size > 0) {
+			await Promise.allSettled([...this.#inFlightEventHandlers]);
+		}
+	}
+
 	/** Internal handler for agent events - shared by subscribe and reconnect.
 	 *
 	 * `agent_end` handling schedules deferred post-prompt recovery work
@@ -2026,7 +2105,7 @@ export class AgentSession {
 	 * `#postPromptTasksPromise` is set the moment `#emit` invokes this handler, so
 	 * the recovery wait always sees the in-flight handler and blocks until it — and
 	 * everything it schedules — settles. */
-	#handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+	#dispatchAgentEvent = async (event: AgentEvent): Promise<void> => {
 		if (event.type === "tool_execution_end" && this.#isTerminalYieldToolResult(event)) {
 			const alreadyTerminated = this.#synchronouslyTerminatedYieldToolCallIds.delete(event.toolCallId);
 			if (!alreadyTerminated) {
@@ -2445,14 +2524,17 @@ export class AgentSession {
 			const persistMessageEnd = () => {
 				// Check if this is a hook/custom message
 				if (event.message.role === "hookMessage" || event.message.role === "custom") {
-					// Persist as CustomMessageEntry
-					this.sessionManager.appendCustomMessageEntry(
-						event.message.customType,
-						event.message.content,
-						event.message.display,
-						event.message.details,
-						event.message.attribution ?? "agent",
-					);
+					// Prewalk's plan nudge is a one-run steering instruction. Persisting it would
+					// resurrect the consumed prompt on resume, fork, or any context rebuild.
+					if (!isPrewalkPlanNudge(event.message)) {
+						this.sessionManager.appendCustomMessageEntry(
+							event.message.customType,
+							event.message.content,
+							event.message.display,
+							event.message.details,
+							event.message.attribution ?? "agent",
+						);
+					}
 					if (event.message.role === "custom" && event.message.customType === "ttsr-injection") {
 						this.#ttsr.markInjectedFromDetails(event.message.details);
 					}
@@ -2601,7 +2683,7 @@ export class AgentSession {
 				// here after maintenance routing, tagged isTerminal so subscribers can
 				// tell final settles from scheduled continuations.
 				await this.#emitSessionEvent({ ...event, isTerminal: !options?.willContinue });
-				void this.#emitAgentEndNotification(activeMessages, options).catch(err => {
+				void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
 					logger.error("Agent end extension notification failed", { err });
 				});
 			};
@@ -2658,14 +2740,21 @@ export class AgentSession {
 			// outside the session transcript (issue #6177).
 			logProviderTurnError(msg);
 
-			// Invalidate GitHub Copilot credentials on auth failure so stale tokens
-			// aren't reused on the next request
-			if (
-				msg.stopReason === "error" &&
-				msg.provider === "github-copilot" &&
-				AIError.is(AIError.classifyMessage(msg), AIError.Flag.AuthFailed)
-			) {
-				await this.#modelRegistry.authStorage.remove("github-copilot");
+			// Invalidate GitHub Copilot credentials on a hard auth failure (401, or an
+			// expired/revoked token) so stale tokens aren't reused on the next request.
+			// Account usage caps and concurrency caps leave the credential valid: the
+			// former rotates until its reset window, while the latter is retried after
+			// a short backoff without touching the credential pool.
+			if (msg.stopReason === "error" && msg.provider === "github-copilot") {
+				const errorId = AIError.classifyMessage(msg);
+				const isConcurrencyCap = AIError.parseRateLimitReason(msg.errorMessage ?? "") === "CONCURRENT_LIMIT";
+				if (
+					AIError.is(errorId, AIError.Flag.AuthFailed) &&
+					!AIError.is(errorId, AIError.Flag.UsageLimit) &&
+					!isConcurrencyCap
+				) {
+					await this.#modelRegistry.authStorage.remove("github-copilot");
+				}
 			}
 
 			if (this.#maintenance.skipPostTurnMaintenanceAssistantTimestamp === msg.timestamp) {
@@ -2966,20 +3055,30 @@ export class AgentSession {
 				}
 				this.#beginInFlight();
 				try {
-					await this.#recovery.maybeRestoreRetryFallbackPrimary();
-					if (
-						this.settings.get("retry.modelFallback") &&
-						this.settings.get("retry.usageAwareFallback") &&
-						!(await this.#runUsageAwarePreflight())
-					) {
-						this.#skipAgentContinue("session-unavailable", options);
-						return;
-					}
+					const reverted = await this.#recovery.maybeRestoreRetryFallbackPrimary();
 					if (signal.aborted || this.#isDisposed) {
 						this.#skipAgentContinue("post-restore-unavailable", options);
 						return;
 					}
-					await this.agent.continue();
+					// A cooldown-expiry revert can drop the active window below the
+					// accumulated context. The user-prompt path re-checks context after
+					// the revert via runPrePromptCompactionIfNeeded; the auto-continue
+					// path must do the same so agent.continue() never sends a
+					// predictably oversized request to the reverted (smaller) model.
+					if (reverted) {
+						await this.#maintenance.runPrePromptCompactionIfNeeded([]);
+						if (signal.aborted || this.#isDisposed) {
+							this.#skipAgentContinue("post-restore-unavailable", options);
+							return;
+						}
+					}
+					if (this.settings.get("retry.usageAwareFallback")) {
+						if (!(await this.#runQueuedUsageAwarePreflight(signal))) {
+							this.#skipAgentContinue("session-unavailable", options);
+							return;
+						}
+					}
+					await this.agent.continue(signal);
 				} catch (error) {
 					logger.warn("agent.continue failed after scheduling", {
 						error: error instanceof Error ? error.message : String(error),
@@ -2987,6 +3086,7 @@ export class AgentSession {
 					});
 					options?.onError?.(error);
 				} finally {
+					this.#usagePreflightReadyForNextModelCall = false;
 					this.#endInFlight();
 				}
 			},
@@ -3390,7 +3490,7 @@ export class AgentSession {
 				success: event.success,
 				attempt: event.attempt,
 				finalError: event.finalError,
-				recoveredErrors: event.recoveredErrors,
+				retryErrors: event.retryErrors,
 			});
 		} else if (event.type === "ttsr_triggered") {
 			await this.#extensionRunner.emit({ type: "ttsr_triggered", rules: event.rules });
@@ -3605,6 +3705,12 @@ export class AgentSession {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		this.#queuedMessageDrainBlocked = false;
+		this.#usagePreflightReadyForNextModelCall = false;
+		this.#detachUsageBeforeQueueDequeue?.();
+		this.#detachUsageBeforeQueueDequeue = undefined;
+		this.#detachUsageBeforeModelCall?.();
+		this.#detachUsageBeforeModelCall = undefined;
 		this.#memory.cancelLocalMemoryStartup();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
@@ -3713,6 +3819,8 @@ export class AgentSession {
 		this.#recordSessionExit(options.reason ?? "dispose");
 		this.#cancelExitRecorder?.();
 		this.#cancelExitRecorder = undefined;
+		this.#cancelFatalRecoveryHint?.();
+		this.#cancelFatalRecoveryHint = undefined;
 		try {
 			await emitSessionShutdownEvent(this.#extensionRunner);
 		} catch (error) {
@@ -3762,8 +3870,6 @@ export class AgentSession {
 		this.#releasePowerAssertion();
 		await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
 		this.#movedFromEmptySessionFile = undefined;
-		// All teardown branches that can append session entries have settled.
-		await this.sessionManager.close();
 		this.#closeAllProviderSessions("dispose");
 		this.setHindsightSessionState(undefined);
 		hindsightState?.dispose();
@@ -3778,6 +3884,77 @@ export class AgentSession {
 		}
 		this.#eventListeners = [];
 		this.#sessionChangeCallbacks.clear();
+
+		// A dispose triggered mid-turn (Ctrl-C / timeout / hard-killed subagent)
+		// only *signals* the agent loop via the earlier abort(); the loop and the
+		// session's fire-and-forget event handlers still unwind asynchronously.
+		// Detach the response/SSE interceptors so a late frame cannot re-record
+		// into rawSseDebugBuffer, then wait (bounded) for both the core run AND
+		// the in-flight event/persistence handlers to settle — the latter can
+		// still append the finished message/entries after agent.waitForIdle()
+		// alone. Without this the release races the unwind and a disposed session
+		// is repopulated with exactly the state we are trying to drop.
+		this.agent.setProviderResponseInterceptor(undefined);
+		this.agent.setRawSseEventInterceptor(undefined);
+		let drained = false;
+		try {
+			await withTimeout(
+				(async () => {
+					await this.agent.waitForIdle();
+					await this.#drainInFlightEventHandlers();
+				})(),
+				options.drainTimeoutMs ?? POST_PROMPT_DRAIN_TIMEOUT_MS,
+				"Timed out waiting for the active agent run to settle during dispose",
+			);
+			drained = true;
+		} catch (error) {
+			logger.warn("Active agent run still settling at dispose deadline", { error: String(error) });
+		}
+
+		// Event handlers can reopen the append writer while they persist their
+		// terminal message; that pipeline has drained (or hit the deadline).
+		// Raise the write barrier BEFORE the final close: a handler that
+		// outlived the deadline could otherwise enqueue disk work behind the
+		// closing tail while we await it, and that work would run against the
+		// file after a revival reopens it. The seal also bumps the disk epoch,
+		// superseding queued tail work and fencing already-running atomic
+		// rewrites at their commit guard; hot-path appends drained above are
+		// already durable, and close() (scheduled post-seal) still flushes and
+		// closes the writer.
+		this.sessionManager.seal();
+		await this.sessionManager.close();
+
+		// Release retained conversation memory. dispose() is terminal, and every
+		// revival path reopens the transcript from disk (AgentLifecycleManager
+		// reviver / persisted-revive / `history://`), so the in-memory copy is
+		// dead weight from here on. Dropping it lets a parked subagent's session
+		// graph shed its heavy payloads even while the lifecycle adoption record's
+		// reviver closure still references the session object. Fixes #8003.
+		this.#releaseRetainedSessionMemory();
+
+		// The deadline does not cancel the drain: a handler parked in a slow
+		// extension hook resumes afterwards and would repopulate exactly the
+		// state released above. Its disk writes are already dead — the release
+		// SEALED the session manager (a revival may reopen the same JSONL
+		// through a new manager the moment dispose returns, and this manager
+		// must never race that writer) — so re-run only the in-memory reset
+		// once the pipeline genuinely settles. The extension runner bounds hook
+		// runtime, so this deferred pass is not unbounded.
+		if (!drained) {
+			void (async () => {
+				await this.agent.waitForIdle();
+				await this.#drainInFlightEventHandlers();
+				this.#releaseRetainedSessionMemory();
+			})().catch(error => logger.warn("Deferred dispose finalization failed", { error: String(error) }));
+		}
+	}
+
+	/** Drop the in-memory conversation state after the terminal dispose flush. */
+	#releaseRetainedSessionMemory(): void {
+		this.agent.reset();
+		this.agent.setAppendOnlyContext(undefined);
+		this.rawSseDebugBuffer.clear();
+		this.sessionManager.releaseRetainedEntries();
 	}
 
 	#closeAllProviderSessions(reason: string): void {
@@ -3926,174 +4103,69 @@ export class AgentSession {
 	}
 
 	/** Install the interactive decision surface for reserve-triggered model changes. */
-	setUsageFallbackConfirmer(
-		confirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined,
-	): void {
+	setUsageFallbackConfirmer(confirmer: UsageFallbackConfirmer | undefined): void {
 		this.#usageFallbackConfirmer = confirmer;
 	}
 
-	async #runUsageAwarePreflight(): Promise<boolean> {
+	#allowQueuedMessageDrainRetry(): void {
+		this.#queuedMessageDrainBlocked = false;
+	}
+
+	#reconcileQueuedMessageDrain(): void {
+		if (!this.agent.hasQueuedMessages()) {
+			this.#queuedMessageDrainBlocked = false;
+		}
+	}
+
+	async #runQueuedUsageAwarePreflight(signal?: AbortSignal): Promise<boolean> {
+		try {
+			const allowed = await this.#runUsageAwarePreflight(signal);
+			this.#usagePreflightReadyForNextModelCall = allowed;
+			this.#usagePreflightReadyModel = allowed ? this.model : undefined;
+			this.#queuedMessageDrainBlocked = !allowed && this.agent.hasQueuedMessages();
+			return allowed;
+		} catch (error) {
+			this.#queuedMessageDrainBlocked = this.agent.hasQueuedMessages();
+			throw error;
+		}
+	}
+
+	async #runUsageAwarePreflightForNextModelCall(signal?: AbortSignal): Promise<boolean> {
+		const allowed = await this.#runUsageAwarePreflight(signal);
+		this.#usagePreflightReadyForNextModelCall = allowed;
+		this.#usagePreflightReadyModel = allowed ? this.model : undefined;
+		return allowed;
+	}
+
+	async #runUsageAwarePreflight(signal?: AbortSignal): Promise<boolean> {
+		if (signal?.aborted) return false;
 		const generation = this.#promptGeneration;
+
 		const controller = new AbortController();
+		const onAbort = () => controller.abort(signal?.reason);
+		signal?.addEventListener("abort", onAbort, { once: true });
 		this.#usagePreflightAbortControllers.add(controller);
 		try {
-			await this.#maybeApplyUsageAwareFallback(controller.signal);
-			return !controller.signal.aborted && this.#promptGeneration === generation;
-		} catch (error) {
-			if (controller.signal.aborted || this.#promptGeneration !== generation) return false;
-			throw error;
+			while (true) {
+				const model = this.model;
+				try {
+					const fallbackCommitted = await this.#recovery.maybeApplyUsageAwareFallback(
+						controller.signal,
+						this.#usageFallbackConfirmer,
+					);
+					if (fallbackCommitted) return true;
+					if (controller.signal.aborted || this.#promptGeneration !== generation) return false;
+					if (this.model === model || modelsAreEqual(this.model, model)) return true;
+				} catch (error) {
+					if (controller.signal.aborted || this.#promptGeneration !== generation) return false;
+					if (this.model !== model && !modelsAreEqual(this.model, model)) continue;
+					throw error;
+				}
+			}
 		} finally {
+			signal?.removeEventListener("abort", onAbort);
 			this.#usagePreflightAbortControllers.delete(controller);
 		}
-	}
-
-	async #confirmUsageFallback(confirmation: UsageFallbackConfirmation, signal: AbortSignal): Promise<boolean> {
-		const confirmer = this.#usageFallbackConfirmer;
-		if (!confirmer || signal.aborted) return false;
-		const aborted = Promise.withResolvers<boolean>();
-		const onAbort = () => aborted.resolve(false);
-		signal.addEventListener("abort", onAbort, { once: true });
-		try {
-			return await Promise.race([confirmer(confirmation), aborted.promise]);
-		} finally {
-			signal.removeEventListener("abort", onAbort);
-		}
-	}
-
-	async #maybeApplyUsageAwareFallback(signal: AbortSignal): Promise<void> {
-		if (!this.settings.get("retry.modelFallback") || !this.settings.get("retry.usageAwareFallback")) return;
-		const currentModel = this.model;
-		if (!currentModel) return;
-		const currentSelector = formatRetryFallbackSelector(currentModel, this.thinkingLevel);
-		let health: ModelUsageHealth;
-		try {
-			health = await this.#modelRegistry.authStorage.getModelUsageHealth(currentModel.provider, {
-				modelId: currentModel.id,
-				sessionId: this.sessionId,
-				baseUrl: currentModel.baseUrl,
-				reserveFraction: this.settings.get("retry.usageReservePct") / 100,
-				signal,
-			});
-		} catch (error) {
-			logger.debug("Usage-aware runtime preflight failed open", {
-				provider: currentModel.provider,
-				model: currentModel.id,
-				error: String(error),
-			});
-			return;
-		}
-		if (signal.aborted) return;
-
-		if (health.state === "healthy") {
-			this.#usageReserveApprovedSelector = undefined;
-			const selected = health.accounts.find(account => account.selected);
-			if (selected && selected.state !== "healthy" && health.accounts.some(account => account.state === "healthy")) {
-				this.#modelRegistry.authStorage.releaseSessionCredentialForReselection(
-					currentModel.provider,
-					this.sessionId,
-				);
-			}
-			return;
-		}
-		if (health.state === "unknown") {
-			this.#usageReserveApprovedSelector = undefined;
-			return;
-		}
-		const reservePolicy = this.settings.get("retry.usageReservePolicy");
-		if (reservePolicy === "fail-closed") {
-			const condition = health.state === "reserve" ? "reserve reached" : "usage depleted";
-			throw new Error(`${condition} for ${currentSelector}; reserve policy is fail-closed.`);
-		}
-
-		const role = this.#recovery.resolveRetryFallbackRole(currentSelector, currentModel);
-		if (!role) return;
-		let fallback: { selector: RetryFallbackSelector; apiKey: string } | undefined;
-		for (const candidate of this.#recovery.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
-			if (this.#recovery.isRetryFallbackSelectorSuppressed(candidate)) continue;
-			const resolved = resolveModelOverride([candidate.raw], this.#modelRegistry, this.settings);
-			const candidateModel = resolved.model ?? this.#modelRegistry.find(candidate.provider, candidate.id);
-			if (!candidateModel) continue;
-			if (!this.#modelRegistry.hasConfiguredAuth(candidateModel)) continue;
-			try {
-				const candidateHealth = await this.#modelRegistry.authStorage.getModelUsageHealth(candidateModel.provider, {
-					modelId: candidateModel.id,
-					sessionId: this.sessionId,
-					baseUrl: candidateModel.baseUrl,
-					reserveFraction: this.settings.get("retry.usageReservePct") / 100,
-					signal,
-				});
-				if (signal.aborted) return;
-				if (candidateHealth.state === "depleted" || candidateHealth.state === "reserve") continue;
-				if (candidateHealth.state === "healthy") {
-					const selected = candidateHealth.accounts.find(account => account.selected);
-					if (
-						selected &&
-						selected.state !== "healthy" &&
-						candidateHealth.accounts.some(account => account.state === "healthy")
-					) {
-						this.#modelRegistry.authStorage.releaseSessionCredentialForReselection(
-							candidateModel.provider,
-							this.sessionId,
-						);
-					}
-				}
-			} catch {
-				if (signal.aborted) return;
-				// Unknown usage fails open for an otherwise valid fallback.
-			}
-			if (signal.aborted) return;
-			let apiKey: string | undefined;
-			try {
-				apiKey = await this.#modelRegistry.getApiKey(candidateModel, this.sessionId, { signal });
-			} catch {
-				if (signal.aborted) return;
-				continue;
-			}
-			if (signal.aborted) return;
-			if (!apiKey) continue;
-			fallback = { selector: candidate, apiKey };
-			break;
-		}
-		if (!fallback) return;
-
-		if (health.state === "reserve") {
-			if (reservePolicy === "confirm" && this.#usageFallbackConfirmer) {
-				if (this.#usageReserveApprovedSelector === currentSelector) return;
-				const selected = health.accounts.find(account => account.selected);
-				const remainingFraction =
-					selected?.remainingFraction ??
-					health.accounts.reduce<number | undefined>(
-						(minimum, account) =>
-							account.remainingFraction === undefined
-								? minimum
-								: minimum === undefined
-									? account.remainingFraction
-									: Math.min(minimum, account.remainingFraction),
-						undefined,
-					);
-				const shouldFallback = await this.#confirmUsageFallback(
-					{
-						from: currentSelector,
-						to: fallback.selector.raw,
-						remainingPercent: remainingFraction === undefined ? undefined : Math.max(0, remainingFraction * 100),
-					},
-					signal,
-				);
-				if (signal.aborted) return;
-				if (!shouldFallback) {
-					this.#usageReserveApprovedSelector = currentSelector;
-					return;
-				}
-			}
-		}
-
-		if (signal.aborted) return;
-		this.#usageReserveApprovedSelector = undefined;
-		await this.#recovery.applyRetryFallbackCandidate(role, fallback.selector, currentSelector, {
-			pinFallback: true,
-			apiKey: fallback.apiKey,
-			signal,
-		});
 	}
 
 	/** Effective thinking level applied to the agent (the resolved level when `auto`). */
@@ -4184,6 +4256,11 @@ export class AgentSession {
 		return this.agent.state.systemPrompt;
 	}
 
+	/** Marks streamed text as committed or buffered for turn-recovery replay decisions. */
+	setTextOutputCommitted(committed: boolean): void {
+		this.#textOutputCommitted = committed;
+	}
+
 	/** Current retry attempt (0 if not retrying) */
 	get retryAttempt(): number {
 		return this.#recovery.attempt;
@@ -4222,6 +4299,11 @@ export class AgentSession {
 	/** Names of every registered tool. */
 	getAllToolNames(): string[] {
 		return this.#tools.getAllToolNames();
+	}
+
+	/** Full metadata for every registered tool, including source provenance (backs `getAllTools()`). */
+	getAllToolInfos(): ToolInfo[] {
+		return this.#tools.getAllToolInfos();
 	}
 
 	/** Installs and activates the ephemeral vibe tool set. */
@@ -5026,7 +5108,7 @@ export class AgentSession {
 		if (this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
-			if (!(await this.#runUsageAwarePreflight())) return false;
+
 			// Steer/follow-up the keyword notices BEFORE the queued user message so the
 			// model reads the steering notice ahead of the prompt it modifies.
 			for (const notice of keywordNotices) {
@@ -5121,7 +5203,7 @@ export class AgentSession {
 		if (options?.queueOnly) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
-			if (!(await this.#runUsageAwarePreflight())) return;
+
 			for (const notice of keywordNotices) {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
@@ -5131,7 +5213,7 @@ export class AgentSession {
 		if (this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
-			if (!(await this.#runUsageAwarePreflight())) return;
+
 			for (const notice of keywordNotices) {
 				await this.#queueCustomMessage(notice, streamingBehavior);
 			}
@@ -5168,7 +5250,7 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		try {
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
-			if (!(await this.#runUsageAwarePreflight())) return;
+			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return;
 			// Flush any pending bash messages before the new prompt
 			await this.#bash.flushPending();
 			this.#eval.flushPending();
@@ -5310,11 +5392,13 @@ export class AgentSession {
 
 				if (result?.systemPrompt !== undefined) {
 					baseXdevCatalogDelivered = false;
-					this.agent.setSystemPrompt(result.systemPrompt);
+					this.#tools.setTurnSystemPromptOverride(result.systemPrompt);
 				} else {
+					this.#tools.clearTurnSystemPromptOverride();
 					this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
 				}
 			} else {
+				this.#tools.clearTurnSystemPromptOverride();
 				this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
 			}
 
@@ -5379,6 +5463,9 @@ export class AgentSession {
 				await this.#waitForPostPromptRecovery(generation);
 			}
 		} finally {
+			// The per-turn before_agent_start override lives only for this turn.
+			this.#tools.clearTurnSystemPromptOverride();
+			this.#usagePreflightReadyForNextModelCall = false;
 			this.#endInFlight();
 		}
 	}
@@ -5544,7 +5631,6 @@ export class AgentSession {
 		}
 
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
-		if (!(await this.#runUsageAwarePreflight())) return;
 		await this.#queueUserMessage(expandedText, images, "steer");
 	}
 
@@ -5562,7 +5648,6 @@ export class AgentSession {
 
 		const expandedText =
 			options?.expandPromptTemplates === false ? text : expandPromptTemplate(text, [...this.#promptTemplates]);
-		if (!(await this.#runUsageAwarePreflight())) return;
 		if (!options?.synthetic) {
 			await this.#queueUserMessage(expandedText, images, "followUp");
 			return;
@@ -5579,6 +5664,7 @@ export class AgentSession {
 		const imageDescriptionNotice = normalizedImages?.length
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
+		this.#allowQueuedMessageDrainRetry();
 		if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 		this.agent.followUp({
 			role: "developer",
@@ -5608,6 +5694,7 @@ export class AgentSession {
 		const imageDescriptionNotice = normalizedImages?.length
 			? await this.#buildImageDescriptionNotice(normalizedImages)
 			: undefined;
+		this.#allowQueuedMessageDrainRetry();
 		if (mode === "followUp") {
 			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
 			this.agent.followUp({
@@ -5634,7 +5721,12 @@ export class AgentSession {
 	}
 
 	#scheduleQueuedMessageDrain(): void {
-		if (this.#queuedMessageDrainScheduled || !this.#canAutoContinueForFollowUp() || !this.agent.hasQueuedMessages()) {
+		if (
+			this.#queuedMessageDrainScheduled ||
+			this.#queuedMessageDrainBlocked ||
+			!this.#canAutoContinueForFollowUp() ||
+			!this.agent.hasQueuedMessages()
+		) {
 			return;
 		}
 		this.#queuedMessageDrainScheduled = true;
@@ -5648,6 +5740,7 @@ export class AgentSession {
 			},
 			onError: () => {
 				this.#queuedMessageDrainScheduled = false;
+				this.#queuedMessageDrainBlocked = this.agent.hasQueuedMessages();
 			},
 		});
 	}
@@ -5784,7 +5877,7 @@ export class AgentSession {
 	): Promise<void> {
 		this.#beginInFlight();
 		try {
-			if (!(await this.#runUsageAwarePreflight())) return;
+			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return;
 			const acceptTerminalEmptyStop = options?.acceptTerminalEmptyStop === true;
 			if (acceptTerminalEmptyStop) {
 				this.#resetPromptMaintenanceState();
@@ -5793,6 +5886,7 @@ export class AgentSession {
 			await this.agent.prompt(message);
 			await this.#waitForPostPromptRecovery();
 		} finally {
+			this.#usagePreflightReadyForNextModelCall = false;
 			this.#recovery.setAcceptTerminalEmptyStop(false);
 			this.#endInFlight();
 		}
@@ -5824,6 +5918,7 @@ export class AgentSession {
 			timestamp: Date.now(),
 		};
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
+		this.#allowQueuedMessageDrainRetry();
 		if (deliverAs === "followUp") {
 			this.agent.followUp(normalizedAppMessage);
 		} else {
@@ -5880,7 +5975,7 @@ export class AgentSession {
 				this.#queueHiddenNextTurnMessage(normalizedAppMessage, options?.triggerTurn ?? false);
 				return false;
 			}
-			if (!(await this.#runUsageAwarePreflight())) return false;
+			this.#allowQueuedMessageDrainRetry();
 
 			if (options?.deliverAs === "followUp") {
 				this.agent.followUp(normalizedAppMessage);
@@ -5963,8 +6058,6 @@ export class AgentSession {
 			if (images.length === 0) images = undefined;
 		}
 
-		if (options?.deliverAs && !(await this.#runUsageAwarePreflight())) return;
-
 		if (options?.deliverAs === "followUp") {
 			await this.#queueUserMessage(text, images, "followUp");
 			return;
@@ -6004,6 +6097,7 @@ export class AgentSession {
 			? isAdvisorCard
 			: m => !isUserQueuedMessage(m) && !isHiddenUserCompanion(m);
 		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
+		this.#reconcileQueuedMessageDrain();
 		return { steering, followUp };
 	}
 
@@ -6053,12 +6147,14 @@ export class AgentSession {
 		if (fromSteer >= 0) {
 			const removed = steering[fromSteer];
 			this.agent.replaceQueues(removeWithCompanions(steering, fromSteer), followUp.slice());
+			this.#reconcileQueuedMessageDrain();
 			return toRestoredQueuedMessage(removed);
 		}
 		const fromFollowUp = lastUserIndex(followUp);
 		if (fromFollowUp >= 0) {
 			const removed = followUp[fromFollowUp];
 			this.agent.replaceQueues(steering.slice(), removeWithCompanions(followUp, fromFollowUp));
+			this.#reconcileQueuedMessageDrain();
 			return toRestoredQueuedMessage(removed);
 		}
 		return undefined;
@@ -6227,6 +6323,9 @@ export class AgentSession {
 			this.abortRetry();
 			this.#promptGeneration++;
 			this.#scheduledHiddenNextTurnGeneration = undefined;
+			// Abort the handoff first so generic compaction cancellation cannot replace
+			// the harness reason with an unreasoned "Handoff cancelled".
+			this.#handoff.abortHandoff(new Error(options?.reason ?? "Handoff aborted by session"));
 			if (options?.preserveCompaction) {
 				// Manual `/compact` installed its own #compactionAbortController before
 				// this internal abort and must keep it alive (that marker is what makes
@@ -6238,7 +6337,6 @@ export class AgentSession {
 			} else {
 				this.abortCompaction();
 			}
-			this.abortHandoff();
 			this.abortBash();
 			this.abortEval();
 			const postPromptDrain = this.#cancelPostPromptTasks();
@@ -6348,6 +6446,8 @@ export class AgentSession {
 			await this.#memory.resetContextForNewTranscript();
 			this.#pendingNextTurnMessages = [];
 			this.#scheduledHiddenNextTurnGeneration = undefined;
+			this.#queuedMessageDrainBlocked = false;
+			this.#usagePreflightReadyForNextModelCall = false;
 
 			this.sessionManager.appendThinkingLevelChange(this.thinkingLevel, this.configuredThinkingLevel());
 			this.sessionManager.appendServiceTierChange(this.#models.serviceTierEntry());
@@ -6712,9 +6812,10 @@ export class AgentSession {
 	}
 
 	#extractRewindReport(messages: AgentMessage[]): string | undefined {
-		if (!this.#checkpointState) return undefined;
+		const checkpointState = this.#checkpointState;
+		if (!checkpointState) return undefined;
 		if (this.#pendingRewindReport) return this.#pendingRewindReport;
-		for (let i = messages.length - 1; i >= 0; i--) {
+		for (let i = messages.length - 1; i >= checkpointState.checkpointMessageCount; i--) {
 			const message = messages[i];
 			if (message?.role !== "toolResult" || message.isError) continue;
 			const semanticResult = semanticToolResult(message.toolName, message);
@@ -7372,6 +7473,9 @@ export class AgentSession {
 		const previousFollowUpMessages = [...this.agent.peekFollowUpQueue()];
 		const previousPendingNextTurnMessages = [...this.#pendingNextTurnMessages];
 		const previousScheduledHiddenNextTurnGeneration = this.#scheduledHiddenNextTurnGeneration;
+		const previousQueuedMessageDrainBlocked = this.#queuedMessageDrainBlocked;
+		const previousUsagePreflightReadyForNextModelCall = this.#usagePreflightReadyForNextModelCall;
+		const previousUsagePreflightReadyModel = this.#usagePreflightReadyModel;
 		const previousModel = this.model;
 		const previousThinkingLevel = this.thinkingLevel;
 		const previousAutoThinking = this.isAutoThinking;
@@ -7396,6 +7500,9 @@ export class AgentSession {
 		this.agent.clearAllQueues();
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.#queuedMessageDrainBlocked = false;
+		this.#usagePreflightReadyForNextModelCall = false;
+		this.#usagePreflightReadyModel = undefined;
 
 		try {
 			if (switchingToDifferentSession) {
@@ -7564,6 +7671,9 @@ export class AgentSession {
 			this.agent.replaceQueues(previousSteeringMessages, previousFollowUpMessages);
 			this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
 			this.#scheduledHiddenNextTurnGeneration = previousScheduledHiddenNextTurnGeneration;
+			this.#queuedMessageDrainBlocked = previousQueuedMessageDrainBlocked;
+			this.#usagePreflightReadyForNextModelCall = previousUsagePreflightReadyForNextModelCall;
+			this.#usagePreflightReadyModel = previousUsagePreflightReadyModel;
 			this.#inheritedProviderPromptCacheKey = previousInheritedProviderPromptCacheKey;
 			this.#checkpointState = previousCheckpointState;
 			this.#pendingRewindReport = previousPendingRewindReport;
@@ -7652,6 +7762,8 @@ export class AgentSession {
 		// Clear pending messages (bound to old session state)
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
+		this.#queuedMessageDrainBlocked = false;
+		this.#usagePreflightReadyForNextModelCall = false;
 
 		await this.#bash.flushPending();
 		// Flush pending writes before branching
@@ -7779,6 +7891,8 @@ export class AgentSession {
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.agent.replaceQueues([], []);
+		this.#queuedMessageDrainBlocked = false;
+		this.#usagePreflightReadyForNextModelCall = false;
 		await this.#bash.flushPending();
 		await this.sessionManager.flush();
 		const bashTransition = this.#bash.beginSessionTransition();

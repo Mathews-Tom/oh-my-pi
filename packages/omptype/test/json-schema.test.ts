@@ -141,11 +141,11 @@ describe("irToJsonSchema", () => {
 	});
 
 	it("honors draft targets, explicit dialects, and unsupported-node fallbacks", () => {
+		// A fixed tuple is closed by `additionalItems: false`; ArkType emits no `maxItems`.
 		expect(irToJsonSchema(parseDef(["string", "number"]), { target: "draft-07" })).toEqual({
 			type: "array",
 			items: [{ type: "string" }, { type: "number" }],
 			minItems: 2,
-			maxItems: 2,
 			additionalItems: false,
 			$schema: "http://json-schema.org/draft-07/schema#",
 		});

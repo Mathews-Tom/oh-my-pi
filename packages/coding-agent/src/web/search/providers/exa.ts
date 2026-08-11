@@ -458,13 +458,13 @@ export class ExaProvider extends SearchProvider {
 	 * still uses {@link isAvailable} so an unrelated configured provider
 	 * keeps priority over the public fallback.
 	 */
-	isExplicitlyAvailable(_authStorage: AuthStorage): boolean {
+	override isExplicitlyAvailable(_authStorage: AuthStorage): boolean {
 		return this.#settingsAllowSearch();
 	}
 
 	#settingsAllowSearch(): boolean {
 		try {
-			if (settings.get("exa.enabled") === false || settings.get("exa.enableSearch") === false) {
+			if (settings.get("exa.enabled") === false) {
 				return false;
 			}
 		} catch {
