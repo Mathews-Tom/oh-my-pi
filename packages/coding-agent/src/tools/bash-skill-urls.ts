@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { Rule } from "../capability/rule";
 import { resolveContainedPathSync } from "../discovery/contained-path";
 import type { Skill } from "../extensibility/skills";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
@@ -25,6 +26,8 @@ interface InternalUrlResolver {
 
 export interface InternalUrlExpansionOptions {
 	skills: readonly Skill[];
+	/** Calling session's loaded rules. Prefer this over process-global rule state for rule:// URLs. */
+	rules?: readonly Rule[];
 	noEscape?: boolean;
 	internalRouter?: InternalUrlResolver;
 	localOptions?: LocalProtocolOptions;
@@ -237,14 +240,17 @@ function shellEscape(p: string): string {
 	return `'${p.replace(/'/g, "'\\''")}'`;
 }
 
-async function resolveInternalUrlToPath(
-	rawUrl: string,
-	skills: readonly Skill[],
-	internalRouter?: InternalUrlResolver,
-	localOptions?: LocalProtocolOptions,
-	ensureLocalParentDirs?: boolean,
-	cwd?: string,
-): Promise<string> {
+interface ResolveInternalUrlToPathOptions {
+	skills: readonly Skill[];
+	rules?: readonly Rule[];
+	internalRouter?: InternalUrlResolver;
+	localOptions?: LocalProtocolOptions;
+	ensureLocalParentDirs?: boolean;
+	cwd?: string;
+}
+
+async function resolveInternalUrlToPath(rawUrl: string, options: ResolveInternalUrlToPathOptions): Promise<string> {
+	const { skills, rules, internalRouter, localOptions, ensureLocalParentDirs, cwd } = options;
 	const url = normalizeLocalScheme(rawUrl);
 	const scheme = extractScheme(url);
 	if (!scheme) {
@@ -277,7 +283,7 @@ async function resolveInternalUrlToPath(
 
 	let resource: InternalResource;
 	try {
-		resource = await internalRouter.resolve(url, { cwd, pathOnly: true });
+		resource = await internalRouter.resolve(url, { cwd, rules, pathOnly: true });
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new ToolError(`Failed to resolve ${scheme}:// URL in bash command: ${url}\n${message}`);
@@ -331,14 +337,14 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 		const url = normalizeLocalScheme(rawUrl);
 		let resolvedPath: string;
 		try {
-			resolvedPath = await resolveInternalUrlToPath(
-				url,
-				options.skills,
-				options.internalRouter,
-				options.localOptions,
-				options.ensureLocalParentDirs,
-				options.cwd,
-			);
+			resolvedPath = await resolveInternalUrlToPath(url, {
+				skills: options.skills,
+				rules: options.rules,
+				internalRouter: options.internalRouter,
+				localOptions: options.localOptions,
+				ensureLocalParentDirs: options.ensureLocalParentDirs,
+				cwd: options.cwd,
+			});
 		} catch {
 			continue;
 		}

@@ -1,7 +1,9 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import { type Rule, resetActiveRulesForTests, setActiveRules } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
-import { type ResolveContext, resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { parseInternalUrl, type ResolveContext, resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { RuleProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/rule-protocol";
 import { expandInternalUrls, expandSkillUrls } from "@oh-my-pi/pi-coding-agent/tools/bash-skill-urls";
 import { ToolError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 
@@ -45,6 +47,15 @@ function createInternalRouter(resources: Record<string, { sourcePath?: string; e
 				immutable: true,
 			};
 		},
+	};
+}
+
+function createRule(name: string, filePath: string, content: string): Rule {
+	return {
+		name,
+		path: filePath,
+		content,
+		_source: { provider: "test", providerName: "test", path: filePath, level: "project" },
 	};
 }
 
@@ -426,5 +437,50 @@ describe("expandInternalUrls", () => {
 			getSessionId: () => "session-1",
 		};
 		await expect(expandInternalUrls(command, { skills: [], localOptions })).resolves.toBe(command);
+	});
+
+	describe("rule:// session scoping", () => {
+		afterEach(() => {
+			resetActiveRulesForTests();
+		});
+
+		it("resolves rule:// URLs against the caller's session rules, not another session's process-global active rules", async () => {
+			// Two top-level sessions share the process. Session B is the most
+			// recently started session, so it owns the process-global active-rule
+			// snapshot (see `setActiveRules` in sdk.ts). Session A's bash command
+			// must still resolve its own "shared" rule, not session B's.
+			const sessionARule = createRule("shared", "/tmp/session-a/shared.md", "Session A rule.\n");
+			const sessionBRule = createRule("shared", "/tmp/session-b/shared.md", "Session B rule.\n");
+			setActiveRules([sessionBRule]);
+
+			const handler = new RuleProtocolHandler();
+			const router = {
+				canHandle: (input: string) => input.startsWith("rule://"),
+				resolve: (input: string, context?: ResolveContext) => handler.resolve(parseInternalUrl(input), context),
+			};
+
+			await expect(
+				expandInternalUrls("cat rule://shared", {
+					skills: [],
+					rules: [sessionARule],
+					internalRouter: router,
+				}),
+			).resolves.toBe(`cat ${shellEscape(sessionARule.path)}`);
+		});
+
+		it("falls back to the process-global active rules when the caller has none", async () => {
+			const globalRule = createRule("shared", "/tmp/global/shared.md", "Global rule.\n");
+			setActiveRules([globalRule]);
+
+			const handler = new RuleProtocolHandler();
+			const router = {
+				canHandle: (input: string) => input.startsWith("rule://"),
+				resolve: (input: string, context?: ResolveContext) => handler.resolve(parseInternalUrl(input), context),
+			};
+
+			await expect(expandInternalUrls("cat rule://shared", { skills: [], internalRouter: router })).resolves.toBe(
+				`cat ${shellEscape(globalRule.path)}`,
+			);
+		});
 	});
 });
