@@ -166,6 +166,14 @@ describe("openai-codex optional response controls", () => {
 		expect("stream_options" in suppressed).toBe(false);
 	});
 
+	it("disables native reasoning with effort none when an external scratchpad replaces it", async () => {
+		const model = createCodexModel("gpt-5.5");
+		const body = await buildTransformedCodexRequestBody(model, createCodexTestContext(), {
+			forceReasoningOff: true,
+		});
+		expect(body.reasoning).toEqual({ effort: "none" });
+	});
+
 	it("forces reasoning.context to all_turns for Responses Lite", async () => {
 		const model = createCodexModel("gpt-5.5");
 

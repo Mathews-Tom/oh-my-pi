@@ -1139,6 +1139,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	externalThinking: {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Thinking",
+			label: "External Thinking",
+			description: "Use a private think tool and send reasoning effort off to GPT Responses models",
+		},
+	},
+
 	"model.loopGuard.enabled": {
 		type: "boolean",
 		default: true,

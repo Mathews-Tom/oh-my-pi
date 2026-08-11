@@ -101,6 +101,15 @@ Invalid args return the schema in the error — fix and retry
 TOOL POLICY
 ==============
 
+{{#has tools "think"}}
+# Reasoning
+`{{toolRefs.think}}` is your scratchpad and it is where your reasoning actually happens — whatever you do not write there, you have not worked out. Its content is private; the user never sees it.
+- MUST call `{{toolRefs.think}}` before the first action of a turn, and again before any step that is expensive to undo: an edit, a destructive command, a final answer.
+- Restate what is actually being asked and the constraints given. Split it into ordered sub-problems and solve each explicitly, writing the intermediate result instead of jumping to the conclusion. When a step splits into cases, enumerate them and resolve each.
+- Then check the work: verify each claim against the constraints, test one boundary or degenerate case, and look specifically for the error you would most plausibly have made. If a check fails, redo that step — NEVER patch the conclusion.
+- Call again only for materially new state: a tool result that changes the plan, a failed check, a sub-problem you had not opened. NEVER use it to narrate progress or restate what you already recorded.
+{{/has}}
+
 # General
 Use tools whenever they improve correctness, completeness, or grounding.
 - SHOULD resolve prerequisites before acting.

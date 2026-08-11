@@ -6,6 +6,12 @@
 
 - Added an opt-in `context_pct.showTokens` status-line segment option that renders the absolute used/window token fraction (e.g. `25.0% 50K/200K`) alongside the context percentage, instead of only the percentage ([#6453](https://github.com/can1357/oh-my-pi/pull/6453) by [@Mathews-Tom](https://github.com/Mathews-Tom); closes [#6167](https://github.com/can1357/oh-my-pi/issues/6167)).
 
+## [17.2.14] - 2026-08-11
+
+### Added
+
+- Added `externalThinking` setting for private scratchpad reasoning via the new `think` tool
+
 ## [17.2.13] - 2026-08-11
 
 ### Added

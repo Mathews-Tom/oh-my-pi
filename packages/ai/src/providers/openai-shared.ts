@@ -2428,6 +2428,20 @@ export function finalizeMessageText(item: ResponseOutputMessage, streamedText: s
 	if (!item.content?.length) return streamedText || "";
 	return item.content.map(part => (part.type === "output_text" ? (part.text ?? "") : (part.refusal ?? ""))).join("");
 }
+export const JUICE_EFFORT_MAP: Record<string, number> = {
+	none: 0,
+	minimal: 2,
+	low: 4,
+	medium: 8,
+	high: 48,
+	xhigh: 112,
+	max: 960,
+};
+
+export function getJuiceValue(effort?: string): number {
+	if (!effort) return 8;
+	return JUICE_EFFORT_MAP[effort] ?? 8;
+}
 
 export function accumulateToolCallArgumentsDelta(
 	block: ResponsesToolCallBlock,
@@ -3308,6 +3322,14 @@ type ReasoningOptions = {
 export interface ApplyResponsesCompatPolicyOptions {
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
 	mapEffort?: (effort: string) => string;
+	/**
+	 * Suppress native reasoning by sending `reasoning.effort: "none"` — the only
+	 * disable level the Responses API defines (`"off"` is not a wire value and
+	 * 400s everywhere). Gateways that reject `none` for a given model are
+	 * handled by the reasoning-effort fallback retry, which clamps to the
+	 * lowest level the error reports as allowed.
+	 */
+	forceReasoningOff?: boolean;
 }
 
 export function applyResponsesCompatPolicy<P extends ResponseCreateParamsStreaming>(
@@ -3316,6 +3338,10 @@ export function applyResponsesCompatPolicy<P extends ResponseCreateParamsStreami
 	options: ApplyResponsesCompatPolicyOptions | undefined,
 ): void {
 	const reasoning = policy.reasoning;
+	if (options?.forceReasoningOff) {
+		params.reasoning = { effort: "none" } as P["reasoning"];
+		return;
+	}
 	if (!reasoning.modelSupported) return;
 	if (reasoning.includeEncryptedReasoning) {
 		const include = params.include ?? [];

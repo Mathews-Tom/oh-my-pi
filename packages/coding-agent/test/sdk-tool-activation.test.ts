@@ -147,6 +147,157 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
+	it("activates the private think tool when external thinking is enabled at runtime", async () => {
+		const tempDir = makeTempDir();
+		const settings = Settings.isolated();
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings,
+		});
+
+		try {
+			expect(session.getToolByName("think")).toBeUndefined();
+			expect(session.getActiveToolNames()).not.toContain("think");
+
+			settings.set("externalThinking", true);
+			await session.setThinkToolEnabled(true);
+
+			expect(session.getToolByName("think")).toBeDefined();
+			expect(session.getActiveToolNames()).toContain("think");
+			expect(session.getXdevToolEntries().map(entry => entry.name)).not.toContain("think");
+
+			settings.set("externalThinking", false);
+			await session.setThinkToolEnabled(false);
+			expect(session.getActiveToolNames()).not.toContain("think");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("activates the private think tool at startup when external thinking is configured", async () => {
+		const tempDir = makeTempDir();
+		const settings = Settings.isolated({ externalThinking: true });
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings,
+		});
+
+		try {
+			expect(session.getToolByName("think")).toBeDefined();
+			expect(session.getActiveToolNames()).toContain("think");
+			expect(session.getXdevToolEntries().map(entry => entry.name)).not.toContain("think");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("forces think and sends reasoning effort off for a Responses turn", async () => {
+		const tempDir = makeTempDir();
+		const settings = Settings.isolated({ externalThinking: true });
+		const requestTexts: string[] = [];
+		const sse = (events: unknown[]): Response =>
+			new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+				headers: { "content-type": "text/event-stream" },
+			});
+		const completed = (id: string) => ({
+			type: "response.completed",
+			response: {
+				id,
+				status: "completed",
+				usage: {
+					input_tokens: 1,
+					output_tokens: 1,
+					total_tokens: 2,
+					input_tokens_details: { cached_tokens: 0 },
+				},
+			},
+		});
+		const server = Bun.serve({
+			port: 0,
+			fetch: async request => {
+				requestTexts.push(await request.text());
+				if (requestTexts.length === 1) {
+					const argumentsJson = JSON.stringify({ thoughts: "Checked the request before answering." });
+					return sse([
+						{
+							type: "response.output_item.added",
+							output_index: 0,
+							item: {
+								type: "function_call",
+								id: "fc_think",
+								call_id: "call_think",
+								name: "think",
+								arguments: "",
+							},
+						},
+						{
+							type: "response.function_call_arguments.done",
+							output_index: 0,
+							item_id: "fc_think",
+							arguments: argumentsJson,
+						},
+						{
+							type: "response.output_item.done",
+							output_index: 0,
+							item: {
+								type: "function_call",
+								id: "fc_think",
+								call_id: "call_think",
+								name: "think",
+								arguments: argumentsJson,
+							},
+						},
+						completed("resp_think"),
+					]);
+				}
+				return sse([
+					{ type: "response.output_text.delta", output_index: 0, delta: "Done." },
+					{
+						type: "response.output_item.done",
+						output_index: 0,
+						item: {
+							type: "message",
+							id: "msg_done",
+							role: "assistant",
+							status: "completed",
+							content: [{ type: "output_text", text: "Done." }],
+						},
+					},
+					completed("resp_done"),
+				]);
+			},
+		});
+		const model = getBundledModel("openai", "gpt-5");
+		if (!model) throw new Error("Expected gpt-5 model to exist");
+		// The prompt preflight validates the key through the registry (not the
+		// per-request `getApiKey` override), so seed it for keyless CI runners.
+		modelRegistry.authStorage.setRuntimeApiKey("openai", "test-key");
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings,
+			model: { ...model, baseUrl: `${server.url}v1` },
+			getApiKey: () => "test-key",
+		});
+		expect(session.getActiveToolNames()).toContain("think");
+
+		try {
+			await session.prompt("Use the scratchpad before answering.");
+			const firstRequest = requestTexts.at(0);
+			if (!firstRequest) throw new Error("Expected the initial provider request.");
+			expect(requestTexts).toHaveLength(2);
+			expect(JSON.parse(firstRequest)).toEqual(
+				expect.objectContaining({
+					// "none" is the only disable level the Responses wire accepts ("off" 400s).
+					reasoning: { effort: "none" },
+					tool_choice: expect.objectContaining({ name: "think" }),
+				}),
+			);
+		} finally {
+			await session.dispose();
+			server.stop(true);
+		}
+	});
+
 	it("publishes tools from lazy session startup before the input lifecycle completes", async () => {
 		const tempDir = makeTempDir();
 		const startupGate = Promise.withResolvers<void>();

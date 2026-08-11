@@ -479,6 +479,11 @@ export interface StreamOptions {
 	 */
 	statefulResponses?: boolean;
 	/**
+	 * Emit `reasoning: { effort: "none" }` for OpenAI Responses and Codex requests.
+	 * Used when a caller supplies an external reasoning scratchpad; other transports ignore it.
+	 */
+	forceReasoningOff?: boolean;
+	/**
 	 * Provider-scoped mutable state store for this agent session.
 	 * Providers can use this to persist transport/session state between turns.
 	 */
