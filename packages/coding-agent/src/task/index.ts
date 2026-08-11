@@ -23,10 +23,12 @@ import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.m
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskAsyncContractTemplate from "../prompts/tools/task-async-contract.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
+import { TASK_EFFORTS, type TaskEffort } from "../thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { isIrcEnabled } from "../tools/hub";
 import { formatBytes, formatDuration } from "../tools/render-utils";
-import { resolveSpawnPolicy } from "./spawn-policy";
+import { isReadOnlyAgent } from "./read-only-policy";
+import { isScoutSpawnable, resolveSpawnPolicy } from "./spawn-policy";
 import {
 	type AgentDefinition,
 	type AgentProgress,
@@ -101,6 +103,7 @@ export { loadBundledAgents as BUNDLED_AGENTS } from "./agents";
 export { discoverCommands, expandCommand, getCommand } from "./commands";
 export { discoverAgents, getAgent } from "./discovery";
 export { AgentOutputManager } from "./output-manager";
+export * from "./read-only-policy";
 export type {
 	AgentDefinition,
 	AgentProgress,
@@ -118,32 +121,6 @@ export {
 	taskSchema,
 } from "./types";
 
-// Built-in tools whose approval tier is "read" (see tool classes' `approval`).
-// An agent is read-only iff its declared tools are a non-empty subset of this set.
-// Fail-safe: any unknown tool makes the agent not read-only.
-export const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
-	"read",
-	"grep",
-	"glob",
-	"web_search",
-	"ast_grep",
-	"yield",
-	"hub",
-	"ask",
-	"todo",
-	"recall",
-	"reflect",
-	"retain",
-	"memory_edit",
-	"inspect_image",
-	"checkpoint",
-	"rewind",
-]);
-
-export function isReadOnlyAgent(agent: AgentDefinition): boolean {
-	return !!agent.tools?.length && agent.tools.every(tool => READ_ONLY_TOOL_NAMES.has(tool));
-}
-
 /**
  * Preview text for a child result. Falls back to "(no output)" — annotated
  * with the request count when the child actually did work, so the parent can
@@ -155,27 +132,31 @@ export function formatResultOutputFallback(result: Pick<SingleResult, "output" |
 	return result.requests > 0 ? `(no output) after ${result.requests} req` : "(no output)";
 }
 
-/**
- * Render the tool description from a cached agent list and current settings.
- */
-function renderDescription(
-	agents: AgentDefinition[],
-	isolationEnabled: boolean,
-	applyIsolatedChanges: boolean,
-	disabledAgents: string[],
-	batchEnabled: boolean,
-	asyncEnabled: boolean,
-	ircEnabled: boolean,
-	parentSpawns: string,
-): string {
-	const spawnPolicy = resolveSpawnPolicy(parentSpawns);
+interface TaskDescriptionOptions {
+	agents: AgentDefinition[];
+	isolationEnabled: boolean;
+	applyIsolatedChanges: boolean;
+	disabledAgents: string[];
+	batchEnabled: boolean;
+	effortEnabled: boolean;
+	asyncEnabled: boolean;
+	ircEnabled: boolean;
+	parentSpawns: string;
+}
+
+/** Render the tool description from a cached agent list and current settings. */
+function renderDescription(options: TaskDescriptionOptions): string {
+	const spawnPolicy = resolveSpawnPolicy(options.parentSpawns);
 	const spawningDisabled = !spawnPolicy.enabled;
-	let filteredAgents = disabledAgents.length > 0 ? agents.filter(a => !disabledAgents.includes(a.name)) : agents;
+	let filteredAgents =
+		options.disabledAgents.length > 0
+			? options.agents.filter(agent => !options.disabledAgents.includes(agent.name))
+			: options.agents;
 	if (spawningDisabled) {
 		filteredAgents = [];
 	} else if (spawnPolicy.allowedAgents !== null) {
 		const allowed = new Set(spawnPolicy.allowedAgents);
-		filteredAgents = filteredAgents.filter(a => allowed.has(a.name));
+		filteredAgents = filteredAgents.filter(agent => allowed.has(agent.name));
 	}
 	const renderedAgents = filteredAgents.map(agent => ({
 		name: agent.name,
@@ -183,16 +164,19 @@ function renderDescription(
 		readOnly: isReadOnlyAgent(agent),
 		blocking: agent.blocking === true,
 	}));
+	const scoutAvailable = isScoutSpawnable(options.disabledAgents, options.parentSpawns);
 	return prompt.render(taskDescriptionTemplate, {
 		agents: renderedAgents,
+		scoutAvailable,
 		spawningDisabled,
 		defaultAgent: spawnPolicy.defaultAgent,
-		isolationEnabled,
-		applyIsolatedChanges,
-		batchEnabled,
-		asyncEnabled,
+		isolationEnabled: options.isolationEnabled,
+		applyIsolatedChanges: options.applyIsolatedChanges,
+		batchEnabled: options.batchEnabled,
+		effortEnabled: options.effortEnabled,
+		asyncEnabled: options.asyncEnabled,
 		hasBlockingAgents: renderedAgents.some(agent => agent.blocking),
-		ircEnabled,
+		ircEnabled: options.ircEnabled,
 	});
 }
 
@@ -231,17 +215,11 @@ function validateShapeParams(batchEnabled: boolean, params: TaskParams): string 
  * policy later, in `spawnParamsFor`. Returns a problem description, or
  * undefined when valid.
  */
-function hasInvalidModelSelector(model: unknown): boolean {
-	if (model === undefined) return false;
-	const selectors = typeof model === "string" ? [model] : Array.isArray(model) ? model : undefined;
-	const materializedSelectors = selectors ? Array.from(selectors) : [];
-	return (
-		!selectors ||
-		materializedSelectors.length === 0 ||
-		materializedSelectors.some(
-			selector => typeof selector !== "string" || !selector.split(",").some(pattern => pattern.trim()),
-		)
-	);
+
+/** Reject an out-of-range `effort` selector on internal/stale-transcript calls that bypass the wire schema. */
+function validateEffort(effort: TaskEffort | undefined, label: string): string | undefined {
+	if (effort === undefined || TASK_EFFORTS.includes(effort)) return undefined;
+	return `${label} has an invalid \`effort\` value ${JSON.stringify(effort)}. Use "lo", "med", or "hi".`;
 }
 
 function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string | undefined {
@@ -259,9 +237,8 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 			if (!item || typeof item.task !== "string" || item.task.trim() === "") {
 				return `Task ${i + 1}${item?.name ? ` (\`${item.name}\`)` : ""} is missing \`task\`. Every task needs complete, self-contained instructions.`;
 			}
-			if (hasInvalidModelSelector(item.model)) {
-				return `Task ${i + 1}${item.name ? ` (\`${item.name}\`)` : ""} has an invalid \`model\`. Provide a non-empty selector or a non-empty array of non-empty selectors.`;
-			}
+			const effortError = validateEffort(item.effort, `Task ${i + 1}${item.name ? ` (\`${item.name}\`)` : ""}`);
+			if (effortError) return effortError;
 		}
 		const seen = new Map<string, string>();
 		for (const item of tasks) {
@@ -284,10 +261,7 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 			? "Missing `tasks`. Provide a `tasks` array (one subagent per item) with a shared `context`."
 			: "Missing `task`. Provide complete, self-contained instructions for the agent.";
 	}
-	if (hasInvalidModelSelector(params.model)) {
-		return "Invalid `model`. Provide a non-empty selector or a non-empty array of non-empty selectors.";
-	}
-	return undefined;
+	return validateEffort(params.effort, "The call");
 }
 
 /**
@@ -300,9 +274,10 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if (Array.isArray(params.tasks) && params.tasks.length > 0) {
 		return params.tasks;
 	}
-	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task, model: params.model };
+	const item: TaskItem = { name: params.name, agent: params.agent, task: params.task };
 	if ("outputSchema" in params) item.outputSchema = params.outputSchema;
 	if ("schemaMode" in params) item.schemaMode = params.schemaMode;
+	if ("effort" in params) item.effort = params.effort;
 	if ("isolated" in params) item.isolated = params.isolated;
 	return [item];
 }
@@ -320,10 +295,10 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	const spawn: TaskParams = { agent: item.agent?.trim() || defaultAgent };
 	if (item.name !== undefined) spawn.name = item.name;
 	if (item.task !== undefined) spawn.task = item.task;
-	if (item.model !== undefined) spawn.model = item.model;
 	if (params.context !== undefined) spawn.context = params.context;
 	if ("outputSchema" in item) spawn.outputSchema = item.outputSchema;
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
+	if ("effort" in item) spawn.effort = item.effort;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
@@ -401,15 +376,19 @@ const GENERIC_SPAWN_AGENTS: ReadonlySet<string> = new Set(["task", "sonic"]);
  * (DepthCapacity: it currently has the `task` tool). `agentNames` are the
  * per-item resolved agent types. Returns undefined when no nudge applies.
  */
-export function buildSpecializationAdvisory(agentNames: string[], depthCapacity: boolean): string | undefined {
+export function buildSpecializationAdvisory(
+	agentNames: string[],
+	depthCapacity: boolean,
+	scoutAvailable = true,
+): string | undefined {
 	if (!depthCapacity) return undefined;
 	const generics = agentNames.filter(name => GENERIC_SPAWN_AGENTS.has(name));
 	if (generics.length < 2) return undefined;
-	return (
-		`Tip: this call spawned ${generics.length} generic \`${generics[0]}\` workers. ` +
-		`Check the agent list for a closer specialist type — e.g. read-only research belongs on ` +
-		`\`agent: "scout"\`, which runs on a faster model.`
-	);
+	const specialist = scoutAvailable
+		? `Check the agent list for a closer specialist type — e.g. read-only research belongs on ` +
+			`\`agent: "scout"\`, which runs on a faster model.`
+		: `Check the agent list for a closer specialist type.`;
+	return `Tip: this call spawned ${generics.length} generic \`${generics[0]}\` workers. ${specialist}`;
 }
 
 /**
@@ -446,10 +425,11 @@ export function composeSpawnAdvisory(args: {
 	depthCapacity: boolean;
 	ircEnabled: boolean;
 	willRunAsync: boolean;
+	scoutAvailable?: boolean;
 }): string | undefined {
 	return (
 		[
-			buildSpecializationAdvisory(args.agents, args.depthCapacity),
+			buildSpecializationAdvisory(args.agents, args.depthCapacity, args.scoutAvailable),
 			args.willRunAsync ? buildCoordinationAdvisory(args.items, args.depthCapacity, args.ircEnabled) : undefined,
 		]
 			.filter(Boolean)
@@ -461,16 +441,19 @@ export function composeSpawnAdvisory(args: {
 class TaskJobError extends Error {}
 
 /**
- * Process-level memo for create-time agent discovery, keyed by resolved cwd.
+ * Process-level create-time discovery memo and published reload snapshots,
+ * keyed by resolved cwd.
  *
  * `TaskTool.create` runs for every (sub)agent session in this process and the
  * walk-up + plugin-registry scan in `discoverAgents` is identical for a given
- * cwd, so repeat creations reuse the first scan. Execution-time discovery
- * (`#runSpawn`) intentionally stays fresh. The memo also tracks the live
- * `discoverAgents` binding: test spies swap that binding, which invalidates
- * the memo automatically.
+ * cwd, so repeat creations reuse the first scan. Explicit plugin reloads
+ * replace the matching snapshot so already-created tools advertise the latest
+ * definitions. Execution-time discovery (`#runSpawn`) intentionally stays
+ * fresh. The memo also tracks the live `discoverAgents` binding: test spies
+ * swap that binding, which invalidates both caches automatically.
  */
 const discoveryMemo = new Map<string, Promise<DiscoveryResult>>();
+const discoverySnapshots = new Map<string, AgentDefinition[]>();
 let discoveryMemoFn: typeof discoverAgents | undefined;
 
 function discoverAgentsForCreate(cwd: string): Promise<DiscoveryResult> {
@@ -478,6 +461,7 @@ function discoverAgentsForCreate(cwd: string): Promise<DiscoveryResult> {
 	if (discoveryMemoFn !== fn) {
 		discoveryMemoFn = fn;
 		discoveryMemo.clear();
+		discoverySnapshots.clear();
 	}
 	const key = path.resolve(cwd);
 	let pending = discoveryMemo.get(key);
@@ -491,12 +475,15 @@ function discoverAgentsForCreate(cwd: string): Promise<DiscoveryResult> {
 	return pending;
 }
 
-function formatModelForApproval(model: unknown): string | undefined {
-	const selectors = typeof model === "string" ? [model] : Array.isArray(model) ? model : [];
-	const normalized = selectors.filter(
-		(selector): selector is string => typeof selector === "string" && !!selector.trim(),
-	);
-	return normalized.length > 0 ? truncateForPrompt(normalized.join(" → ")) : undefined;
+/** Rescan one cwd and publish its definitions to existing and future task tools. */
+export async function refreshAgentDiscovery(cwd: string): Promise<void> {
+	const key = path.resolve(cwd);
+	discoveryMemo.delete(key);
+	const pending = discoverAgentsForCreate(cwd);
+	const { agents } = await pending;
+	if (discoveryMemo.get(key) === pending) {
+		discoverySnapshots.set(key, agents);
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -522,8 +509,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		if (typeof params.name === "string" && params.name.trim()) {
 			lines.push(`Name: ${truncateForPrompt(params.name)}`);
 		}
-		const model = formatModelForApproval(params.model);
-		if (model) lines.push(`Model: ${model}`);
 		if (typeof params.task === "string") {
 			lines.push(`Task:\n${truncateForPrompt(params.task)}`);
 		}
@@ -554,8 +539,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					lines.push(`Name: ${truncateForPrompt(firstTask.name)}`);
 				}
 				lines.push(`Agent: ${truncateForPrompt(effectiveAgent(firstTask))}`);
-				const itemModel = formatModelForApproval("model" in firstTask ? firstTask.model : undefined);
-				if (itemModel) lines.push(`Model: ${itemModel}`);
 				if ("task" in firstTask && typeof firstTask.task === "string") {
 					lines.push(`Task:\n${truncateForPrompt(firstTask.task)}`);
 				}
@@ -601,28 +584,34 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const isolationEnabled = !planMode && this.session.settings.get("task.isolation.mode") !== "none";
 		const defaultAgent = resolveSpawnPolicy(this.session.getSessionSpawns()).defaultAgent;
-		return getTaskSchema({ isolationEnabled, batchEnabled: this.#isBatchEnabled(), defaultAgent });
+		return getTaskSchema({
+			isolationEnabled,
+			batchEnabled: this.#isBatchEnabled(),
+			effortEnabled: this.session.settings.get("task.enableEffort"),
+			defaultAgent,
+		});
 	}
 
 	renderCall(args: unknown, options: Parameters<typeof renderTaskCall>[1], theme: Theme) {
 		return renderTaskCall(repairTaskParams(args as TaskParams), options, theme);
 	}
 
-	/** Dynamic description that reflects current disabled-agent settings */
+	/** Dynamic description that reflects current task settings. */
 	get description(): string {
 		const disabledAgents = this.session.settings.get("task.disabledAgents") as string[];
 		const planMode = this.session.getPlanModeState?.()?.enabled === true;
 		const isolationMode = this.session.settings.get("task.isolation.mode");
-		return renderDescription(
-			this.#discoveredAgents,
-			!planMode && isolationMode !== "none",
-			this.session.settings.get("task.isolation.apply"),
+		return renderDescription({
+			agents: discoverySnapshots.get(path.resolve(this.session.cwd)) ?? this.#discoveredAgents,
+			isolationEnabled: !planMode && isolationMode !== "none",
+			applyIsolatedChanges: this.session.settings.get("task.isolation.apply"),
 			disabledAgents,
-			this.#isBatchEnabled(),
-			this.session.settings.get("async.enabled"),
-			isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
-			this.session.getSessionSpawns() ?? "*",
-		);
+			batchEnabled: this.#isBatchEnabled(),
+			effortEnabled: this.session.settings.get("task.enableEffort"),
+			asyncEnabled: this.session.settings.get("async.enabled"),
+			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
+			parentSpawns: this.session.getSessionSpawns() ?? "*",
+		});
 	}
 	private constructor(
 		private readonly session: ToolSession,
@@ -663,9 +652,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			assignment: (params.task ?? "").trim(),
 			context: this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined,
 			agent: params.agent,
-			model: params.model,
 			...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 			...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
+			...(params.effort !== undefined ? { effort: params.effort } : {}),
 			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
 			blockedAgent: this.#blockedAgent,
 			enableLsp: (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp"),
@@ -760,6 +749,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						depthCapacity,
 						ircEnabled,
 						willRunAsync: false,
+						scoutAvailable: isScoutSpawnable(
+							this.session.settings.get("task.disabledAgents") as string[] | undefined,
+							this.session.getSessionSpawns?.() ?? "*",
+						),
 					});
 			const result = await this.#executeSyncFanout(
 				toolCallId,
@@ -793,6 +786,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					depthCapacity,
 					ircEnabled,
 					willRunAsync: asyncItems.length > 0,
+					scoutAvailable: isScoutSpawnable(
+						this.session.settings.get("task.disabledAgents") as string[] | undefined,
+						this.session.getSessionSpawns?.() ?? "*",
+					),
 				});
 		// Returns a fresh result (copied content array, copied text part) rather
 		// than mutating the caller's — task results are short-lived here, but an
@@ -854,6 +851,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					id: agentId,
 					agent: agentType,
 					agentSource,
+					modelRole: policy.modelRole,
 					status: "pending",
 					task: renderSubagentUserPrompt(assignment),
 					assignment,
@@ -1137,8 +1135,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							// polling row reflects the resolved model, reasoning level,
 							// and running counters without reverting the "running"
 							// status back to the subagent's initial "pending" snapshot.
+							progress.modelRole = nextProgress.modelRole ?? progress.modelRole;
 							progress.resolvedModel = nextProgress.resolvedModel;
-							progress.resolvedModelIsFallback = nextProgress.resolvedModelIsFallback;
+							progress.resolvedModelIsFallback =
+								nextProgress.resolvedModelIsFallback ?? progress.resolvedModelIsFallback;
 							progress.tokens = nextProgress.tokens;
 							progress.requests = nextProgress.requests;
 							progress.contextTokens = nextProgress.contextTokens;
@@ -1181,9 +1181,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.extractedToolData = singleResult?.extractedToolData;
 					progress.retryFailure = singleResult?.retryFailure;
 					progress.retryState = undefined;
+					progress.modelRole = singleResult?.modelRole ?? progress.modelRole;
 					if (singleResult?.resolvedModel) {
 						progress.resolvedModel = singleResult.resolvedModel;
-						progress.resolvedModelIsFallback = singleResult.resolvedModelIsFallback;
+						progress.resolvedModelIsFallback =
+							singleResult.resolvedModelIsFallback ?? progress.resolvedModelIsFallback;
 					} else {
 						delete progress.resolvedModel;
 						delete progress.resolvedModelIsFallback;
@@ -1419,9 +1421,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				assignment,
 				context,
 				agent: params.agent,
-				model: params.model,
 				...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 				...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
+				...(params.effort !== undefined ? { effort: params.effort } : {}),
 				identity: { id: preAllocatedId, label: params.name },
 				index: spawnIndex,
 				parentToolCallId: toolCallId,

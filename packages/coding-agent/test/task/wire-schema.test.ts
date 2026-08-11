@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { TaskTool, taskSchema } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { getTaskSchema, oneLineLabel } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { type } from "arktype";
 
 // Contract: the task tool's wire shape is flat `{ name?, agent?, task, isolated? }`
 // (batch: `{ context, tasks[] }` of the same items). `agent` defaults to the
@@ -118,17 +118,15 @@ describe("task approval details surface the dispatch", () => {
 		} as unknown as ToolSession);
 	}
 
-	it("surfaces agent, name, model, and task for a flat spawn", async () => {
+	it("surfaces agent, name, and task for a flat spawn", async () => {
 		const tool = await makeTool();
 		const lines = tool.formatApprovalDetails({
 			agent: "reviewer",
 			name: "ReviewAuth",
-			model: "openai-codex/gpt-5.6-sol:high",
 			task: "audit the auth module",
 		});
 		expect(lines).toContain("Agent: reviewer");
 		expect(lines).toContain("Name: ReviewAuth");
-		expect(lines).toContain("Model: openai-codex/gpt-5.6-sol:high");
 		expect(lines).toContain("Task:\naudit the auth module");
 	});
 
@@ -139,7 +137,6 @@ describe("task approval details surface the dispatch", () => {
 			tasks: [
 				{
 					name: "DbMigrator",
-					model: ["anthropic/claude-sonnet-4", "openai/gpt-5"],
 					task: "migrate the schema",
 				},
 				{ task: "second item" },
@@ -149,7 +146,6 @@ describe("task approval details surface the dispatch", () => {
 		expect(lines).toContain("Batch agents: scout ×2");
 		expect(lines).toContain("Name: DbMigrator");
 		expect(lines).toContain("Agent: scout");
-		expect(lines).toContain("Model: anthropic/claude-sonnet-4 → openai/gpt-5");
 		expect(lines).toContain("Task:\nmigrate the schema");
 		expect(lines).toContain("+1 more task");
 	});

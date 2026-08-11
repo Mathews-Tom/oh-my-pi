@@ -495,7 +495,8 @@ const streamOpenAIResponsesOnce = (
 			const idleTimeoutMs =
 				options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs(model.compat.streamIdleTimeoutMs);
 			const firstEventTimeoutMs =
-				options?.streamFirstEventTimeoutMs ?? getOpenAIStreamFirstEventTimeoutMs(idleTimeoutMs);
+				options?.streamFirstEventTimeoutMs ??
+				getOpenAIStreamFirstEventTimeoutMs(idleTimeoutMs, model.compat.streamFirstEventTimeoutMs);
 			const requestTimeoutMs =
 				firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0 ? firstEventTimeoutMs : undefined;
 			const requestUrl = `${resolvedBaseUrl}/responses`;
@@ -609,12 +610,11 @@ const streamOpenAIResponsesOnce = (
 							strictRetryAvailable &&
 							!requestSignal.aborted &&
 							(compiledGrammarTooLarge ||
-								shouldRetryWithoutStrictTools(
-									error,
-									capturedErrorResponse,
-									activeStrictToolsApplied,
-									context.tools,
-								));
+								shouldRetryWithoutStrictTools(error, capturedErrorResponse, {
+									model,
+									strictToolsApplied: activeStrictToolsApplied,
+									tools: context.tools,
+								}));
 						if (canRetryWithoutStrictTools) {
 							strictRetryAvailable = false;
 							forceDisableStrictTools = true;
@@ -930,6 +930,25 @@ function isStableStringResponsesInstruction(item: unknown): item is ResponsesStr
 	);
 }
 
+function matchesResponsesCacheBaseline(
+	baseline: ResponsesPromptCacheableMessage,
+	current: ResponsesPromptCacheableMessage,
+): boolean {
+	if (baseline.role !== current.role || baseline.content.length !== current.content.length) return false;
+	for (let index = 0; index < baseline.content.length; index++) {
+		const baselineBlock = baseline.content[index];
+		const currentBlock = current.content[index];
+		if (!baselineBlock || !currentBlock) return false;
+		const breakpoint = baselineBlock.prompt_cache_breakpoint;
+		if (breakpoint) {
+			if (!Bun.deepEquals(baselineBlock, { ...currentBlock, prompt_cache_breakpoint: breakpoint })) return false;
+		} else if (!Bun.deepEquals(baselineBlock, currentBlock)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 function restoreResponsesCacheBreakpointsFromBaseline(
 	input: ResponseInput | undefined,
 	baseline: ResponseInput | undefined,
@@ -944,7 +963,7 @@ function restoreResponsesCacheBreakpointsFromBaseline(
 		if (isStableStringResponsesInstruction(message)) {
 			const [baselineBlock] = baselineMessage.content;
 			if (
-				baselineMessage.content.length === 1 &&
+				baselineMessage.role === message.role &&
 				baselineBlock?.type === "input_text" &&
 				baselineBlock.text === message.content &&
 				baselineBlock.prompt_cache_breakpoint
@@ -963,11 +982,12 @@ function restoreResponsesCacheBreakpointsFromBaseline(
 			continue;
 		}
 
-		if (!isResponsesPromptCacheableMessage(message)) continue;
-		for (let j = 0; j < baselineMessage.content.length && j < message.content.length; j++) {
+		if (!isResponsesPromptCacheableMessage(message) || !matchesResponsesCacheBaseline(baselineMessage, message))
+			continue;
+		for (let j = 0; j < baselineMessage.content.length; j++) {
 			const baselineBlock = baselineMessage.content[j];
 			const block = message.content[j];
-			if (!baselineBlock?.prompt_cache_breakpoint || !isResponsesPromptCacheableContentBlock(block)) continue;
+			if (!baselineBlock?.prompt_cache_breakpoint || !block) continue;
 			Object.assign(block, { prompt_cache_breakpoint: baselineBlock.prompt_cache_breakpoint });
 			restored = true;
 		}
@@ -1093,6 +1113,10 @@ export function buildParams(
 			filterReasoning: policy.reasoning.filterReasoningHistory,
 		},
 		includeThinkingSignatures: shouldReplayNativeHistory && !policy.reasoning.filterReasoningHistory,
+		requiresReasoningReplayForAllTurns:
+			policy.reasoning.enabled && policy.reasoning.requiresReasoningContentForAllAssistantTurns,
+		requiresReasoningReplayForToolCalls:
+			policy.reasoning.enabled && policy.reasoning.requiresReasoningContentForToolCalls,
 		repairOrphanOutputs: true,
 	});
 
@@ -1138,6 +1162,7 @@ export function buildParams(
 		store: false,
 		stream_options: model.compat.supportsObfuscationOptOut ? { include_obfuscation: false } : undefined,
 	};
+	if (options?.include?.length) params.include = Array.from(new Set(options.include));
 	maybeAddOpenRouterAnthropicCacheControl(params, model, cacheRetention);
 	const outputToken = resolveOpenAIOutputTokenParam({
 		field: "max_output_tokens",
@@ -1174,13 +1199,29 @@ export function buildParams(
 			const emittedNames = new Set(
 				params.tools.map(t => (t as { name?: string }).name).filter((n): n is string => n !== undefined),
 			);
+			const emittedComputer = params.tools.some(tool => tool.type === "computer");
 			const survivingTools =
 				params.tools.length === context.tools.length
 					? context.tools
-					: context.tools.filter(t => emittedNames.has(t.customWireName ?? t.name));
+					: context.tools.filter(
+							t =>
+								emittedNames.has(t.customWireName ?? t.name) ||
+								(t.native?.type === "computer" && emittedComputer),
+						);
 			const toolChoice = mapOpenAIResponsesToolChoiceForTools(options.toolChoice, survivingTools, model);
 			if (toolChoice !== undefined && params.tools.length > 0) {
-				params.tool_choice = toolChoice;
+				if (
+					typeof toolChoice === "object" &&
+					toolChoice.type === "function" &&
+					!model.compat.supportsNamedToolChoice
+				) {
+					// String-only hosts cannot receive the named object. Restrict the
+					// catalogue first so "required" still forces the requested tool.
+					params.tools = params.tools.filter(tool => tool.type === "function" && tool.name === toolChoice.name);
+					params.tool_choice = "required";
+				} else {
+					params.tool_choice = toolChoice;
+				}
 			}
 		}
 	}
@@ -1251,6 +1292,11 @@ export function mapOpenAIResponsesToolChoiceForTools(
 	if (isForcedToolChoice(choice) && !model.compat.supportsForcedToolChoice) {
 		return "auto";
 	}
+	if (typeof choice !== "string" && choice?.type === "computer") {
+		const computer = tools.find(tool => tool.native?.type === "computer");
+		if (!computer) return undefined;
+		return model.supportsComputerUse === true ? { type: "computer" } : { type: "function", name: computer.name };
+	}
 	const mapped = mapToOpenAIResponsesToolChoice(choice);
 	if (!mapped || typeof mapped === "string" || mapped.type !== "function") {
 		return mapped;
@@ -1261,6 +1307,9 @@ export function mapOpenAIResponsesToolChoiceForTools(
 		? tools.find(tool => tool.customFormat && (tool.name === mapped.name || tool.customWireName === mapped.name))
 		: undefined;
 	const offeredTool = customTool ?? directTool;
+	if (offeredTool?.native?.type === "computer") {
+		return model.supportsComputerUse === true ? { type: "computer" } : { type: "function", name: offeredTool.name };
+	}
 	if (!offeredTool) {
 		return undefined;
 	}
@@ -1280,6 +1329,13 @@ export function convertTools(
 	const allowFreeform = supportsFreeformApplyPatch(model);
 	const out: OpenAITool[] = [];
 	for (const tool of tools) {
+		if (tool.native?.type === "computer" && model.supportsComputerUse === true) {
+			out.push({ type: "computer" });
+			continue;
+		}
+		// Models without native computer support fall through and receive the
+		// tool as a plain function tool (name/description/schema below), so
+		// function-calling models can still drive the desktop.
 		if (allowFreeform && tool.customFormat) {
 			out.push({
 				type: "custom",

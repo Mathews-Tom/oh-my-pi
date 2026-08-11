@@ -1,5 +1,7 @@
 import * as fs from "node:fs";
-import { workerHostEntry } from "@oh-my-pi/pi-utils";
+import * as path from "node:path";
+import { getStatsDbPath, workerHostEntry } from "@oh-my-pi/pi-utils";
+import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
 import {
 	getRecentErrors as dbGetRecentErrors,
 	getRecentRequests as dbGetRecentRequests,
@@ -13,9 +15,12 @@ import {
 	getModelPerformanceSeries,
 	getModelTimeSeries,
 	getOverallStats,
+	getProviderHourlyBurn,
+	getProviderTimeSeries,
 	getStatsByAgentType,
 	getStatsByFolder,
 	getStatsByModel,
+	getStatsByProvider,
 	getTimeSeries,
 	getToolStats,
 	getToolStatsByModel,
@@ -35,7 +40,33 @@ import type { SyncWorkerRequest, SyncWorkerResponse } from "./sync-worker";
 // hidden argv mode, so the compiled binary and npm bundle only need one
 // JavaScript entry. Standalone source `omp-stats` keeps using this package's
 // own sync-worker source file.
-import type { BehaviorDashboardStats, DashboardStats, MessageStats, RequestDetails, ToolDashboardStats } from "./types";
+import type {
+	BehaviorDashboardStats,
+	DashboardStats,
+	MessageStats,
+	ProviderDashboardStats,
+	RequestDetails,
+	ToolDashboardStats,
+} from "./types";
+import { computeUsageWindowStats, fetchUsageSnapshots } from "./usage-windows";
+
+const STATS_SYNC_LOCK_RETRY_MS = 25;
+const STATS_SYNC_LOCK_WAIT_MS = 60 * 60 * 1000;
+
+/**
+ * Serialize stats ingestion and archive reconciliation across processes.
+ * The lock covers file discovery, parsing, and the final SQLite write so a
+ * parse result for a session moved by GC can never commit after cleanup.
+ * The native lock is owned by an operating-system primitive, so an interrupted
+ * owner is released automatically and a live owner is never displaced.
+ */
+export async function withStatsSyncLock<T>(dbPath: string, fn: () => Promise<T>): Promise<T> {
+	await fs.promises.mkdir(path.dirname(dbPath), { recursive: true });
+	return await withFileLock(`${dbPath}.sync`, fn, {
+		retryDelayMs: STATS_SYNC_LOCK_RETRY_MS,
+		retries: Math.ceil(STATS_SYNC_LOCK_WAIT_MS / STATS_SYNC_LOCK_RETRY_MS),
+	});
+}
 
 /**
  * Apply a freshly parsed result to the database. Runs entirely on the
@@ -207,6 +238,10 @@ export async function smokeTestSyncWorker({ timeoutMs = 5_000 }: { timeoutMs?: n
  * bar walks at a steady rate).
  */
 export async function syncAllSessions(opts?: SyncOptions): Promise<{ processed: number; files: number }> {
+	return withStatsSyncLock(getStatsDbPath(), () => syncAllSessionsLocked(opts));
+}
+
+async function syncAllSessionsLocked(opts?: SyncOptions): Promise<{ processed: number; files: number }> {
 	await initDb();
 
 	const files = await listAllSessionFiles();
@@ -502,5 +537,26 @@ export async function getToolDashboardStats(range?: string | null): Promise<Tool
 		byTool: getToolStats(cutoff ?? undefined),
 		byToolModel: getToolStatsByModel(cutoff ?? undefined),
 		series: getToolTimeSeries(modelSeriesDays, cutoff, modelSeriesBucketMs),
+	};
+}
+
+/**
+ * Get the providers dashboard payload: per-provider totals, peak-burn-hours
+ * histogram, provider token time series, and subscription-window analytics
+ * (utilization series + insights) derived from recorded usage-limit snapshots.
+ */
+export async function getProviderDashboardStats(range?: string | null): Promise<ProviderDashboardStats> {
+	await initDb();
+	const { modelSeriesDays, modelSeriesBucketMs, cutoff } = getTimeRangeConfig(range);
+	const providers = getStatsByProvider(cutoff ?? undefined);
+	const tokensByProvider = new Map(providers.map(p => [p.provider, p.totalTokens]));
+	const snapshots = await fetchUsageSnapshots(cutoff ?? 0);
+	const { usageSeries, windowInsights } = computeUsageWindowStats(snapshots, tokensByProvider);
+	return {
+		providers,
+		hourly: getProviderHourlyBurn(cutoff ?? undefined),
+		series: getProviderTimeSeries(modelSeriesDays, cutoff, modelSeriesBucketMs),
+		usageSeries,
+		windowInsights,
 	};
 }

@@ -27,7 +27,7 @@ import { DEFAULT_MODEL_PER_PROVIDER } from "@oh-my-pi/pi-catalog/provider-models
 import { resolveBareVariantAlias, resolveVariantAlias } from "@oh-my-pi/pi-catalog/variant-collapse";
 import { fuzzyMatch } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
-import chalk from "chalk";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
 import {
 	AUTO_THINKING,
@@ -466,7 +466,7 @@ export interface ModelMatchPreferences {
 }
 
 export type ModelLookupRegistry = Pick<ModelRegistry, "getAvailable">;
-type CliModelRegistry = Pick<ModelRegistry, "getAll">;
+type CliModelRegistry = Pick<ModelRegistry, "getAll" | "getAvailable">;
 type InitialModelRegistry = Pick<ModelRegistry, "getAvailable" | "find">;
 type RestorableModelRegistry = Pick<ModelRegistry, "getAvailable" | "find" | "getApiKey">;
 
@@ -932,6 +932,28 @@ function normalizeModelPatternList(value: string | string[] | undefined): string
 	return patterns.map(pattern => pattern.trim()).filter(Boolean);
 }
 
+/**
+ * Extract the first explicit model-role alias from a raw model selection.
+ *
+ * This intentionally runs before role expansion so callers can retain the
+ * source identity (`@smol`, `pi/slow`, or `*`) even when it resolves to a
+ * concrete provider/model or inherited fallback. Bare role names and explicit
+ * provider/model selectors are not role aliases.
+ */
+export function resolveExplicitModelRole(
+	value: string | string[] | undefined,
+	settings?: ModelRoleLookup,
+): string | undefined {
+	for (const pattern of normalizeModelPatternList(value)) {
+		const prefixLength = modelRoleAliasPrefixLength(pattern);
+		if (prefixLength === undefined) continue;
+		const { base } = splitThinkingSuffix(pattern, prefixLength, MAX_THINKING_SUFFIX_OPTIONS);
+		const role = getModelRoleAlias(base, settings);
+		if (role) return role;
+	}
+	return undefined;
+}
+
 function isSessionInheritedAgentPattern(value: string): boolean {
 	return (
 		value === DEFAULT_MODEL_ROLE ||
@@ -1068,6 +1090,8 @@ export function resolveConfiguredModelPatterns(
 	});
 }
 export interface AgentModelPatternResolutionOptions {
+	/** Highest-priority request selector, when supplied by a caller. */
+	requestModel?: string | string[];
 	settingsOverride?: string | string[];
 	agentModel?: string | string[];
 	settings?: Settings;
@@ -1075,11 +1099,25 @@ export interface AgentModelPatternResolutionOptions {
 	fallbackModelPattern?: string;
 }
 
-export function resolveAgentModelPatterns(options: AgentModelPatternResolutionOptions): string[] {
-	const { settingsOverride, agentModel, settings, activeModelPattern, fallbackModelPattern } = options;
+interface EffectiveAgentModelSelection {
+	source?: string | string[];
+	patterns: string[];
+}
+
+function resolveEffectiveAgentModelSelection(
+	options: AgentModelPatternResolutionOptions,
+): EffectiveAgentModelSelection {
+	const { requestModel, settingsOverride, agentModel, settings, activeModelPattern, fallbackModelPattern } = options;
+
+	const requestPatterns = resolveConfiguredModelPatterns(requestModel, settings);
+	if (requestPatterns.length > 0) {
+		return { source: requestModel, patterns: requestPatterns };
+	}
 
 	const overridePatterns = resolveConfiguredModelPatterns(settingsOverride, settings);
-	if (overridePatterns.length > 0) return overridePatterns;
+	if (overridePatterns.length > 0) {
+		return { source: settingsOverride, patterns: overridePatterns };
+	}
 
 	const normalizedAgentPatterns = normalizeModelPatternList(agentModel);
 	const configuredAgentPatterns = resolveConfiguredModelPatterns(agentModel, settings);
@@ -1090,15 +1128,40 @@ export function resolveAgentModelPatterns(options: AgentModelPatternResolutionOp
 			singleAgentPattern === formatModelRoleAlias("task") ||
 			singleAgentPattern === `${LEGACY_MODEL_ROLE_ALIAS_PREFIX}task`
 		) {
-			return configuredAgentPatterns;
+			return { source: agentModel, patterns: configuredAgentPatterns };
 		}
-		if (!agentInheritsSessionModel) return configuredAgentPatterns;
+		if (!agentInheritsSessionModel) return { source: agentModel, patterns: configuredAgentPatterns };
 	}
 
 	const fallback =
 		activeModelPattern?.trim() || fallbackModelPattern?.trim() || settings?.getModelRole("default")?.trim() || "";
-	return resolveConfiguredModelPatterns(fallback, settings);
+	return { patterns: resolveConfiguredModelPatterns(fallback, settings) };
 }
+
+/** Effective agent model patterns paired with the pre-expansion role alias behind them. */
+export interface AgentModelSelection {
+	/** Expanded model patterns to spawn with. */
+	patterns: string[];
+	/** Role alias the patterns came from (`@task` -> `task`), when the source named one. */
+	role: string | undefined;
+}
+
+/**
+ * Resolve an agent's model patterns together with the role identity they were
+ * expanded from. Spawn paths MUST take both from this single call: the child's
+ * inherited retry-fallback chain is keyed off the role, which the expansion
+ * discards, and deriving the two halves separately is how they drift apart.
+ */
+export function resolveAgentModelSelection(options: AgentModelPatternResolutionOptions): AgentModelSelection {
+	const { source, patterns } = resolveEffectiveAgentModelSelection(options);
+	return { patterns, role: resolveExplicitModelRole(source, options.settings) };
+}
+
+/** Effective agent model patterns alone, for callers with no interest in role identity. */
+export function resolveAgentModelPatterns(options: AgentModelPatternResolutionOptions): string[] {
+	return resolveEffectiveAgentModelSelection(options).patterns;
+}
+
 /** Default prewalk hand-off target when no explicit target is configured. */
 export const DEFAULT_PREWALK_TARGET = "@smol";
 
@@ -1601,6 +1664,7 @@ function findExactCliModel(
 	selector: string,
 	allModels: Model<Api>[],
 	availableModels: Model<Api>[],
+	options?: { catalogFallback?: boolean },
 ): Model<Api> | undefined {
 	// Explicit provider/id references stay authoritative against the full catalog.
 	const referenced = findExactModelReferenceMatch(selector, allModels);
@@ -1615,6 +1679,13 @@ function findExactCliModel(
 		model.id.toLowerCase() === lower || formatModelString(model).toLowerCase() === lower;
 	const preferred = availableModels.find(isFlatMatch);
 	if (preferred) return preferred;
+	// The unauthenticated catalog fallback is a weak match: a bare id like
+	// `default` collides with the bundled `cursor/default` model, which must not
+	// shadow a configured `modelRoles.default` role the user can actually run.
+	// Callers resolving a possible role name pass `catalogFallback: false` so the
+	// role gets a chance first; the deferred fuzzy fallback below still recovers
+	// the catalog id when no role matches.
+	if (options?.catalogFallback === false) return undefined;
 	return availableModels === allModels ? undefined : allModels.find(isFlatMatch);
 }
 
@@ -1635,13 +1706,16 @@ export interface ResolveCliModelResult {
 /**
  * Resolve a single model from CLI flags.
  *
- * Exact model names take precedence over configured role names.
+ * Explicit `provider/id` references and authenticated bare ids take precedence
+ * over configured role names, which in turn take precedence over an
+ * unauthenticated catalog-only id (so a bundled `cursor/default` never shadows a
+ * configured `modelRoles.default`).
  */
 export function resolveCliModel(options: {
 	cliProvider?: string;
 	cliModel?: string;
 	modelRegistry: CliModelRegistry;
-	/** Authenticated models to prefer for unqualified selectors; omit to preserve catalog-order behavior. */
+	/** Authenticated models to prefer for unqualified selectors; defaults to the registry's authenticated set. */
 	availableModels?: Model<Api>[];
 	settings?: Settings;
 	preferences?: ModelMatchPreferences;
@@ -1662,7 +1736,7 @@ export function resolveCliModel(options: {
 		};
 	}
 
-	const availableModels = preferredModels ?? allModels;
+	const availableModels = preferredModels ?? modelRegistry.getAvailable();
 	const providerMap = new Map<string, string>();
 	for (const model of allModels) {
 		providerMap.set(model.provider.toLowerCase(), model.provider);
@@ -1680,7 +1754,7 @@ export function resolveCliModel(options: {
 
 	const trimmedModel = cliModel.trim();
 	if (!provider) {
-		const exact = findExactCliModel(trimmedModel, allModels, availableModels);
+		const exact = findExactCliModel(trimmedModel, allModels, availableModels, { catalogFallback: false });
 		if (exact) {
 			return {
 				model: exact,
@@ -1696,7 +1770,7 @@ export function resolveCliModel(options: {
 			MAX_THINKING_SUFFIX_OPTIONS,
 		);
 		if (exactThinkingLevel) {
-			const exactSuffixed = findExactCliModel(exactBase, allModels, availableModels);
+			const exactSuffixed = findExactCliModel(exactBase, allModels, availableModels, { catalogFallback: false });
 			if (exactSuffixed) {
 				return {
 					model: exactSuffixed,

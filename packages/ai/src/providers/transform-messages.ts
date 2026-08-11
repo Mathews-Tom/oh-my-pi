@@ -295,7 +295,15 @@ function normalizeAnthropicTargetToolCallId<TApi extends Api>(
  * - Preserves tool call structure (unlike converting to text summaries)
  * - Injects synthetic "aborted" tool results
  */
-const SENSITIVE_TOKEN_RE =
+/**
+ * Credential-shaped token patterns scrubbed from outbound provider traffic when
+ * credential redaction is enabled. Exported so hosts can route the same shapes
+ * through reversible obfuscation (keyed placeholders restored before local tool
+ * execution) instead of the irreversible `[*_token_redacted]` rewrite below —
+ * an irreversible placeholder echoed back in edit-tool `old_string` can never
+ * match the real bytes on disk.
+ */
+export const SENSITIVE_TOKEN_RE =
 	/(?<![a-zA-Z0-9_*-])(gh[opusr]_[a-zA-Z0-9_*]{36,}|github_pat_[a-zA-Z0-9_*]{36,}|glpat-[a-zA-Z0-9_*-]{20,}|sk-proj-[a-zA-Z0-9_*-]{36,}|sk-ant-[a-zA-Z0-9_*-]{36,}|sk-[a-zA-Z0-9_*-]{48,})(?![a-zA-Z0-9_*-])/gi;
 
 function hasPlausibleCredentialEntropy(token: string): boolean {
@@ -739,6 +747,14 @@ export function transformMessages<TApi extends Api>(
 						return [];
 					}
 					if (isSameModel) return block;
+					return [];
+				}
+
+				if (block.type === "anthropicServerTool") {
+					// Anthropic requires native server-tool calls and results to be
+					// replayed unchanged. They are meaningful only to the provider
+					// that produced them; every cross-provider target drops them.
+					if (isAnthropicReplay && assistantMsg.provider === model.provider) return block;
 					return [];
 				}
 

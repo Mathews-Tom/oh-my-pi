@@ -104,6 +104,54 @@ describe("Firecrawl web search provider", () => {
 			authMode: "api_key",
 		});
 	});
+	it("maps before:/after: to a cdr tbs and strips dates from the operator query", async () => {
+		const captured: { body?: unknown } = {};
+		const fetchMock: FetchImpl = async (_input, init) => {
+			captured.body = JSON.parse(String(init?.body ?? "null")) as unknown;
+			return new Response(JSON.stringify({ data: { web: [] } }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		};
+
+		await searchFirecrawl({
+			...makeParams("bun runtime site:github.com/oven-sh intitle:install after:2024-01-01 before:2024-06-30"),
+			recency: "month",
+			fetch: fetchMock,
+		});
+
+		expect(captured.body).toEqual({
+			query: "bun runtime site:github.com/oven-sh intitle:install",
+			limit: 10,
+			sources: [{ type: "web" }],
+			// Explicit absolute bounds take precedence over the qdr:m recency window.
+			tbs: "cdr:1,cd_min:01/01/2024,cd_max:06/30/2024",
+		});
+	});
+
+	it("re-emits non-date operators in the query while keeping recency tbs", async () => {
+		const captured: { body?: unknown } = {};
+		const fetchMock: FetchImpl = async (_input, init) => {
+			captured.body = JSON.parse(String(init?.body ?? "null")) as unknown;
+			return new Response(JSON.stringify({ data: { web: [] } }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		};
+
+		await searchFirecrawl({
+			...makeParams('"exact phrase" -site:reddit.com filetype:pdf'),
+			recency: "week",
+			fetch: fetchMock,
+		});
+
+		expect(captured.body).toEqual({
+			query: '"exact phrase" -site:reddit.com filetype:pdf',
+			limit: 10,
+			sources: [{ type: "web" }],
+			tbs: "qdr:w",
+		});
+	});
 
 	it("uses the initially resolved credential for the first authenticated request", async () => {
 		let resolutionCount = 0;
@@ -187,18 +235,58 @@ describe("Firecrawl web search provider", () => {
 		}
 	});
 
-	it("keeps keyless Firecrawl out of auto selection while allowing explicit selection", () => {
+	it("keeps hosted keyless Firecrawl explicit-only but admits configured self-hosting", () => {
 		const originalApiKey = process.env.FIRECRAWL_API_KEY;
+		const originalBaseUrl = process.env.FIRECRAWL_BASE_URL;
+		const originalApiUrl = process.env.FIRECRAWL_API_URL;
 		delete process.env.FIRECRAWL_API_KEY;
+		delete process.env.FIRECRAWL_BASE_URL;
+		delete process.env.FIRECRAWL_API_URL;
 		try {
 			const provider = new FirecrawlProvider();
 			const authStorage = makeAuthStorage(undefined);
 
 			expect(provider.isAvailable(authStorage)).toBe(false);
 			expect(provider.isExplicitlyAvailable(authStorage)).toBe(true);
+			process.env.FIRECRAWL_BASE_URL = "http://localhost:3002";
+			expect(provider.isAvailable(authStorage)).toBe(true);
 		} finally {
 			if (originalApiKey === undefined) delete process.env.FIRECRAWL_API_KEY;
 			else process.env.FIRECRAWL_API_KEY = originalApiKey;
+			if (originalBaseUrl === undefined) delete process.env.FIRECRAWL_BASE_URL;
+			else process.env.FIRECRAWL_BASE_URL = originalBaseUrl;
+			if (originalApiUrl === undefined) delete process.env.FIRECRAWL_API_URL;
+			else process.env.FIRECRAWL_API_URL = originalApiUrl;
+		}
+	});
+
+	it("uses a self-hosted endpoint and accepts Firecrawl v1 array responses", async () => {
+		const originalBaseUrl = process.env.FIRECRAWL_BASE_URL;
+		process.env.FIRECRAWL_BASE_URL = "http://localhost:3002/v1/";
+		let requestUrl = "";
+		try {
+			const fetchMock: FetchImpl = async input => {
+				requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+				return new Response(
+					JSON.stringify({
+						success: true,
+						data: [{ title: "Legacy result", url: "https://example.com/legacy", snippet: "Legacy snippet" }],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			};
+			const response = await searchFirecrawl({
+				...makeParams("legacy query", makeAuthStorage(undefined)),
+				fetch: fetchMock,
+			});
+
+			expect(requestUrl).toBe("http://localhost:3002/v1/search");
+			expect(response.sources).toEqual([
+				{ title: "Legacy result", url: "https://example.com/legacy", snippet: "Legacy snippet" },
+			]);
+		} finally {
+			if (originalBaseUrl === undefined) delete process.env.FIRECRAWL_BASE_URL;
+			else process.env.FIRECRAWL_BASE_URL = originalBaseUrl;
 		}
 	});
 

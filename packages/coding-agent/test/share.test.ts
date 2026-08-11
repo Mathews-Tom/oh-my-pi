@@ -152,7 +152,14 @@ describe("buildShareSnapshot", () => {
 				},
 			} as unknown as SessionEntry,
 		];
-		const header = { type: "session", version: 3, id: "t", timestamp: ts, cwd: `/home/${secret}/proj` };
+		const header = {
+			type: "session",
+			version: 3,
+			id: "t",
+			timestamp: ts,
+			cwd: `/home/${secret}/proj`,
+			previousSessionFiles: [`/home/${secret}/old/session.jsonl`],
+		};
 		const sm = {
 			getHeader: () => header,
 			getEntries: () => entries,
@@ -169,11 +176,13 @@ describe("buildShareSnapshot", () => {
 		expect(flat).toContain("/.env");
 		// Source entries keep the real values; redaction is share-only.
 		expect(JSON.stringify(entries)).toContain(secret);
+		expect(JSON.stringify(header)).toContain(secret);
 	});
 
 	test("redacts assistant tool calls / error messages and bash meta, and drops provider replay payloads", () => {
 		const secret = "asst-secret-ABCDE";
 		const replaySentinel = "REPLAY_BLOB_SENTINEL_XYZ";
+		const serverToolSentinel = "SERVER_TOOL_ENCRYPTED_SENTINEL_QWE";
 		const ts = "2026-06-12T00:00:00.000Z";
 		const usage = {
 			input: 0,
@@ -200,6 +209,23 @@ describe("buildShareSnapshot", () => {
 							arguments: { path: `/x/${secret}` },
 							intent: `intent ${secret}`,
 							rawBlock: `raw ${secret}`,
+						},
+						{
+							type: "anthropicServerTool",
+							block: {
+								type: "server_tool_use",
+								id: "srvtoolu_1",
+								name: "web_search",
+								input: { query: `find ${secret}` },
+							},
+						},
+						{
+							type: "anthropicServerTool",
+							block: {
+								type: "web_search_tool_result",
+								tool_use_id: "srvtoolu_1",
+								content: [{ type: "web_search_result", encrypted_content: serverToolSentinel }],
+							},
 						},
 					],
 					api: "test",
@@ -246,6 +272,9 @@ describe("buildShareSnapshot", () => {
 		// Opaque provider-replay payload is dropped wholesale — the sentinel is NOT a configured secret,
 		// so its absence proves the subtree was removed rather than merely obfuscated.
 		expect(flat).not.toContain(replaySentinel);
+		// Native Anthropic server-tool blocks are opaque provider-replay state: dropped wholesale,
+		// so neither the obfuscated query secret nor the encrypted result sentinel can leak.
+		expect(flat).not.toContain(serverToolSentinel);
 		// Source entries keep the real values; redaction is share-only.
 		expect(JSON.stringify(entries)).toContain(secret);
 	});

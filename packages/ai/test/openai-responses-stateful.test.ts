@@ -329,6 +329,59 @@ describe("openai-responses stateful chaining", () => {
 		]);
 	});
 
+	it("recomputes the cache breakpoint when the marked message content changes", async () => {
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = createCapturingFetch(sentRequests);
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const options = {
+			apiKey: "test-key",
+			sessionId: "stateful-edited-marked-message-session",
+			providerSessionState,
+			statefulResponses: true,
+			promptCache: { mode: "explicit" as const },
+			fetch: fetchMock,
+		};
+		const oldestUser = { role: "user" as const, content: "Oldest stable question", timestamp: 1000 };
+		const firstUser = { role: "user" as const, content: "First question", timestamp: 1001 };
+		const firstResponse = await streamOpenAIResponses(
+			explicitPromptCacheModel,
+			{ messages: [oldestUser, firstUser] },
+			options,
+		).result();
+
+		await streamOpenAIResponses(
+			explicitPromptCacheModel,
+			{
+				messages: [
+					{ ...oldestUser, content: "Edited oldest question" },
+					firstUser,
+					firstResponse,
+					{ role: "user", content: "Second question", timestamp: 1002 },
+				],
+			},
+			options,
+		).result();
+
+		expect(sentRequests).toHaveLength(2);
+		expect(sentRequests[1]?.previous_response_id).toBeUndefined();
+		const replayInput = sentRequests[1]?.input;
+		if (!Array.isArray(replayInput)) throw new Error("Expected a full Responses replay");
+		expect(replayInput[0]).toEqual({
+			role: "user",
+			content: [{ type: "input_text", text: "Edited oldest question" }],
+		});
+		expect(replayInput[1]).toEqual({
+			role: "user",
+			content: [
+				{
+					type: "input_text",
+					text: "First question",
+					prompt_cache_breakpoint: { mode: "explicit" },
+				},
+			],
+		});
+	});
+
 	it("chains turns without appending an extra no-reasoning developer item", async () => {
 		const sentRequests: Array<Record<string, unknown>> = [];
 		const fetchMock = createCapturingFetch(sentRequests);

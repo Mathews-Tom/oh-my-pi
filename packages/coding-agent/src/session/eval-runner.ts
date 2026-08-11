@@ -2,6 +2,7 @@ import type { Agent } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { disposeJuliaKernelSessionsByOwner } from "../eval/jl/executor";
+import { disposeVmContextsByOwner } from "../eval/js/context-manager";
 import { namespaceSessionId as namespacePythonSessionId } from "../eval/py";
 import {
 	disposeKernelSessionsByOwner,
@@ -145,6 +146,11 @@ export class EvalRunner {
 		return this.#pendingMessages.length > 0;
 	}
 
+	/** Returns the stable owner shared by eval and session-owned tools. */
+	getKernelOwnerId(): string {
+		return this.#kernelOwnerId;
+	}
+
 	/** Returns the eval session shared with the Python backend. */
 	getSessionId(): string | null {
 		if (this.#parentSessionId !== undefined) return this.#parentSessionId;
@@ -176,6 +182,7 @@ export class EvalRunner {
 			disposeKernelSessionsByOwner(this.#kernelOwnerId),
 			disposeRubyKernelSessionsByOwner(this.#kernelOwnerId),
 			disposeJuliaKernelSessionsByOwner(this.#kernelOwnerId),
+			disposeVmContextsByOwner(this.#kernelOwnerId),
 		]);
 		const errors: unknown[] = [];
 		for (const result of results) if (result.status === "rejected") errors.push(result.reason);
