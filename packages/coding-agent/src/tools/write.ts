@@ -704,7 +704,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		};
 	}
 
-	async #resolveSqliteWritePath(writePath: string): Promise<ResolvedSqliteWritePath | null> {
+	async #resolveSqliteWritePath(
+		writePath: string,
+		context: AgentToolContext | undefined,
+	): Promise<ResolvedSqliteWritePath | null> {
 		const candidates = parseSqlitePathCandidates(writePath).filter(candidate => candidate.sqlitePath !== writePath);
 		if (candidates.length === 0) {
 			return null;
@@ -729,6 +732,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				if (stat.isDirectory()) {
 					continue;
 				}
+				// `isSqliteFile` reads the file's magic bytes to probe its format —
+				// authorize the candidate for read before that probe, not only the
+				// eventual write target `#writeSqliteRow` checks once resolution
+				// picks this candidate.
+				this.#assertResolvedReadAllowed(absolutePath, context);
 				if (!(await isSqliteFile(absolutePath))) {
 					sawExistingNonSqlite = true;
 					continue;
@@ -771,7 +779,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			// compound spelling through the pre-execution gate; authorize the
 			// real backing database file here too, before opening it, not after
 			// a post-execution recheck would run once the row is already mutated.
+			// Opening it queries its schema and looks up the target row before
+			// updating or deleting, so `read` is required too, not just `write`.
 			this.#assertResolvedWriteAllowed(resolvedSqlitePath.absolutePath, context);
+			this.#assertResolvedReadAllowed(resolvedSqlitePath.absolutePath, context);
 			db = new Database(resolvedSqlitePath.absolutePath, { create: false, strict: true });
 			db.run("PRAGMA busy_timeout = 3000");
 
@@ -1070,8 +1081,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			// `conflict://*` resolves through the pre-execution gate as a single
 			// synthetic URI, not the real per-file targets it splices — authorize
 			// each one here, where the registered entries' real paths are known.
+			// Splicing reads the whole file below, so `read` is required too,
+			// not just `write`.
 			try {
 				this.#assertResolvedWriteAllowed(absolutePath, context);
+				this.#assertResolvedReadAllowed(absolutePath, context);
 			} catch (error) {
 				failedFiles.push({
 					displayPath: sample.displayPath,
@@ -1335,7 +1349,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				return archiveResult;
 			}
 
-			const resolvedSqlitePath = await this.#resolveSqliteWritePath(path);
+			const resolvedSqlitePath = await this.#resolveSqliteWritePath(path, context);
 			if (resolvedSqlitePath) {
 				enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update" });
 

@@ -167,3 +167,55 @@ export function relativeToRoots(absolutePath: string, roots: readonly string[]):
 	}
 	return out;
 }
+
+/**
+ * Every workspace-relative spelling of `absolutePath`, like
+ * {@link relativeToRoots}, but keeping the lexical (as-written) and
+ * realpath-resolved spellings in two separate groups instead of one flat,
+ * deduplicated list.
+ *
+ * `decidePathTarget` needs the split: an allow glob matching only the alias
+ * spelling (`**\/.env.example` for a symlink `.env.example -> .env`) must not
+ * clear a deny glob matching the canonical spelling (`**\/.env`) it actually
+ * resolves to — checking allow/deny against the two identities together lets
+ * whichever one happens to match first at the merged-list stage decide for
+ * both. Each identity is authorized independently instead.
+ */
+export function relativeSpellingGroups(
+	absolutePath: string,
+	roots: readonly string[],
+): { lexical: string[]; canonical: string[]; resolved: string; realTarget: string } {
+	const resolved = path.resolve(absolutePath);
+	const realTarget = tryRealpath(resolved) ?? projectViaDeepestExistingAncestor(resolved) ?? resolved;
+	const lexical: string[] = [];
+	const canonical: string[] = [];
+	const seenLexical = new Set<string>();
+	const seenCanonical = new Set<string>();
+	for (const root of roots) {
+		const resolvedRoot = path.resolve(root);
+		for (const candidateRoot of [resolvedRoot, tryRealpath(resolvedRoot)]) {
+			if (!candidateRoot) continue;
+			const lexicalRelative = path.relative(candidateRoot, resolved);
+			if (
+				lexicalRelative &&
+				!lexicalRelative.startsWith("..") &&
+				!path.isAbsolute(lexicalRelative) &&
+				!seenLexical.has(lexicalRelative)
+			) {
+				seenLexical.add(lexicalRelative);
+				lexical.push(lexicalRelative);
+			}
+			const canonicalRelative = path.relative(candidateRoot, realTarget);
+			if (
+				canonicalRelative &&
+				!canonicalRelative.startsWith("..") &&
+				!path.isAbsolute(canonicalRelative) &&
+				!seenCanonical.has(canonicalRelative)
+			) {
+				seenCanonical.add(canonicalRelative);
+				canonical.push(canonicalRelative);
+			}
+		}
+	}
+	return { lexical, canonical, resolved, realTarget };
+}

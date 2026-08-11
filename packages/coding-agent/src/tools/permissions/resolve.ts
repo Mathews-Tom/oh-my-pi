@@ -15,7 +15,7 @@ import * as path from "node:path";
 import { extractUriScheme } from "../../internal-urls/parse";
 import { resolveVaultUrlToPath } from "../../internal-urls/vault-protocol";
 import { isInternalUrlPath, isReadableUrlPath, isSshUrl, resolveToCwd, splitPathAndSel } from "../path-utils";
-import { confineToRoots, relativeToRoots } from "./confine";
+import { confineToRoots, relativeSpellingGroups } from "./confine";
 import { matchGlob } from "./matcher";
 import { ALLOW, type PathTarget, type PermissionDecision, type PermissionPolicy, type PermissionRoots } from "./types";
 
@@ -107,6 +107,17 @@ const CONFINE_WRITES_RULE = "permissions.confineWrites";
  * `tools.approvalMode` or `tools.approval.<tool>`, so it cannot auto-approve
  * anything the user would otherwise have been prompted for.
  */
+/**
+ * Permission globs are documented and written with `/` (`**\/.ssh/**`), but
+ * on Windows `path.relative`/an absolute path use `\`, and `Bun.Glob` does
+ * not treat the two as equivalent - `**\/.ssh/**` never matches `.ssh\config`.
+ * `path.basename` alone rescues only filename-only rules; a directory-scoped
+ * rule (the common case) is silently bypassed without this.
+ */
+function normalizeCandidate(candidate: string): string {
+	return candidate.replaceAll("\\", "/");
+}
+
 export function decidePathTarget(
 	target: PathTarget,
 	absolutePath: string,
@@ -114,19 +125,6 @@ export function decidePathTarget(
 	roots: PermissionRoots,
 ): PermissionDecision {
 	const rootList = permissionRootList(roots);
-	const relatives = relativeToRoots(absolutePath, rootList);
-	// Permission globs are documented and written with `/` (`**/.ssh/**`),
-	// but on Windows `path.relative`/an absolute path use `\`, and `Bun.Glob`
-	// does not treat the two as equivalent - `**/.ssh/**` never matches
-	// `.ssh\config`. `path.basename` alone rescues only filename-only rules;
-	// a directory-scoped rule (the common case) is silently bypassed
-	// without this. `absolutePath` itself is a POSIX-style internal-URL
-	// selector, an already-forward-slash SSH remote path, or a real
-	// filesystem path, so normalizing every backslash here is safe for all
-	// three.
-	const candidates = [...relatives, absolutePath, path.basename(absolutePath)].map(candidate =>
-		candidate.replaceAll("\\", "/"),
-	);
 
 	const confine = target.access === "write" ? policy.confineWrites : policy.confineReads;
 	if (confine) {
@@ -137,20 +135,38 @@ export function decidePathTarget(
 		}
 	}
 
-	const allowed = matchGlob(policy.allow[target.access], candidates);
-	if (allowed) return ALLOW;
+	// Checked as two separate identities, not one merged candidate list: a
+	// symlink alias (`.env.example -> .env`) contributes both the lexical
+	// spelling and the realpath-resolved canonical spelling. Merging them
+	// before matching would let an allow glob on the alias (`**/.env.example`)
+	// short-circuit the whole decision before the canonical spelling ever
+	// gets checked against `**/.env` - the alias would then silently
+	// authorize reading/writing its own deny-listed backing file. Each
+	// identity gets its own allow-then-deny check instead, so an allow
+	// override on one spelling can never clear a deny on the other.
+	const spellings = relativeSpellingGroups(absolutePath, rootList);
+	// `absolutePath` itself is a POSIX-style internal-URL selector, an
+	// already-forward-slash SSH remote path, or a real filesystem path, so
+	// normalizing every backslash here is safe for all three.
+	const identities = [
+		[...spellings.lexical, spellings.resolved, path.basename(spellings.resolved)].map(normalizeCandidate),
+		[...spellings.canonical, spellings.realTarget, path.basename(spellings.realTarget)].map(normalizeCandidate),
+	];
 
-	const denied = matchGlob(policy.deny[target.access], candidates);
-	if (denied) {
-		return {
-			kind: "deny",
-			rule: denied,
-			reason:
-				`${target.access === "write" ? "Writing" : "Reading"} "${target.raw}" is blocked by the ` +
-				`resource permission rule "${denied}" (permissions.profile: ${policy.profile}).\n` +
-				`To allow it: add "${denied}" to permissions.allow.${target.access}, ` +
-				`or set permissions.profile: off.`,
-		};
+	for (const candidates of identities) {
+		if (matchGlob(policy.allow[target.access], candidates)) continue;
+		const denied = matchGlob(policy.deny[target.access], candidates);
+		if (denied) {
+			return {
+				kind: "deny",
+				rule: denied,
+				reason:
+					`${target.access === "write" ? "Writing" : "Reading"} "${target.raw}" is blocked by the ` +
+					`resource permission rule "${denied}" (permissions.profile: ${policy.profile}).\n` +
+					`To allow it: add "${denied}" to permissions.allow.${target.access}, ` +
+					`or set permissions.profile: off.`,
+			};
+		}
 	}
 
 	return ALLOW;
