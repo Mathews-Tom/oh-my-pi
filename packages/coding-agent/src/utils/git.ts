@@ -543,7 +543,15 @@ async function runText(cwd: string, args: readonly string[], options: CommandOpt
 	return (await runChecked(cwd, args, options)).stdout;
 }
 
-async function tryText(
+/**
+ * Run a read-only `git` plumbing command and return trimmed-free stdout, or
+ * `undefined` on any non-zero exit. Routes through the same hardened spawn as
+ * every other git query in this module: ambient `GIT_DIR`/`GIT_WORK_TREE`/etc.
+ * are cleared so the command cannot be redirected at another repository by
+ * inherited environment variables, and the deadline/output-cap/non-interactive
+ * env apply uniformly.
+ */
+export async function tryText(
 	cwd: string,
 	args: readonly string[],
 	options: CommandOptions = {},

@@ -19,6 +19,7 @@ import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import type { MCPRequestIdFormat } from "../mcp/types";
 import { type ConfiguredThinkingLevel, parseConfiguredThinkingLevel } from "../thinking";
 import { normalizeToolNames } from "../tools/builtin-names";
+import { tryText } from "../utils/git";
 
 import { realpathIfExists, resolveContainedPath } from "./contained-path";
 import { buildPluginDirRoot } from "./plugin-dir-roots";
@@ -660,21 +661,22 @@ async function resolveGitDir(rootDir: string): Promise<string | undefined> {
 	return path.resolve(rootDir, match[1].trim());
 }
 
-async function resolveGitExcludeFile(rootDir: string): Promise<string | undefined> {
+// tryText rejects when `git` is not on PATH at all (distinct from a git command
+// exiting non-zero, which it already reports as `undefined`); rule discovery
+// runs on arbitrary directories that may not have git installed, so that case
+// degrades the same way as a failed git invocation instead of throwing.
+async function safeTryText(rootDir: string, args: readonly string[]): ReturnType<typeof tryText> {
 	try {
-		const child = Bun.spawn(["git", "-C", rootDir, "rev-parse", "--git-path", "info/exclude"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const [exitCode, text] = await Promise.all([
-			child.exited,
-			new Response(child.stdout as ReadableStream<Uint8Array>).text(),
-		]);
-		if (exitCode === 0) {
-			const gitPath = text.trim();
-			if (gitPath) return path.isAbsolute(gitPath) ? gitPath : path.resolve(rootDir, gitPath);
-		}
-	} catch {}
+		return await tryText(rootDir, args, { readOnly: true });
+	} catch {
+		return undefined;
+	}
+}
+
+async function resolveGitExcludeFile(rootDir: string): Promise<string | undefined> {
+	const text = await safeTryText(rootDir, ["rev-parse", "--git-path", "info/exclude"]);
+	const gitPath = text?.trim();
+	if (gitPath) return path.isAbsolute(gitPath) ? gitPath : path.resolve(rootDir, gitPath);
 	const gitDir = await resolveGitDir(rootDir);
 	return gitDir ? path.join(gitDir, "info", "exclude") : undefined;
 }
@@ -712,22 +714,13 @@ async function configuredGlobalGitignorePath(): Promise<string | undefined> {
 	return undefined;
 }
 async function gitignorePath(rootDir: string): Promise<string | null> {
-	try {
-		const child = Bun.spawn(["git", "-C", rootDir, "config", "--path", "core.excludesFile"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const [exitCode, text] = await Promise.all([
-			child.exited,
-			new Response(child.stdout as ReadableStream<Uint8Array>).text(),
-		]);
-		if (exitCode === 0) {
-			const configured = text.trim();
-			if (!configured) return null;
-			const expanded = expandHomePath(configured);
-			return path.isAbsolute(expanded) ? expanded : path.resolve(rootDir, expanded);
-		}
-	} catch {}
+	const text = await safeTryText(rootDir, ["config", "--path", "core.excludesFile"]);
+	if (text !== undefined) {
+		const configured = text.trim();
+		if (!configured) return null;
+		const expanded = expandHomePath(configured);
+		return path.isAbsolute(expanded) ? expanded : path.resolve(rootDir, expanded);
+	}
 	const configured = await configuredGlobalGitignorePath();
 	if (configured) return configured;
 	const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
@@ -735,21 +728,10 @@ async function gitignorePath(rootDir: string): Promise<string | null> {
 }
 
 async function resolveGitIgnoreCase(rootDir: string): Promise<boolean> {
-	try {
-		const child = Bun.spawn(["git", "-C", rootDir, "config", "--bool", "core.ignoreCase"], {
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const [exitCode, text] = await Promise.all([
-			child.exited,
-			new Response(child.stdout as ReadableStream<Uint8Array>).text(),
-		]);
-		if (exitCode !== 0) return false;
-		const normalized = text.trim().toLowerCase();
-		return normalized === "true" || normalized === "yes" || normalized === "on" || normalized === "1";
-	} catch {
-		return false;
-	}
+	const text = await safeTryText(rootDir, ["config", "--bool", "core.ignoreCase"]);
+	if (text === undefined) return false;
+	const normalized = text.trim().toLowerCase();
+	return normalized === "true" || normalized === "yes" || normalized === "on" || normalized === "1";
 }
 
 type GitignoreRulesCache = Map<string, Promise<GitignoreRule[]>>;
