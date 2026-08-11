@@ -8,11 +8,16 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { ExtensionRunner, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import {
+	ExtensionRunner,
+	loadExtensionFromFactory,
+	loadExtensions,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 
@@ -156,6 +161,20 @@ describe("AgentSession handoff", () => {
 		expect(events.filter(event => event.type === "auto_compaction_start")).toHaveLength(0);
 		expect(events.filter(event => event.type === "auto_compaction_end")).toHaveLength(0);
 		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
+	});
+
+	it("clears staged preview state when handoff creates the replacement session", async () => {
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockResolvedValue("## Goal\nContinue from here");
+		session.toolChoiceQueue.registerPendingInvoker("old-session-preview", "ast_edit", async () => ({
+			content: [{ type: "text", text: "applied old preview" }],
+		}));
+		expect(session.peekPendingInvoker()).toBeDefined();
+		expect(session.nextToolChoiceDirective()).toBeDefined();
+
+		await session.handoff();
+
+		expect(session.peekPendingInvoker()).toBeUndefined();
+		expect(session.nextToolChoiceDirective()).toBeUndefined();
 	});
 
 	it("emits handoff lifecycle hooks on the outgoing and replacement sessions", async () => {
@@ -643,6 +662,7 @@ describe("AgentSession handoff", () => {
 						}
 					: undefined,
 			),
+			clearManagedTimers: vi.fn(),
 		} as unknown as ExtensionRunner;
 		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(fixedPreparation);
 		vi.spyOn(compactionModule, "compact").mockResolvedValue({
@@ -713,6 +733,7 @@ describe("AgentSession handoff", () => {
 						}
 					: undefined,
 			),
+			clearManagedTimers: vi.fn(),
 		} as unknown as ExtensionRunner;
 		vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue(fixedPreparation);
 		const compactSpy = vi.spyOn(compactionModule, "compact").mockResolvedValue({
@@ -723,8 +744,10 @@ describe("AgentSession handoff", () => {
 			details: {},
 			preserveData: { resultState: "keep-result" },
 		});
+		const promptCacheKey = "inherited-parent-cache";
 		const localAgent = new Agent({
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			promptCacheKey,
 		});
 		const localSession = new AgentSession({
 			agent: localAgent,
@@ -741,6 +764,7 @@ describe("AgentSession handoff", () => {
 		try {
 			await localSession.runIdleCompaction();
 			expect(compactSpy).toHaveBeenCalledTimes(1);
+			expect(compactSpy.mock.calls[0]?.[5]?.promptCacheKey).toBe(promptCacheKey);
 			const compactionEntry = localSessionManager.getEntries().find(entry => entry.type === "compaction");
 			if (compactionEntry?.type !== "compaction") throw new Error("Expected persisted compaction entry");
 			expect(compactionEntry.preserveData).toEqual({
@@ -824,6 +848,31 @@ describe("AgentSession handoff", () => {
 		).toHaveLength(1);
 		expect(fallbackCandidateKey).toBeDefined();
 		expect(promptSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not switch providers after provider-native auto-compaction fails", async () => {
+		session.settings.set("compaction.strategy", "context-full");
+		session.settings.set("compaction.thresholdTokens", 50);
+		session.settings.set("compaction.keepRecentTokens", 1);
+		session.settings.set("contextPromotion.enabled", false);
+
+		const attemptedCandidates: string[] = [];
+		vi.spyOn(compactionModule, "compact").mockImplementation(async (_preparation, candidate) => {
+			attemptedCandidates.push(`${candidate.provider}/${candidate.id}`);
+			throw new compactionModule.NativeCompactionError(new Error("native compaction transport failed"));
+		});
+
+		await session.prompt("pending prompt ".repeat(120));
+		await waitFor(() =>
+			events.some(
+				event =>
+					event.type === "auto_compaction_end" &&
+					event.errorMessage?.includes("native compaction transport failed") === true,
+			),
+		);
+
+		expect(attemptedCandidates.length).toBeGreaterThan(0);
+		expect(new Set(attemptedCandidates.map(candidate => candidate.split("/", 1)[0]))).toHaveLength(1);
 	});
 	it("keeps pre-prompt context-full checks aligned with provider-anchored usage", async () => {
 		await session.dispose();
@@ -1489,6 +1538,26 @@ describe("AgentSession handoff", () => {
 			streamFn: mock.stream,
 		});
 
+		const agentEndWillContinue: Array<boolean | undefined> = [];
+		const extensionsResult = await loadExtensions([], tempDir.path());
+		const captureAgentEnd = await loadExtensionFromFactory(
+			pi => {
+				pi.on("agent_end", event => {
+					agentEndWillContinue.push(event.willContinue);
+				});
+			},
+			tempDir.path(),
+			new EventBus(),
+			extensionsResult.runtime,
+			"capture-agent-end",
+		);
+		const extensionRunner = new ExtensionRunner(
+			[captureAgentEnd],
+			extensionsResult.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
 		session = new AgentSession({
 			agent,
 			sessionManager,
@@ -1499,6 +1568,7 @@ describe("AgentSession handoff", () => {
 				"compaction.thresholdPercent": 1,
 				"contextPromotion.enabled": false,
 			}),
+			extensionRunner,
 			modelRegistry,
 		});
 		session.subscribe(event => {
@@ -1512,6 +1582,7 @@ describe("AgentSession handoff", () => {
 
 		expect(mock.calls).toHaveLength(1);
 		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
+		expect(agentEndWillContinue).toEqual([undefined]);
 		const endEvents = events.filter(event => event.type === "auto_compaction_end");
 		expect(endEvents).toHaveLength(1);
 		expect(endEvents[0]).toMatchObject({ type: "auto_compaction_end", action: "handoff", aborted: false });

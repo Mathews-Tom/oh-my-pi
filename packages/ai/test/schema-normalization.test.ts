@@ -203,7 +203,58 @@ describe("upgradeJsonSchemaTo202012", () => {
 // ---------------------------------------------------------------------------
 
 describe("normalizeSchemaForGoogle", () => {
-	it("sets object type when converting an object const to an enum entry", () => {
+	it("preserves string enums and removes enums Google cannot represent", () => {
+		const sanitized = normalizeSchemaForGoogle({
+			type: "object",
+			properties: {
+				valid: { type: "string", enum: ["draft", "published"] },
+				numeric: { type: "number", enum: [1, 2] },
+				mixed: { enum: ["draft", 1] },
+			},
+		}) as { properties: Record<string, unknown> };
+
+		expect(sanitized.properties).toEqual({
+			valid: { type: "string", enum: ["draft", "published"] },
+			numeric: { type: "number" },
+			mixed: {},
+		});
+	});
+
+	it("preserves enum keys inside object-valued defaults", () => {
+		expect(
+			normalizeSchemaForGoogle({
+				type: "object",
+				default: { enum: [1], value: 2 },
+			}),
+		).toEqual({
+			type: "object",
+			default: { enum: [1], value: 2 },
+			properties: {},
+		});
+	});
+
+	it("keeps CCA incompatibility passes out of literal defaults", () => {
+		const literal = {
+			nullable: true,
+			allOf: [{ type: "object" }],
+			oneOf: [{ type: "string" }, { type: "number" }],
+		};
+		expect(
+			normalizeSchemaForCCA({
+				type: "object",
+				properties: {
+					value: { oneOf: [{ type: "string" }, { type: "string" }] },
+				},
+				default: literal,
+			}),
+		).toEqual({
+			type: "object",
+			properties: { value: { type: "string" } },
+			default: literal,
+		});
+	});
+
+	it("sets object type while removing an object-valued enum converted from const", () => {
 		const sanitized = normalizeSchemaForGoogle({
 			const: { a: 1 },
 		});
@@ -211,11 +262,10 @@ describe("normalizeSchemaForGoogle", () => {
 		expect(sanitized).toEqual({
 			type: "object",
 			properties: {},
-			enum: [{ a: 1 }],
 		});
 	});
 
-	it("deduplicates a deep-equal object const against an existing enum entry", () => {
+	it("removes an object-valued enum after deduplicating a deep-equal const", () => {
 		const sanitized = normalizeSchemaForGoogle({
 			type: "object",
 			enum: [{ a: 1 }],
@@ -225,11 +275,10 @@ describe("normalizeSchemaForGoogle", () => {
 		expect(sanitized).toEqual({
 			type: "object",
 			properties: {},
-			enum: [{ a: 1 }],
 		});
 	});
 
-	it("does not stamp a wrong scalar type when const variants span multiple primitive types", () => {
+	it("removes an enum when const variants span multiple primitive types", () => {
 		const sanitized = normalizeSchemaForGoogle({
 			anyOf: [
 				{ const: "A", type: "string" },
@@ -238,21 +287,21 @@ describe("normalizeSchemaForGoogle", () => {
 			],
 		}) as Record<string, unknown>;
 
-		expect(sanitized.enum).toEqual(["A", 1, true]);
+		expect(sanitized.enum).toBeUndefined();
 		expect(sanitized.type).toBeUndefined();
 	});
 
-	it("collapses inferred null type to nullable when const is null", () => {
+	it("collapses inferred null type to nullable while removing its enum", () => {
 		// After python-genai parity (handle_null_fields), bare `type: 'null'` is
 		// folded into `nullable: true` so the schema is OpenAPI-compatible.
 		const sanitized = normalizeSchemaForGoogle({ const: null }) as Record<string, unknown>;
 
 		expect(sanitized.type).toBeUndefined();
 		expect(sanitized.nullable).toBe(true);
-		expect(sanitized.enum).toEqual([null]);
+		expect(sanitized.enum).toBeUndefined();
 	});
 
-	it("preserves a property schema literally named additionalProperties inside properties", () => {
+	it("coerces a boolean subschema literally named additionalProperties inside properties", () => {
 		const sanitized = normalizeSchemaForGoogle({
 			type: "object",
 			properties: {
@@ -262,20 +311,81 @@ describe("normalizeSchemaForGoogle", () => {
 		}) as Record<string, unknown>;
 
 		const properties = sanitized.properties as Record<string, unknown>;
+		// The key survives (it is a property, not the stripped keyword), but its
+		// boolean subschema value coerces to the object form (issue #5604).
 		expect(Object.hasOwn(properties, "additionalProperties")).toBe(true);
-		expect(properties.additionalProperties).toBe(false);
+		expect(properties.additionalProperties).toEqual({ not: {} });
 	});
 
-	it("preserves boolean schemas for a single property literally named additionalProperties", () => {
-		const schema = {
+	it("coerces a boolean subschema for a single property literally named additionalProperties", () => {
+		const sanitized = normalizeSchemaForGoogle({
 			type: "object",
 			properties: {
 				additionalProperties: false,
 			},
 			required: ["additionalProperties"],
-		} as const;
+		}) as Record<string, unknown>;
 
-		expect(normalizeSchemaForGoogle(schema)).toEqual(schema);
+		const properties = sanitized.properties as Record<string, unknown>;
+		expect(properties.additionalProperties).toEqual({ not: {} });
+		expect(sanitized.required).toEqual(["additionalProperties"]);
+	});
+
+	it("coerces boolean subschemas to object equivalents on the Google wire (issue #5604)", () => {
+		const google = normalizeSchemaForGoogle({
+			type: "object",
+			properties: {
+				propertyValue: true,
+				attributeValue: false,
+			},
+		}) as Record<string, unknown>;
+
+		expect(google.properties).toEqual({ propertyValue: {}, attributeValue: { not: {} } });
+		// Root-level and array-branch booleans are covered by the same choke point.
+		expect(normalizeSchemaForGoogle(true)).toEqual({});
+		expect(normalizeSchemaForGoogle(false)).toEqual({ not: {} });
+		expect(normalizeSchemaForGoogle({ anyOf: [true, { type: "string" }] })).toEqual({
+			anyOf: [{}, { type: "string" }],
+		});
+	});
+
+	it("strips draft-2019 conditional keywords the OpenAPI-style wire cannot model", () => {
+		// `dependentSchemas`/`dependencies`/`dependentRequired` have no Google
+		// OpenAPI Schema representation and are not caught by residual checks, so
+		// they must be dropped before serialization on both transports.
+		const input = {
+			type: "object",
+			properties: { propertyValue: true },
+			dependentSchemas: { hasFoo: true },
+			dependentRequired: { hasFoo: ["propertyValue"] },
+		};
+		const expected = { type: "object", properties: { propertyValue: {} } };
+
+		expect(normalizeSchemaForGoogle(input)).toEqual(expected);
+		expect(normalizeSchemaForCCA(input)).toEqual(expected);
+
+		// MCP accepts native JSON Schema booleans, so it preserves them.
+		expect(
+			normalizeSchemaForMCP({
+				type: "object",
+				dependentSchemas: { hasFoo: true, hasBar: false },
+			}),
+		).toEqual({
+			type: "object",
+			dependentSchemas: { hasFoo: true, hasBar: false },
+		});
+	});
+
+	it("falls back when a false subschema produces unsupported `not` on the CCA wire", () => {
+		const fallback = { type: "object", properties: {} };
+
+		expect(normalizeSchemaForCCA(false)).toEqual(fallback);
+		expect(normalizeSchemaForCCA({ type: "object", properties: { attributeValue: false } })).toEqual(fallback);
+		// A property named `not` is a schema-map entry, not the unsupported keyword.
+		expect(normalizeSchemaForCCA({ type: "object", properties: { not: { type: "string" } } })).toEqual({
+			type: "object",
+			properties: { not: { type: "string" } },
+		});
 	});
 
 	it("inlines local $ref / $defs entries for Google compatibility", () => {
@@ -1132,6 +1242,7 @@ function assertMfjsValid(node: unknown, path = "$"): void {
 		for (const [i, entry] of node.entries()) assertMfjsValid(entry, `${path}[${i}]`);
 		return;
 	}
+	if (typeof node === "boolean") throw new Error(`MFJS requires an object schema at ${path}`);
 	if (typeof node !== "object" || node === null) return;
 	const obj = node as Record<string, unknown>;
 	for (const key of Object.keys(obj)) {
@@ -1213,6 +1324,37 @@ describe("normalizeSchemaForMoonshot", () => {
 		expect(props.extra.additionalProperties).toBe(true);
 		expect(props.skip.anyOf).toEqual([{ type: "number" }, { type: "null" }]);
 		expect(props.limit).toEqual({ type: "integer", default: 10 });
+	});
+
+	it("normalizes schema-valued additionalProperties without walking literal payload objects", () => {
+		const literal = { oneOf: [{ const: "literal-a" }, { const: "literal-b" }] };
+		const normalized = normalizeSchemaForMoonshot({
+			type: "object",
+			additionalProperties: { oneOf: [{ const: 1 }, { const: 2 }] },
+			default: literal,
+		});
+
+		expect(normalized).toEqual({
+			type: "object",
+			additionalProperties: { type: "number", enum: [1, 2] },
+			default: literal,
+		});
+	});
+
+	it("coerces boolean subschemas to MFJS object forms without changing boolean keywords", () => {
+		expect(
+			normalizeSchemaForMoonshot({
+				type: "object",
+				properties: { allowed: true, forbidden: false },
+				additionalProperties: false,
+			}),
+		).toEqual({
+			type: "object",
+			properties: { allowed: {}, forbidden: {} },
+			additionalProperties: false,
+		});
+		expect(normalizeSchemaForMoonshot(true)).toEqual({});
+		expect(normalizeSchemaForMoonshot(false)).toEqual({});
 	});
 
 	it("folds oneOf into anyOf (the only MFJS combinator)", () => {

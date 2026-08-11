@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
 import { loadCustomTools, type ToolPathWithSource } from "../../src/extensibility/custom-tools/loader";
 
 let tempRoot: string | undefined;
@@ -71,6 +73,48 @@ const MISSING_NAME_SOURCE = [
 ].join("\n");
 
 describe("custom tool loader", () => {
+	it("injects callable omptype-backed zod schemas through validation and wire emission", async () => {
+		const toolPath = await writeTool(
+			"zod-wire.js",
+			[
+				"export default api => ({",
+				'\tname: "zod_wire_tool",',
+				'\tdescription: "Validates an injected zod schema",',
+				"\tparameters: api.zod.object({ path: api.zod.string() }),",
+				"\tasync execute() {",
+				'\t\treturn { content: [{ type: "text", text: "ok" }] };',
+				"\t},",
+				"});",
+			].join("\n"),
+		);
+		const result = await loadCustomTools([{ path: toolPath }], requireTempRoot(), []);
+		const tool = result.tools[0]?.tool;
+
+		expect(result.errors).toEqual([]);
+		expect(tool).toBeDefined();
+		expect(
+			validateToolArguments(tool!, {
+				type: "toolCall",
+				id: "valid",
+				name: tool!.name,
+				arguments: { path: "README.md" },
+			}),
+		).toEqual({ path: "README.md" });
+		expect(() =>
+			validateToolArguments(tool!, {
+				type: "toolCall",
+				id: "invalid",
+				name: tool!.name,
+				arguments: {},
+			}),
+		).toThrow('Validation failed for tool "zod_wire_tool"');
+		expect(toolWireSchema(tool!)).toMatchObject({
+			type: "object",
+			properties: { path: { type: "string" } },
+			required: ["path"],
+		});
+	});
+
 	it("skips a tool that calls process.exit synchronously at import time and still loads later valid tools", async () => {
 		// CLI-shaped module: main() at the bottom, exit on failure (issue #1704).
 		// Without the exit guard this terminates the test process before the
@@ -171,5 +215,106 @@ describe("custom tool loader", () => {
 		});
 		expect(result.errors[0]?.error.toLowerCase()).toContain("invalid");
 		expect(result.errors[0]?.error).toContain("index 1");
+	});
+
+	it("restores host stdin after a tool hijacks it at import time (#5618)", async () => {
+		// A ~/.claude/tools MCP server attaches a stdin consumer at module top
+		// level (a bare `resume()` here stands in for `new StdioServerTransport()`).
+		// Without the stdin guard this steals Bun's single stdin reader and the
+		// TUI goes permanently deaf after one keypress. The tool also exports a
+		// valid default, so the guard must restore stdin on the success path too.
+		const hijackTool = await writeTool(
+			"stdin-hijack.js",
+			[
+				'process.stdin.on("data", () => {});',
+				"process.stdin.resume();",
+				"export default api => ({",
+				'\tname: "stdin_hijack_tool",',
+				'\tdescription: "Loads fine but hijacks stdin at import",',
+				"\tparameters: api.zod.object({}),",
+				"\tasync execute() {",
+				'\t\treturn { content: [{ type: "text", text: "ok" }] };',
+				"\t},",
+				"});",
+			].join("\n"),
+		);
+
+		const dataBefore = process.stdin.listenerCount("data");
+		const pausedBefore = process.stdin.isPaused();
+		try {
+			const result = await loadCustomTools([{ path: hijackTool }], requireTempRoot(), []);
+			expect(result.tools.map(tool => tool.tool.name)).toEqual(["stdin_hijack_tool"]);
+			expect(process.stdin.listenerCount("data")).toBe(dataBefore);
+			expect(process.stdin.isPaused()).toBe(pausedBefore);
+		} finally {
+			// Defensive: if the guard regressed and leaked a listener, drop the
+			// extras so this test cannot poison later files in the suite.
+			const leaked = process.stdin.listeners("data").slice(dataBefore);
+			for (const listener of leaked) {
+				process.stdin.removeListener("data", listener as (...args: unknown[]) => void);
+			}
+			if (pausedBefore && !process.stdin.isPaused()) process.stdin.pause();
+		}
+	});
+
+	it("resumes host stdin when a tool pauses it at import time", async () => {
+		const pausedBefore = process.stdin.isPaused();
+		if (pausedBefore) process.stdin.resume();
+		const pauseTool = await writeTool(
+			"stdin-pause.js",
+			[
+				"process.stdin.pause();",
+				"export default api => ({",
+				'\tname: "stdin_pause_tool",',
+				'\tdescription: "Pauses host stdin at import",',
+				"\tparameters: api.zod.object({}),",
+				"\tasync execute() {",
+				'\t\treturn { content: [{ type: "text", text: "ok" }] };',
+				"\t},",
+				"});",
+			].join("\n"),
+		);
+		try {
+			const result = await loadCustomTools([{ path: pauseTool }], requireTempRoot(), []);
+			expect(result.tools.map(tool => tool.tool.name)).toEqual(["stdin_pause_tool"]);
+			expect(process.stdin.isPaused()).toBeFalse();
+		} finally {
+			if (pausedBefore) process.stdin.pause();
+			else process.stdin.resume();
+		}
+	});
+
+	it("reinstates a host stdin listener a tool removes at import time (#5744)", async () => {
+		// A tool factory that calls process.stdin.removeAllListeners("data")
+		// during (re)load — e.g. a subagent re-running preloaded factories while
+		// the parent TUI is live — must not permanently strip ProcessTerminal's
+		// input handler. The guard reconciles stdin back to the pre-load snapshot,
+		// reinstating any listener the module removed.
+		const stripTool = await writeTool(
+			"stdin-strip.js",
+			[
+				'process.stdin.removeAllListeners("data");',
+				"export default api => ({",
+				'\tname: "stdin_strip_tool",',
+				'\tdescription: "Removes host data listeners at import",',
+				"\tparameters: api.zod.object({}),",
+				"\tasync execute() {",
+				'\t\treturn { content: [{ type: "text", text: "ok" }] };',
+				"\t},",
+				"});",
+			].join("\n"),
+		);
+
+		const hostListener = (): void => {};
+		process.stdin.on("data", hostListener);
+		const dataBefore = process.stdin.listenerCount("data");
+		try {
+			const result = await loadCustomTools([{ path: stripTool }], requireTempRoot(), []);
+			expect(result.tools.map(tool => tool.tool.name)).toEqual(["stdin_strip_tool"]);
+			expect(process.stdin.listenerCount("data")).toBe(dataBefore);
+			expect(process.stdin.listeners("data")).toContain(hostListener);
+		} finally {
+			process.stdin.removeListener("data", hostListener);
+		}
 	});
 });

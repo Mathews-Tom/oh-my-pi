@@ -4,14 +4,23 @@
 import type * as fs1 from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { Type } from "@oh-my-pi/omptype";
+import * as zodModule from "@oh-my-pi/omptype/zod";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent, Model, TextContent, TSchema } from "@oh-my-pi/pi-ai";
+import type {
+	ImageContent,
+	Model,
+	ServiceTier,
+	ServiceTierByFamily,
+	ServiceTierFamily,
+	TextContent,
+	TSchema,
+} from "@oh-my-pi/pi-ai";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { hasFsCode, isEacces, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import { Type } from "arktype";
-import * as zodModule from "zod/v4";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
 import { type Hook, hookCapability } from "../../capability/hook";
+import { isServiceTierFamily, isServiceTierForFamily } from "../../config/service-tier";
 import { loadCapability } from "../../discovery";
 import { getExtensionNameFromPath } from "../../discovery/helpers";
 import type { ExecOptions } from "../../exec/exec";
@@ -20,11 +29,11 @@ import { execCommand } from "../../exec/exec";
 import * as PiCodingAgent from "../../index";
 import type { CustomMessagePayload } from "../../session/messages";
 import { EventBus } from "../../utils/event-bus";
+import * as TypeBox from "../legacy-typebox";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
 import { getAllPluginExtensionPaths } from "../plugins/loader";
-import * as TypeBox from "../typebox";
 
-import { resolvePath, withExitGuard } from "../utils";
+import { resolvePath, withHostGuard } from "../utils";
 import type {
 	AssistantThinkingRenderer,
 	Extension,
@@ -104,6 +113,14 @@ export class ExtensionRuntime implements IExtensionRuntime {
 	}
 
 	setThinkingLevel(): void {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	getServiceTiers(): ServiceTierByFamily {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+
+	setServiceTier(): void {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
@@ -252,6 +269,17 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		this.runtime.setThinkingLevel(level, persist);
 	}
 
+	getServiceTiers(): Readonly<ServiceTierByFamily> {
+		return { ...this.runtime.getServiceTiers() };
+	}
+
+	setServiceTier(family: ServiceTierFamily, tier: ServiceTier | undefined): void {
+		if (!isServiceTierFamily(family) || (tier !== undefined && !isServiceTierForFamily(family, tier))) {
+			throw new TypeError(`Invalid service tier "${String(tier)}" for family "${String(family)}"`);
+		}
+		this.runtime.setServiceTier(family, tier);
+	}
+
 	getSessionName(): string | undefined {
 		return this.runtime.getSessionName();
 	}
@@ -290,7 +318,7 @@ async function loadExtension(
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
 	try {
-		const module = (await withExitGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
+		const module = (await withHostGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
 		const factory = getExtensionFactory(module);
 
 		if (typeof factory !== "function") {
@@ -302,7 +330,7 @@ async function loadExtension(
 
 		const extension = createExtension(extensionPath, resolvedPath);
 		const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
-		await withExitGuard(async () => {
+		await withHostGuard(async () => {
 			await factory(api);
 		});
 
@@ -481,6 +509,26 @@ async function discoverExtensionsInDir(dir: string): Promise<string[]> {
 
 	return discovered;
 }
+async function discoverHooksInPackageRoot(root: string): Promise<string[]> {
+	const hooks: string[] = [];
+	for (const hookType of ["pre", "post"]) {
+		const hookDir = path.join(root, "hooks", hookType);
+		let entries: fs1.Dirent[];
+		try {
+			entries = await fs.readdir(hookDir, { withFileTypes: true });
+		} catch (err) {
+			if (isEnoent(err) || isEacces(err) || hasFsCode(err, "ENOTDIR") || hasFsCode(err, "EPERM")) continue;
+			throw err;
+		}
+		for (const entry of entries) {
+			if ((entry.isFile() || entry.isSymbolicLink()) && isExtensionFile(entry.name)) {
+				hooks.push(path.join(hookDir, entry.name));
+			}
+		}
+	}
+	return hooks;
+}
+
 /**
  * Discover absolute paths of extensions to load, without importing or
  * binding factories. Hot path on session startup — the scan walks native
@@ -494,10 +542,16 @@ async function discoverExtensionsInDir(dir: string): Promise<string[]> {
  * `LoadExtensionsResult` directly would reuse handlers/tools/commands that
  * closed over the parent's `cwd` and event bus.
  */
+export interface DiscoverExtensionPathOptions {
+	/** Include ambient native extensions, hooks, and installed plugins. */
+	ambient?: boolean;
+}
+
 export async function discoverExtensionPaths(
 	configuredPaths: string[],
 	cwd: string,
 	disabledExtensionIds?: string[],
+	options: DiscoverExtensionPathOptions = {},
 ): Promise<string[]> {
 	const allPaths: string[] = [];
 	const seen = new Set<string>();
@@ -521,33 +575,44 @@ export async function discoverExtensionPaths(
 		}
 	};
 
-	// 1. Discover extension modules via capability API (native .omp/.pi only).
-	// Scope the load to the native provider — the extension-module capability
-	// also has claude/codex/gemini/opencode providers, and their items were
-	// discarded here anyway (see #4198). The provider filter skips the walk
-	// entirely instead of running four foreign directory scans and dropping
-	// the results.
-	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, {
-		...loadOptions,
-		providers: ["native"],
-	});
-	for (const ext of discovered.items) {
-		addPath(ext.path);
+	const ambient = options.ambient !== false;
+	if (ambient) {
+		// 1. Discover extension modules via capability API (native .omp/.pi only).
+		// Scope the load to the native provider — the extension-module capability
+		// also has claude/codex/gemini/opencode providers, and their items were
+		// discarded here anyway (see #4198). The provider filter skips the walk
+		// entirely instead of running four foreign directory scans and dropping
+		// the results.
+		const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, {
+			...loadOptions,
+			providers: ["native"],
+		});
+		for (const ext of discovered.items) {
+			addPath(ext.path);
+		}
 	}
 
-	// 2. Discover JS/TS hook factories from hookCapability and bind them through
-	// the extension runner, which owns the current runtime event bus. Hook
-	// capability loading already applies hook-specific disabled ids; do not also
-	// filter them through extension-module names.
-	const hooks = await loadCapability<Hook>(hookCapability.id, loadOptions);
-	for (const hookPath of hooks.items
-		.map(hook => hook.path)
-		.filter(hookPath => isExtensionFile(path.basename(hookPath)))) {
-		addPath(hookPath);
+	// 2. Discover JS/TS hook factories and bind them through the extension
+	// runner, which owns the current runtime event bus. Non-ambient discovery
+	// scans only this invocation's configured package roots; it must not consult
+	// settings, installed packages, or process-global CLI injection state.
+	if (ambient) {
+		const hooks = await loadCapability<Hook>(hookCapability.id, loadOptions);
+		for (const hookPath of hooks.items
+			.map(hook => hook.path)
+			.filter(hookPath => isExtensionFile(path.basename(hookPath)))) {
+			addPath(hookPath);
+		}
+	} else {
+		for (const configuredPath of configuredPaths) {
+			addPaths(await discoverHooksInPackageRoot(resolvePath(configuredPath, cwd)));
+		}
 	}
 
-	// 3. Discover extension entry points from installed plugins
-	addPaths(await getAllPluginExtensionPaths(cwd));
+	// 3. Discover extension entry points from installed plugins.
+	if (ambient) {
+		addPaths(await getAllPluginExtensionPaths(cwd));
+	}
 
 	// 4. Explicitly configured paths
 	for (const configuredPath of configuredPaths) {
@@ -590,7 +655,8 @@ export async function discoverAndLoadExtensions(
 	cwd: string,
 	eventBus?: EventBus,
 	disabledExtensionIds?: string[],
+	options: DiscoverExtensionPathOptions = {},
 ): Promise<LoadExtensionsResult> {
-	const paths = await discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds);
+	const paths = await discoverExtensionPaths(configuredPaths, cwd, disabledExtensionIds, options);
 	return loadExtensions(paths, cwd, eventBus);
 }

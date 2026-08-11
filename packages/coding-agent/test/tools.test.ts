@@ -237,7 +237,7 @@ function createTestToolSession(
 		getArtifactsDir: () => sessionDir,
 		allocateOutputArtifact: async (toolType: string) => {
 			fs.mkdirSync(sessionDir, { recursive: true });
-			const id = `artifact-${++artifactCounter}`;
+			const id = String(++artifactCounter);
 			return { id, path: path.join(sessionDir, `${id}.${toolType}.log`) };
 		},
 		settings,
@@ -280,7 +280,7 @@ describe("Coding Agent Tools", () => {
 	});
 
 	beforeEach(() => {
-		// Force replace mode for edit tool tests using old_text/new_text
+		// Force replace mode for edit tool tests using old_string/new_string
 		originalEditVariant = Bun.env.PI_EDIT_VARIANT;
 		Bun.env.PI_EDIT_VARIANT = "replace";
 
@@ -417,7 +417,8 @@ describe("Coding Agent Tools", () => {
 
 			await noLspEditTool.execute("test-edit-ipynb", {
 				path: notebookPath,
-				edits: [{ old_text: "print('old')", new_text: "print('new')" }],
+				old_string: "print('old')",
+				new_string: "print('new')",
 			});
 
 			const updated = JSON.parse(fs.readFileSync(notebookPath, "utf-8"));
@@ -601,6 +602,20 @@ describe("Coding Agent Tools", () => {
 			expect(output).not.toContain("Cannot read binary file");
 		});
 
+		it("does not route a legacy .xls through markit's unsupported-format error", async () => {
+			// `.xls` was advertised as convertible but markit only registers the
+			// OOXML `.xlsx` converter, so reading a legacy `.xls` surfaced
+			// "Unsupported format: .xls" instead of falling through to normal
+			// file handling (issue #5808). An OLE2 header (`D0 CF 11 E0`) is a
+			// binary blob, so the read tool now refuses it as binary.
+			const xlsFile = path.join(testDir, "legacy.xls");
+			fs.writeFileSync(xlsFile, Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]));
+
+			const output = getTextOutput(await readTool.execute("test-call-legacy-xls", { path: xlsFile }));
+			expect(output).not.toContain("Unsupported format");
+			expect(output).toContain("Cannot read binary file");
+		});
+
 		it("should reject malformed internal-URL selectors instead of dumping the whole resource", async () => {
 			await expect(readTool.execute("test-call-bad-internal-sel", { path: "artifact://3:-100" })).rejects.toThrow(
 				/Invalid selector ':-100'/,
@@ -621,6 +636,66 @@ describe("Coding Agent Tools", () => {
 			expect(result.details?.truncation?.truncatedBy).toBe("lines");
 			expect(result.details?.truncation?.totalLines).toBe(3500);
 			expect(result.details?.truncation?.outputLines).toBe(defaultLimit);
+		});
+
+		it("should spill oversized read output to an artifact", async () => {
+			const testFile = path.join(testDir, "oversized-read.txt");
+			const line = "0123456789".repeat(20);
+			fs.writeFileSync(testFile, `${Array.from({ length: 3500 }, () => line).join("\n")}\n`);
+			const spillSettings = Settings.isolated({
+				"tools.artifactSpillThreshold": 20,
+				"tools.artifactTailBytes": 1,
+				"tools.artifactTailLines": 10,
+				"tools.artifactHeadBytes": 1,
+			});
+			const defaultLimit = spillSettings.get("read.defaultLimit");
+			const spillManager = SessionManager.create(testDir, path.join(testDir, "spill-sessions"));
+			await spillManager.ensureOnDisk();
+			const spillSession = createTestToolSession(testDir, spillSettings, {
+				getSessionFile: () => spillManager.getSessionFile() ?? null,
+				getArtifactsDir: () => spillManager.getArtifactsDir(),
+				localProtocolOptions: {
+					getArtifactsDir: () => spillManager.getArtifactsDir(),
+					getSessionId: () => spillManager.getSessionId(),
+				},
+			});
+			const spillReadTool = wrapToolWithMetaNotice(new ReadTool(spillSession));
+			const context = {
+				...createTestToolContext(["read"]),
+				settings: spillSettings,
+				sessionManager: spillManager,
+			};
+
+			try {
+				const result = await spillReadTool.execute(
+					"test-call-read-spill",
+					{ path: testFile },
+					undefined,
+					undefined,
+					context,
+				);
+				const truncation = result.details?.meta?.truncation;
+				const output = getTextOutput(result);
+
+				expect(truncation?.artifactId).toBeDefined();
+				expect(Buffer.byteLength(output, "utf-8")).toBeLessThan(20 * 1024);
+				expect(output).toContain("artifact://");
+				expect(truncation?.nextOffset).toBe(defaultLimit + 1);
+				expect(output).toContain(`Use :${defaultLimit + 1} to continue`);
+
+				const saveArtifact = vi.spyOn(spillManager, "saveArtifact");
+				const artifactResult = await spillReadTool.execute(
+					"test-call-read-spilled-artifact",
+					{ path: `artifact://${truncation?.artifactId}` },
+					undefined,
+					undefined,
+					context,
+				);
+				expect(getTextOutput(artifactResult)).toContain(line);
+				expect(saveArtifact).not.toHaveBeenCalled();
+			} finally {
+				await spillManager.close();
+			}
 		});
 
 		it("should render directories as a two-level tree without capping root entries", async () => {
@@ -734,6 +809,20 @@ describe("Coding Agent Tools", () => {
 			{
 				label: ".zip",
 				path: "fixture-subpath.zip",
+				create: (entries: ArchiveFixtureEntry[]) => createZipArchive(entries),
+			},
+			{
+				// `.jar`/`.war` are ZIP containers under a different extension.
+				// Regression: archiveFormatFromPath / parseArchivePathCandidates
+				// previously excluded them, so `read lib.jar:member` failed with
+				// path-not-found (issue #5808).
+				label: ".jar",
+				path: "fixture-subpath.jar",
+				create: (entries: ArchiveFixtureEntry[]) => createZipArchive(entries),
+			},
+			{
+				label: ".war",
+				path: "fixture-subpath.war",
 				create: (entries: ArchiveFixtureEntry[]) => createZipArchive(entries),
 			},
 		]) {
@@ -1030,7 +1119,8 @@ describe("Coding Agent Tools", () => {
 
 			const result = await editTool.execute("test-call-5", {
 				path: testFile,
-				edits: [{ old_text: "world", new_text: "testing" }],
+				old_string: "world",
+				new_string: "testing",
 			});
 			const details = result.details as { diff?: string } | undefined;
 
@@ -1049,7 +1139,8 @@ describe("Coding Agent Tools", () => {
 			await expect(
 				editTool.execute("test-call-6", {
 					path: testFile,
-					edits: [{ old_text: "nonexistent", new_text: "testing" }],
+					old_string: "nonexistent",
+					new_string: "testing",
 				}),
 			).rejects.toThrow(/Could not find/);
 		});
@@ -1062,18 +1153,21 @@ describe("Coding Agent Tools", () => {
 			await expect(
 				editTool.execute("test-call-7", {
 					path: testFile,
-					edits: [{ old_text: "foo", new_text: "bar" }],
+					old_string: "foo",
+					new_string: "bar",
 				}),
 			).rejects.toThrow(/Found 3 occurrences/);
 		});
 
-		it("should replace all occurrences with all: true", async () => {
+		it("should replace all occurrences with replace_all: true", async () => {
 			const testFile = path.join(testDir, "edit-all-test.txt");
 			fs.writeFileSync(testFile, "foo bar foo baz foo");
 
 			const result = await editTool.execute("test-all-1", {
 				path: testFile,
-				edits: [{ old_text: "foo", new_text: "qux", all: true }],
+				old_string: "foo",
+				new_string: "qux",
+				replace_all: true,
 			});
 
 			expect(getTextOutput(result)).toContain("Successfully replaced 3 occurrences");
@@ -1081,7 +1175,7 @@ describe("Coding Agent Tools", () => {
 			expect(content).toBe("qux bar qux baz qux");
 		});
 
-		it("should reject all: true when multiple fuzzy matches are ambiguous", async () => {
+		it("should reject replace_all: true when multiple fuzzy matches are ambiguous", async () => {
 			const testFile = path.join(testDir, "edit-all-fuzzy.txt");
 			// File has two similar blocks with different indentation
 			fs.writeFileSync(
@@ -1103,36 +1197,36 @@ function b() {
 			await expect(
 				editTool.execute("test-all-fuzzy", {
 					path: testFile,
-					edits: [
-						{
-							old_text: "if (x) {\n  doThing();\n}",
-							new_text: "if (y) {\n  doOther();\n}",
-							all: true,
-						},
-					],
+					old_string: "if (x) {\n  doThing();\n}",
+					new_string: "if (y) {\n  doOther();\n}",
+					replace_all: true,
 				}),
 			).rejects.toThrow(/Found 2 high-confidence matches/);
 		});
 
-		it("should fail with all: true if no matches found", async () => {
+		it("should fail with replace_all: true if no matches found", async () => {
 			const testFile = path.join(testDir, "edit-all-nomatch.txt");
 			fs.writeFileSync(testFile, "hello world");
 
 			await expect(
 				editTool.execute("test-all-nomatch", {
 					path: testFile,
-					edits: [{ old_text: "nonexistent", new_text: "bar", all: true }],
+					old_string: "nonexistent",
+					new_string: "bar",
+					replace_all: true,
 				}),
 			).rejects.toThrow(/Could not find/);
 		});
 
-		it("should replace multiline text with all: true", async () => {
+		it("should replace multiline text with replace_all: true", async () => {
 			const testFile = path.join(testDir, "edit-all-multiline.txt");
 			fs.writeFileSync(testFile, "start\nfoo\nbar\nend\nstart\nfoo\nbar\nend");
 
 			const result = await editTool.execute("test-all-multiline", {
 				path: testFile,
-				edits: [{ old_text: "foo\nbar", new_text: "replaced", all: true }],
+				old_string: "foo\nbar",
+				new_string: "replaced",
+				replace_all: true,
 			});
 
 			expect(getTextOutput(result)).toContain("Successfully replaced 2 occurrences");
@@ -1140,18 +1234,43 @@ function b() {
 			expect(content).toBe("start\nreplaced\nend\nstart\nreplaced\nend");
 		});
 
-		it("should work with all: true when only one occurrence exists", async () => {
+		it("should work with replace_all: true when only one occurrence exists", async () => {
 			const testFile = path.join(testDir, "edit-all-single.txt");
 			fs.writeFileSync(testFile, "hello world");
 
 			const result = await editTool.execute("test-all-single", {
 				path: testFile,
-				edits: [{ old_text: "world", new_text: "universe", all: true }],
+				old_string: "world",
+				new_string: "universe",
+				replace_all: true,
 			});
 
 			expect(getTextOutput(result)).toContain("Successfully replaced text");
 			const content = await Bun.file(testFile).text();
 			expect(content).toBe("hello universe");
+		});
+
+		it("applies the bridge's internal edits batch form as one aggregate result", async () => {
+			// Only the Cursor exec bridge produces this shape (multi-replacement
+			// pi_edit frames); it must apply every replacement in order and
+			// return a single aggregated diff.
+			const testFile = path.join(testDir, "edit-batch.txt");
+			fs.writeFileSync(testFile, "alpha\nbeta\n");
+
+			const result = await editTool.execute("test-batch-1", {
+				path: testFile,
+				edits: [
+					{ old_string: "alpha", new_string: "ALPHA" },
+					{ old_string: "beta", new_string: "BETA" },
+				],
+			});
+
+			expect(result.isError).toBeUndefined();
+			const content = await Bun.file(testFile).text();
+			expect(content).toBe("ALPHA\nBETA\n");
+			const details = result.details as { diff?: string } | undefined;
+			expect(details?.diff).toContain("ALPHA");
+			expect(details?.diff).toContain("BETA");
 		});
 	});
 
@@ -1328,10 +1447,10 @@ function b() {
 
 		it("should write truncated output to artifacts", async () => {
 			const result = await bashTool.execute("test-call-8-artifact", {
-				// A single line past the 768-byte column cap is the minimal output
-				// that trips truncation + artifact spill; the old 60K-arg brace
-				// expansion paid ~60ms of shell time to prove the same path.
-				command: "printf 'a%.0s' {1..2000}",
+				// Emit well past the ~50KB inline window across many lines so the
+				// output is genuinely window-truncated (not merely column-capped),
+				// which is what allocates the spill artifact.
+				command: "seq 1 30000",
 			});
 
 			const artifactId = result.details?.meta?.truncation?.artifactId;
@@ -1422,7 +1541,6 @@ function b() {
 			expect(result.details?.async?.state).toBe("running");
 			expect(result.details?.async?.type).toBe("bash");
 			expect(getTextOutput(result)).toContain("Backgrounded as job");
-			expect(getTextOutput(result)).toContain("start");
 
 			const jobId = result.details?.async?.jobId;
 			if (!jobId) {
@@ -1435,8 +1553,62 @@ function b() {
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			expect(deliveries).toHaveLength(1);
 			expect(deliveries[0]?.jobId).toBe(jobId);
+			expect(deliveries[0]?.text).toContain("start");
 			expect(deliveries[0]?.text).toContain("done");
 			expect(updates).toEqual(updatesAtBackground);
+			await asyncJobManager.dispose();
+		});
+
+		it("backgrounds a running command when the steering signal fires mid-wait", async () => {
+			const asyncJobManager = new AsyncJobManager({});
+			const autoBackgroundBashTool = wrapToolWithMetaNotice(
+				new BashTool(
+					createTestToolSession(
+						testDir,
+						Settings.isolated({
+							"bash.autoBackground.enabled": true,
+							// High threshold: only the steering signal can background this.
+							"bash.autoBackground.thresholdMs": 60_000,
+						}),
+						{
+							getSessionId: () => "test-session",
+							asyncJobManager,
+						},
+					),
+				),
+			);
+
+			const steering = new AbortController();
+			steering.abort();
+			const result = await autoBackgroundBashTool.execute(
+				"test-call-steer-background",
+				{ command: "printf 'start\\n'; sleep 0.05; printf 'done\\n'" },
+				undefined,
+				undefined,
+				{
+					...createTestToolContext([]),
+					toolCall: {
+						batchId: "batch-1",
+						index: 0,
+						total: 1,
+						toolCalls: [{ id: "test-call-steer-background", name: "bash" }],
+						steeringSignal: steering.signal,
+					},
+				},
+			);
+
+			// The steer backgrounds the command instead of killing it: the call
+			// returns a running job and the command finishes on its own.
+			expect(result.details?.async?.state).toBe("running");
+			expect(getTextOutput(result)).toContain("Backgrounded early to handle an incoming message");
+			const jobId = result.details?.async?.jobId;
+			if (!jobId) {
+				throw new Error("expected a steer-backgrounded job id");
+			}
+			const job = asyncJobManager.getJob(jobId);
+			expect(job?.status).toBe("running");
+			await job?.promise;
+			expect(asyncJobManager.getJob(jobId)?.status).toBe("completed");
 			await asyncJobManager.dispose();
 		});
 
@@ -1520,10 +1692,14 @@ function b() {
 		it("should respect timeout", async () => {
 			// Reduce the effective timeout through the production clamp seam; the
 			// real subprocess kill-on-timeout path is still exercised, just faster.
+			// Timeouts settle as a flagged result (rendered as a warning) rather
+			// than a thrown error since #5546; ACP keeps its rejection semantics.
 			vi.spyOn(toolTimeouts, "clampTimeout").mockReturnValue(0.05);
-			await expect(bashTool.execute("test-call-10", { command: "sleep 5", timeout: 1 })).rejects.toThrow(
-				/timed out/i,
-			);
+			const result = await bashTool.execute("test-call-10", { command: "sleep 5", timeout: 1 });
+			expect(result.isError).toBe(true);
+			expect((result.details as { timedOut?: boolean } | undefined)?.timedOut).toBe(true);
+			const text = result.content.find(c => c.type === "text")?.text ?? "";
+			expect(text).toMatch(/timed out/i);
 		});
 
 		it("should abort and recover for subsequent commands", async () => {
@@ -2166,7 +2342,7 @@ describe("edit tool CRLF handling", () => {
 	let originalEditVariant: string | undefined;
 
 	beforeEach(() => {
-		// Force replace mode for edit tool tests using old_text/new_text
+		// Force replace mode for edit tool tests using old_string/new_string
 		originalEditVariant = Bun.env.PI_EDIT_VARIANT;
 		Bun.env.PI_EDIT_VARIANT = "replace";
 
@@ -2186,14 +2362,15 @@ describe("edit tool CRLF handling", () => {
 		}
 	});
 
-	it("should match LF old_text against CRLF file content", async () => {
+	it("should match LF old_string against CRLF file content", async () => {
 		const testFile = path.join(testDir, "crlf-test.txt");
 
 		fs.writeFileSync(testFile, "line one\r\nline two\r\nline three\r\n");
 
 		const result = await editTool.execute("test-crlf-1", {
 			path: testFile,
-			edits: [{ old_text: "line two\n", new_text: "replaced line\n" }],
+			old_string: "line two\n",
+			new_string: "replaced line\n",
 		});
 
 		expect(getTextOutput(result)).toContain("Successfully replaced");
@@ -2205,7 +2382,8 @@ describe("edit tool CRLF handling", () => {
 
 		await editTool.execute("test-crlf-2", {
 			path: testFile,
-			edits: [{ old_text: "second\n", new_text: "REPLACED\n" }],
+			old_string: "second\n",
+			new_string: "REPLACED\n",
 		});
 
 		const content = await Bun.file(testFile).text();
@@ -2218,7 +2396,8 @@ describe("edit tool CRLF handling", () => {
 
 		await editTool.execute("test-lf-1", {
 			path: testFile,
-			edits: [{ old_text: "second\n", new_text: "REPLACED\n" }],
+			old_string: "second\n",
+			new_string: "REPLACED\n",
 		});
 
 		const content = await Bun.file(testFile).text();
@@ -2233,7 +2412,8 @@ describe("edit tool CRLF handling", () => {
 		await expect(
 			editTool.execute("test-crlf-dup", {
 				path: testFile,
-				edits: [{ old_text: "hello\nworld\n", new_text: "replaced\n" }],
+				old_string: "hello\nworld\n",
+				new_string: "replaced\n",
 			}),
 		).rejects.toThrow(/Found 2 occurrences/);
 	});
@@ -2245,7 +2425,8 @@ describe("edit tool CRLF handling", () => {
 
 		await editTool.execute("test-bom", {
 			path: testFile,
-			edits: [{ old_text: "second\n", new_text: "REPLACED\n" }],
+			old_string: "second\n",
+			new_string: "REPLACED\n",
 		});
 
 		const content = await Bun.file(testFile).text();

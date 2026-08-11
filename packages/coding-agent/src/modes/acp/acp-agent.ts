@@ -42,7 +42,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
-import { getBlobsDir, isEnoent, logger, VERSION } from "@oh-my-pi/pi-utils";
+import { getBlobsDir, isEnoent, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
 import { disableProvider, enableProvider, reset as resetCapabilities } from "../../capability";
 import { Settings } from "../../config/settings";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -82,7 +82,6 @@ import {
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
-	buildToolCallStartUpdate,
 	extractAssistantMessageText,
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
@@ -164,6 +163,10 @@ function isPromptTurnInFlight(turn: PromptTurnState | undefined): turn is Prompt
 type ManagedSessionRecord = {
 	session: AgentSession;
 	mcpManager: MCPManager | undefined;
+	// Ordered queue of MCP tool refreshes for this record. Rebuilt per
+	// `#configureMcpServers` call; drained on reconfigure so a stale in-flight
+	// refresh can never land after a newer configuration's tools.
+	mcpRefreshChain: Promise<void> | undefined;
 	promptTurn: PromptTurnState | undefined;
 	promptQueue: PromptQueueState;
 	liveMessageId: string | undefined;
@@ -293,7 +296,7 @@ function buildAcpSpeechModelsCatalog(): Record<string, unknown> {
 async function elicitFromAcpClient(
 	connection: AgentSideConnection,
 	sessionId: string,
-	method: "select" | "confirm" | "input",
+	method: "select" | "confirm" | "input" | "editor",
 	message: string,
 	property: ElicitationPropertySchema,
 	dialogOptions: ExtensionUIDialogOptions | undefined,
@@ -374,9 +377,9 @@ function isAcceptedElicitation(
  * symmetric with every other `sessionUpdate` call in this file
  * (`record.session.sessionId` is always evaluated at emit time).
  *
- * The non-elicitation surface (custom components, editor, theming,
- * terminal input) remains stubbed — ACP clients render those themselves
- * or not at all. Capability gating respects the client's `initialize`
+ * The non-elicitation surface (custom components, theming, terminal
+ * input) remains stubbed — ACP clients render those themselves or not
+ * at all. Capability gating respects the client's `initialize`
  * advertisement.
  */
 export function createAcpExtensionUiContext(
@@ -440,7 +443,18 @@ export function createAcpExtensionUiContext(
 		pasteToEditor: () => {},
 		setEditorText: () => {},
 		getEditorText: () => "",
-		editor: async () => undefined,
+		editor: async (title, prefill, dialogOptions) => {
+			if (!supportsForm) return undefined;
+			const value = await elicitFromAcpClient(
+				connection,
+				getSessionId(),
+				"editor",
+				title,
+				{ type: "string", ...(prefill ? { default: prefill } : {}) },
+				dialogOptions,
+			);
+			return typeof value === "string" ? value : undefined;
+		},
 		addAutocompleteProvider: () => {},
 		setEditorComponent: () => {},
 		get theme() {
@@ -648,12 +662,17 @@ export class AcpAgent implements Agent {
 			});
 		}
 
-		// For `thinking` the lifetime subscription pushes post-bootstrap; only
-		// push here when it's not yet installed so pre-bootstrap callers still
-		// see the change without a post-bootstrap duplicate.
-		const thinkingHandledBySubscription =
-			params.configId === THINKING_CONFIG_ID && record.lifetimeUnsubscribe !== undefined;
-		if (!thinkingHandledBySubscription) {
+		// For `model`/`thinking`, `#setModelById`/`#setThinkingLevelById` change
+		// the session model/thinking level through AgentSession, which now emits
+		// a lifetime event (`model_changed`/`thinking_level_changed`) that
+		// `#handleLifetimeEvent` turns into a push once the subscription is
+		// installed. Only push here when that subscription is not yet
+		// installed, so pre-bootstrap callers still see the change without a
+		// post-bootstrap duplicate.
+		const handledBySubscription =
+			(params.configId === THINKING_CONFIG_ID || params.configId === MODEL_CONFIG_ID) &&
+			record.lifetimeUnsubscribe !== undefined;
+		if (!handledBySubscription) {
 			await this.#pushConfigOptionUpdate(record);
 		}
 		return { configOptions: this.#buildConfigOptions(record.session) };
@@ -1027,7 +1046,7 @@ export class AcpAgent implements Agent {
 		this.#connection.signal.addEventListener(
 			"abort",
 			() => {
-				void this.#disposeAllSessions();
+				void this.dispose();
 			},
 			{ once: true },
 		);
@@ -1132,6 +1151,7 @@ export class AcpAgent implements Agent {
 		return {
 			session,
 			mcpManager: undefined,
+			mcpRefreshChain: undefined,
 			promptTurn: undefined,
 			promptQueue: { promise: Promise.resolve(), release: undefined },
 			liveMessageId: undefined,
@@ -1146,14 +1166,15 @@ export class AcpAgent implements Agent {
 	}
 
 	async #handleLifetimeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): Promise<void> {
-		if (event.type !== "thinking_level_changed") {
+		if (event.type !== "thinking_level_changed" && event.type !== "model_changed") {
 			return;
 		}
 		try {
 			await this.#pushConfigOptionUpdate(record);
 		} catch (error) {
-			logger.warn("Failed to push thinking-level config_option_update", {
+			logger.warn("Failed to push config_option_update after a lifetime event", {
 				sessionId: record.session.sessionId,
+				eventType: event.type,
 				error,
 			});
 		}
@@ -1571,7 +1592,7 @@ export class AcpAgent implements Agent {
 	#buildThinkingOptions(session: AgentSession): Array<{ value: string; name: string; description?: string }> {
 		return [
 			{ value: THINKING_OFF, name: "Off" },
-			{ value: AUTO_THINKING, name: "Auto", description: "Auto-detect per prompt (low–xhigh)" },
+			{ value: AUTO_THINKING, name: "Auto", description: "Auto-detect per prompt" },
 			...session.getAvailableThinkingLevels().map(level => ({
 				value: level,
 				name: level,
@@ -1686,6 +1707,12 @@ export class AcpAgent implements Agent {
 			planExists: true,
 		};
 		if (!approved) {
+			// Rejection keeps plan mode active for another planning turn. Promote the
+			// reviewed path into plan-mode state so the next `#buildPlanModeMessage()`
+			// targets the plan just reviewed, not the stale state path.
+			if (state.planFilePath !== planFilePath) {
+				session.setPlanModeState({ ...state, planFilePath });
+			}
 			const normalizedTitle = normalizePlanTitle(resolvedTitle).title;
 			return {
 				content: [
@@ -1912,6 +1939,7 @@ export class AcpAgent implements Agent {
 		const projectPath = await resolveActiveProjectRegistryPath(cwd);
 		clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
 		resetCapabilities();
+		await record.session.refreshSkills();
 		const fileCommands = await loadSlashCommands({ cwd });
 		record.session.setSlashCommands(fileCommands);
 		await this.#emitAvailableCommandsUpdate(record);
@@ -2109,6 +2137,23 @@ export class AcpAgent implements Agent {
 					});
 					continue;
 				}
+				if (
+					item.type === "image" &&
+					"data" in item &&
+					typeof item.data === "string" &&
+					"mimeType" in item &&
+					typeof item.mimeType === "string"
+				) {
+					notifications.push({
+						sessionId,
+						update: {
+							sessionUpdate: "agent_message_chunk",
+							content: { type: "image", data: item.data, mimeType: item.mimeType },
+							messageId,
+						},
+					});
+					continue;
+				}
 				if (item.type === "thinking" && "thinking" in item && typeof item.thinking === "string") {
 					const thinking = canonicalizeMessage(item.thinking);
 					if (thinking.length === 0) continue;
@@ -2129,14 +2174,18 @@ export class AcpAgent implements Agent {
 					typeof toolItem.name === "string"
 				) {
 					const args = this.#buildReplayAssistantToolArgs(toolItem);
-					const update = buildToolCallStartUpdate({
-						toolCallId: toolItem.id,
-						toolName: toolItem.name,
-						args,
-						status: "completed",
-						cwd,
-					});
-					notifications.push({ sessionId, update });
+					notifications.push(
+						...mapAgentSessionEventToAcpSessionUpdates(
+							{
+								type: "tool_execution_start",
+								toolCallId: toolItem.id,
+								toolName: toolItem.name,
+								args,
+							},
+							sessionId,
+							{ cwd },
+						),
+					);
 					replayedToolCallIds.add(toolItem.id);
 					replayedToolCallArgs.set(toolItem.id, args);
 				}
@@ -2257,6 +2306,24 @@ export class AcpAgent implements Agent {
 			return;
 		}
 
+		const uiContext = createAcpExtensionUiContext(
+			this.#connection,
+			() => record.session.sessionId,
+			this.#clientCapabilities,
+		);
+		if (this.#clientCapabilities?.elicitation?.form != null) {
+			record.session.setUsageFallbackConfirmer(confirmation => {
+				const reserve =
+					confirmation.remainingPercent === undefined
+						? "inside the configured reserve margin"
+						: `${confirmation.remainingPercent.toFixed(1)}% remaining`;
+				return uiContext.confirm(
+					"Coding-plan reserve reached",
+					`${confirmation.from} has ${reserve}. Switch to ${confirmation.to}? Choose No to keep using the current plan.`,
+				);
+			});
+		}
+
 		const extensionRunner = record.session.extensionRunner;
 		if (!extensionRunner) {
 			record.extensionsConfigured = true;
@@ -2293,6 +2360,8 @@ export class AcpAgent implements Agent {
 				},
 				getThinkingLevel: () => record.session.thinkingLevel,
 				setThinkingLevel: level => record.session.setThinkingLevel(level),
+				getServiceTiers: () => record.session.serviceTierByFamily,
+				setServiceTier: (family, tier) => record.session.setServiceTierFamily(family, tier),
 				getSessionName: () => record.session.sessionManager.getSessionName(),
 				setSessionName: async name => {
 					await record.session.sessionManager.setSessionName(name, "user");
@@ -2337,15 +2406,7 @@ export class AcpAgent implements Agent {
 				},
 				compact: instructionsOrOptions => runExtensionCompact(record.session, instructionsOrOptions),
 			},
-			// Per-session getter: `record.session.sessionId` reads through to
-			// `sessionManager.getSessionId()` (it's a getter, not a field), so an
-			// extension command that calls `ctx.newSession` / `ctx.switchSession`
-			// — both exposed in the block just above — mutates the underlying id
-			// mid-flight. Reading lazily on each elicitation matches every other
-			// `sessionUpdate` call in this file. Hoisting the factory to an
-			// `AcpAgent` field would still be wrong because it would also lose
-			// the per-`record` binding.
-			createAcpExtensionUiContext(this.#connection, () => record.session.sessionId, this.#clientCapabilities),
+			uiContext,
 		);
 		await extensionRunner.emit({ type: "session_start" });
 		record.extensionsConfigured = true;
@@ -2355,6 +2416,11 @@ export class AcpAgent implements Agent {
 		if (record.mcpManager) {
 			await record.mcpManager.disconnectAll();
 		}
+		// Drain any in-flight refresh queued by a previous configuration: a refresh
+		// that already passed its manager guard could otherwise finish applying a
+		// stale tool set after this reconfiguration installs the new one.
+		await record.mcpRefreshChain;
+		record.mcpRefreshChain = undefined;
 		if (servers.length === 0) {
 			record.mcpManager = undefined;
 			await record.session.refreshMCPTools([]);
@@ -2362,6 +2428,30 @@ export class AcpAgent implements Agent {
 		}
 
 		const manager = new MCPManager(record.session.sessionManager.getCwd());
+		// MCP servers connect and reconnect independently, so `onToolsChanged` can fire
+		// several times back to back. Each firing is chained onto `record.mcpRefreshChain`
+		// so refreshes apply in order, and each one re-reads `manager.getTools()` at the
+		// time it actually runs rather than the snapshot from when it was queued — so a
+		// refresh can never apply a stale, smaller tool set after a newer one already landed.
+		// The returned promise propagates failures (the initial awaited refresh below must
+		// fail session setup, as the pre-queue code did); the stored chain swallows them
+		// after logging so background firings only warn and the chain never rejects.
+		const enqueueMcpToolsRefresh = (): Promise<void> => {
+			const run = (record.mcpRefreshChain ?? Promise.resolve()).then(async () => {
+				if (record.mcpManager !== manager) return;
+				await record.session.refreshMCPTools(manager.getTools());
+			});
+			record.mcpRefreshChain = run.catch(error => {
+				logger.warn("ACP MCP tool refresh failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+			return run;
+		};
+		manager.setOnToolsChanged(() => {
+			// Failures are logged once via the stored chain's catch above.
+			enqueueMcpToolsRefresh().catch(() => {});
+		});
 		const configs: MCPConfigMap = {};
 		const sources: MCPSourceMap = {};
 		for (const server of servers) {
@@ -2384,7 +2474,7 @@ export class AcpAgent implements Agent {
 		}
 
 		record.mcpManager = manager;
-		await record.session.refreshMCPTools(result.tools);
+		await enqueueMcpToolsRefresh();
 	}
 
 	#toMcpConfig(server: McpServer): MCPServerConfig {
@@ -2443,7 +2533,7 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	async #disposeSessionRecord(record: ManagedSessionRecord): Promise<void> {
+	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
 		if (record.mcpManager) {
 			try {
@@ -2454,21 +2544,22 @@ export class AcpAgent implements Agent {
 			record.mcpManager = undefined;
 		}
 		try {
-			await record.session.dispose();
+			await record.session.dispose({ reason });
 		} catch (error) {
 			logger.warn("Failed to dispose ACP session", { error });
 		}
 	}
 
-	async #disposeStandaloneSession(session: AgentSession): Promise<void> {
+	async #disposeStandaloneSession(session: AgentSession, reason?: postmortem.Reason): Promise<void> {
 		try {
-			await session.dispose();
+			await session.dispose({ reason });
 		} catch (error) {
 			logger.warn("Failed to dispose ACP session", { error });
 		}
 	}
 
-	async #disposeAllSessions(): Promise<void> {
+	/** Dispose every session owned by this ACP connection and await persisted teardown. */
+	async dispose(reason?: postmortem.Reason): Promise<void> {
 		if (this.#disposePromise) {
 			await this.#disposePromise;
 			return;
@@ -2484,7 +2575,7 @@ export class AcpAgent implements Agent {
 							"ACP agent disposed before queued prompt could run",
 						);
 						await this.#cancelPromptForClose(record);
-						await this.#disposeSessionRecord(record);
+						await this.#disposeSessionRecord(record, reason);
 					} catch (error) {
 						logger.warn("Failed to clean up ACP session", { sessionId, error });
 					}
@@ -2494,7 +2585,7 @@ export class AcpAgent implements Agent {
 			const initialSession = this.#initialSession;
 			this.#initialSession = undefined;
 			if (initialSession) {
-				await this.#disposeStandaloneSession(initialSession);
+				await this.#disposeStandaloneSession(initialSession, reason);
 			}
 		})();
 

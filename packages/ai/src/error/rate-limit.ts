@@ -19,17 +19,27 @@ const SERVER_ERROR_BACKOFF_MS = 20 * 1000; // 20s
 const ACCOUNT_RATE_LIMIT_PATTERN =
 	/\baccount(?:'s)?\b[^\n]{0,80}\brate.?limit\b|\brate.?limit\b[^\n]{0,80}\baccount\b/i;
 const INSUFFICIENT_BALANCE_PATTERN = /insufficient.?balance/i;
+const SPEND_LIMIT_PATTERN = /spend.?limit/i;
+const OPENROUTER_DAILY_FREE_LIMIT_PATTERN = /\bfree[-_ ]models[-_ ]per[-_ ]day\b/i;
+// gRPC/Connect end-streams carry the status as its name (`resource_exhausted`),
+// while HTTP bodies use the phrase ("resource exhausted"). Strip either form
+// before classifying explicit details; an otherwise opaque status is transient
+// model capacity, while quota/rate-limit/server wording remains authoritative.
+const RESOURCE_EXHAUSTED_PATTERN = /resource.?exhausted/gi;
 
 /**
  * Classify a rate-limit error message into a reason category.
- * Priority order: QUOTA (Antigravity "quota will reset") > MODEL_CAPACITY > QUOTA (account) >
- * RATE_LIMIT > QUOTA (generic) > SERVER_ERROR > UNKNOWN.
+ * Priority order: explicit details in a resource-exhausted error > QUOTA
+ * (Antigravity "quota will reset") > MODEL_CAPACITY > QUOTA (account) >
+ * RATE_LIMIT > QUOTA (generic) > SERVER_ERROR > bare resource-exhausted > UNKNOWN.
  *
- * "resource exhausted" maps to MODEL_CAPACITY (transient, short wait)
- * "quota exceeded" / "quota will reset" maps to QUOTA_EXHAUSTED (long wait, switch account)
+ * Bare "resource exhausted" / "resource_exhausted" maps to MODEL_CAPACITY (transient, short wait).
+ * Explicit details such as "quota exceeded" retain their normal classification.
  */
 export function parseRateLimitReason(errorMessage: string): RateLimitReason {
-	const lower = errorMessage.toLowerCase();
+	const lowerWithStatus = errorMessage.toLowerCase();
+	const lower = lowerWithStatus.replace(RESOURCE_EXHAUSTED_PATTERN, "");
+	const hasResourceExhaustedStatus = lower !== lowerWithStatus;
 
 	// Antigravity / Cloud Code Assist surface multi-hour daily-quota exhaustion as
 	// "You have exhausted your capacity on this model. Your quota will reset after …".
@@ -40,17 +50,19 @@ export function parseRateLimitReason(errorMessage: string): RateLimitReason {
 		return "QUOTA_EXHAUSTED";
 	}
 
-	if (
-		lower.includes("capacity") ||
-		lower.includes("overloaded") ||
-		lower.includes("529") ||
-		lower.includes("503") ||
-		lower.includes("resource exhausted")
-	) {
+	if (lower.includes("capacity") || lower.includes("overloaded") || lower.includes("529") || lower.includes("503")) {
 		return "MODEL_CAPACITY_EXHAUSTED";
 	}
 
 	if (ACCOUNT_RATE_LIMIT_PATTERN.test(errorMessage)) {
+		return "QUOTA_EXHAUSTED";
+	}
+
+	if (SPEND_LIMIT_PATTERN.test(errorMessage)) {
+		return "QUOTA_EXHAUSTED";
+	}
+
+	if (OPENROUTER_DAILY_FREE_LIMIT_PATTERN.test(errorMessage)) {
 		return "QUOTA_EXHAUSTED";
 	}
 
@@ -82,6 +94,10 @@ export function parseRateLimitReason(errorMessage: string): RateLimitReason {
 		return "SERVER_ERROR";
 	}
 
+	if (hasResourceExhaustedStatus) {
+		return "MODEL_CAPACITY_EXHAUSTED";
+	}
+
 	return "UNKNOWN";
 }
 
@@ -106,16 +122,19 @@ export function calculateRateLimitBackoffMs(reason: RateLimitReason): number {
 
 /** Detect usage/quota limit errors in error messages (persistent, requires credential switch). */
 const USAGE_LIMIT_PATTERN =
-	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|quota.?(?:exceeded|reached|insufficient)|额度不足|额度耗尽|resource.?exhausted|exhausted your capacity|quota will reset|insufficient.?(?:balance|quota)|run out of credits|out of credits|spending[- _]?limit|personal-team-blocked/i;
+	/usage.?limit|usage_limit_reached|usage_not_included|limit_reached|quota.?(?:exceeded|reached|insufficient)|额度不足|额度耗尽|resource.?exhausted|exhausted your capacity|quota will reset|insufficient.?(?:balance|quota)|balance.?exhausted|run out of credits|out of credits|spending[- _]?limit|personal-team-blocked/i;
 
 /**
  * HTTP status codes that, absent richer body classification, represent an
  * account-local usage cap rather than a bad credential or a transient blip.
+ * HTTP 402 Payment Required is categorically an account-billing cap (xAI
+ * Grok Build "usage balance exhausted", DeepSeek "Insufficient Balance",
+ * OpenRouter credit exhaustion) — never a transient blip or bad credential.
  * Always combine with {@link isUsageLimitOutcome} when a message is available
  * — a 429 carrying transient rate-limit wording is NOT a usage cap.
  */
 export function isUsageLimitStatus(status: number | undefined): boolean {
-	return status === 429;
+	return status === 429 || status === 402;
 }
 
 /**
@@ -125,7 +144,7 @@ export function isUsageLimitStatus(status: number | undefined): boolean {
  *  1. Body matches {@link isUsageLimitError} (Codex `usage_limit_reached`,
  *     Anthropic account rate-limit, Google `resource_exhausted`, OpenAI
  *     `insufficient_quota`, …) → rotate.
- *  2. Status is not 429 → backoff (caller's domain).
+ *  2. Status is not a usage-limit status (429/402) → backoff (caller's domain).
  *  3. Body is absent or {@link isOpaqueStatusBody opaque} (just the status,
  *     empty JSON, HTTP framing only) → rotate conservatively: the server
  *     gave us nothing else to go on.
@@ -144,14 +163,15 @@ export function isUsageLimitOutcome(status: number | undefined, message: string 
 }
 
 /**
- * A 429 body is opaque when it carries no signal beyond the status itself —
- * empty, whitespace-only, the status digits with HTTP/JSON framing, or
- * generic punctuation. Anything else (retry hints, capacity wording, error
- * descriptions) is informative enough to defer to the classifier.
+ * A usage-limit status body is opaque when it carries no signal beyond the
+ * status itself — empty, whitespace-only, the status digits with HTTP/JSON
+ * framing, or generic punctuation. Anything else (retry hints, capacity
+ * wording, error descriptions) is informative enough to defer to the
+ * classifier.
  */
 export function isOpaqueStatusBody(message: string): boolean {
 	const cleaned = message
-		.replace(/\b429\b/g, "")
+		.replace(/\b(?:429|402)\b/g, "")
 		.replace(/\b(?:http|https|status|error|code|response|message)\b/gi, "");
 	return !/[a-z\d]{3,}/i.test(cleaned);
 }
@@ -163,5 +183,10 @@ export function isOpaqueStatusBody(message: string): boolean {
  * {@link isUsageLimitOutcome} uses it for the account-rotation decision.
  */
 export function matchesUsageLimitText(errorMessage: string): boolean {
-	return USAGE_LIMIT_PATTERN.test(errorMessage) || ACCOUNT_RATE_LIMIT_PATTERN.test(errorMessage);
+	return (
+		USAGE_LIMIT_PATTERN.test(errorMessage) ||
+		SPEND_LIMIT_PATTERN.test(errorMessage) ||
+		ACCOUNT_RATE_LIMIT_PATTERN.test(errorMessage) ||
+		OPENROUTER_DAILY_FREE_LIMIT_PATTERN.test(errorMessage)
+	);
 }

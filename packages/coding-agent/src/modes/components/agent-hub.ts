@@ -13,17 +13,15 @@
  *
  * Replaces the old SessionObserverOverlayComponent (ctrl+s observer).
  */
-import * as fs from "node:fs";
-import * as path from "node:path";
 import { type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { Container, Ellipsis, matchesKey, type OverlayHandle, padding, type TUI, visibleWidth } from "@oh-my-pi/pi-tui";
 import { formatAge, getProjectDir, logger } from "@oh-my-pi/pi-utils";
-import { ADVISOR_TRANSCRIPT_FILENAME, isAdvisorTranscriptName } from "../../advisor";
 import type { KeyId } from "../../config/keybindings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
 import { IrcBus } from "../../irc/bus";
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, type AgentStatus, MAIN_AGENT_ID } from "../../registry/agent-registry";
+import { registerPersistedSubagents } from "../../registry/persisted-agents";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { parseThinkingLevel } from "../../thinking";
 import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
@@ -78,95 +76,43 @@ function formatModelBadge(modelId: string, level: ThinkingLevel | undefined): st
 	return `${model} ${theme.getThinkingBorderColor(level)(display)}`;
 }
 
-/**
- * Active model + reasoning level for a hub row: live session state when the
- * agent is attached, else the executor-reported `resolvedModel` selector
- * (`provider/id`, optionally `:<level>`). Undefined when neither is known
- * (e.g. a parked historical agent restored from disk).
- */
-function modelBadge(ref: AgentRef, observed: ObservableSession | undefined): string | undefined {
-	const model = ref.session?.model;
-	if (model) {
-		const level = model.thinking ? ref.session?.thinkingLevel : undefined;
-		return formatModelBadge(model.id, level);
-	}
-	const resolved = observed?.progress?.resolvedModel;
-	if (!resolved) return undefined;
+/** Format a resolved selector, preserving provider identity when requested. */
+function formatResolvedModelBadge(resolved: string, preserveProvider = false): string {
 	// Model ids may themselves contain colons (`qwen3:14b`), so only treat the
 	// suffix as a thinking level when it parses as one.
 	const colon = resolved.lastIndexOf(":");
 	const level = colon >= 0 ? parseThinkingLevel(resolved.slice(colon + 1)) : undefined;
 	const selector = level !== undefined ? resolved.slice(0, colon) : resolved;
-	return formatModelBadge(selector.slice(selector.indexOf("/") + 1), level);
+	const label = preserveProvider ? selector : selector.slice(selector.indexOf("/") + 1);
+	return formatModelBadge(label, level);
 }
 
-async function registerPersistedSubagents(
-	registry: AgentRegistry,
-	sessionFile: string | null | undefined,
-): Promise<void> {
-	if (!sessionFile?.endsWith(".jsonl")) return;
-	const root = sessionFile.slice(0, -6);
-	await registerPersistedSubagentsFromDir(registry, root, undefined);
-}
-
-async function registerPersistedSubagentsFromDir(
-	registry: AgentRegistry,
-	dir: string,
-	parentId: string | undefined,
-): Promise<void> {
-	let entries: fs.Dirent[];
-	try {
-		entries = await fs.promises.readdir(dir, { withFileTypes: true });
-	} catch {
-		return;
+/**
+ * Active model + reasoning level for a hub row: live session state when the
+ * agent is attached, else the executor-reported `resolvedModel` selector
+ * (`provider/id`, optionally `:<level>`). Active retry fallbacks retain their
+ * provider and carry an explicit marker. Undefined when no model is known
+ * (e.g. a parked historical agent restored from disk).
+ */
+function modelBadge(ref: AgentRef, observed: ObservableSession | undefined): string | undefined {
+	const progress = observed?.progress;
+	// Prefer the live session's own resolved fallback selector; else honor the
+	// executor-reported fallback flag. The latter covers observer-only rows (no
+	// live session) AND live rows whose fallback armed no session retry state —
+	// e.g. the Fireworks Fast → base degrade, which emits `retry_fallback_applied`
+	// without populating `#activeRetryFallback`, so `retryFallbackModel` is undefined.
+	const fallbackSelector =
+		ref.session?.retryFallbackModel ?? (progress?.resolvedModelIsFallback ? progress.resolvedModel : undefined);
+	if (fallbackSelector) {
+		return `${theme.fg("warning", "fallback →")} ${formatResolvedModelBadge(fallbackSelector, true)}`;
 	}
-	for (const entry of entries) {
-		if (!entry.isFile() || !entry.name.endsWith(".jsonl") || entry.name.includes(".bak")) continue;
-		const sessionFile = path.join(dir, entry.name);
-		// The advisor transcript is observability-only: register it as a non-peer
-		// `advisor` kind under its owning session so the Hub can show its read-only
-		// transcript, but it never joins agent-facing rosters and is not revivable.
-		if (isAdvisorTranscriptName(entry.name)) {
-			const owner = parentId ?? MAIN_AGENT_ID;
-			// `__advisor.jsonl` → the default advisor (no slug); `__advisor.<slug>.jsonl`
-			// → a named advisor, keyed and labeled by its slug.
-			const slug =
-				entry.name === ADVISOR_TRANSCRIPT_FILENAME ? "" : entry.name.slice("__advisor.".length, -".jsonl".length);
-			const advisorId = slug ? `${owner}/advisor:${slug}` : `${owner}/advisor`;
-			const displayName = slug ? `advisor:${slug}` : "advisor";
-			const existing = registry.get(advisorId);
-			// Never clobber a non-advisor ref that happens to share this id (a freak
-			// user task literally named `<owner>/advisor`): leave it, skip the advisor.
-			if (existing && existing.kind !== "advisor") continue;
-			if (existing?.sessionFile !== sessionFile) {
-				// The id is reused across `/new`; refresh it to the current session's file.
-				if (existing) registry.unregister(advisorId);
-				registry.register({
-					id: advisorId,
-					displayName,
-					kind: "advisor",
-					parentId: owner,
-					session: null,
-					sessionFile,
-					status: "parked",
-				});
-			}
-			continue;
-		}
-		const id = entry.name.slice(0, -6);
-		if (!registry.get(id)) {
-			registry.register({
-				id,
-				displayName: id,
-				kind: "sub",
-				parentId: parentId ?? MAIN_AGENT_ID,
-				session: null,
-				sessionFile,
-				status: "parked",
-			});
-		}
-		await registerPersistedSubagentsFromDir(registry, path.join(dir, id), id);
+	const model = ref.session?.model;
+	if (model) {
+		const level = model.thinking ? ref.session?.thinkingLevel : undefined;
+		return formatModelBadge(model.id, level);
 	}
+	const resolved = progress?.resolvedModel;
+	return resolved ? formatResolvedModelBadge(resolved) : undefined;
 }
 
 /** Result of one host-backed transcript read for the Agent Hub viewer. */
@@ -690,7 +636,7 @@ export class AgentHubOverlayComponent extends Container {
 				if (ref.status === "running" && ref.session) {
 					await ref.session.abort({ reason: USER_INTERRUPT_LABEL });
 				}
-				await this.#lifecycle().release(ref.id);
+				await this.#lifecycle().release(ref.id, ref, { tombstone: true });
 			} catch (error) {
 				logger.warn("Agent hub: kill failed", { id: ref.id, error: String(error) });
 				this.#notice = error instanceof Error ? error.message : String(error);

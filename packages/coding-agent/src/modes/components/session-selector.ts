@@ -724,6 +724,12 @@ export interface SessionSelectorOptions {
 	loadAllSessions?: () => Promise<SessionInfo[]>;
 	/** Preloaded all-projects list; cached so the first Tab toggle is instant. */
 	allSessions?: SessionInfo[];
+	/** Picker heading; defaults to "Resume Session". */
+	title?: string;
+	/** Fixed scope label, or false to omit the scope suffix. */
+	scopeLabel?: string | false;
+	/** Show each session's working directory in the list. */
+	showCwd?: boolean;
 	/**
 	 * Reads the live terminal height so the visible window fits the viewport.
 	 * Omitted only in tests; defaults to a conservative 24 rows.
@@ -760,6 +766,7 @@ export class SessionSelectorComponent extends Container {
 	#globalSessions: SessionInfo[] | null = null;
 	#scope: "folder" | "all" = "folder";
 	#toggling = false;
+	#inputLocked = false;
 	// 0-based line where the session list begins within this component's own
 	// render, captured each frame. The fullscreen picker overlay paints from
 	// screen row 0, so a mouse row maps to `row - #listLineOffset` inside the
@@ -772,6 +779,8 @@ export class SessionSelectorComponent extends Container {
 	readonly #getTerminalRows: () => number;
 	readonly #fillHeight: boolean;
 	readonly #bottomBorder = new DynamicBorder();
+	readonly #title: string;
+	readonly #scopeLabel: string | false | undefined;
 
 	constructor(
 		sessions: SessionInfo[],
@@ -789,6 +798,8 @@ export class SessionSelectorComponent extends Container {
 		this.#globalSessions = options.allSessions ?? null;
 		this.#getTerminalRows = options.getTerminalRows ?? (() => 24);
 		this.#fillHeight = options.fillHeight ?? false;
+		this.#title = options.title ?? "Resume Session";
+		this.#scopeLabel = options.scopeLabel;
 		// Add header
 		this.addChild(new Spacer(1));
 		this.#headerText = new Text(this.#headerLabel(), 1, 0);
@@ -800,7 +811,12 @@ export class SessionSelectorComponent extends Container {
 		// Create session list in folder scope; the empty-state hint invites the
 		// user to Tab into all-projects rather than silently surfacing other
 		// projects' history (issue #3099).
-		this.#sessionList = new SessionList(sessions, false, options.historyMatcher, options.getTerminalRows);
+		this.#sessionList = new SessionList(
+			sessions,
+			options.showCwd ?? false,
+			options.historyMatcher,
+			options.getTerminalRows,
+		);
 		// Every exit path cancels the list's pending history merge, so a stale
 		// debounce timer can never run its SQLite lookup after the picker closed.
 		this.#sessionList.onSelect = session => {
@@ -830,8 +846,9 @@ export class SessionSelectorComponent extends Container {
 	}
 
 	#headerLabel(): string {
-		const scopeLabel = this.#scope === "all" ? "all projects" : "current folder";
-		return `${theme.bold("Resume Session")} ${theme.fg("muted", `(${scopeLabel})`)}`;
+		if (this.#scopeLabel === false) return theme.bold(this.#title);
+		const scopeLabel = this.#scopeLabel ?? (this.#scope === "all" ? "all projects" : "current folder");
+		return `${theme.bold(this.#title)} ${theme.fg("muted", `(${scopeLabel})`)}`;
 	}
 
 	/**
@@ -873,6 +890,14 @@ export class SessionSelectorComponent extends Container {
 
 	setOnRequestRender(callback: () => void): void {
 		this.#onRequestRender = callback;
+	}
+	/** Ignore input after selection while the host resumes the session. */
+	lockInput(): void {
+		this.#inputLocked = true;
+	}
+	/** Re-enable input after a failed resume so the user can pick again. */
+	unlockInput(): void {
+		this.#inputLocked = false;
 	}
 
 	/**
@@ -972,6 +997,7 @@ export class SessionSelectorComponent extends Container {
 	}
 
 	handleInput(keyData: string): void {
+		if (this.#inputLocked) return;
 		if (keyData.startsWith("\x1b[<")) {
 			this.#handleMouse(keyData);
 			return;

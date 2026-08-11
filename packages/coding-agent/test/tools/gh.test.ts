@@ -10,12 +10,14 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import {
 	buildSearchDateQualifier,
 	GithubTool,
+	getOrFetchPrDiff,
 	parsePrUnifiedDiff,
 	parseSearchDateBound,
 	resolveDefaultRepoMemoized,
 } from "@oh-my-pi/pi-coding-agent/tools/gh";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
-import { getAgentDir, hashPath, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
+import * as piUtils from "@oh-my-pi/pi-utils";
+import { $which, getAgentDir, hashPath, removeWithRetries, setAgentDir, WhichCachePolicy } from "@oh-my-pi/pi-utils";
 
 // Isolate every `git` invocation in this file from the developer's host
 // configuration. The fixture spawns dozens of git subprocesses against tiny
@@ -275,6 +277,122 @@ describe("parsePrUnifiedDiff", () => {
 	});
 });
 
+describe("getOrFetchPrDiff diff-too-large fallback", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	function http406(): Error {
+		return new Error(
+			"could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000)",
+		);
+	}
+
+	it("reassembles a unified diff from the per-file API when gh pr diff returns HTTP 406", async () => {
+		vi.spyOn(git.github, "text").mockRejectedValue(http406());
+		const jsonSpy = vi
+			.spyOn(git.github, "json")
+			.mockResolvedValueOnce({ changed_files: 2 } as never)
+			.mockResolvedValueOnce([
+				{
+					filename: "src/big.ts",
+					status: "modified",
+					additions: 2,
+					deletions: 1,
+					patch: "@@ -1,2 +1,3 @@\n-old\n+new one\n+new two",
+				},
+				{
+					filename: "src/added.ts",
+					status: "added",
+					additions: 1,
+					deletions: 0,
+					patch: "@@ -0,0 +1 @@\n+brand new",
+				},
+			] as unknown as never);
+
+		const result = await getOrFetchPrDiff({
+			cwd: "/tmp/test",
+			repo: "owner/repo",
+			number: 79,
+			cacheAuthKey: null,
+		});
+
+		expect(result.payload.files.map(f => f.path)).toEqual(["src/big.ts", "src/added.ts"]);
+		expect(result.payload.files[0]).toMatchObject({ additions: 2, deletions: 1, changeType: "modified" });
+		expect(result.payload.files[1]).toMatchObject({ additions: 1, deletions: 0, changeType: "added" });
+		// The reassembled diff parses through parsePrUnifiedDiff identically.
+		expect(result.payload.unified).toContain("diff --git a/src/big.ts b/src/big.ts");
+		expect(result.payload.unified).toContain("new file mode");
+		// The metadata lookup precedes the files endpoint.
+		expect(jsonSpy.mock.calls[1]?.[1]).toContain("/repos/owner/repo/pulls/79/files");
+	});
+
+	it("keeps files with omitted patches visible instead of dropping them", async () => {
+		vi.spyOn(git.github, "text").mockRejectedValue(http406());
+		vi.spyOn(git.github, "json")
+			.mockResolvedValueOnce({ changed_files: 1 } as never)
+			.mockResolvedValueOnce([
+				{ filename: "assets/logo.png", status: "modified", additions: 0, deletions: 0 },
+			] as unknown as never);
+
+		const result = await getOrFetchPrDiff({
+			cwd: "/tmp/test",
+			repo: "owner/repo",
+			number: 80,
+			cacheAuthKey: null,
+		});
+
+		expect(result.payload.files.map(f => f.path)).toEqual(["assets/logo.png"]);
+		expect(result.payload.unified).toContain("patch unavailable");
+	});
+
+	it("preserves paths containing a diff-header delimiter", async () => {
+		vi.spyOn(git.github, "text").mockRejectedValue(http406());
+		vi.spyOn(git.github, "json")
+			.mockResolvedValueOnce({ changed_files: 1 } as never)
+			.mockResolvedValueOnce([
+				{
+					filename: "dir b/file.ts",
+					status: "modified",
+					additions: 1,
+					deletions: 1,
+					patch: "@@ -1 +1 @@\n-old\n+new",
+				},
+			] as unknown as never);
+
+		const result = await getOrFetchPrDiff({
+			cwd: "/tmp/test",
+			repo: "owner/repo",
+			number: 83,
+			cacheAuthKey: null,
+		});
+
+		expect(result.payload.files[0]).toMatchObject({ path: "dir b/file.ts", additions: 1, deletions: 1 });
+		expect(result.payload.unified).toContain('diff --git "a/dir b/file.ts" "b/dir b/file.ts"');
+	});
+
+	it("rejects instead of silently reviewing a PR beyond the files API cap", async () => {
+		vi.spyOn(git.github, "text").mockRejectedValue(http406());
+		const jsonSpy = vi.spyOn(git.github, "json").mockResolvedValueOnce({ changed_files: 3001 } as never);
+
+		await expect(
+			getOrFetchPrDiff({ cwd: "/tmp/test", repo: "owner/repo", number: 82, cacheAuthKey: null }),
+		).rejects.toThrow("exceeding GitHub's 3000-file limit");
+		expect(jsonSpy.mock.calls).toHaveLength(1);
+		expect(jsonSpy.mock.calls[0]?.[1]).toContain("/repos/owner/repo/pulls/82");
+	});
+
+	it("propagates non-406 errors without hitting the files endpoint", async () => {
+		vi.spyOn(git.github, "text").mockRejectedValue(new Error("authentication required"));
+		const jsonSpy = vi.spyOn(git.github, "json");
+
+		await expect(
+			getOrFetchPrDiff({ cwd: "/tmp/test", repo: "owner/repo", number: 81, cacheAuthKey: null }),
+		).rejects.toThrow("authentication required");
+		expect(jsonSpy).not.toHaveBeenCalled();
+	});
+});
+
 describe("github tool", () => {
 	beforeAll(async () => {
 		prFixtureTemplate = await buildPrFixtureTemplate();
@@ -319,6 +437,35 @@ describe("github tool", () => {
 		expect(text).toContain("Default branch: trunk");
 		expect(text).toContain("Stars: 4567");
 		expect(text).toContain("Topics: cli, github");
+	});
+
+	it("reads repository files through the GitHub contents API", async () => {
+		const textSpy = vi.spyOn(git.github, "text").mockResolvedValue('{"version":"16.3.11"}\n');
+		const tool = new GithubTool(createSession());
+		const result = await tool.execute("file-read", {
+			op: "file_read",
+			repo: "can1357/oh-my-pi",
+			branch: "main",
+			path: "packages/coding-agent/package.json",
+		});
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+		expect(text).toBe('{"version":"16.3.11"}\n');
+		expect(textSpy).toHaveBeenCalledWith(
+			"/tmp/test",
+			[
+				"api",
+				"/repos/can1357/oh-my-pi/contents/packages/coding-agent/package.json",
+				"--method",
+				"GET",
+				"-H",
+				"Accept: application/vnd.github.raw+json",
+				"-f",
+				"ref=main",
+			],
+			undefined,
+			{ repoProvided: true, trimOutput: false },
+		);
 	});
 
 	it("creates a pull request via gh and renders the resulting summary", async () => {
@@ -938,6 +1085,151 @@ exec ${JSON.stringify(realGit)} "$@"
 				await removeWithRetries(fakeBin);
 			}
 		});
+
+		it("pins Git messages while preserving UTF-8 character locale", async () => {
+			if (process.platform === "win32") return;
+			const originalPath = process.env.PATH;
+			const originalLocale = {
+				EXPECTED_LC_CTYPE: process.env.EXPECTED_LC_CTYPE,
+				LANG: process.env.LANG,
+				LC_ALL: process.env.LC_ALL,
+				LC_CTYPE: process.env.LC_CTYPE,
+				LC_MESSAGES: process.env.LC_MESSAGES,
+			};
+			const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "omp-fake-git-locale-"));
+			const realGit = $which("git");
+			expect(realGit).not.toBeNull();
+			if (realGit === null) return;
+			const fakeGit = path.join(fakeBin, "git");
+			await fs.writeFile(
+				fakeGit,
+				`#!/bin/sh
+if [ "\${LC_MESSAGES-}" != "C" ]; then
+	echo "LC_MESSAGES was \${LC_MESSAGES-<unset>}" >&2
+	exit 41
+fi
+if [ "\${LC_CTYPE-}" != "\${EXPECTED_LC_CTYPE-}" ]; then
+	echo "LC_CTYPE was \${LC_CTYPE-<unset>}, expected \${EXPECTED_LC_CTYPE-<unset>}" >&2
+	exit 42
+fi
+if [ "\${LC_ALL+x}" = "x" ]; then
+	echo "LC_ALL leaked: \${LC_ALL}" >&2
+	exit 43
+fi
+exec ${JSON.stringify(realGit)} "$@"
+`,
+			);
+			await fs.chmod(fakeGit, 0o755);
+
+			try {
+				process.env.PATH = fakeBin;
+				process.env.EXPECTED_LC_CTYPE = "C.UTF-8";
+				process.env.LC_ALL = "C.UTF-8";
+				delete process.env.LANG;
+				process.env.LC_CTYPE = "";
+				delete process.env.LC_MESSAGES;
+				await git.diff(remoteFixture.repoRoot, { env: { LC_MESSAGES: undefined } });
+
+				process.env.EXPECTED_LC_CTYPE = "fr_FR.UTF-8";
+				process.env.LC_ALL = "fr_FR.UTF-8";
+				process.env.LC_CTYPE = "C";
+				process.env.LC_MESSAGES = "fr_FR.UTF-8";
+				await git.diff(remoteFixture.repoRoot, { env: { LC_MESSAGES: undefined } });
+
+				process.env.EXPECTED_LC_CTYPE = "UTF-8-SENTINEL";
+				process.env.LC_ALL = "fr_FR.UTF-8";
+				process.env.LC_CTYPE = "UTF-8-SENTINEL";
+				process.env.LC_MESSAGES = "fr_FR.UTF-8";
+				await git.diff(remoteFixture.repoRoot, { env: { LC_ALL: "C", LC_MESSAGES: undefined } });
+			} finally {
+				if (originalPath === undefined) {
+					delete process.env.PATH;
+				} else {
+					process.env.PATH = originalPath;
+				}
+				for (const [key, value] of Object.entries(originalLocale)) {
+					if (value === undefined) {
+						delete process.env[key];
+					} else {
+						process.env[key] = value;
+					}
+				}
+				await removeWithRetries(fakeBin);
+			}
+		});
+	});
+
+	it("pins gh messages while preserving UTF-8 character locale", async () => {
+		if (process.platform === "win32") return;
+		const originalPath = process.env.PATH;
+		const originalLocale = {
+			EXPECTED_LC_CTYPE: process.env.EXPECTED_LC_CTYPE,
+			LANG: process.env.LANG,
+			LC_ALL: process.env.LC_ALL,
+			LC_CTYPE: process.env.LC_CTYPE,
+			LC_MESSAGES: process.env.LC_MESSAGES,
+		};
+		const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "omp-fake-gh-locale-"));
+		const fakeGh = path.join(fakeBin, "gh");
+		await fs.writeFile(
+			fakeGh,
+			`#!/bin/sh
+if [ "\${LC_MESSAGES-}" != "C" ]; then
+	echo "LC_MESSAGES was \${LC_MESSAGES-<unset>}" >&2
+	exit 41
+fi
+if [ "\${LC_CTYPE-}" != "\${EXPECTED_LC_CTYPE-}" ]; then
+	echo "LC_CTYPE was \${LC_CTYPE-<unset>}, expected \${EXPECTED_LC_CTYPE-<unset>}" >&2
+	exit 42
+fi
+if [ "\${LC_ALL+x}" = "x" ]; then
+	echo "LC_ALL leaked: \${LC_ALL}" >&2
+	exit 43
+fi
+echo ok
+`,
+		);
+		const realWhich = $which;
+		const whichSpy = vi
+			.spyOn(piUtils, "$which")
+			.mockImplementation((command, options) =>
+				command === "gh"
+					? realWhich(command, { ...options, cache: WhichCachePolicy.Bypass })
+					: realWhich(command, options),
+			);
+
+		await fs.chmod(fakeGh, 0o755);
+
+		try {
+			process.env.PATH = fakeBin;
+			for (const lcCtype of [undefined, ""] as const) {
+				process.env.EXPECTED_LC_CTYPE = "C.UTF-8";
+				process.env.LC_ALL = "C.UTF-8";
+				delete process.env.LANG;
+				delete process.env.LC_MESSAGES;
+				if (lcCtype === undefined) {
+					delete process.env.LC_CTYPE;
+				} else {
+					process.env.LC_CTYPE = lcCtype;
+				}
+				await expect(git.github.run(process.cwd(), ["--version"])).resolves.toMatchObject({ stdout: "ok" });
+			}
+		} finally {
+			whichSpy.mockRestore();
+			if (originalPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = originalPath;
+			}
+			for (const [key, value] of Object.entries(originalLocale)) {
+				if (value === undefined) {
+					delete process.env[key];
+				} else {
+					process.env[key] = value;
+				}
+			}
+			await removeWithRetries(fakeBin);
+		}
 	});
 
 	it("serializes concurrent git mutations through withRepoLock so callers don't race git's internal locks", async () => {

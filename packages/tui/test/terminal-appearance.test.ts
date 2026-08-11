@@ -19,6 +19,7 @@ const originalWslDistroName = Bun.env.WSL_DISTRO_NAME;
 const originalWslInterop = Bun.env.WSL_INTEROP;
 const originalWtSession = Bun.env.WT_SESSION;
 const originalTermProgram = Bun.env.TERM_PROGRAM;
+const originalTmux = Bun.env.TMUX;
 
 // These suites drive the real ProcessTerminal start()/probe pipeline, so they
 // opt out of the test-default headless suppression and restore it per case.
@@ -60,6 +61,7 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		restoreEnv("WSL_DISTRO_NAME", originalWslDistroName);
 		restoreEnv("WT_SESSION", originalWtSession);
 		restoreEnv("TERM_PROGRAM", originalTermProgram);
+		restoreEnv("TMUX", originalTmux);
 	});
 
 	function setupTerminal() {
@@ -127,25 +129,94 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		terminal.stop();
 	});
 
-	it("OSC 11 updates terminal.appearance and fires callbacks with dedup", () => {
-		const { terminal } = setupTerminal();
-		const appearances: string[] = [];
-		terminal.onAppearanceChange(a => appearances.push(a));
+	it("preserves an explicit refresh token queued behind an automatic OSC 11 query", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount } = setupTerminal();
 
-		// Send dark background response + DA1
+		// Seed the current appearance and drain all startup probe sentinels.
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		for (let i = 0; i < 7; i++) process.stdin.emit("data", "\x1b[?1;2c");
+
+		const events: Array<{ kind: "report" | "change"; appearance: string; token: number | undefined }> = [];
+		terminal.onAppearanceReport?.((appearance, token) => {
+			events.push({ kind: "report", appearance, token });
+		});
+		terminal.onAppearanceChange((appearance, token) => {
+			events.push({ kind: "change", appearance, token });
+		});
+		events.length = 0;
+
+		// Mode 2031 starts an automatic query. The explicit refresh must queue
+		// behind it rather than lending its identity to the in-flight response.
+		process.stdin.emit("data", "\x1b[?997;1n");
+		vi.advanceTimersByTime(100);
+		expect(queryCount()).toBe(2);
+		const supersededToken = 41;
+		const requestToken = 42;
+		expect(terminal.refreshAppearance?.(supersededToken)).toBe(supersededToken);
+		expect(terminal.refreshAppearance?.(requestToken)).toBe(requestToken);
+		expect(queryCount()).toBe(2);
+
+		// The automatic response is unchanged and therefore reports without a
+		// change callback or request token. Its DA1 starts the queued refresh.
 		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
 		process.stdin.emit("data", "\x1b[?1;2c");
+		expect(queryCount()).toBe(3);
 
-		expect(terminal.appearance).toBe("dark");
-		expect(appearances).toEqual(["dark"]);
-
-		// Send same color again — callback should NOT fire again
-		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
 		process.stdin.emit("data", "\x1b[?1;2c");
-
-		expect(appearances).toEqual(["dark"]);
-
 		terminal.stop();
+
+		expect(events).toEqual([
+			{ kind: "report", appearance: "dark", token: undefined },
+			{ kind: "report", appearance: "light", token: requestToken },
+			{ kind: "change", appearance: "light", token: requestToken },
+		]);
+	});
+
+	it("reports every OSC 11 response while change callbacks remain deduplicated", () => {
+		const { terminal } = setupTerminal();
+		const reports: Array<{ reported: string; current: string | undefined }> = [];
+		const changes: string[] = [];
+		let selfUnsubscribeCalls = 0;
+		const unsubscribeSelf = terminal.onAppearanceReport?.(() => {
+			selfUnsubscribeCalls++;
+			unsubscribeSelf?.();
+		});
+		terminal.onAppearanceReport?.(() => {
+			throw new Error("report callback failure");
+		});
+		const unsubscribeCollector = terminal.onAppearanceReport?.(appearance => {
+			reports.push({ reported: appearance, current: terminal.appearance });
+		});
+		terminal.onAppearanceChange(appearance => changes.push(appearance));
+
+		// Complete the startup query and drain every startup probe sentinel before
+		// issuing explicit refreshes, so each response belongs to a real query cycle.
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		for (let i = 0; i < 7; i++) process.stdin.emit("data", "\x1b[?1;2c");
+
+		terminal.refreshAppearance?.();
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+
+		terminal.refreshAppearance?.();
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+
+		// Stop before asserting so a failed expectation cannot leak stdin listeners
+		// or terminal modes into subsequent tests.
+		terminal.stop();
+		unsubscribeCollector?.();
+		unsubscribeCollector?.();
+
+		expect(reports).toEqual([
+			{ reported: "dark", current: "dark" },
+			{ reported: "dark", current: "dark" },
+			{ reported: "light", current: "light" },
+		]);
+		expect(selfUnsubscribeCalls).toBe(1);
+		expect(changes).toEqual(["dark", "light"]);
 	});
 
 	it("replays already detected OSC 11 appearance to late subscribers", () => {
@@ -255,6 +326,93 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		vi.advanceTimersByTime(30_000);
 
 		expect(queryCount()).toBe(afterStartup + 1);
+
+		terminal.stop();
+	});
+
+	it("refreshAppearance() issues exactly one OSC 11 re-query per call (#5352)", () => {
+		const { terminal, queryCount } = setupTerminal();
+
+		// Drain the OSC 11 reply and all seven startup DA1 sentinels (keyboard,
+		// OSC 11, and the DECRQM probes for 2026/2048/2031/1010/1011) so the
+		// probe FIFO is empty before the refresh gesture.
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		for (let i = 0; i < 7; i++) process.stdin.emit("data", "\x1b[?1;2c");
+		const afterInitial = queryCount();
+
+		// An explicit refresh gesture (Ctrl+L) issues one bounded probe.
+		terminal.refreshAppearance?.();
+		const afterFirstRefresh = queryCount();
+
+		// Complete that query's cycle, then refresh again: still one probe each.
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+		terminal.refreshAppearance?.();
+		const afterSecondRefresh = queryCount();
+
+		terminal.stop();
+		const afterStop = queryCount();
+		terminal.refreshAppearance?.();
+		const afterStoppedRefresh = queryCount();
+
+		expect(afterFirstRefresh).toBe(afterInitial + 1);
+		expect(afterSecondRefresh).toBe(afterInitial + 2);
+		expect(afterStoppedRefresh).toBe(afterStop);
+	});
+
+	it("passes an explicit appearance refresh through tmux without changing the startup probe", () => {
+		Bun.env.TMUX = "/tmp/tmux-1000/default,1234,0";
+		const { terminal, writes } = setupTerminal();
+
+		expect(writes).toContain("\x1b]11;?\x07");
+		expect(writes).toContain("\x1b[c");
+
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		for (let i = 0; i < 7; i++) process.stdin.emit("data", "\x1b[?1;2c");
+		terminal.refreshAppearance?.();
+
+		expect(writes).toContain("\x1bPtmux;\x1b\x1b]11;?\x07\x1b\x1b[c\x1b\\");
+
+		terminal.stop();
+	});
+
+	it("refreshAppearance() re-evaluates a changed background through the callback pipeline", () => {
+		const { terminal } = setupTerminal();
+		const appearances: string[] = [];
+		terminal.onAppearanceChange(a => appearances.push(a));
+
+		// Startup classifies the terminal as light.
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		for (let i = 0; i < 7; i++) process.stdin.emit("data", "\x1b[?1;2c");
+		expect(terminal.appearance).toBe("light");
+		expect(appearances).toEqual(["light"]);
+
+		// User switches the OS/terminal to dark and presses Ctrl+L. The bounded
+		// re-query picks up the new background and fires the appearance callback.
+		terminal.refreshAppearance?.();
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+
+		expect(terminal.appearance).toBe("dark");
+		expect(appearances).toEqual(["light", "dark"]);
+
+		terminal.stop();
+	});
+
+	it("refreshAppearance() still probes through a Mode 2031-capable bridge (#5352)", () => {
+		const { terminal, queryCount } = setupTerminal();
+
+		// Drain startup, then have the bridge (e.g. tmux) advertise Mode 2031
+		// support via DECRQM — CSI ? 2031 ; 2 $ y (reset/supported). The outer
+		// terminal may still never emit an appearance notification, so an explicit
+		// refresh must not be gated on advertised 2031 support.
+		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
+		for (let i = 0; i < 7; i++) process.stdin.emit("data", "\x1b[?1;2c");
+		process.stdin.emit("data", "\x1b[?2031;2$y");
+		const afterInitial = queryCount();
+
+		terminal.refreshAppearance?.();
+		expect(queryCount()).toBe(afterInitial + 1);
 
 		terminal.stop();
 	});
@@ -443,7 +601,7 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		// Simulate kitty-capable terminal reply (level >=1).
 		process.stdin.emit("data", "\x1b[?1u");
 
-		const pushes = writes.filter(w => w === "\x1b[>1u" || w === "\x1b[>7u" || w === "\x1b[>31u").length;
+		const pushes = writes.filter(w => w === "\x1b[>5u" || w === "\x1b[>7u" || w === "\x1b[>31u").length;
 		expect(pushes).toBe(1);
 
 		terminal.stop();
@@ -589,13 +747,18 @@ describe("ProcessTerminal DECRQM + in-band resize (DEC 2026/2048)", () => {
 		expect(writes).not.toContain("\x1b[?2048l");
 	});
 
-	it("falls back to unsupported when the DA1 sentinel beats the DECRPM reply", () => {
+	it("marks a missing DECRPM response as inconclusive when the DA1 sentinel arrives", () => {
 		const { terminal, reports } = setup();
+		const confirmations: boolean[] = [];
+		terminal.onPrivateModeReport?.((mode, _supported, confirmed) => {
+			if (mode === 2026) confirmations.push(confirmed ?? true);
+		});
 		// Drain keyboard + osc11 sentinels, then 2026's DA1 (no DECRPM arrived).
 		process.stdin.emit("data", "\x1b[?1;2c");
 		process.stdin.emit("data", "\x1b[?1;2c");
 		process.stdin.emit("data", "\x1b[?1;2c");
 		expect(reports).toContainEqual({ mode: 2026, supported: false });
+		expect(confirmations).toEqual([false]);
 		terminal.stop();
 	});
 

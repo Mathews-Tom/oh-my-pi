@@ -38,6 +38,7 @@ interface FakeAcpBuiltinSession {
 	model: { provider: string; id: string } | undefined;
 	newSession(opts?: { drop?: boolean; parentSession?: string }): Promise<boolean>;
 	switchSession(sessionPath: string): Promise<boolean>;
+	moveSession(newCwd: string, targetSessionDir?: string): Promise<void>;
 	markMovedFromEmptySessionFile(sessionFile: string): void;
 	fork(): Promise<boolean>;
 	handoff(instr?: string): Promise<{ document: string; savedPath?: string } | undefined>;
@@ -120,6 +121,10 @@ function createRuntime() {
 			await fakeSessionManager.flush();
 			await fakeSessionManager.setSessionFile(this._switchedTo);
 			return true;
+		},
+		async moveSession(newCwd: string, _targetSessionDir?: string) {
+			if (!fakeSessionManager) throw new Error("fake session manager not initialized");
+			await fakeSessionManager.moveTo(newCwd);
 		},
 		markMovedFromEmptySessionFile(sessionFile: string) {
 			this._movedFromEmptySessionFile = path.resolve(sessionFile);
@@ -273,6 +278,40 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).toContain("5 hours (prolite)");
 		expect(output[0]).toContain("user@example.com: 0.24 unknown used (76.0% left)");
 		expect(output[0]).toContain("resets in");
+	});
+
+	it("suppresses redundant usage window suffixes while retaining legitimate ones", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.session.fetchUsageReports = async () => [
+			{
+				provider: "anthropic",
+				fetchedAt: Date.now(),
+				limits: [
+					{
+						id: "anthropic:extra",
+						label: "Claude Extra Usage",
+						scope: { provider: "anthropic", windowId: "extra" },
+						amount: { used: 123.45, unit: "usd" },
+					},
+					{
+						id: "anthropic:daily",
+						label: "Daily quota",
+						scope: { provider: "anthropic", windowId: "24h" },
+						window: { id: "24h", label: "24 hours" },
+						amount: { used: 20, unit: "requests" },
+					},
+				],
+				metadata: { email: "user@example.com" },
+			},
+		];
+
+		const result = await executeAcpBuiltinSlashCommand("/usage", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("Claude Extra Usage");
+		expect(output[0]).not.toContain("Claude Extra Usage — extra");
+		expect(output[0]).toContain("123.45 usd used");
+		expect(output[0]).toContain("Daily quota — 24 hours");
 	});
 	it("/usage show renders the same report as plain /usage", async () => {
 		const now = 1_700_000_000_000;
@@ -779,6 +818,28 @@ describe("wave 3 commands", () => {
 		expect(output[0]).toContain("Usage: /memory");
 	});
 
+	it("/memory stats: tells the user memory is off instead of naming a nonexistent 'off backend'", async () => {
+		const { output, runtime } = createRuntime();
+		const result = await executeAcpBuiltinSlashCommand("/memory stats", runtime);
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toBe("Memory backend is off — there is nothing to show.");
+	});
+
+	it("/memory diagnose: tells the user memory is off instead of naming a nonexistent 'off backend'", async () => {
+		const { output, runtime } = createRuntime();
+		const result = await executeAcpBuiltinSlashCommand("/memory diagnose", runtime);
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toBe("Memory backend is off — there is nothing to show.");
+	});
+
+	it("/memory stats: still names the backend when a real backend simply has no stats hook", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.settings.set("memory.backend" as never, "local" as never);
+		const result = await executeAcpBuiltinSlashCommand("/memory stats", runtime);
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toBe("Memory stats is not available for the local backend.");
+	});
+
 	// /todo start fuzzy match
 	it("/todo start: finds pending task by substring and starts it", async () => {
 		const { output, session, runtime } = createRuntime();
@@ -1132,6 +1193,46 @@ describe("wave 5 — adapters and polish", () => {
 			expect(output[0]).toContain("hello@1.0.0");
 		} finally {
 			discoverSpy.mockRestore();
+		}
+	});
+});
+
+describe("/move preflight flush", () => {
+	it("aborts text-mode /move when pending settings flush fails", async () => {
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-acp-move-"));
+		try {
+			const { output, fakeSessionManager, runtime } = createRuntime();
+			spyOn(runtime.settings, "flush").mockRejectedValue(new Error("disk full"));
+
+			const result = await executeAcpBuiltinSlashCommand(`/move ${targetDir}`, runtime);
+
+			expect(result).toEqual({ consumed: true });
+			expect(output[0]).toContain("disk full");
+			expect(fakeSessionManager!._movedTo).toBeUndefined();
+		} finally {
+			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
+
+	it("completes text-mode /move when flush succeeds", async () => {
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-acp-move-ok-"));
+		const originalProjectDir = process.cwd();
+		try {
+			const { output, fakeSessionManager, runtime } = createRuntime();
+			let flushed = false;
+			spyOn(runtime.settings, "flush").mockImplementation(async () => {
+				flushed = true;
+			});
+
+			const result = await executeAcpBuiltinSlashCommand(`/move ${targetDir}`, runtime);
+
+			expect(result).toEqual({ consumed: true });
+			expect(flushed).toBe(true);
+			expect(fakeSessionManager!._movedTo).toBe(targetDir);
+			expect(output[0]).toContain("Moved to");
+		} finally {
+			setProjectDir(originalProjectDir);
+			await fs.rm(targetDir, { recursive: true, force: true });
 		}
 	});
 });

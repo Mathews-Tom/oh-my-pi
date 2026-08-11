@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
-import { isVertexExpressOpenAIUrl, isVertexRawPredictUrl } from "@oh-my-pi/pi-catalog/hosts";
+import { isVertexExpressOpenAIUrl, isVertexRawPredictUrl, resolveVertexEndpointHost } from "@oh-my-pi/pi-catalog/hosts";
 import {
 	mapEffortToAnthropicAdaptiveEffort,
 	mapEffortToGoogleThinkingLevel,
@@ -15,14 +15,16 @@ import {
 } from "@oh-my-pi/pi-catalog/model-thinking";
 import { CATALOG_PROVIDERS, type ProviderCatalogEntry } from "@oh-my-pi/pi-catalog/provider-models";
 import { CODEX_BASE_URL } from "@oh-my-pi/pi-catalog/wire/codex";
-import { $env, $pickenv, getConfigRootDir, isEnoent, logger, withExtraCaFetch } from "@oh-my-pi/pi-utils";
+import { $env, $pickenv, getProviderInFlightRoot, isEnoent, logger, withExtraCaFetch } from "@oh-my-pi/pi-utils";
 import { getCustomApi } from "./api-registry";
 import { createAuthRetryKeyState, isApiKeyResolver, resolveNextAuthRetryKey } from "./auth-retry";
 import * as AIError from "./error";
 import { ProviderHttpError } from "./error";
+import { isInvalidatedOAuthTokenError } from "./error/auth-classify";
 import { isUsageLimitOutcome } from "./error/rate-limit";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
+import { coworkFetch } from "./providers/cowork-fetch";
 import type { CursorOptions } from "./providers/cursor";
 import type { DevinOptions } from "./providers/devin";
 import { isGitLabDuoModel, streamGitLabDuo } from "./providers/gitlab-duo";
@@ -58,7 +60,7 @@ import {
 	streamOpenAIResponses,
 } from "./providers/register-builtins";
 import { isSyntheticModel, streamSynthetic } from "./providers/synthetic";
-import { PROVIDER_REGISTRY } from "./registry";
+import { getProviderDefinition, PROVIDER_REGISTRY } from "./registry";
 import type {
 	Api,
 	AssistantMessage,
@@ -72,12 +74,18 @@ import type {
 	ThinkingBudgets,
 	ToolChoice,
 } from "./types";
+import { resolveCacheRetention } from "./utils";
 import { AssistantMessageEventStream } from "./utils/event-stream";
 import { isFoundryEnabled } from "./utils/foundry";
 import { wrapLeakedThinkingStream } from "./utils/leaked-thinking-stream";
 import { wrapFetchForProxy } from "./utils/proxy";
 import { withRequestDebugFetch } from "./utils/request-debug";
 import { withGeminiThinkingLoopGuard } from "./utils/thinking-loop";
+
+function defaultFetchForModel(model: Model<Api>): FetchImpl {
+	if (model.provider === "anthropic" && model.api === "anthropic-messages") return coworkFetch;
+	return globalThis.fetch;
+}
 
 function isGoogleVertexAuthenticatedModel(model: Model<Api>): boolean {
 	return (
@@ -128,7 +136,7 @@ function isOfficialOpenAIApiUrl(baseUrl: string | undefined): boolean {
 }
 
 /** Strict official-Codex endpoint check; exact origin or a path boundary after {@link CODEX_BASE_URL}. */
-function isOfficialCodexApiUrl(baseUrl: string | undefined): boolean {
+export function isOfficialCodexApiUrl(baseUrl: string | undefined): boolean {
 	if (!baseUrl) return true;
 	const lower = baseUrl.toLowerCase().replace(/\/+$/, "");
 	return lower === CODEX_BASE_URL || lower.startsWith(`${CODEX_BASE_URL}/`);
@@ -181,7 +189,7 @@ function resolveProviderInFlightLimit(
 
 function providerInFlightRoot(): string {
 	if (providerInFlightRootOverride) return providerInFlightRootOverride;
-	return path.join(getConfigRootDir(), "run", "provider-inflight");
+	return getProviderInFlightRoot();
 }
 
 function providerInFlightSegment(provider: string): string {
@@ -660,7 +668,7 @@ function resolveVertexRequest(input: string | URL | Request): string | URL | Req
 			url.includes("{location}") ||
 			url.includes("%7Bproject%7D") ||
 			url.includes("%7Blocation%7D");
-		const host = location === "global" ? "aiplatform.googleapis.com" : `${location}-aiplatform.googleapis.com`;
+		const host = resolveVertexEndpointHost(location);
 		const rewritten = hasPlaceholder
 			? url
 					.replace("https://{location}-aiplatform.googleapis.com", `https://${host}`)
@@ -689,7 +697,6 @@ type KeyResolver = string | (() => string | undefined);
 const LEGACY_ENV_KEYS: Record<string, KeyResolver> = {
 	// Non-provider / search-tool keys and API-name keys not modeled as registry provider defs.
 	"azure-openai-responses": "AZURE_OPENAI_API_KEY",
-	exa: "EXA_API_KEY",
 	jina: "JINA_API_KEY",
 	brave: "BRAVE_API_KEY",
 	tinyfish: "TINYFISH_API_KEY",
@@ -768,12 +775,14 @@ function streamDispatch<TApi extends Api>(
 	context: Context,
 	options?: OptionsForApi<TApi>,
 ): AssistantMessageEventStream {
-	const baseOptions = (options || {}) as StreamOptions;
+	const inputOptions = (options || {}) as StreamOptions;
+	const baseOptions = { ...inputOptions, fetch: inputOptions.fetch ?? defaultFetchForModel(model) };
 	const debugOptions = withExtraCaFetch(withRequestDebugFetch(baseOptions));
 	const requestOptions = {
 		...debugOptions,
-		fetch: wrapFetchForProxy(debugOptions.fetch ?? (globalThis.fetch as FetchImpl), model.provider),
+		fetch: wrapFetchForProxy(debugOptions.fetch, model.provider),
 	} as OptionsForApi<TApi>;
+	assertExplicitOpenAIResponsesPromptCacheSupport(model, requestOptions);
 
 	// Check custom API registry first (extension-provided APIs like "vertex-claude-api")
 	const customApiProvider = getCustomApi(model.api);
@@ -803,33 +812,37 @@ function streamDispatch<TApi extends Api>(
 		} as GitLabDuoWorkflowOptions);
 	}
 
-	// Vertex AI uses Application Default Credentials, not API keys
+	// Vertex AI and Bedrock Converse authenticate outside the generic API-key path.
 	if (model.api === "google-vertex") {
 		return streamGoogleVertex(model as Model<"google-vertex">, context, requestOptions as GoogleVertexOptions);
-	} else if (model.api === "bedrock-converse-stream") {
-		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
+	}
+	if (model.api === "bedrock-converse-stream") {
 		return streamBedrock(model as Model<"bedrock-converse-stream">, context, requestOptions as BedrockOptions);
 	}
 
-	const apiKey = requestOptions.apiKey || getEnvApiKey(model.provider);
+	const prepareRequest = getProviderDefinition(model.provider)?.prepareRequest;
+	const prepared = prepareRequest?.(model as Model<Api>, requestOptions as StreamOptions);
+	const providerModel = prepared?.model ?? (model as Model<Api>);
+	const preparedOptions = prepared?.options ?? (requestOptions as StreamOptions);
+	const apiKey = preparedOptions.apiKey || getEnvApiKey(providerModel.provider);
 	if (!apiKey) {
-		throw new AIError.MissingApiKeyError(model.provider);
+		throw new AIError.MissingApiKeyError(providerModel.provider);
 	}
-	const providerOptions = isGoogleVertexAuthenticatedModel(model)
+	const providerOptions = isGoogleVertexAuthenticatedModel(providerModel)
 		? {
-				...requestOptions,
+				...preparedOptions,
 				apiKey: "vertex-adc",
-				fetch: createVertexAuthenticatedFetch(requestOptions),
+				fetch: createVertexAuthenticatedFetch(preparedOptions),
 			}
-		: { ...requestOptions, apiKey };
+		: { ...preparedOptions, apiKey };
 
-	const api: Api = model.api;
+	const api: Api = providerModel.api;
 	switch (api) {
 		case "anthropic-messages": {
 			const anthropicOptions = providerOptions as AnthropicOptions;
-			return streamAnthropic(model as Model<"anthropic-messages">, context, {
+			return streamAnthropic(providerModel as Model<"anthropic-messages">, context, {
 				...anthropicOptions,
-				isOAuth: anthropicOptions.isOAuth ?? model.isOAuth,
+				isOAuth: anthropicOptions.isOAuth ?? providerModel.isOAuth,
 			});
 		}
 
@@ -837,13 +850,13 @@ function streamDispatch<TApi extends Api>(
 			const useResponses = $env.PI_OPENROUTER_RESPONSES !== "0";
 			if (useResponses) {
 				return streamOpenAIResponses(
-					model as Model<"openai-responses">,
+					providerModel as Model<"openai-responses">,
 					context,
 					providerOptions as OptionsForApi<"openai-responses">,
 				);
 			}
 			return streamOpenAICompletions(
-				model as Model<"openai-completions">,
+				providerModel as Model<"openai-completions">,
 				context,
 				providerOptions as OptionsForApi<"openai-completions">,
 			);
@@ -851,50 +864,50 @@ function streamDispatch<TApi extends Api>(
 
 		case "openai-completions":
 			return streamOpenAICompletions(
-				model as Model<"openai-completions">,
+				providerModel as Model<"openai-completions">,
 				context,
 				providerOptions as OptionsForApi<"openai-completions">,
 			);
 
 		case "openai-responses":
 			return streamOpenAIResponses(
-				model as Model<"openai-responses">,
+				providerModel as Model<"openai-responses">,
 				context,
 				providerOptions as OptionsForApi<"openai-responses">,
 			);
 
 		case "azure-openai-responses":
 			return streamAzureOpenAIResponses(
-				model as Model<"azure-openai-responses">,
+				providerModel as Model<"azure-openai-responses">,
 				context,
 				providerOptions as OptionsForApi<"azure-openai-responses">,
 			);
 
 		case "openai-codex-responses":
 			return streamOpenAICodexResponses(
-				model as Model<"openai-codex-responses">,
+				providerModel as Model<"openai-codex-responses">,
 				context,
 				providerOptions as OptionsForApi<"openai-codex-responses">,
 			);
 
 		case "google-generative-ai":
-			return streamGoogle(model as Model<"google-generative-ai">, context, providerOptions);
+			return streamGoogle(providerModel as Model<"google-generative-ai">, context, providerOptions);
 
 		case "google-gemini-cli":
 			return streamGoogleGeminiCli(
-				model as Model<"google-gemini-cli">,
+				providerModel as Model<"google-gemini-cli">,
 				context,
 				providerOptions as GoogleGeminiCliOptions,
 			);
 
 		case "ollama-chat":
-			return streamOllama(model as Model<"ollama-chat">, context, providerOptions as OllamaChatOptions);
+			return streamOllama(providerModel as Model<"ollama-chat">, context, providerOptions as OllamaChatOptions);
 
 		case "cursor-agent":
-			return streamCursor(model as Model<"cursor-agent">, context, providerOptions as CursorOptions);
+			return streamCursor(providerModel as Model<"cursor-agent">, context, providerOptions as CursorOptions);
 
 		case "devin-agent":
-			return streamDevin(model as Model<"devin-agent">, context, providerOptions as DevinOptions);
+			return streamDevin(providerModel as Model<"devin-agent">, context, providerOptions as DevinOptions);
 
 		default:
 			throw new AIError.ConfigurationError(`Unhandled API: ${api}`);
@@ -967,7 +980,9 @@ function extractStatusFromAssistantError(message: AssistantMessage): number | un
 }
 
 function isRetryableUpstreamError(error: unknown, status: number | undefined, message: string | undefined): boolean {
-	// 401 means the credential is bad. Usage-limit phrasing (Codex's
+	// 401 means the credential is bad; 403 is its valid-token twin (access
+	// denied by plan, model policy, or org restriction — a sibling account may
+	// not share it). Usage-limit phrasing (Codex's
 	// "You have hit your ChatGPT usage limit", Anthropic's "usage_limit_reached",
 	// Google's "resource_exhausted", OpenAI's "insufficient_quota") and 429s
 	// without transient rate-limit wording mean this account is parked but a
@@ -979,7 +994,8 @@ function isRetryableUpstreamError(error: unknown, status: number | undefined, me
 	// `parseRateLimitReason` and stay in the provider's own backoff layer
 	// instead of burning siblings.
 	if (AIError.isUsageLimit(error)) return true;
-	if (status === 401) return true;
+	if (isInvalidatedOAuthTokenError(error)) return true;
+	if (status === 401 || status === 403) return true;
 	return isUsageLimitOutcome(status, message);
 }
 
@@ -1004,22 +1020,22 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-	const baseOptions = (options || {}) as SimpleStreamOptions;
+	const inputOptions = (options || {}) as SimpleStreamOptions;
+	const baseOptions = { ...inputOptions, fetch: inputOptions.fetch ?? defaultFetchForModel(model) };
 	const debugOptions = withExtraCaFetch(withRequestDebugFetch(baseOptions));
 	const requestOptions = {
 		...debugOptions,
-		fetch: wrapFetchForProxy(debugOptions.fetch ?? (globalThis.fetch as FetchImpl), model.provider),
+		fetch: wrapFetchForProxy(debugOptions.fetch, model.provider),
 	} as SimpleStreamOptions;
+
 	const apiKeyResolver = isApiKeyResolver(requestOptions?.apiKey) ? requestOptions.apiKey : undefined;
 	if (apiKeyResolver) {
 		const outer = new AssistantMessageEventStream();
 		const signal = requestOptions?.signal;
-		// One inner attempt against a resolved string key. A retryable auth error
-		// that arrives before any replay-unsafe event is buffered and returned
-		// (so the caller can retry with a fresh key) instead of surfaced. Once any
-		// non-start event escapes, retry is no longer safe and the failure is
-		// emitted directly.
-		const runAttempt = async (apiKey: string): Promise<AuthRetryFailure | undefined> => {
+		// One inner attempt against a resolved key, or against the Bedrock AWS
+		// credential chain when its optional resolver has no stored bearer key.
+		// Retryable auth failures are buffered until replay is safe.
+		const runAttempt = async (apiKey?: string): Promise<AuthRetryFailure | undefined> => {
 			const bufferedEvents: AssistantMessageEvent[] = [];
 			let emittedReplayUnsafeEvent = false;
 			const flushBuffered = (): void => {
@@ -1093,6 +1109,11 @@ export function streamSimple<TApi extends Api>(
 				return;
 			}
 			if (lastKey === undefined) {
+				if (getProviderDefinition(model.provider)?.allowsMissingApiKey) {
+					const failure = await runAttempt();
+					if (failure) emitFailure(failure);
+					return;
+				}
 				outer.fail(new AIError.MissingApiKeyError(model.provider));
 				return;
 			}
@@ -1142,6 +1163,13 @@ export function streamSimple<TApi extends Api>(
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
 		const providerOptions = mapOptionsForApi(model, requestOptions, undefined);
 		return stream(model, context, providerOptions);
+	} else if (getProviderDefinition(model.provider)?.allowsMissingApiKey) {
+		const providerOptions = mapOptionsForApi(
+			model,
+			requestOptions,
+			typeof requestOptions.apiKey === "string" ? requestOptions.apiKey : getEnvApiKey(model.provider),
+		);
+		return stream(model, context, providerOptions);
 	}
 
 	// The resolver form is handled by the wrapper above; only a static string
@@ -1176,12 +1204,17 @@ export function streamSimple<TApi extends Api>(
 
 	// Kimi Code - route to dedicated handler that wraps OpenAI or Anthropic API
 	if (isKimiModel(model)) {
-		// Pass raw SimpleStreamOptions - streamKimi handles mapping internally
-		return withProviderInFlightLimit(model, requestOptions, () =>
+		// streamKimi handles openai/anthropic format mapping internally, but the
+		// mandatory-reasoning clamp is a request-shaping concern owned here: K3's
+		// `supports_thinking_type: "only"` endpoint rejects disabled/omitted
+		// thinking, so clamp disabled requests to the lowest supported effort
+		// (mirrors the mapOptionsForApi path every other provider takes).
+		const kimiOptions = normalizeMandatoryReasoningOptions(model, requestOptions);
+		return withProviderInFlightLimit(model, kimiOptions, () =>
 			streamKimi(model as Model<"openai-completions">, context, {
-				...requestOptions,
+				...kimiOptions,
 				apiKey,
-				format: requestOptions?.kimiApiFormat ?? "anthropic",
+				format: kimiOptions?.kimiApiFormat,
 			}),
 		);
 	}
@@ -1394,12 +1427,48 @@ function normalizeMandatoryReasoningOptions<TApi extends Api>(
 	return { ...options, reasoning: floor, disableReasoning: undefined };
 }
 
+function supportsExplicitOpenAIResponsesPromptCache(compat: unknown): boolean {
+	return (
+		typeof compat === "object" &&
+		compat !== null &&
+		"supportsPromptCacheBreakpoints" in compat &&
+		compat.supportsPromptCacheBreakpoints === true
+	);
+}
+
+function isOpenAIResponsesPromptCacheSurface<TApi extends Api>(model: Model<TApi>): boolean {
+	return (
+		model.api === "openai-responses" ||
+		model.api === "azure-openai-responses" ||
+		(model.api === "openrouter" && $env.PI_OPENROUTER_RESPONSES !== "0")
+	);
+}
+
+function assertExplicitOpenAIResponsesPromptCacheSupport<TApi extends Api>(
+	model: Model<TApi>,
+	options?: StreamOptions,
+): void {
+	if (
+		model.transport === "pi-native" ||
+		resolveCacheRetention(options?.cacheRetention) === "none" ||
+		options?.promptCache?.mode !== "explicit" ||
+		!isOpenAIResponsesPromptCacheSurface(model) ||
+		supportsExplicitOpenAIResponsesPromptCache(model.compat)
+	) {
+		return;
+	}
+	throw new AIError.ConfigurationError(
+		`OpenAI explicit prompt caching is unsupported for ${model.provider}/${model.id}; enable compat.supportsPromptCacheBreakpoints only for a compatible endpoint.`,
+	);
+}
+
 function mapOptionsForApi<TApi extends Api>(
 	model: Model<TApi>,
 	rawOptions?: SimpleStreamOptions,
 	apiKey?: string,
 ): OptionsForApi<TApi> {
 	const options = normalizeMandatoryReasoningOptions(model, rawOptions);
+	const simpleProviderOptions = getProviderDefinition(model.provider)?.mapSimpleOptions?.(options ?? {});
 	const base = {
 		temperature: options?.temperature,
 		topP: options?.topP,
@@ -1420,6 +1489,7 @@ function mapOptionsForApi<TApi extends Api>(
 		promptCacheKey: options?.promptCacheKey,
 		streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
 		streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
+		codexSseMaxAttempts: options?.codexSseMaxAttempts,
 		providerSessionState: options?.providerSessionState,
 		maxInFlightRequests: options?.maxInFlightRequests,
 		onPayload: options?.onPayload,
@@ -1428,13 +1498,18 @@ function mapOptionsForApi<TApi extends Api>(
 		execHandlers: options?.execHandlers,
 		fetch: options?.fetch,
 		fallbacks: options?.fallbacks,
+		...simpleProviderOptions,
 	};
 
 	switch (model.api) {
 		case "anthropic-messages": {
-			// Explicitly disable thinking when reasoning is not specified or model doesn't support it
+			// Explicitly disable thinking when reasoning is not specified, the caller
+			// disabled it, or the model doesn't support it. `disableReasoning` is a
+			// SimpleStreamOptions flag that never reaches AnthropicOptions on its own,
+			// so it must be folded into `thinkingEnabled` here (mandatory-reasoning
+			// models already clamp it away in normalizeMandatoryReasoningOptions).
 			const reasoning = options?.reasoning;
-			if (!reasoning || !model.reasoning) {
+			if (!reasoning || !model.reasoning || options?.disableReasoning) {
 				return castApi<"anthropic-messages">({
 					...base,
 					requestModelId: resolveWireModelId(model, undefined),
@@ -1568,6 +1643,8 @@ function mapOptionsForApi<TApi extends Api>(
 					maxTokensExplicit: rawOptions?.maxTokens !== undefined,
 					disableReasoning: options?.disableReasoning,
 					textVerbosity: options?.textVerbosity,
+					promptCache: options?.promptCache,
+					statefulResponses: options?.statefulResponses,
 				});
 			}
 			return castApi<"openai-completions">({
@@ -1578,6 +1655,7 @@ function mapOptionsForApi<TApi extends Api>(
 				serviceTier: options?.serviceTier,
 				openrouterVariant: options?.openrouterVariant,
 				maxTokensExplicit: rawOptions?.maxTokens !== undefined,
+				promptCache: options?.promptCache,
 			});
 		}
 
@@ -1590,6 +1668,7 @@ function mapOptionsForApi<TApi extends Api>(
 				serviceTier: options?.serviceTier,
 				openrouterVariant: options?.openrouterVariant,
 				maxTokensExplicit: rawOptions?.maxTokens !== undefined,
+				promptCache: options?.promptCache,
 			});
 
 		case "openai-responses":
@@ -1603,6 +1682,8 @@ function mapOptionsForApi<TApi extends Api>(
 				maxTokensExplicit: rawOptions?.maxTokens !== undefined,
 				disableReasoning: options?.disableReasoning,
 				textVerbosity: options?.textVerbosity,
+				promptCache: options?.promptCache,
+				statefulResponses: options?.statefulResponses,
 			});
 
 		case "azure-openai-responses":
@@ -1612,6 +1693,8 @@ function mapOptionsForApi<TApi extends Api>(
 				toolChoice: mapOpenAiToolChoice(options?.toolChoice),
 				serviceTier: options?.serviceTier,
 				reasoningSummary: options?.hideThinkingSummary ? null : undefined,
+				promptCache: options?.promptCache,
+				statefulResponses: options?.statefulResponses,
 			});
 
 		case "openai-codex-responses":
@@ -1636,6 +1719,7 @@ function mapOptionsForApi<TApi extends Api>(
 					serviceTier: options?.serviceTier,
 					thinking: { enabled: false },
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
+					cachedContent: options?.cachedContent,
 				});
 			}
 
@@ -1654,10 +1738,11 @@ function mapOptionsForApi<TApi extends Api>(
 					},
 					hideThinkingSummary: options?.hideThinkingSummary,
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
+					cachedContent: options?.cachedContent,
 				});
 			}
 
-			return castApi<"google-gemini-cli">({
+			return castApi<"google-generative-ai">({
 				...base,
 				thinking: {
 					enabled: true,
@@ -1665,6 +1750,7 @@ function mapOptionsForApi<TApi extends Api>(
 				},
 				hideThinkingSummary: options?.hideThinkingSummary,
 				toolChoice: mapGoogleToolChoice(options?.toolChoice),
+				cachedContent: options?.cachedContent,
 			});
 		}
 
@@ -1738,6 +1824,7 @@ function mapOptionsForApi<TApi extends Api>(
 					serviceTier: options?.serviceTier,
 					thinking: { enabled: false },
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
+					cachedContent: options?.cachedContent,
 				});
 			}
 
@@ -1755,6 +1842,7 @@ function mapOptionsForApi<TApi extends Api>(
 					},
 					hideThinkingSummary: options?.hideThinkingSummary,
 					toolChoice: mapGoogleToolChoice(options?.toolChoice),
+					cachedContent: options?.cachedContent,
 				});
 			}
 
@@ -1767,6 +1855,7 @@ function mapOptionsForApi<TApi extends Api>(
 				},
 				hideThinkingSummary: options?.hideThinkingSummary,
 				toolChoice: mapGoogleToolChoice(options?.toolChoice),
+				cachedContent: options?.cachedContent,
 			});
 		}
 

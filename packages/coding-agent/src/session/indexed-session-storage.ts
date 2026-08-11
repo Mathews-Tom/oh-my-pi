@@ -270,8 +270,15 @@ export class IndexedSessionStorage implements SessionStorage {
 				{ trackDrain: false },
 			);
 		} catch (err) {
-			this.#restoreIndex(path, previous);
-			throw toError(err);
+			const error = toError(err);
+			try {
+				if ((await this.#backend.readFull(path)) === content) return;
+			} catch {
+				// Preserve the original write failure; verification was unavailable.
+			}
+			const current = this.#index.get(path);
+			if (current?.mtimeMs === mtimeMs) this.#restoreIndex(path, previous);
+			throw error;
 		}
 	}
 
@@ -502,6 +509,15 @@ class IndexedSessionStorageWriter implements SessionStorageWriter {
 		});
 		this.#pendingChain = next.catch(() => {});
 		return next;
+	}
+
+	appendSync(line: string): void {
+		if (this.#closed) throw new Error("Writer closed");
+		if (this.#error) throw this.#error;
+		// Local index is updated immediately; remote publish stays ordered on the
+		// path queue. Callers that need remote durability still await append()/flush().
+		const mtimeMs = this.#storage._appendForWriter(this.#path, line);
+		void this.#trackPromise(this.#storage._queueAppend(this.#path, line, mtimeMs, () => this.#error));
 	}
 
 	async append(line: string): Promise<void> {

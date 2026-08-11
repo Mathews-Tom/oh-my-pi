@@ -7,7 +7,7 @@ import type {
 	AgentToolUpdateCallback,
 	ToolApprovalDecision,
 } from "@oh-my-pi/pi-agent-core";
-import { logger, once, prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { isEnoent, logger, once, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { BunFile } from "bun";
 import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
@@ -17,9 +17,11 @@ import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
 import {
+	clearInitializationFailure,
 	ensureFileOpen,
 	FileChangeType,
 	getActiveClients,
+	getActiveOrPendingClient,
 	getOrCreateClient,
 	type LspServerStatus,
 	notifySaved,
@@ -28,6 +30,8 @@ import {
 	sendNotification,
 	sendRequest,
 	setIdleTimeout,
+	shutdownClientInstance,
+	supportsDocumentDiagnostics,
 	syncContent,
 	WARMUP_TIMEOUT_MS,
 	waitForProjectLoaded,
@@ -43,6 +47,7 @@ import {
 } from "./edits";
 import { resolveFormatOptions } from "./format-options";
 import { detectLspmux } from "./lspmux";
+import { MUX_RESTART_METHOD } from "./mux/protocol";
 import {
 	type CodeAction,
 	type CodeActionContext,
@@ -210,6 +215,7 @@ async function syncFileContent(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
+	createMissing = true,
 ): Promise<void> {
 	throwIfAborted(signal);
 	await Promise.allSettled(
@@ -218,11 +224,15 @@ async function syncFileContent(
 			if (serverConfig.createClient) {
 				return;
 			}
-			const client = await getOrCreateClient(serverConfig, cwd, undefined, signal);
+			const client = createMissing
+				? await getOrCreateClient(serverConfig, cwd, undefined, signal)
+				: await getActiveOrPendingClient(serverConfig, cwd, signal);
+			if (!client) return;
 			throwIfAborted(signal);
 			await syncContent(client, absolutePath, content, signal);
 		}),
 	);
+	throwIfAborted(signal);
 }
 
 /**
@@ -238,6 +248,7 @@ async function notifyFileSaved(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
+	createMissing = true,
 ): Promise<void> {
 	throwIfAborted(signal);
 	await Promise.allSettled(
@@ -246,10 +257,14 @@ async function notifyFileSaved(
 			if (serverConfig.createClient) {
 				return;
 			}
-			const client = await getOrCreateClient(serverConfig, cwd, undefined, signal);
+			const client = createMissing
+				? await getOrCreateClient(serverConfig, cwd, undefined, signal)
+				: await getActiveOrPendingClient(serverConfig, cwd, signal);
+			if (!client) return;
 			await notifySaved(client, absolutePath, signal);
 		}),
 	);
+	throwIfAborted(signal);
 }
 
 // Cache config per cwd to avoid repeated file I/O
@@ -495,12 +510,18 @@ function isMethodNotFoundError(err: unknown): boolean {
 }
 
 async function reloadServer(client: LspClient, serverName: string, signal?: AbortSignal): Promise<string> {
-	// rust-analyzer exposes a real reload request.
+	throwIfAborted(signal);
+	// rust-analyzer exposes a real reload request. Every other server rejects it
+	// with method-not-found — that alone justifies the generic fallback. A caller
+	// cancel or tool timeout must propagate, never be mistaken for an unsupported
+	// method and swallowed into a bogus "Restarted" (issue #6369).
 	try {
 		await sendRequest(client, "rust-analyzer/reloadWorkspace", null, signal);
 		return `Reloaded ${serverName}`;
-	} catch {
-		// Method not supported — fall through.
+	} catch (err) {
+		throwIfAborted(signal);
+		if (!isMethodNotFoundError(err)) throw err;
+		// Method not supported — fall through to the generic reload.
 	}
 	// workspace/didChangeConfiguration is a notification per spec; sending it
 	// as a request hangs until the tool deadline on servers that route it to
@@ -509,7 +530,22 @@ async function reloadServer(client: LspClient, serverName: string, signal?: Abor
 		await sendNotification(client, "workspace/didChangeConfiguration", { settings: {} }, signal);
 		return `Reloaded ${serverName}`;
 	} catch {
-		client.proc.kill();
+		throwIfAborted(signal);
+		// The reload notification could not be delivered — the connection is
+		// wedged or the process already died. Tear the client down (removing it
+		// from the registry by identity and awaiting confirmed process exit) so
+		// the next request cold-starts a fresh client. A kill that never confirms
+		// exit is not a restart: surface the teardown failure truthfully.
+		//
+		// On a broker-shared link a per-session teardown only detaches this
+		// process while the wedged server keeps serving everyone else — ask the
+		// mux to kill the shared server first (best-effort; it also severs us).
+		if (client.proc.sharedMux) {
+			await sendNotification(client, MUX_RESTART_METHOD, undefined, AbortSignal.timeout(2_000)).catch(() => {});
+		}
+		if (!(await shutdownClientInstance(client))) {
+			throw new Error(`Failed to restart ${serverName}: server process did not exit after kill`);
+		}
 		return `Restarted ${serverName}`;
 	}
 }
@@ -530,17 +566,49 @@ interface WaitForDiagnosticsOptions {
 	settleMs?: number;
 }
 
+function requestDocumentDiagnostics(
+	client: LspClient,
+	uri: string,
+	signal: AbortSignal | undefined,
+	timeoutMs: number,
+): Promise<Diagnostic[] | undefined> {
+	return sendRequest(client, "textDocument/diagnostic", { textDocument: { uri } }, signal, timeoutMs)
+		.then(report => {
+			if (!report || typeof report !== "object" || !("kind" in report) || report.kind !== "full") {
+				return undefined;
+			}
+			if (!("items" in report) || !Array.isArray(report.items)) return undefined;
+			return report.items;
+		})
+		.catch(err => {
+			if (!signal?.aborted) {
+				logger.debug("LSP document diagnostic pull failed", { server: client.name, uri, error: String(err) });
+			}
+			return undefined;
+		});
+}
+
 async function waitForDiagnostics(
 	client: LspClient,
 	uri: string,
 	options: WaitForDiagnosticsOptions = {},
 ): Promise<Diagnostic[]> {
 	const { timeoutMs = 3000, signal, minVersion, expectedDocumentVersion, settleMs = DIAGNOSTICS_SETTLE_MS } = options;
-	const start = Date.now();
+	const deadline = Date.now() + timeoutMs;
+	let pullAttempted = false;
+	let pullResultPromise: Promise<{ diagnostics: Diagnostic[] | undefined }> | undefined;
+	let pulled: Diagnostic[] | undefined;
 	let settledRef: PublishedDiagnostics | undefined;
 	let settledAt = 0;
-	while (Date.now() - start < timeoutMs) {
+	while (Date.now() < deadline) {
 		throwIfAborted(signal);
+		if (!pullAttempted && supportsDocumentDiagnostics(client)) {
+			pullAttempted = true;
+			pullResultPromise = requestDocumentDiagnostics(client, uri, signal, Math.max(1, deadline - Date.now())).then(
+				diagnostics => ({ diagnostics }),
+			);
+		}
+
 		const versionOk = minVersion === undefined || client.diagnosticsVersion > minVersion;
 		const published = client.diagnostics.get(uri);
 		if (published && versionOk) {
@@ -557,13 +625,36 @@ async function waitForDiagnostics(
 				return published.diagnostics;
 			}
 		}
-		await Bun.sleep(DIAGNOSTICS_POLL_MS);
+
+		const pollMs = Math.min(DIAGNOSTICS_POLL_MS, Math.max(0, deadline - Date.now()));
+		if (!pullResultPromise) {
+			await Bun.sleep(pollMs);
+			continue;
+		}
+		const pullResult = await Promise.race([pullResultPromise, Bun.sleep(pollMs).then(() => undefined)]);
+		if (pullResult) {
+			pullResultPromise = undefined;
+			pulled = pullResult.diagnostics;
+			if (pulled !== undefined) break;
+		}
 	}
+
 	const versionOk = minVersion === undefined || client.diagnosticsVersion > minVersion;
-	if (!versionOk) {
-		return [];
+	const published = client.diagnostics.get(uri);
+	if (published && versionOk) {
+		return published.diagnostics;
 	}
-	return client.diagnostics.get(uri)?.diagnostics ?? [];
+	if (pullResultPromise) {
+		pulled = (await pullResultPromise).diagnostics;
+	}
+	throwIfAborted(signal);
+	if (pulled === undefined) return [];
+	client.diagnostics.set(uri, {
+		diagnostics: pulled,
+		version: expectedDocumentVersion ?? client.openFiles.get(uri)?.version ?? null,
+	});
+	client.diagnosticsVersion += 1;
+	return pulled;
 }
 
 /** Project type detection result */
@@ -1031,9 +1122,12 @@ export async function writethroughNoop(
 
 interface PendingWritethrough {
 	dst: string;
-	content: string;
 	file?: BunFile;
 	changeType: FileChangeType;
+}
+
+interface RunLspWritethroughOptions {
+	contentAlreadyWritten?: boolean;
 }
 
 interface LspWritethroughBatchRequest {
@@ -1234,12 +1328,16 @@ async function runLspWritethrough(
 		onDeferredDiagnostics: (diagnostics: FileDiagnosticsResult) => void;
 		signal: AbortSignal;
 	},
+	runOptions?: RunLspWritethroughOptions,
 ): Promise<FileDiagnosticsResult | undefined> {
 	const { enableFormat, enableDiagnostics } = options;
+	const contentAlreadyWritten = runOptions?.contentAlreadyWritten ?? false;
 
 	let finalContent = content;
 	const writeContent = async (value: string) => (file ? file.write(value) : Bun.write(dst, value));
-	const getWritePromise = once(() => writeContent(finalContent));
+	const getWritePromise = once(() =>
+		contentAlreadyWritten && finalContent === content ? Promise.resolve() : writeContent(finalContent),
+	);
 	let writeNotified = false;
 	const notifyWriteCommitted = async (notifySignal: AbortSignal | undefined = signal) => {
 		if (writeNotified) return;
@@ -1277,7 +1375,8 @@ async function runLspWritethrough(
 	// Capture diagnostic versions BEFORE syncing to detect stale diagnostics
 	// Bound client creation by the writethrough budget: a hung/broken server
 	// must not add its full init wait (30s default) to every edit.
-	const minVersions = enableDiagnostics ? await captureDiagnosticVersions(cwd, servers, 5_000, signal) : undefined;
+	const minVersionsPromise = enableDiagnostics ? captureDiagnosticVersions(cwd, servers, 5_000, signal) : undefined;
+	let minVersions = useCustomFormatter ? undefined : await minVersionsPromise;
 	let expectedDocumentVersions: ServerVersionMap | undefined;
 
 	let formatter: FileFormatResult | undefined;
@@ -1297,13 +1396,19 @@ async function runLspWritethrough(
 		operationSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 		await untilAborted(operationSignal, async () => {
 			if (useCustomFormatter) {
-				// Custom linters (e.g. Biome CLI) require on-disk input.
-				await writeContent(content);
-				finalContent = await formatContent(dst, content, cwd, customLinterServers, operationSignal);
+				// Custom linters operate on on-disk input; the shared pre-write also
+				// supports implementations that inspect the file before formatting.
+				if (!contentAlreadyWritten) await writeContent(content);
+				const [formattedContent, capturedVersions] = await Promise.all([
+					formatContent(dst, content, cwd, customLinterServers, operationSignal),
+					minVersionsPromise,
+				]);
+				finalContent = formattedContent;
+				minVersions = capturedVersions;
 				formatter = finalContent !== content ? FileFormatResult.FORMATTED : FileFormatResult.UNCHANGED;
-				await writeContent(finalContent);
+				if (!contentAlreadyWritten || finalContent !== content) await writeContent(finalContent);
 				await notifyWriteCommitted(operationSignal);
-				await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal);
+				await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, enableDiagnostics);
 			} else {
 				// 1. Sync original content to LSP servers
 				await syncFileContent(dst, content, cwd, lspServers, operationSignal);
@@ -1329,7 +1434,7 @@ async function runLspWritethrough(
 			}
 
 			// 5. Notify saved to LSP servers
-			await notifyFileSaved(dst, cwd, lspServers, operationSignal);
+			await notifyFileSaved(dst, cwd, lspServers, operationSignal, !useCustomFormatter || enableDiagnostics);
 		});
 		synced = true;
 	} catch {
@@ -1395,6 +1500,14 @@ async function flushWritethroughBatch(
 	const results: Array<FileDiagnosticsResult | undefined> = [];
 	for (const entry of batch) {
 		const bundle = getDeferred?.(entry.dst);
+		let content: string;
+		try {
+			content = await fs.promises.readFile(entry.dst, "utf8");
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			bundle?.finalize(undefined);
+			continue;
+		}
 		const deferredInner =
 			bundle &&
 			({
@@ -1403,13 +1516,14 @@ async function flushWritethroughBatch(
 			} as const);
 		const diag = await runLspWritethrough(
 			entry.dst,
-			entry.content,
+			content,
 			cwd,
 			options,
 			entry.changeType,
 			signal,
 			entry.file,
 			deferredInner,
+			{ contentAlreadyWritten: true },
 		);
 		bundle?.finalize(diag);
 		results.push(diag);
@@ -1455,13 +1569,37 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 			return diagnostics;
 		}
 
-		const state = getOrCreateWritethroughBatch(batch.id, resolvedOptions);
-		state.entries.set(dst, { dst, content, file, changeType });
-
-		if (!batch.flush) {
+		// File commits are never deferred: the batch owns only LSP post-processing,
+		// so a later flush cannot replay an obsolete whole-file snapshot.
+		try {
 			await writethroughNoop(dst, content, signal, file);
-			return undefined;
+		} catch (error) {
+			if (batch.flush) {
+				const pending = writethroughBatches.get(batch.id);
+				if (pending) {
+					writethroughBatches.delete(batch.id);
+					try {
+						await flushWritethroughBatch(
+							Array.from(pending.entries.values()),
+							cwd,
+							pending.options,
+							signal,
+							getDeferred,
+						);
+					} catch (flushError) {
+						logger.warn("Failed to flush pending LSP batch after final write failure", {
+							batchId: batch.id,
+							error: flushError instanceof Error ? flushError.message : String(flushError),
+						});
+					}
+				}
+			}
+			throw error;
 		}
+
+		const state = getOrCreateWritethroughBatch(batch.id, resolvedOptions);
+		state.entries.set(dst, { dst, file, changeType });
+		if (!batch.flush) return undefined;
 
 		writethroughBatches.delete(batch.id);
 		return flushWritethroughBatch(Array.from(state.entries.values()), cwd, state.options, signal, getDeferred);
@@ -1509,7 +1647,10 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<LspToolDetails>> {
 		const { action, file, line, symbol, query, new_name, apply, timeout } = params;
-		const timeoutSec = clampTimeout("lsp", timeout);
+		if (this.session.lspReadOnly && !LSP_READONLY_ACTIONS.has(action)) {
+			throw new ToolError(`LSP action ${action} is disabled in this read-only session`);
+		}
+		const timeoutSec = clampTimeout("lsp", timeout, this.session.settings.get("tools.maxTimeout"));
 		const timeoutSignal = AbortSignal.timeout(timeoutSec * 1000);
 		const callerSignal = signal;
 		signal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
@@ -2256,6 +2397,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			const outputs: string[] = [];
 			for (const [workspaceServerName, workspaceServerConfig] of servers) {
 				throwIfAborted(signal);
+				clearInitializationFailure(workspaceServerConfig, this.session.cwd);
 				try {
 					const workspaceClient = await getOrCreateClient(
 						workspaceServerConfig,
@@ -2287,6 +2429,8 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		}
 
 		const [serverName, serverConfig] = serverInfo;
+
+		if (action === "reload") clearInitializationFailure(serverConfig, this.session.cwd);
 
 		try {
 			const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, signal);

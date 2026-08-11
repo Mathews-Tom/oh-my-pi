@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import {
 	type InputItem,
 	type RequestBody,
@@ -11,10 +11,14 @@ import {
 	streamOpenAICodexResponses,
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { isOpenAIResponsesProgressEvent } from "@oh-my-pi/pi-ai/providers/openai-shared";
+import { configureCredentialRedaction } from "@oh-my-pi/pi-ai/providers/transform-messages";
 import type { CodexCompactionRequestContext, Context, FetchImpl, ProviderSessionState } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { createCodexModel } from "./helpers";
+
+beforeAll(() => configureCredentialRedaction(true));
+afterAll(() => configureCredentialRedaction(false));
 
 const TEST_INSTALLATION_ID = "00000000-0000-4000-8000-000000000001";
 
@@ -87,6 +91,16 @@ function requireRecord(value: unknown, label: string): Record<string, unknown> {
 	return value;
 }
 
+/**
+ * Decode a captured Codex SSE request body. The provider zstd-compresses the
+ * body by default, so a binary payload is decompressed before JSON parsing.
+ */
+function decodeCodexRequestBody(body: RequestInit["body"]): string {
+	if (typeof body === "string") return body;
+	if (body instanceof Uint8Array) return new TextDecoder().decode(Bun.zstdDecompressSync(body));
+	throw new Error("expected a string or binary Codex request body");
+}
+
 function parseTurnMetadata(clientMetadata: Record<string, unknown>): Record<string, unknown> {
 	const encoded = clientMetadata["x-codex-turn-metadata"];
 	if (typeof encoded !== "string") throw new Error("expected x-codex-turn-metadata");
@@ -106,7 +120,7 @@ function createCodexFetchMock(sse: string, onRequest: (captured: CapturedCodexRe
 		if (url.endsWith("/responses")) {
 			onRequest({
 				headers: init?.headers instanceof Headers ? init.headers : new Headers(init?.headers),
-				body: typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {},
+				body: JSON.parse(decodeCodexRequestBody(init?.body)) as Record<string, unknown>,
 			});
 			return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
 		}
@@ -187,25 +201,24 @@ describe("openai-codex reasoning.context", () => {
 
 	// gpt-5.1-codex / gpt-5.3-codex / gpt-5.3-codex-spark reject `all_turns`
 	// ("Unsupported value: 'all_turns' is not supported with this model").
-	it.each([
-		"gpt-5.1-codex",
-		"gpt-5.3-codex",
-		"gpt-5.3-codex-spark",
-	])("omits the all_turns default for pre-5.4 model %s", async modelId => {
-		const model = createCodexModel(modelId);
+	it.each(["gpt-5.1-codex", "gpt-5.3-codex", "gpt-5.3-codex-spark"])(
+		"omits the all_turns default for pre-5.4 model %s",
+		async modelId => {
+			const model = createCodexModel(modelId);
 
-		const defaulted = await transformRequestBody({ model: model.id }, model, { reasoningEffort: "medium" });
-		expect(defaulted.reasoning).toBeDefined();
-		expect(defaulted.reasoning?.context).toBeUndefined();
-		expect("context" in (defaulted.reasoning ?? {})).toBe(false);
+			const defaulted = await transformRequestBody({ model: model.id }, model, { reasoningEffort: "medium" });
+			expect(defaulted.reasoning).toBeDefined();
+			expect(defaulted.reasoning?.context).toBeUndefined();
+			expect("context" in (defaulted.reasoning ?? {})).toBe(false);
 
-		// A supported override (current_turn/auto) is still honored.
-		const overridden = await transformRequestBody({ model: model.id }, model, {
-			reasoningEffort: "medium",
-			reasoningContext: "current_turn",
-		});
-		expect(overridden.reasoning?.context).toBe("current_turn");
-	});
+			// A supported override (current_turn/auto) is still honored.
+			const overridden = await transformRequestBody({ model: model.id }, model, {
+				reasoningEffort: "medium",
+				reasoningContext: "current_turn",
+			});
+			expect(overridden.reasoning?.context).toBe("current_turn");
+		},
+	);
 
 	it("suppresses an explicit all_turns override on a pre-5.4 model", async () => {
 		const model = createCodexModel("gpt-5.3-codex-spark");
@@ -241,24 +254,23 @@ describe("openai-codex reasoning.summary", () => {
 
 	// gpt-5.1-codex / gpt-5.3-codex / gpt-5.3-codex-spark reject `reasoning.summary`
 	// ("Unsupported parameter: 'reasoning.summary' is not supported with this model").
-	it.each([
-		"gpt-5.1-codex",
-		"gpt-5.3-codex",
-		"gpt-5.3-codex-spark",
-	])("omits reasoning.summary for pre-5.4 model %s", async modelId => {
-		const model = createCodexModel(modelId);
+	it.each(["gpt-5.1-codex", "gpt-5.3-codex", "gpt-5.3-codex-spark"])(
+		"omits reasoning.summary for pre-5.4 model %s",
+		async modelId => {
+			const model = createCodexModel(modelId);
 
-		const defaulted = await transformRequestBody({ model: model.id }, model, { reasoningEffort: "medium" });
-		expect(defaulted.reasoning).toBeDefined();
-		expect("summary" in (defaulted.reasoning ?? {})).toBe(false);
+			const defaulted = await transformRequestBody({ model: model.id }, model, { reasoningEffort: "medium" });
+			expect(defaulted.reasoning).toBeDefined();
+			expect("summary" in (defaulted.reasoning ?? {})).toBe(false);
 
-		// Even an explicit summary level is suppressed on unsupported ids.
-		const forced = await transformRequestBody({ model: model.id }, model, {
-			reasoningEffort: "medium",
-			reasoningSummary: "detailed",
-		});
-		expect("summary" in (forced.reasoning ?? {})).toBe(false);
-	});
+			// Even an explicit summary level is suppressed on unsupported ids.
+			const forced = await transformRequestBody({ model: model.id }, model, {
+				reasoningEffort: "medium",
+				reasoningSummary: "detailed",
+			});
+			expect("summary" in (forced.reasoning ?? {})).toBe(false);
+		},
+	);
 });
 
 describe("openai-codex Responses Lite input shaping", () => {
@@ -344,6 +356,41 @@ describe("openai-codex Responses Lite input shaping", () => {
 		expect(noTools.parallel_tool_calls).toBe(false);
 	});
 
+	it("falls back from forced hosted tool choices without weakening explicit tool-use constraints", async () => {
+		const model = createCodexModel("gpt-5.6-terra");
+		const tools = [{ type: "function", name: "handoff", parameters: { type: "object" } }];
+
+		const forced = await transformRequestBody(
+			{ model: model.id, tools, tool_choice: { type: "web_search" } },
+			model,
+			{ responsesLite: true },
+		);
+		expect(forced.tool_choice).toBe("auto");
+		expect(forced.tools).toBeUndefined();
+
+		const disabled = await transformRequestBody({ model: model.id, tools, tool_choice: "none" }, model, {
+			responsesLite: true,
+		});
+		expect(disabled.tool_choice).toBe("none");
+		expect(disabled.tools).toBeUndefined();
+	});
+
+	it.each(["gpt-5.3-codex-spark", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"])(
+		"preserves a forced computer function through Lite for %s",
+		async modelId => {
+			const model = createCodexModel(modelId);
+			const computer = { type: "function", name: "computer", parameters: { type: "object" } };
+			const other = { type: "function", name: "read", parameters: { type: "object" } };
+			const body = await transformRequestBody(
+				{ model: model.id, tools: [computer, other], tool_choice: { type: "function", name: "computer" } },
+				model,
+				{ responsesLite: true },
+			);
+			expect(body.input?.[0]).toEqual({ type: "additional_tools", role: "developer", tools: [computer] });
+			expect(body.tool_choice).toBe("required");
+		},
+	);
+
 	it("moves instructions and tools into input items under lite", async () => {
 		const model = createCodexModel("gpt-5.6-terra");
 		const tools = [{ type: "function", name: "shot", parameters: { type: "object" } }];
@@ -373,17 +420,30 @@ describe("openai-codex Responses Lite input shaping", () => {
 		});
 	});
 
-	it("defaults lite from the model useResponsesLite flag and honors explicit opt-out", async () => {
+	it("resolves Lite from explicit options, the environment, then the model default", async () => {
+		const previous = Bun.env.PI_CODEX_RESPONSES_LITE;
 		const model = createCodexModel("gpt-5.6-terra", { useResponsesLite: true });
-		const lite = await transformRequestBody({ model: model.id, instructions: "sys" }, model, {});
-		expect(lite.instructions).toBeUndefined();
-		expect(lite.input?.[0]?.type).toBe("additional_tools");
+		try {
+			delete Bun.env.PI_CODEX_RESPONSES_LITE;
+			const modelDefault = await transformRequestBody({ model: model.id, instructions: "sys" }, model, {});
+			expect(modelDefault.instructions).toBeUndefined();
+			expect(modelDefault.input?.[0]?.type).toBe("additional_tools");
 
-		const optOut = await transformRequestBody({ model: model.id, instructions: "sys" }, model, {
-			responsesLite: false,
-		});
-		expect(optOut.instructions).toBe("sys");
-		expect(optOut.input?.some(item => item.type === "additional_tools")).toBe(false);
+			Bun.env.PI_CODEX_RESPONSES_LITE = "false";
+			const envOptOut = await transformRequestBody({ model: model.id, instructions: "sys" }, model, {});
+			expect(envOptOut.instructions).toBe("sys");
+			expect(envOptOut.input?.some(item => item.type === "additional_tools")).toBe(false);
+
+			Bun.env.PI_CODEX_RESPONSES_LITE = "true";
+			const explicitOptOut = await transformRequestBody({ model: model.id, instructions: "sys" }, model, {
+				responsesLite: false,
+			});
+			expect(explicitOptOut.instructions).toBe("sys");
+			expect(explicitOptOut.input?.some(item => item.type === "additional_tools")).toBe(false);
+		} finally {
+			if (previous === undefined) delete Bun.env.PI_CODEX_RESPONSES_LITE;
+			else Bun.env.PI_CODEX_RESPONSES_LITE = previous;
+		}
 	});
 });
 
@@ -1184,5 +1244,36 @@ describe("openai-codex concurrent reasoning summaries", () => {
 		expect(JSON.parse(replayOnly?.thinkingSignature ?? "{}").id).toBe("rs_3");
 		const text = result.content.find(block => block.type === "text");
 		expect(text?.text).toBe("Hello");
+	});
+});
+
+describe("openai-codex native history redaction", () => {
+	it("redacts credentials from user provider history before replaying it", () => {
+		const model = createCodexModel("gpt-5.1-codex");
+		const credential = "sk-ABCdef1234567890ABCdef1234567890ABCdef1234567890ABCdef123456";
+		const context: Context = {
+			messages: [
+				{
+					role: "user",
+					content: "fallback",
+					timestamp: Date.now(),
+					providerPayload: {
+						type: "openaiResponsesHistory",
+						provider: model.provider,
+						items: [{ type: "message", role: "user", content: [{ type: "input_text", text: credential }] }],
+					},
+				} as Context["messages"][number],
+			],
+		};
+
+		const messages = convertCodexResponsesMessages(model, context);
+
+		expect(messages).toEqual([
+			{
+				type: "message",
+				role: "user",
+				content: [{ type: "input_text", text: "[openai_token_redacted]" }],
+			},
+		]);
 	});
 });

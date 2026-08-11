@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, TextContent } from "@oh-my-pi/pi-ai";
@@ -14,7 +15,6 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TodoTool, type ToolSession, USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 
 // Re-injecting eager preludes after compaction: the first-message preludes are the
 // oldest messages, so compaction summarizes them away and the agent silently loses
@@ -58,10 +58,11 @@ function getMessageText(message: AgentMessage): string {
 	if (!("content" in message)) return "";
 	if (typeof message.content === "string") return message.content;
 	if (!Array.isArray(message.content)) return "";
-	return message.content
-		.filter(isTextContentBlock)
-		.map(content => content.text)
-		.join("\n");
+	const text: string[] = [];
+	for (const content of message.content) {
+		if (isTextContentBlock(content)) text.push(content.text);
+	}
+	return text.join("\n");
 }
 
 function createAssistantResponse(text: string) {
@@ -253,8 +254,26 @@ describe("AgentSession eager prelude re-injection after compaction", () => {
 		return { session, observedCalls, sessionManager, waitForCall };
 	}
 
+	function activateOngoingGoal(session: AgentSession): void {
+		const now = Date.now();
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "eager-prelude-compaction",
+				objective: "finish the parser refactor",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: now,
+				updatedAt: now,
+			},
+		});
+	}
+
 	/** Run the first prompt, drive a compaction, and resolve with the auto-continuation provider call. */
 	async function runToContinuation(session: AgentSession, waitForCall: WaitForCall): Promise<ObservedPromptCall> {
+		activateOngoingGoal(session);
 		await session.prompt("refactor the parser across modules");
 		emitHighUsageTurn(session);
 		return waitForCall(call => call.messageTexts.some(text => text.includes(CONTINUE_MARKER)));
@@ -347,6 +366,7 @@ describe("AgentSession eager prelude re-injection after compaction", () => {
 			"todo.eager": "preferred",
 		});
 		await session.prompt("refactor the parser across modules");
+		activateOngoingGoal(session);
 		// A surviving todo entry; pin firstKeptEntryId so compaction preserves it in the branch.
 		const todoEntryId = sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, {
 			phases: [{ name: "Work", tasks: [{ content: "do the thing", status: "pending" }] }],

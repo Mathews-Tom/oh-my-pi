@@ -285,6 +285,146 @@ describe("AuthStorage OAuth refresh race", () => {
 		expect(refreshCalls).toBe(1);
 	});
 
+	test("serializes rotating provider refresh tokens across AuthStorage instances", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		const expires = Date.now() - 60_000;
+		const refreshedExpires = Date.now() + 60 * 60_000;
+		const usedRefreshTokens = new Set<string>();
+		let refreshCalls = 0;
+
+		oauthUtils.registerOAuthProvider({
+			id: "unit-oauth-cross-process",
+			name: "Unit OAuth Cross Process",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: refreshedExpires };
+			},
+			async refreshToken(credentials) {
+				refreshCalls += 1;
+				if (usedRefreshTokens.has(credentials.refresh)) {
+					throw new Error('HTTP 400 invalid_grant {"error":"invalid_grant"}');
+				}
+				usedRefreshTokens.add(credentials.refresh);
+				await Bun.sleep(50);
+				return {
+					...credentials,
+					access: "access-rotated",
+					refresh: "refresh-rotated",
+					expires: refreshedExpires,
+				};
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+
+		await authStorage.set("unit-oauth-cross-process", [
+			{ type: "oauth", access: "access-old", refresh: "refresh-old", expires },
+		]);
+
+		const secondStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
+		const secondStorage = new AuthStorage(secondStore);
+		await secondStorage.reload();
+		try {
+			const [first, second] = await Promise.all([
+				authStorage.getApiKey("unit-oauth-cross-process", "session-first"),
+				secondStorage.getApiKey("unit-oauth-cross-process", "session-second"),
+			]);
+
+			expect(first).toBe("access-rotated");
+			expect(second).toBe("access-rotated");
+			expect(refreshCalls).toBe(1);
+			expect(secondStore.listAuthCredentials("unit-oauth-cross-process")).toHaveLength(1);
+		} finally {
+			secondStorage.close();
+		}
+	});
+
+	test("does not overwrite a peer rotation after releasing the refresh lease", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+		const sharedStore = store;
+
+		const expires = Date.now() - 60_000;
+		const refreshedExpires = Date.now() + 60 * 60_000;
+		let credentialId: number | undefined;
+
+		oauthUtils.registerOAuthProvider({
+			id: "unit-oauth-post-lease-race",
+			name: "Unit OAuth Post-Lease Race",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: refreshedExpires };
+			},
+			async refreshToken(credentials) {
+				return {
+					...credentials,
+					access: "access-from-this-process",
+					refresh: "refresh-from-this-process",
+					expires: refreshedExpires,
+				};
+			},
+			getApiKey(credentials) {
+				if (credentialId === undefined) throw new Error("credential id not initialized");
+				sharedStore.updateAuthCredential(credentialId, {
+					type: "oauth",
+					access: "access-from-peer",
+					refresh: "refresh-from-peer",
+					expires: refreshedExpires,
+				});
+				return credentials.access;
+			},
+		});
+
+		await authStorage.set("unit-oauth-post-lease-race", [
+			{ type: "oauth", access: "access-old", refresh: "refresh-old", expires },
+		]);
+		credentialId = store.listAuthCredentials("unit-oauth-post-lease-race")[0]?.id;
+		expect(credentialId).toBeDefined();
+
+		const apiKey = await authStorage.getApiKey("unit-oauth-post-lease-race", "session-post-lease");
+		expect(apiKey).toBe("access-from-this-process");
+		const persisted = store.listAuthCredentials("unit-oauth-post-lease-race")[0]?.credential;
+		expect(persisted?.type).toBe("oauth");
+		if (persisted?.type === "oauth") {
+			expect(persisted.refresh).toBe("refresh-from-peer");
+			expect(persisted.access).toBe("access-from-peer");
+		}
+	});
+
+	test("returns the targeted OAuth row after a compare-and-set refresh loss", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const expires = Date.now() - 60_000;
+		await authStorage.set("unit-oauth-cas-loss", [
+			{ type: "oauth", access: "access-first", refresh: "refresh-first", expires },
+			{ type: "oauth", access: "access-target", refresh: "refresh-target", expires },
+		]);
+		const credentialId = store.listAuthCredentials("unit-oauth-cas-loss")[1]?.id;
+		expect(credentialId).toBeDefined();
+		if (credentialId === undefined) return;
+
+		const result = await authStorage.refreshStoredOAuthCredential("unit-oauth-cas-loss", {
+			credentialId,
+			forceRefresh: true,
+			credentialFromRow: credential => credential,
+			async refresh(current) {
+				store!.updateAuthCredential(credentialId, {
+					...current,
+					access: "access-from-peer",
+					refresh: "refresh-from-peer",
+				});
+				return { ...current, access: "access-from-this-process", refresh: "refresh-from-this-process" };
+			},
+		});
+
+		expect(result.refreshed).toBe(false);
+		expect(result.credential).toMatchObject({ access: "access-from-peer", refresh: "refresh-from-peer" });
+		const rows = store.listAuthCredentials("unit-oauth-cas-loss");
+		expect(rows[0]?.credential).toMatchObject({ type: "oauth", access: "access-first" });
+		expect(rows[1]?.credential).toMatchObject({ type: "oauth", access: "access-from-peer" });
+	});
+
 	test("syncs peer-updated SQLite OAuth rows before returning access tokens", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
 
@@ -616,5 +756,97 @@ describe("AuthStorage OAuth refresh race", () => {
 			access: "access-old",
 			refresh: "refresh-old",
 		});
+	});
+
+	test("refreshes an expired stored credential even when it mismatches the observed copy", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const now = Date.parse("2026-07-10T13:00:00.000Z");
+		setSystemTime(new Date(now));
+		await authStorage.set("unit-oauth-observed-mismatch-expired", [
+			{
+				type: "oauth",
+				access: "stored-access-expired",
+				refresh: "stored-refresh",
+				expires: now - 60_000,
+			},
+		]);
+
+		// The caller observed a different (also stale) copy of the credential — the
+		// exact state the finalize path hits when a concurrent usage-fetch cycle
+		// rotates the in-memory credential out from under the request between the
+		// selection sync and the refresh read. Before the fix the observed-mismatch
+		// guard returned the stored copy verbatim without checking whether it was
+		// usable, so the expired token flowed straight into getOAuthApiKey.
+		const observed = {
+			type: "oauth" as const,
+			access: "observed-access-different",
+			refresh: "stored-refresh",
+			expires: now - 120_000,
+		};
+
+		let refreshCalled = false;
+		const result = await authStorage.refreshStoredOAuthCredential("unit-oauth-observed-mismatch-expired", {
+			observedCredential: observed,
+			credentialFromRow: row => row,
+			forceRefresh: false,
+			refresh: async credential => {
+				refreshCalled = true;
+				return {
+					...credential,
+					access: "refreshed-access",
+					refresh: "stored-refresh",
+					expires: now + 60 * 60_000,
+				};
+			},
+		});
+
+		// The expired stored credential must be refreshed, not returned as-is.
+		expect(refreshCalled).toBe(true);
+		expect(result).toMatchObject({ refreshed: true, removed: false });
+		expect(result.credential).toMatchObject({ type: "oauth", access: "refreshed-access" });
+		const stored = store.listAuthCredentials("unit-oauth-observed-mismatch-expired");
+		expect(stored[0]?.credential).toMatchObject({ type: "oauth", access: "refreshed-access" });
+	});
+
+	test("adopts a fresh stored credential without refreshing when it mismatches the observed copy", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const now = Date.parse("2026-07-10T13:30:00.000Z");
+		setSystemTime(new Date(now));
+		await authStorage.set("unit-oauth-observed-mismatch-fresh", [
+			{
+				type: "oauth",
+				access: "peer-rotated-access",
+				refresh: "peer-rotated-refresh",
+				expires: now + 60 * 60_000,
+			},
+		]);
+
+		// A peer already rotated the row to a fresh token; the caller's observed
+		// copy is stale. The fresh stored copy must be adopted without a redundant
+		// refresh (which would waste a rotation and could invalidate the peer's
+		// token).
+		const observed = {
+			type: "oauth" as const,
+			access: "stale-observed-access",
+			refresh: "stale-observed-refresh",
+			expires: now - 60_000,
+		};
+
+		let refreshCalled = false;
+		const result = await authStorage.refreshStoredOAuthCredential("unit-oauth-observed-mismatch-fresh", {
+			observedCredential: observed,
+			credentialFromRow: row => row,
+			forceRefresh: false,
+			refresh: async credential => {
+				refreshCalled = true;
+				return { ...credential, access: "should-not-be-used", expires: now + 60 * 60_000 };
+			},
+		});
+
+		expect(refreshCalled).toBe(false);
+		expect(result).toMatchObject({ refreshed: false, removed: false });
+		expect(result.credential).toMatchObject({ type: "oauth", access: "peer-rotated-access" });
 	});
 });

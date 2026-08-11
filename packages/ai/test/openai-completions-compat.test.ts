@@ -115,7 +115,7 @@ function kimiZaiModel(): Model<"openai-completions"> {
 async function captureOpenAICompletionsPayload(
 	model: Model<"openai-completions">,
 	context: Context = baseContext(),
-	options?: { reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" },
+	options?: { reasoning?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; temperature?: number },
 ): Promise<unknown> {
 	const { promise, resolve } = Promise.withResolvers<unknown>();
 	const fetchMock = createMockFetch(["[DONE]"]);
@@ -156,6 +156,19 @@ function getLastTextPart(content: unknown): Record<string, unknown> | undefined 
 }
 
 describe("openai-completions compatibility", () => {
+	it("omits sampling params for OpenAI reasoning models", async () => {
+		const model = buildModel({
+			...gpt4oMiniSpec,
+			id: "gpt-5.6-luna",
+			provider: "github-copilot",
+			api: "openai-completions",
+		} as ModelSpec<"openai-completions">);
+		expect(model.compat.supportsSamplingParams).toBe(false);
+
+		const payload = await captureOpenAICompletionsPayload(model, undefined, { temperature: 0 });
+		expect(toObject(payload)?.temperature).toBeUndefined();
+	});
+
 	it("serializes assistant text content as a plain string", () => {
 		const model: Model<"openai-completions"> = buildModel({
 			...gpt4oMiniSpec,
@@ -196,6 +209,7 @@ describe("openai-completions compatibility", () => {
 			supportsStrictMode: true,
 			toolStrictMode: "none",
 			supportsReasoningParams: true,
+			supportsSamplingParams: true,
 			alwaysSendMaxTokens: false,
 			isOpenRouterHost: false,
 			isVercelGatewayHost: false,
@@ -1710,6 +1724,88 @@ describe("kimi model detection via detectCompat", () => {
 		expect(payload.tool_choice).toBe("auto");
 	});
 
+	// #7315: DeepSeek reasoning models via OpenCode Zen/Go 400 with "Thinking
+	// mode does not support this tool_choice" when a specific function is forced.
+	// Dropping reasoning_effort does not turn off the gateway's default thinking
+	// mode, so the compat descriptor itself must mark forced tool choice
+	// unsupported (no per-model override) and buildParams must downgrade the
+	// selector to "auto" while keeping the tool advertised.
+	it("scopes the DeepSeek forced tool_choice downgrade to OpenCode gateways", async () => {
+		const todoTool: Tool = {
+			name: "todo",
+			description: "Manage the todo list",
+			parameters: { type: "object", properties: {}, required: [] },
+		};
+		async function captureToolChoice(model: Model<"openai-completions">): Promise<Record<string, unknown>> {
+			const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+			streamOpenAICompletions(
+				model,
+				{
+					messages: [{ role: "user", content: "do it", timestamp: Date.now() }],
+					tools: [todoTool],
+				},
+				{
+					apiKey: "test-key",
+					fetch: createMockFetch(["[DONE]"]),
+					reasoning: "high",
+					toolChoice: { type: "tool", name: "todo" },
+					signal: createAbortedSignal(),
+					onPayload: payload => {
+						const object = toObject(payload);
+						if (!object) throw new Error("Expected object payload");
+						resolve(object);
+					},
+				},
+			);
+			return promise;
+		}
+
+		const deepseekSpec = {
+			id: "deepseek-v4-flash",
+			name: "DeepSeek V4 Flash",
+			api: "openai-completions",
+			provider: "opencode-zen",
+			baseUrl: "https://opencode.ai/zen/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 8_192,
+		} satisfies ModelSpec<"openai-completions">;
+
+		const openCode = buildModel(deepseekSpec);
+		expect(openCode.compat.supportsForcedToolChoice).toBe(false);
+		const openCodePayload = await captureToolChoice(openCode);
+		expect(openCodePayload.tool_choice).toBe("auto");
+		expect(
+			Array.isArray(openCodePayload.tools) &&
+				openCodePayload.tools.some(tool => getNestedObject(tool, "function")?.name === "todo"),
+		).toBe(true);
+
+		// A custom provider id pointed at the OpenCode gateway URL is still
+		// classified as OpenCode by baseUrl, so the downgrade must apply there too.
+		const customOpenCode = buildModel({
+			...deepseekSpec,
+			provider: "my-opencode",
+		} satisfies ModelSpec<"openai-completions">);
+		expect(customOpenCode.compat.supportsForcedToolChoice).toBe(false);
+		const customPayload = await captureToolChoice(customOpenCode);
+		expect(customPayload.tool_choice).toBe("auto");
+
+		const nvidia = buildModel({
+			...deepseekSpec,
+			provider: "nvidia",
+			baseUrl: "https://integrate.api.nvidia.com/v1",
+			id: "deepseek-ai/deepseek-v4-flash",
+		} satisfies ModelSpec<"openai-completions">);
+		expect(nvidia.compat.supportsForcedToolChoice).toBe(true);
+		const nvidiaPayload = await captureToolChoice(nvidia);
+		expect(nvidiaPayload.tool_choice).toEqual({
+			type: "function",
+			function: { name: "todo" },
+		});
+	});
+
 	// #1484 follow-up: DeepSeek V4 on opencode-go exhibits the same gateway
 	// invariant as Kimi (same Zen gateway). DeepSeek emits reasoning under the
 	// `reasoning` signature, so the pre-fix code wrote both `reasoning` and
@@ -2368,6 +2464,22 @@ describe("Moonshot Flavored JSON Schema tool normalization", () => {
 				additionalProperties: false,
 			},
 		},
+		{
+			name: "task",
+			description: "spawn task",
+			parameters: {
+				type: "object",
+				properties: {
+					tasks: {
+						type: "array",
+						items: {
+							type: "object",
+							properties: { outputSchema: true },
+						},
+					},
+				},
+			},
+		},
 	];
 
 	function toolParameters(payload: unknown, toolName: string): Record<string, unknown> {
@@ -2405,8 +2517,8 @@ describe("Moonshot Flavored JSON Schema tool normalization", () => {
 		return buildModel({
 			...gpt4oMiniSpec,
 			api: "openai-completions",
-			provider: "vllm",
-			baseUrl: "http://localhost:8000/v1",
+			provider: "custom",
+			baseUrl: "https://api.example.com/v1",
 			id: "local-model",
 		} as ModelSpec<"openai-completions">);
 	}
@@ -2420,6 +2532,10 @@ describe("Moonshot Flavored JSON Schema tool normalization", () => {
 		const paths = probeProperty(payload, "find", "paths");
 		expect(paths.minItems).toBeUndefined();
 		expect(paths.type).toBe("array");
+		const taskProperties = toObject(
+			toObject(toObject(probeProperty(payload, "task", "tasks").items)?.properties)?.outputSchema,
+		);
+		expect(taskProperties).toEqual({});
 	});
 
 	it("leaves raw JSON Schema untouched on non-Moonshot hosts (flag-gated)", async () => {
@@ -2432,5 +2548,136 @@ describe("Moonshot Flavored JSON Schema tool normalization", () => {
 		expect(op).toEqual({ type: "string", enum: ["pr_checkout", "pr_create"], description: "github operation" });
 		const paths = probeProperty(payload, "find", "paths");
 		expect(paths.minItems).toBe(1);
+		const taskItems = toObject(probeProperty(payload, "task", "tasks").items);
+		const taskProperties = toObject(taskItems?.properties);
+		expect(taskProperties?.outputSchema).toBe(true);
+	});
+});
+
+describe("grammar tool-schema normalization (issue #5914)", () => {
+	const primitiveUnion = {
+		anyOf: [
+			{ type: "string" },
+			{ type: "number" },
+			{ type: "boolean" },
+			{ type: "object" },
+			{ type: "array" },
+			{ type: "null" },
+		],
+	};
+
+	// An open field (`z.unknown()` / ArkType `"unknown"` / raw `{}`) becomes a
+	// bare boolean `true` after `toolWireSchema`'s empty-schema normalization
+	// (issue #1179). The `task` tool ships exactly this via `outputSchema`.
+	const openFieldTool: Tool = {
+		name: "task",
+		description: "spawn subagents",
+		parameters: {
+			type: "object",
+			properties: {
+				task: { type: "string" },
+				outputSchema: {},
+				nested: {
+					type: "object",
+					properties: { value: { type: "string" } },
+					additionalProperties: false,
+				},
+			},
+			required: ["task"],
+			additionalProperties: false,
+		},
+	};
+
+	function toolParameters(payload: unknown, toolName: string): Record<string, unknown> {
+		const tools = toObject(payload)?.tools;
+		if (!Array.isArray(tools)) throw new Error("payload tools missing");
+		for (const entry of tools) {
+			const fn = getNestedObject(entry, "function");
+			if (fn?.name === toolName) {
+				const params = toObject(fn.parameters);
+				if (!params) throw new Error(`tool ${toolName} has no parameters`);
+				return params;
+			}
+		}
+		throw new Error(`tool ${toolName} not in payload`);
+	}
+
+	function localLlamaModel(): Model<"openai-completions"> {
+		return buildModel({
+			...gpt4oMiniSpec,
+			api: "openai-completions",
+			provider: "llama.cpp",
+			baseUrl: "http://127.0.0.1:8080/v1",
+			id: "qwen3-coder",
+		} as ModelSpec<"openai-completions">);
+	}
+
+	function remoteModel(): Model<"openai-completions"> {
+		return buildModel({
+			...gpt4oMiniSpec,
+			api: "openai-completions",
+			provider: "custom",
+			baseUrl: "https://api.example.com/v1",
+			id: "remote-model",
+		} as ModelSpec<"openai-completions">);
+	}
+
+	it("auto-detects the grammar flavor for local OpenAI-compatible backends", () => {
+		expect(localLlamaModel().compat.toolSchemaFlavor).toBe("grammar");
+	});
+
+	it("widens bare boolean subschemas and keeps additionalProperties:false", async () => {
+		const model = localLlamaModel();
+		const payload = await captureOpenAICompletionsPayload(model, { ...baseContext(), tools: [openFieldTool] });
+		const params = toolParameters(payload, "task");
+		const properties = toObject(params.properties);
+		if (!properties) throw new Error("task tool has no properties");
+
+		// The offending bare `true` (from the `{}` open field) becomes a
+		// value-accepting primitive union the GBNF converter can compile.
+		expect(properties.outputSchema).toEqual(primitiveUnion);
+		// No bare boolean subschema remains anywhere in the wire schema.
+		expect(JSON.stringify(params)).not.toContain('"outputSchema":true');
+		// The closed-object contract survives: dropping `additionalProperties:
+		// false` would silently reopen the object to arbitrary keys.
+		expect(params.additionalProperties).toBe(false);
+		const nested = toObject(properties.nested);
+		expect(nested?.additionalProperties).toBe(false);
+	});
+
+	it("widens booleans nested inside object-valued additionalProperties", async () => {
+		const model = localLlamaModel();
+		const mapTool: Tool = {
+			name: "map_tool",
+			description: "tool with a schema-valued additionalProperties",
+			parameters: {
+				type: "object",
+				properties: {
+					env: {
+						type: "object",
+						additionalProperties: { type: "object", properties: { metadata: {} } },
+					},
+				},
+				additionalProperties: false,
+			},
+		};
+		const payload = await captureOpenAICompletionsPayload(model, { ...baseContext(), tools: [mapTool] });
+		const params = toolParameters(payload, "map_tool");
+		const env = getNestedObject(toObject(params.properties), "env");
+		const ap = toObject(env?.additionalProperties);
+		// The schema-valued form is traversed: the nested open field is widened
+		// so the GBNF converter never reaches a bare boolean subschema.
+		expect(getNestedObject(toObject(ap?.properties), "metadata")).toEqual(primitiveUnion);
+		// The boolean form on the outer object still survives untouched.
+		expect(params.additionalProperties).toBe(false);
+	});
+
+	it("leaves the wire schema untouched on non-grammar hosts", async () => {
+		const model = remoteModel();
+		expect(model.compat.toolSchemaFlavor).toBeUndefined();
+		const payload = await captureOpenAICompletionsPayload(model, { ...baseContext(), tools: [openFieldTool] });
+		const properties = toObject(toolParameters(payload, "task").properties);
+		// Off the grammar path the open field keeps the normalized bare boolean.
+		expect(properties?.outputSchema).toBe(true);
 	});
 });

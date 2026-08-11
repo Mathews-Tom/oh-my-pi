@@ -2,17 +2,17 @@
  * Hook loader - loads TypeScript hook modules using native Bun import.
  */
 import * as path from "node:path";
+import * as arktype from "@oh-my-pi/omptype";
+import * as zodModule from "@oh-my-pi/omptype/zod";
 import { logger } from "@oh-my-pi/pi-utils";
-import * as arktype from "arktype";
-import * as zodModule from "zod/v4";
 import { hookCapability } from "../../capability/hook";
 import type { Hook } from "../../discovery";
 import { loadCapability } from "../../discovery";
 // Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
 import * as PiCodingAgent from "../../index";
 import type { CustomMessagePayload } from "../../session/messages";
-import * as typebox from "../typebox";
-import { resolvePath, withExitGuard } from "../utils";
+import * as typebox from "../legacy-typebox";
+import { resolvePath, withHostGuard } from "../utils";
 import { execCommand } from "./runner";
 import type { ExecOptions, HookAPI, HookFactory, HookMessageRenderer, RegisteredCommand } from "./types";
 
@@ -149,7 +149,7 @@ async function loadHook(hookPath: string, cwd: string): Promise<{ hook: LoadedHo
 
 	try {
 		// Import the module using native Bun import
-		const module = await withExitGuard(() => import(resolvedPath));
+		const module = await withHostGuard(() => import(resolvedPath));
 		const factory = module.default as HookFactory;
 
 		if (typeof factory !== "function") {
@@ -164,7 +164,7 @@ async function loadHook(hookPath: string, cwd: string): Promise<{ hook: LoadedHo
 		);
 
 		// Call factory to register handlers
-		await withExitGuard(async () => factory(api));
+		await withHostGuard(async () => factory(api));
 
 		return {
 			hook: {

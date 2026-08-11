@@ -45,6 +45,8 @@ export interface AgentRef {
 	activity?: string;
 }
 
+export type AgentRefExpectation = AgentRef | AgentSession;
+
 export type RegistryEvent =
 	| { type: "registered"; ref: AgentRef }
 	| { type: "status_changed"; ref: AgentRef }
@@ -80,6 +82,10 @@ export class AgentRegistry {
 	readonly #refs = new Map<string, AgentRef>();
 	readonly #listeners = new Set<RegistryListener>();
 
+	#matchesExpected(ref: AgentRef, expected?: AgentRefExpectation): boolean {
+		return expected === undefined || ref === expected || ref.session === expected;
+	}
+
 	register(input: RegisterInput): AgentRef {
 		const now = Date.now();
 		const ref: AgentRef = {
@@ -98,15 +104,32 @@ export class AgentRegistry {
 		return ref;
 	}
 
-	setStatus(id: string, status: AgentStatus): void {
+	/**
+	 * Register a new id only when it is absent, or reuse the exact detached
+	 * `parked` ref a revival was authorized to revive. A missing, replaced, or
+	 * terminal expected ref is a failed CAS: delayed revivers must never claim an
+	 * id after its prior generation disappeared or was hard-killed.
+	 */
+	registerIfAvailable(input: RegisterInput, expected: AgentRef | null): AgentRef | undefined {
+		const current = this.#refs.get(input.id);
+		if (expected === null) return current ? undefined : this.register(input);
+		return current === expected && current.status === "parked" && !current.session ? current : undefined;
+	}
+
+	setStatus(id: string, status: AgentStatus, expected?: AgentRefExpectation): boolean {
 		const ref = this.#refs.get(id);
-		if (!ref || ref.status === status) return;
+		if (!ref || !this.#matchesExpected(ref, expected)) return false;
+		// `aborted` is terminal: delayed progress/revival work from the killed
+		// generation must never transition the tombstone back to a live status.
+		if (ref.status === "aborted") return status === "aborted";
+		if (ref.status === status) return true;
 		ref.status = status;
 		// Activity describes current work; it is meaningless once the agent
 		// leaves `running`, so drop it to avoid showing stale work in rosters.
 		if (status !== "running") ref.activity = undefined;
 		ref.lastActivity = Date.now();
 		this.#emit({ type: "status_changed", ref });
+		return true;
 	}
 
 	/**
@@ -133,25 +156,36 @@ export class AgentRegistry {
 		ref.activity = gist;
 	}
 
-	attachSession(id: string, session: AgentSession, sessionFile?: string | null): void {
+	attachSession(
+		id: string,
+		session: AgentSession,
+		sessionFile?: string | null,
+		expected?: AgentRefExpectation,
+	): boolean {
 		const ref = this.#refs.get(id);
-		if (!ref) return;
+		// Never attach a late-created session to a hard-killed tombstone. This
+		// closes the race between a parked reviver claiming the ref and finishing
+		// createAgentSession after an explicit kill.
+		if (!ref || ref.status === "aborted" || !this.#matchesExpected(ref, expected)) return false;
 		ref.session = session;
 		if (sessionFile !== undefined) ref.sessionFile = sessionFile;
 		ref.lastActivity = Date.now();
+		return true;
 	}
 
-	detachSession(id: string): void {
+	detachSession(id: string, expected?: AgentRefExpectation): boolean {
 		const ref = this.#refs.get(id);
-		if (!ref) return;
+		if (!ref || !this.#matchesExpected(ref, expected)) return false;
 		ref.session = null;
+		return true;
 	}
 
-	unregister(id: string): void {
+	unregister(id: string, expected?: AgentRefExpectation): boolean {
 		const ref = this.#refs.get(id);
-		if (!ref) return;
+		if (!ref || !this.#matchesExpected(ref, expected)) return false;
 		this.#refs.delete(id);
 		this.#emit({ type: "removed", ref });
+		return true;
 	}
 
 	get(id: string): AgentRef | undefined {
