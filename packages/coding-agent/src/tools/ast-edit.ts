@@ -506,6 +506,28 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 											`determined.\nTo allow it: set permissions.profile: off.`,
 									};
 							if (liveDenial) throw new PermissionDeniedError(this.name, liveDenial.rule, liveDenial.reason);
+
+							// `fileList` is the preview-time discovery; the real (non-dry-run)
+							// pass below re-runs the recursive glob/path search independently
+							// and can therefore match a file created or renamed into scope
+							// since the preview — one `checkStructuredTargets(fileList, ...)`
+							// above never saw. Re-discover (dry-run, non-mutating) right before
+							// applying and authorize that concrete, current set too, so a
+							// denied file that only now matches the scope is caught before the
+							// real pass ever opens it.
+							const freshPreview = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
+								rewrites: normalizedRewrites,
+								dryRun: true,
+								maxFiles,
+								failOnParseError: false,
+							});
+							const { record: recordFreshFile, list: freshFileList } = createFileRecorder();
+							for (const fileChange of freshPreview.fileChanges) recordFreshFile(formatPath(fileChange.path));
+							for (const change of freshPreview.changes) recordFreshFile(formatPath(change.path));
+							const freshDenial = liveRoots
+								? checkStructuredTargets(astEditFileTargets(freshFileList), livePolicy, liveRoots)
+								: undefined;
+							if (freshDenial) throw new PermissionDeniedError(this.name, freshDenial.rule, freshDenial.reason);
 						}
 						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 							rewrites: normalizedRewrites,

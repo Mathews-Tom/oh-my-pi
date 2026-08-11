@@ -347,6 +347,19 @@ function extractResultFiles(details: unknown, access: PathAccess): PathTarget[] 
 }
 
 /**
+ * True when the tool's declared `path` argument was already exempt from the
+ * pre-execution gate (`local://`, `memory://`, `artifact://`, …) - a result
+ * extractor must skip it too, matching `extractReadResultTargets`. An exempt
+ * scheme can resolve its backing file outside every workspace root by
+ * design (e.g. `memory://` under the agent directory); rechecking that
+ * resolved path against `confineReads` would reject a search that already
+ * succeeded and was never meant to be confined.
+ */
+function isResultTargetsExempt(args: Record<string, unknown>): boolean {
+	return typeof args.path === "string" && isExemptPathArgument(args.path);
+}
+
+/**
  * The fixed suffix `crates/pi-natives/src/ast.rs` appends to a per-file
  * "syntax tree contains error nodes" parse-error entry, after the file's
  * `display_path`: `format!("{}: parse error (syntax tree contains error
@@ -439,15 +452,15 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	grep: {
 		kind: "structured",
 		extract: delimitedPath("path", "read"),
-		resultTargets: (_args, details) => extractResultFiles(details, "read"),
+		resultTargets: (args, details) => (isResultTargetsExempt(args) ? [] : extractResultFiles(details, "read")),
 	},
 	ast_grep: {
 		kind: "structured",
 		extract: delimitedPath("path", "read"),
-		resultTargets: (_args, details) => [
-			...extractResultFiles(details, "read"),
-			...extractAstParseErrorTargets(details),
-		],
+		resultTargets: (args, details) =>
+			isResultTargetsExempt(args)
+				? []
+				: [...extractResultFiles(details, "read"), ...extractAstParseErrorTargets(details)],
 	},
 	ast_edit: {
 		kind: "structured",
