@@ -665,7 +665,7 @@ async function resolveGitDir(rootDir: string): Promise<string | undefined> {
 // exiting non-zero, which it already reports as `undefined`); rule discovery
 // runs on arbitrary directories that may not have git installed, so that case
 // degrades the same way as a failed git invocation instead of throwing.
-async function safeTryText(rootDir: string, args: readonly string[]): ReturnType<typeof tryText> {
+async function safeTryText(rootDir: string, args: readonly string[]): Promise<string | undefined> {
 	try {
 		return await tryText(rootDir, args, { readOnly: true });
 	} catch {

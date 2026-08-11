@@ -7,14 +7,6 @@
 import { getActiveRules } from "../capability/rule";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
 
-function decodeRuleName(name: string): string {
-	try {
-		return decodeURIComponent(name);
-	} catch {
-		return name;
-	}
-}
-
 export function encodeRuleUrlHost(name: string): string {
 	return name
 		.split(":")
@@ -37,14 +29,9 @@ export class RuleProtocolHandler implements ProtocolHandler {
 		const exactNames = [url.rawHost, url.rawEncodedHost, ...(url.port ? [] : [url.hostname])].filter(
 			(name, index, names): name is string => Boolean(name) && names.indexOf(name) === index,
 		);
-		let rule = exactNames
+		const rule = exactNames
 			.map(name => rules.find(r => r.name === name))
 			.find((candidate): candidate is (typeof rules)[number] => Boolean(candidate));
-		if (!rule) {
-			rule = exactNames
-				.map(name => rules.find(r => decodeRuleName(r.name) === decodeRuleName(name)))
-				.find((candidate): candidate is (typeof rules)[number] => Boolean(candidate));
-		}
 		if (!rule) {
 			const available = rules.map(r => r.name);
 			const availableStr = available.length > 0 ? available.join(", ") : "none";

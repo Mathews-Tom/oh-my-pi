@@ -108,6 +108,27 @@ describe("Claude Code rule discovery", () => {
 		);
 	});
 
+	test("loads project rules rooted at home when CLAUDE_CONFIG_DIR overrides the user config dir", async () => {
+		// A dotfiles-style repo can be rooted at $HOME itself. Once CLAUDE_CONFIG_DIR
+		// points user config elsewhere, $HOME/.claude is no longer the user config dir —
+		// it's just this repo's project-level .claude, and must not be skipped.
+		const claudeConfigDir = path.join(root, "claude-config");
+		process.env.CLAUDE_CONFIG_DIR = claudeConfigDir;
+		await fs.mkdir(path.join(home, ".git"), { recursive: true });
+		await writeFile(path.join(claudeConfigDir, "rules", "global.md"), "Global rule.\n");
+		await writeFile(path.join(home, ".claude", "rules", "local.md"), "Local rule.\n");
+
+		const result = await loadCapability<Rule>(ruleCapability.id, {
+			cwd: home,
+			providers: ["claude"],
+		});
+
+		expect(result.items.map(rule => rule.name)).toEqual(["global", "local"]);
+		expect(result.items.find(rule => rule.name === "local")?.path).toBe(
+			path.join(home, ".claude", "rules", "local.md"),
+		);
+	});
+
 	test("does not apply home gitignore rules to user rules", async () => {
 		await writeFile(path.join(home, ".gitignore"), "*.md\n");
 		await writeFile(path.join(home, ".claude", "rules", "global.md"), "Global rule.\n");

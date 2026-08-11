@@ -67,12 +67,13 @@ function getProjectClaudeAnchor(ctx: LoadContext): string {
 
 function getProjectClaudePathCandidates(ctx: LoadContext, ...segments: string[]): string[] {
 	const paths: string[] = [];
-	const home = path.resolve(ctx.home);
+	const userClaude = path.resolve(getUserClaude(ctx));
 	const anchor = path.resolve(getProjectClaudeAnchor(ctx));
 	let current = path.resolve(ctx.cwd);
 	while (true) {
-		if (current !== home) {
-			paths.push(path.join(current, CONFIG_DIR, ...segments));
+		const candidateClaude = path.join(current, CONFIG_DIR);
+		if (candidateClaude !== userClaude) {
+			paths.push(path.join(candidateClaude, ...segments));
 		}
 		if (current === anchor) break;
 		const parent = path.dirname(current);
