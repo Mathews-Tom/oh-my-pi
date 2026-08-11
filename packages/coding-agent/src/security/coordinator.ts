@@ -422,7 +422,7 @@ async function prepareSecurityExecutionTarget(
 }
 
 export class SecurityCoordinator {
-	readonly #host: SecurityCoordinatorHost;
+	#host: SecurityCoordinatorHost;
 	readonly #createSession: SecurityScanSessionFactory;
 	readonly #openStore: (repositoryRoot: string) => Promise<SecurityStore>;
 	readonly #deriveOutputWorkRoot: (cwd: string) => Promise<string>;
@@ -443,6 +443,21 @@ export class SecurityCoordinator {
 		this.#now = dependencies.now ?? (() => new Date());
 		this.#createOperationId = dependencies.createOperationId ?? createOperationId;
 	}
+
+	/**
+	 * Replace the host every field on this coordinator reads through,
+	 * including `additionalDirectories` and `settings`. `getSecurityCoordinator`
+	 * calls this on every cache hit: without it, a session that adds or removes
+	 * a workspace directory (or rotates credentials, or swaps its active model)
+	 * after the first `security_scan` call would keep authorizing writes
+	 * against the directory list captured when the coordinator was first
+	 * constructed, forever — `assertSecurityWriteAllowed` reads `this.#host`
+	 * fresh on every call, so this is the only place that host goes stale.
+	 */
+	updateHost(host: SecurityCoordinatorHost): void {
+		this.#host = host;
+	}
+
 	async #ensureRecovered(): Promise<void> {
 		this.#recovery ??= this.#recoverInterruptedOperations();
 		await this.#recovery;
@@ -819,7 +834,10 @@ const COORDINATORS = new Map<string, SecurityCoordinator>();
 export function getSecurityCoordinator(host: SecurityCoordinatorHost): SecurityCoordinator {
 	const key = `${path.resolve(host.cwd)}\u0000${host.sessionId ?? "sessionless"}`;
 	const existing = COORDINATORS.get(key);
-	if (existing) return existing;
+	if (existing) {
+		existing.updateHost(host);
+		return existing;
+	}
 	const coordinator = new SecurityCoordinator(host);
 	COORDINATORS.set(key, coordinator);
 	return coordinator;

@@ -22,6 +22,8 @@ import { BASH_DEFAULT_PREVIEW_LINES } from "../../tools/bash";
 import { formatDefaultToolExecution } from "../../tools/default-renderer";
 import { EVAL_DEFAULT_PREVIEW_LINES } from "../../tools/eval";
 import { isWaitingPollDetails } from "../../tools/hub";
+import { checkStructuredTargets } from "../../tools/permissions/gate";
+import type { PathTarget, PermissionPolicy, PermissionRoots } from "../../tools/permissions/types";
 import { formatStatusIcon, replaceTabs, resolveImageOptions } from "../../tools/render-utils";
 import { type FirstResultViewportRepaint, type ToolRenderer, toolRenderers } from "../../tools/renderers";
 import { TODO_STRIKE_TOTAL_FRAMES, type TodoToolDetails } from "../../tools/todo";
@@ -233,6 +235,19 @@ export interface ToolExecutionOptions {
 	/** Live-region probe used to settle detached task progress once the block
 	 * leaves the repaintable transcript region. */
 	liveRegion?: TranscriptLiveRegionProbe;
+	/**
+	 * Resolve the resource-permission policy and workspace roots to gate
+	 * filesystem-backed edit previews against, called fresh on every preview
+	 * recompute (not memoized at construction) so a live `/add-dir`,
+	 * `/remove-dir`, or `permissions.*` settings change taking effect
+	 * mid-session is honored immediately. Returns `null` when
+	 * `permissions.profile` is `off` or no session roots are available, in
+	 * which case previews compute unchecked exactly as before this option
+	 * existed. Omitted entirely by callers with no live session (history
+	 * replay, the component gallery) — previews there were never gated by the
+	 * tool wrapper either.
+	 */
+	resolvePermissions?: () => { policy: PermissionPolicy; roots: PermissionRoots } | null;
 }
 
 export interface ToolExecutionHandle extends Component {
@@ -296,6 +311,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 	#editAllowFuzzy: boolean | undefined;
 	#snapshots?: SnapshotStore;
 	#clipboard?: Clipboard;
+	#resolvePermissions?: () => { policy: PermissionPolicy; roots: PermissionRoots } | null;
 	#isPartial = true;
 	#resultVersion = 0;
 	#lastDisplayKey: string | undefined;
@@ -407,6 +423,7 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 		this.#editAllowFuzzy = options.editAllowFuzzy;
 		this.#snapshots = options.snapshots;
 		this.#clipboard = options.clipboard;
+		this.#resolvePermissions = options.resolvePermissions;
 		this.#liveRegion = options.liveRegion;
 		this.#tool = tool;
 		this.#ui = ui;
@@ -514,6 +531,25 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 			effectiveArgs = strategy.extractCompleteEdits(previewArgs, partialJson);
 		} catch {
 			effectiveArgs = previewArgs;
+		}
+
+		// Authorize every target the preview is about to read before the strategy
+		// touches disk. `strategy.computeDiffPreview` reads the live file (whole-file
+		// diff, hashline section replay, patch/apply_patch re-diff) straight off
+		// `effectiveArgs` — a streamed hashline header naming a read-denied file
+		// (`.env` under `strict`) would otherwise render that file's content in the
+		// live preview well before the tool wrapper's own gate ever runs. Denying the
+		// whole preview when any target is blocked mirrors how the real gate treats a
+		// multi-target call: partial authorization isn't a thing it does either.
+		if (this.#resolvePermissions) {
+			const previewPaths = strategy.matcherPaths(effectiveArgs);
+			if (previewPaths && previewPaths.length > 0) {
+				const permissions = this.#resolvePermissions();
+				if (permissions) {
+					const targets: PathTarget[] = previewPaths.map(raw => ({ raw, access: "read", field: "preview" }));
+					if (checkStructuredTargets(targets, permissions.policy, permissions.roots)) return;
+				}
+			}
 		}
 
 		// Coalesce duplicate computes for identical args. The key pairs the

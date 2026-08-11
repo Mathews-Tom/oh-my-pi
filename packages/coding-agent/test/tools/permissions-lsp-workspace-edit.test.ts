@@ -58,48 +58,105 @@ afterAll(() => {
 });
 
 describe("assertWorkspaceEditAllowed", () => {
-	it("denies a legacy changes-map edit that targets a denied secret", () => {
+	it("denies a legacy changes-map edit that targets a denied secret", async () => {
 		const edit: WorkspaceEdit = { changes: { [fileUri(".env")]: [] } };
-		expect(() => assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).toThrow(PermissionDeniedError);
+		await expect(assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).rejects.toBeInstanceOf(
+			PermissionDeniedError,
+		);
 	});
 
-	it("denies a documentChanges text edit that targets a denied secret", () => {
+	it("denies a documentChanges text edit that targets a denied secret", async () => {
 		const edit: WorkspaceEdit = {
 			documentChanges: [{ textDocument: { uri: fileUri(".env"), version: 1 }, edits: [] }],
 		};
-		expect(() => assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).toThrow(PermissionDeniedError);
+		await expect(assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).rejects.toBeInstanceOf(
+			PermissionDeniedError,
+		);
 	});
 
 	// The rename-initiated-from-an-allowed-file scenario the finding names:
 	// the *source* file is fine, but the server-returned edit also renames a
 	// second file outside every workspace root.
-	it("denies a rename op whose destination escapes the workspace", () => {
+	it("denies a rename op whose destination escapes the workspace", async () => {
 		const edit: WorkspaceEdit = {
 			documentChanges: [
 				{ kind: "rename", oldUri: fileUri("src", "main.ts"), newUri: `file://${path.join(outside, "moved.ts")}` },
 			],
 		};
-		expect(() => assertWorkspaceEditAllowed(edit, contextOf(WORKSPACE), "lsp")).toThrow(PermissionDeniedError);
+		await expect(assertWorkspaceEditAllowed(edit, contextOf(WORKSPACE), "lsp")).rejects.toBeInstanceOf(
+			PermissionDeniedError,
+		);
 	});
 
-	it("denies a create op that targets a denied secret", () => {
+	it("denies a create op that targets a denied secret", async () => {
 		const edit: WorkspaceEdit = { documentChanges: [{ kind: "create", uri: fileUri(".env.local") }] };
-		expect(() => assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).toThrow(PermissionDeniedError);
+		await expect(assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).rejects.toBeInstanceOf(
+			PermissionDeniedError,
+		);
 	});
 
-	it("denies a delete op that targets a denied secret", () => {
+	it("denies a delete op that targets a denied secret", async () => {
 		const edit: WorkspaceEdit = { documentChanges: [{ kind: "delete", uri: fileUri(".env") }] };
-		expect(() => assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).toThrow(PermissionDeniedError);
+		await expect(assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).rejects.toBeInstanceOf(
+			PermissionDeniedError,
+		);
 	});
 
-	it("permits an ordinary in-workspace edit", () => {
+	it("permits an ordinary in-workspace edit", async () => {
 		const edit: WorkspaceEdit = { changes: { [fileUri("src", "main.ts")]: [] } };
-		expect(() => assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).not.toThrow();
+		await expect(assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).resolves.toBeUndefined();
 	});
 
-	it("no-ops entirely under permissions.profile: off", () => {
+	it("no-ops entirely under permissions.profile: off", async () => {
 		const edit: WorkspaceEdit = { changes: { [fileUri(".env")]: [] } };
-		expect(() => assertWorkspaceEditAllowed(edit, contextOf({ "permissions.profile": "off" }), "lsp")).not.toThrow();
+		await expect(
+			assertWorkspaceEditAllowed(edit, contextOf({ "permissions.profile": "off" }), "lsp"),
+		).resolves.toBeUndefined();
+	});
+
+	// The finding: a `delete` resource op names only the directory URI, so the
+	// declared-target check above authorizes `config/` itself but never looks
+	// inside it — yet `applyWorkspaceEdit` removes the whole subtree with
+	// `fs.rm(dirPath, { recursive: true })`. A write-denied descendant must
+	// block the delete even though the directory itself is allowed.
+	describe("directory delete", () => {
+		let deletableDir: string;
+
+		beforeAll(() => {
+			deletableDir = path.join(workspace, "deletable");
+			fs.mkdirSync(path.join(deletableDir, "nested"), { recursive: true });
+			fs.writeFileSync(path.join(deletableDir, "ok.ts"), "export {};");
+			fs.writeFileSync(path.join(deletableDir, "nested", ".env"), "SECRET=1");
+		});
+
+		afterAll(() => {
+			fs.rmSync(deletableDir, { recursive: true, force: true });
+		});
+
+		it("denies deleting an allowed directory that contains a write-denied descendant", async () => {
+			const edit: WorkspaceEdit = { documentChanges: [{ kind: "delete", uri: `file://${deletableDir}` }] };
+			await expect(assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).rejects.toBeInstanceOf(
+				PermissionDeniedError,
+			);
+		});
+
+		it("permits deleting a directory whose every descendant is allowed", async () => {
+			const cleanDir = path.join(workspace, "deletable-clean");
+			fs.mkdirSync(path.join(cleanDir, "nested"), { recursive: true });
+			fs.writeFileSync(path.join(cleanDir, "ok.ts"), "export {};");
+			fs.writeFileSync(path.join(cleanDir, "nested", "also-ok.ts"), "export {};");
+			try {
+				const edit: WorkspaceEdit = { documentChanges: [{ kind: "delete", uri: `file://${cleanDir}` }] };
+				await expect(assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).resolves.toBeUndefined();
+			} finally {
+				fs.rmSync(cleanDir, { recursive: true, force: true });
+			}
+		});
+
+		it("permits deleting a single denied-descendant-free file (no directory enumeration needed)", async () => {
+			const edit: WorkspaceEdit = { documentChanges: [{ kind: "delete", uri: fileUri("src", "main.ts") }] };
+			await expect(assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).resolves.toBeUndefined();
+		});
 	});
 });
 

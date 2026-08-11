@@ -16,12 +16,15 @@
  * tool name — MCP, extension, custom — defaults to `opaque`, so a new
  * `filesystem/read_file {path: ".env"}` is scanned rather than waved through.
  */
+import type { Dirent } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
+import * as path from "node:path";
 import { Patch } from "@oh-my-pi/hashline";
 import { LSP_READONLY_ACTIONS } from "../../lsp";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
 import { unwrapHashlineHeaderPath } from "../plan-mode-guard";
-import { isExemptPathArgument } from "./resolve";
-import type { PathAccess, PathTarget } from "./types";
+import { decideTarget, isExemptPathArgument } from "./resolve";
+import type { PathAccess, PathTarget, PermissionPolicy, PermissionRoots } from "./types";
 
 /** Pulls the declared path arguments out of one tool call's arguments. */
 export type PathTargetExtractor = (args: Record<string, unknown>) => PathTarget[];
@@ -430,6 +433,82 @@ function extractReadResultTargets(args: Record<string, unknown>, details: unknow
 	}
 	pushPath(out, record.resolvedPath, "read", "resolvedPath");
 	return out;
+}
+
+/**
+ * Every regular file beneath `root` `permissions.deny.read` does not block,
+ * decided with the exact same {@link decideTarget} the point-path gate uses
+ * so this can never diverge from what a single-file `read`/`grep` call would
+ * be denied. Returns `null` when the policy has no `deny.read` rules at all —
+ * the common case, where the caller keeps its existing single native
+ * recursive call unchanged.
+ *
+ * `grep`'s native recursion has no exclusion mechanism (its `glob` option is
+ * one positive filter, not a deny list), so a broad `grep({ path: "." })`
+ * under an active `deny.read` rule would otherwise open every descendant,
+ * including one a search matches nothing in — a repeated match/no-match
+ * probe against a file whose content should never be inspected at all is
+ * itself an oracle over that content, and a post-execution recheck of
+ * *matched* files (`extractResultFiles` below) can never see a file that
+ * matched nothing. This walk is the only sound way to keep that file from
+ * being opened in the first place.
+ *
+ * Two accepted, narrower trade-offs versus native's own traversal, both
+ * scoped to the moment this actually returns non-null (an active
+ * `deny.read` rule with something denied in scope — never the default
+ * policy): the walk is plain `readdir` recursion rather than ripgrep's
+ * optimized one, and the caller ends up searching the returned list as
+ * explicit file targets, which — like every other explicit-file grep call —
+ * do not get re-filtered through `.gitignore`.
+ */
+export async function excludeDenyReadDescendants(
+	root: string,
+	policy: PermissionPolicy,
+	roots: PermissionRoots,
+): Promise<string[] | null> {
+	if (policy.deny.read.length === 0) return null;
+	const out: string[] = [];
+	await collectAllowedReadFiles(root, policy, roots, out);
+	return out;
+}
+
+async function collectAllowedReadFiles(
+	dir: string,
+	policy: PermissionPolicy,
+	roots: PermissionRoots,
+	out: string[],
+): Promise<void> {
+	let entries: Dirent[];
+	try {
+		entries = await readdir(dir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		// `.git`'s own object/pack contents are never search targets for any
+		// caller of this tool; skipping it outright avoids walking a directory
+		// that can rival the working tree in size.
+		if (entry.name === ".git") continue;
+		const abs = path.join(dir, entry.name);
+		if (decideTarget({ raw: abs, access: "read", field: "grep" }, policy, roots).kind === "deny") continue;
+		if (entry.isDirectory()) {
+			await collectAllowedReadFiles(abs, policy, roots, out);
+			continue;
+		}
+		if (entry.isFile()) {
+			out.push(abs);
+			continue;
+		}
+		if (entry.isSymbolicLink()) {
+			// A symlink's own path already cleared `decideTarget` above — under
+			// `confineReads` that call resolved it exactly as `read`/`grep` would
+			// (realpath, refusing a dangling link) — so what's left here is only
+			// classifying the *kind* of what it points to, not re-authorizing it.
+			const resolved = await stat(abs).catch(() => null);
+			if (resolved?.isDirectory()) await collectAllowedReadFiles(abs, policy, roots, out);
+			else if (resolved?.isFile()) out.push(abs);
+		}
+	}
 }
 
 /**

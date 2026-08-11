@@ -13,6 +13,9 @@
  * at the exact call sites in `lsp/index.ts` that apply them, since the
  * server response — not the declared request — is what needs checking.
  */
+import type { Dirent } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
+import * as path from "node:path";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { loadPermissionsConfig } from "../tools/permissions/config";
 import { checkStructuredTargets, PermissionDeniedError, permissionRoots } from "../tools/permissions/gate";
@@ -32,9 +35,14 @@ import { uriToFile } from "./utils";
  * so a text-edit target can be checked for `read` in addition to `write`
  * without over-authorizing the resource ops that never read anything.
  */
-function collectWorkspaceEditUris(edit: WorkspaceEdit): { textEditUris: string[]; resourceOpUris: string[] } {
+function collectWorkspaceEditUris(edit: WorkspaceEdit): {
+	textEditUris: string[];
+	resourceOpUris: string[];
+	deleteUris: string[];
+} {
 	const textEditUris = new Set<string>();
 	const resourceOpUris = new Set<string>();
+	const deleteUris = new Set<string>();
 	if (edit.changes) {
 		for (const uri in edit.changes) textEditUris.add(uri);
 	}
@@ -50,11 +58,51 @@ function collectWorkspaceEditUris(edit: WorkspaceEdit): { textEditUris: string[]
 					resourceOpUris.add(change.newUri);
 				} else if (change.kind === "delete") {
 					resourceOpUris.add(change.uri);
+					deleteUris.add(change.uri);
 				}
 			}
 		}
 	}
-	return { textEditUris: [...textEditUris], resourceOpUris: [...resourceOpUris] };
+	return { textEditUris: [...textEditUris], resourceOpUris: [...resourceOpUris], deleteUris: [...deleteUris] };
+}
+
+/**
+ * Every file inside `directoryUri`, recursively, as write-access targets —
+ * the concrete files `fs.rm(dirPath, { recursive: true })`
+ * (`applyWorkspaceEdit`, `lsp/edits.ts`) actually removes. A `delete`
+ * resource op names only the directory URI itself, so authorizing that one
+ * URI alone lets the recursive removal take a write-denied descendant
+ * (`config/.env` under an allowed `config/`) with it, unchecked. Mirrors
+ * `enumerateRenamePairs` (`lsp/tool.ts`) — the same gap already closed for a
+ * directory *rename*. Returns no targets (rather than throwing) for a
+ * non-directory or unreadable URI: a plain-file delete is already fully
+ * authorized by its own URI in `resourceOpUris`, and a directory that
+ * vanished between the edit's computation and this check has nothing left
+ * to enumerate.
+ */
+async function collectDirectoryDeleteTargets(directoryUri: string): Promise<PathTarget[]> {
+	const directoryPath = uriToFile(directoryUri);
+	try {
+		if (!(await stat(directoryPath)).isDirectory()) return [];
+	} catch {
+		return [];
+	}
+	let entries: Dirent[];
+	try {
+		entries = await readdir(directoryPath, { recursive: true, withFileTypes: true });
+	} catch {
+		return [];
+	}
+	const targets: PathTarget[] = [];
+	for (const entry of entries) {
+		if (entry.isDirectory()) continue;
+		targets.push({
+			raw: path.join(entry.parentPath ?? directoryPath, entry.name),
+			access: "write",
+			field: "workspaceEdit",
+		});
+	}
+	return targets;
 }
 
 function requireRootsOrDeny(toolName: string, profile: string, roots: PermissionRoots | null): PermissionRoots {
@@ -78,21 +126,23 @@ function requireRootsOrDeny(toolName: string, profile: string, roots: Permission
  * that is write-allowed but read-denied would otherwise let the edit's
  * server-computed content bypass `permissions.deny.read`.
  */
-export function assertWorkspaceEditAllowed(
+export async function assertWorkspaceEditAllowed(
 	edit: WorkspaceEdit,
 	context: AgentToolContext | undefined,
 	toolName: string,
-): void {
+): Promise<void> {
 	const policy = loadPermissionsConfig(context?.settings);
 	if (!policy) return;
 	const roots = requireRootsOrDeny(toolName, policy.profile, permissionRoots(context));
-	const { textEditUris, resourceOpUris } = collectWorkspaceEditUris(edit);
+	const { textEditUris, resourceOpUris, deleteUris } = collectWorkspaceEditUris(edit);
+	const deleteDescendantTargets = (await Promise.all(deleteUris.map(collectDirectoryDeleteTargets))).flat();
 	const targets: PathTarget[] = [
 		...textEditUris.flatMap(uri => [
 			{ raw: uriToFile(uri), access: "write" as const, field: "workspaceEdit" },
 			{ raw: uriToFile(uri), access: "read" as const, field: "workspaceEdit" },
 		]),
 		...resourceOpUris.map(uri => ({ raw: uriToFile(uri), access: "write" as const, field: "workspaceEdit" })),
+		...deleteDescendantTargets,
 	];
 	const denial = checkStructuredTargets(targets, policy, roots);
 	if (denial) throw new PermissionDeniedError(toolName, denial.rule, denial.reason);

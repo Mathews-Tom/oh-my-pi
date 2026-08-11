@@ -492,7 +492,7 @@ async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequ
 		// command with no literal denied path in its own arguments still
 		// cannot make the server create, rename, delete, or write outside the
 		// workspace or at a denied path via this path.
-		assertWorkspaceEditAllowed(params.edit, client.permissionsContext, client.name);
+		await assertWorkspaceEditAllowed(params.edit, client.permissionsContext, client.name);
 		await applyWorkspaceEdit(params.edit, client.cwd);
 		await sendResponse(client, message.id, { applied: true }, "workspace/applyEdit");
 	} catch (err) {

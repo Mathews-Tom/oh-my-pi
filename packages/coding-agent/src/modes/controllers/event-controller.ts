@@ -26,6 +26,8 @@ import idleRecapPrompt from "../../prompts/system/recap-user.md" with { type: "t
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { isSilentAbort, readQueueChipText, resolveAbortLabel } from "../../session/messages";
 import { type ApprovalMode, resolveApproval } from "../../tools/approval";
+import { loadPermissionsConfig } from "../../tools/permissions/config";
+import type { PermissionPolicy, PermissionRoots } from "../../tools/permissions/types";
 import { previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { PROPOSE_DEVICE_NAME, writeDeviceDispatch } from "../../tools/resolve";
 import { nextActionableTask } from "../../tools/todo";
@@ -908,6 +910,25 @@ export class EventController {
 	}
 
 	/**
+	 * Resource-permission policy and roots for a `ToolExecutionComponent`'s
+	 * live edit-preview gate, re-read from the session on every call (not
+	 * cached on the controller) so a `/add-dir`/`/remove-dir` or
+	 * `permissions.*` settings change mid-session takes effect on the very
+	 * next streamed chunk.
+	 */
+	#resolveEditPreviewPermissions(): { policy: PermissionPolicy; roots: PermissionRoots } | null {
+		const policy = loadPermissionsConfig(settings);
+		if (!policy) return null;
+		return {
+			policy,
+			roots: {
+				cwd: this.ctx.sessionManager.getCwd(),
+				additionalDirectories: this.ctx.sessionManager.getAdditionalDirectories(),
+			},
+		};
+	}
+
+	/**
 	 * Resolve the pending displaceable poll block before the next block lands.
 	 * A follow-up `hub` call displaces it — the stale "waiting on N jobs" frame
 	 * is removed so repeated polls read as one persistent poll — while anything
@@ -1124,6 +1145,7 @@ export class EventController {
 							showImages: settings.get("terminal.showImages"),
 							editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
 							editAllowFuzzy: settings.get("edit.fuzzyMatch"),
+							resolvePermissions: () => this.#resolveEditPreviewPermissions(),
 						},
 						tool,
 						this.ctx.ui,
@@ -1376,6 +1398,7 @@ export class EventController {
 					editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
 					editAllowFuzzy: settings.get("edit.fuzzyMatch"),
 					liveRegion: this.ctx.chatContainer,
+					resolvePermissions: () => this.#resolveEditPreviewPermissions(),
 				},
 				tool,
 				this.ctx.ui,

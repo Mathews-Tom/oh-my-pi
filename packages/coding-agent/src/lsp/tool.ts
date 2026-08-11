@@ -673,7 +673,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			// not the declared `file`/`new_name` args the pre-execution gate
 			// checked - a server can return edits for unrelated URIs. Reuse the
 			// WorkspaceEdit check via a synthetic edit naming every accepted URI.
-			assertWorkspaceEditAllowed(
+			await assertWorkspaceEditAllowed(
 				{ changes: Object.fromEntries([...acceptedByUri.keys()].map(uri => [uri, []])) },
 				context,
 				this.name,
@@ -700,7 +700,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			// concrete list of what actually moves. Reuse the same rename-op
 			// shape `assertWorkspaceEditAllowed` already authorizes write-only
 			// for the LSP-computed edits above.
-			assertWorkspaceEditAllowed(
+			await assertWorkspaceEditAllowed(
 				{ documentChanges: pairs.map(pair => ({ kind: "rename", oldUri: pair.oldUri, newUri: pair.newUri })) },
 				context,
 				this.name,
@@ -1283,7 +1283,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							resolveCodeAction: async actionItem =>
 								(await sendRequest(client, "codeAction/resolve", actionItem, signal)) as CodeAction,
 							applyWorkspaceEdit: async edit => {
-								assertWorkspaceEditAllowed(edit, context, this.name);
+								await assertWorkspaceEditAllowed(edit, context, this.name);
 								return applyWorkspaceEdit(edit, this.session.cwd);
 							},
 							executeCommand: async commandItem => {
@@ -1382,7 +1382,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					} else {
 						const shouldApply = apply !== false;
 						if (shouldApply) {
-							assertWorkspaceEditAllowed(result, context, this.name);
+							await assertWorkspaceEditAllowed(result, context, this.name);
 							const applied = await applyWorkspaceEdit(result, this.session.cwd);
 							output = `Applied rename:\n${applied.map(a => `  ${a}`).join("\n")}`;
 						} else {

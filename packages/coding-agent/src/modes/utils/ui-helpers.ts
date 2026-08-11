@@ -48,6 +48,7 @@ import {
 	type SkillPromptDetails,
 } from "../../session/messages";
 import type { SessionContext, StrippedToolCallsMarker } from "../../session/session-context";
+import { loadPermissionsConfig } from "../../tools/permissions/config";
 import { replaceTabs } from "../../tools/render-utils";
 import { buildSkillCommandPrompt, invokeSkillCommandFromText, isKnownSkillCommand } from "../skill-command";
 import { createAssistantMessageComponent } from "./interactive-context-helpers";
@@ -507,6 +508,18 @@ export class UiHelpers {
 							editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
 							editAllowFuzzy: settings.get("edit.fuzzyMatch"),
 							liveRegion: this.ctx.chatContainer,
+							resolvePermissions: () => {
+								const policy = loadPermissionsConfig(settings);
+								if (!policy) return null;
+								const sessionManager = this.ctx.viewSession.sessionManager;
+								return {
+									policy,
+									roots: {
+										cwd: sessionManager.getCwd(),
+										additionalDirectories: sessionManager.getAdditionalDirectories(),
+									},
+								};
+							},
 						},
 						tool,
 						this.ctx.ui,
