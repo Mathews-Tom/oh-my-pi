@@ -27,6 +27,7 @@ import {
 } from "../../tools/fs-cache-invalidation";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd } from "../../tools/path-utils";
+import { decideTarget, loadPermissionsConfig, PermissionDeniedError, permissionRoots } from "../../tools/permissions";
 import { enforcePlanModeWrite, resolvePlanPath } from "../../tools/plan-mode-guard";
 import { ToolError } from "../../tools/tool-errors";
 import {
@@ -1796,6 +1797,41 @@ function mergeDiagnosticsWithWarnings(
 	};
 }
 
+/**
+ * Authorize an existing patch target for read, when the pre-execution gate's
+ * static classification would not have. `op: "create"` deliberately permits
+ * replacing an existing file (`allowCreateOverwrite`), so a call whose every
+ * edit entry is `create` is classified write-only at the gate
+ * (`tool-path-targets.ts`) - but against an existing target, this still
+ * calls the default-enabled `assertEditableFile` below (reads the file's
+ * prefix) and, for a notebook, `serializeEditedNotebookText` reads the whole
+ * file before it is overwritten. Checked here, against the real resolved
+ * path and only when it exists, so a genuine (`create`, doesn't-exist-yet)
+ * write stays write-only.
+ */
+async function assertPatchReadAllowedIfExists(
+	resolvedPath: string,
+	context: AgentToolContext | undefined,
+): Promise<void> {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy) return;
+	if (!(await Bun.file(resolvedPath).exists())) return;
+	const roots = permissionRoots(context);
+	if (!roots) {
+		throw new PermissionDeniedError(
+			"edit",
+			"permissions.profile",
+			`Tool "edit" is blocked: permissions.profile is "${policy.profile}" but this call has no session, ` +
+				`so the workspace roots the rules are measured against cannot be determined.\n` +
+				`To allow it: set permissions.profile: off.`,
+		);
+	}
+	const decision = decideTarget({ raw: resolvedPath, access: "read", field: "path" }, policy, roots);
+	if (decision.kind === "deny") {
+		throw new PermissionDeniedError("edit", decision.rule, decision.reason);
+	}
+}
+
 export async function executePatchSingle(
 	options: ExecutePatchSingleOptions,
 ): Promise<AgentToolResult<EditToolDetails, typeof patchEditEntrySchema>> {
@@ -1820,6 +1856,7 @@ export async function executePatchSingle(
 	const resolvedPath = resolvePlanPath(session, path);
 	const resolvedRename = rename ? resolvePlanPath(session, rename) : undefined;
 
+	await assertPatchReadAllowedIfExists(resolvedPath, context);
 	await assertEditableFile(resolvedPath, path, session.settings);
 
 	// Capture pre-edit content so we can verify the write actually hit disk.

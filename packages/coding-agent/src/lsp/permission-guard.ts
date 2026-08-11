@@ -22,28 +22,39 @@ import type { PathTarget, PermissionRoots } from "../tools/permissions/types";
 import type { Command, DocumentChange, Location, SymbolInformation, TextEdit, WorkspaceEdit } from "./types";
 import { uriToFile } from "./utils";
 
-function collectWorkspaceEditUris(edit: WorkspaceEdit): string[] {
-	const uris = new Set<string>();
+/**
+ * Every URI a `WorkspaceEdit` touches, split by how `applyWorkspaceEdit`
+ * (`lsp/edits.ts`) actually applies it: a text edit (`edit.changes` map entry
+ * or a `TextDocumentEdit`'s `textDocument.uri`) calls `applyTextEdits`, which
+ * reads the whole file before rewriting it; a `create` resource op writes
+ * empty content with nothing to read, and `rename`/`delete` use
+ * `fs.rename`/`fs.rm` — neither reads the file's content either. Kept apart
+ * so a text-edit target can be checked for `read` in addition to `write`
+ * without over-authorizing the resource ops that never read anything.
+ */
+function collectWorkspaceEditUris(edit: WorkspaceEdit): { textEditUris: string[]; resourceOpUris: string[] } {
+	const textEditUris = new Set<string>();
+	const resourceOpUris = new Set<string>();
 	if (edit.changes) {
-		for (const uri in edit.changes) uris.add(uri);
+		for (const uri in edit.changes) textEditUris.add(uri);
 	}
 	if (edit.documentChanges) {
 		for (const change of edit.documentChanges) {
 			if ("textDocument" in change && change.textDocument) {
-				uris.add(change.textDocument.uri);
+				textEditUris.add(change.textDocument.uri);
 			} else if ("kind" in change && change.kind) {
 				if (change.kind === "create") {
-					uris.add(change.uri);
+					resourceOpUris.add(change.uri);
 				} else if (change.kind === "rename") {
-					uris.add(change.oldUri);
-					uris.add(change.newUri);
+					resourceOpUris.add(change.oldUri);
+					resourceOpUris.add(change.newUri);
 				} else if (change.kind === "delete") {
-					uris.add(change.uri);
+					resourceOpUris.add(change.uri);
 				}
 			}
 		}
 	}
-	return [...uris];
+	return { textEditUris: [...textEditUris], resourceOpUris: [...resourceOpUris] };
 }
 
 function requireRootsOrDeny(toolName: string, profile: string, roots: PermissionRoots | null): PermissionRoots {
@@ -62,7 +73,10 @@ function requireRootsOrDeny(toolName: string, profile: string, roots: Permission
  * permission layer denies. No-ops under `permissions.profile: off`,
  * mirroring the gate's own short-circuit. Every URI is checked as a write —
  * applying an edit always mutates, whatever the source file's own access
- * would have been.
+ * would have been. A text-edit target is also checked for `read`:
+ * `applyTextEdits` reads the whole file before rewriting it, so a target
+ * that is write-allowed but read-denied would otherwise let the edit's
+ * server-computed content bypass `permissions.deny.read`.
  */
 export function assertWorkspaceEditAllowed(
 	edit: WorkspaceEdit,
@@ -72,11 +86,14 @@ export function assertWorkspaceEditAllowed(
 	const policy = loadPermissionsConfig(context?.settings);
 	if (!policy) return;
 	const roots = requireRootsOrDeny(toolName, policy.profile, permissionRoots(context));
-	const targets: PathTarget[] = collectWorkspaceEditUris(edit).map(uri => ({
-		raw: uriToFile(uri),
-		access: "write",
-		field: "workspaceEdit",
-	}));
+	const { textEditUris, resourceOpUris } = collectWorkspaceEditUris(edit);
+	const targets: PathTarget[] = [
+		...textEditUris.flatMap(uri => [
+			{ raw: uriToFile(uri), access: "write" as const, field: "workspaceEdit" },
+			{ raw: uriToFile(uri), access: "read" as const, field: "workspaceEdit" },
+		]),
+		...resourceOpUris.map(uri => ({ raw: uriToFile(uri), access: "write" as const, field: "workspaceEdit" })),
+	];
 	const denial = checkStructuredTargets(targets, policy, roots);
 	if (denial) throw new PermissionDeniedError(toolName, denial.rule, denial.reason);
 }
