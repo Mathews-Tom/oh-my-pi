@@ -177,4 +177,65 @@ describe("ast_grep parse errors", () => {
 			await removeWithRetries(tempDir);
 		}
 	});
+
+	it("rebases file-valued multi-target results to their actual paths", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-grep-file-targets-"));
+		try {
+			const firstPath = path.join(tempDir, "first.ts");
+			const secondPath = path.join(tempDir, "second.ts");
+			await Bun.write(firstPath, "const firstSymbol = 1;\n");
+			await Bun.write(secondPath, "const secondSymbol = 1;\n");
+			const tools = await createTools(createTestSession(tempDir));
+			const tool = tools.find(entry => entry.name === "ast_grep");
+			expect(tool).toBeDefined();
+
+			const result = await tool!.execute("ast-grep-file-targets", {
+				pat: "const $NAME = 1",
+				path: `${firstPath};${secondPath}`,
+			});
+			const details = result.details as
+				| { files?: string[]; filesSearched?: number; matchCount?: number }
+				| undefined;
+
+			expect(details?.filesSearched).toBe(2);
+			expect(details?.matchCount).toBe(2);
+			expect(details?.files).toEqual(["first.ts", "second.ts"]);
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("excludes denied descendants before recursive AST traversal", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-grep-permissions-"));
+		try {
+			await Bun.write(path.join(tempDir, "allowed.ts"), "const allowedSymbol = 1;\n");
+			await Bun.write(path.join(tempDir, "private.ts"), "const privateSymbol = 1;\n");
+			const settings = Settings.isolated({
+				"astGrep.enabled": true,
+				"tools.xdev": false,
+				"permissions.profile": "workspace",
+				"permissions.deny.read": ["**/private.ts"],
+			});
+			const tools = await createTools(createTestSession(tempDir, { settings }));
+			const tool = tools.find(entry => entry.name === "ast_grep");
+			expect(tool).toBeDefined();
+
+			const result = await tool!.execute("ast-grep-permissions", {
+				pat: "const $NAME = 1",
+				path: tempDir,
+			});
+			const details = result.details as
+				| { files?: string[]; filesSearched?: number; matchCount?: number }
+				| undefined;
+			const text = result.content.find(content => content.type === "text")?.text ?? "";
+
+			expect(details?.filesSearched).toBe(1);
+			expect(details?.matchCount).toBe(1);
+			expect(details?.files).toEqual(["allowed.ts"]);
+			expect(text).toContain("allowed.ts");
+			expect(text).not.toContain("private.ts");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
 });

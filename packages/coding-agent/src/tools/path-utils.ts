@@ -887,6 +887,7 @@ export interface ParsedFindPattern {
 export interface ResolvedSearchTarget {
 	basePath: string;
 	glob?: string;
+	pathIsFile?: boolean;
 }
 
 export interface ResolvedMultiSearchPath {
@@ -1100,6 +1101,7 @@ async function resolveSearchPathItems(
 			? parsedItems.map(item => ({
 					basePath: item.absoluteBasePath,
 					glob: item.parsedPath.glob ? combineSearchGlobs(item.parsedPath.glob, suffixGlob) : suffixGlob,
+					pathIsFile: item.stat.isFile(),
 				}))
 			: undefined;
 

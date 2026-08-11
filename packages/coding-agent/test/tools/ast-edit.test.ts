@@ -92,6 +92,35 @@ describe("ast_edit tool schema", () => {
 		}
 	});
 
+	it("rebases file-valued multi-target previews to their actual paths", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-file-targets-"));
+		try {
+			const firstPath = path.join(tempDir, "first.ts");
+			const secondPath = path.join(tempDir, "second.ts");
+			await Bun.write(firstPath, "legacyWrap(firstValue, firstArg)\n");
+			await Bun.write(secondPath, "legacyWrap(secondValue, secondArg)\n");
+			const tools = await createTools(createTestSession(tempDir));
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+
+			const result = await tool!.execute("ast-edit-file-targets", {
+				ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
+				paths: [firstPath, secondPath],
+			});
+			const details = result.details as
+				| { fileReplacements?: Array<{ path: string; count: number }>; files?: string[] }
+				| undefined;
+
+			expect(details?.files).toEqual(["first.ts", "second.ts"]);
+			expect(details?.fileReplacements).toEqual([
+				{ path: "first.ts", count: 1 },
+				{ path: "second.ts", count: 1 },
+			]);
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
 	it("registers a pending action that apply writes changes", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-pending-"));
 		try {

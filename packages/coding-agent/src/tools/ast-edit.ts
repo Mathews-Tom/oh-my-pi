@@ -27,7 +27,7 @@ import { parseReadUrlTarget } from "./fetch";
 import { createFileRecorder, formatResultPath } from "./file-recorder";
 import { classifyGroupedLines, formatGroupedFiles, groupLineIndicesByBlank } from "./grouped-file-output";
 import type { OutputMeta } from "./output-meta";
-import { isInternalUrlPath, resolveToolSearchScope } from "./path-utils";
+import { isInternalUrlPath, type ResolvedSearchTarget, resolveToolSearchScope } from "./path-utils";
 import {
 	checkStructuredTargets,
 	loadPermissionsConfig,
@@ -84,7 +84,7 @@ interface AstEditAggregatedResult {
 }
 
 async function runAstEditTargets(
-	targets: Array<{ basePath: string; glob?: string }>,
+	targets: ResolvedSearchTarget[],
 	commonBasePath: string,
 	options: AstEditCallOptions,
 ): Promise<AstEditAggregatedResult> {
@@ -111,12 +111,12 @@ async function runAstEditTargets(
 		applied = applied && targetResult.applied;
 		if (targetResult.parseErrors) parseErrors.push(...targetResult.parseErrors);
 		for (const change of targetResult.changes) {
-			const absolute = path.resolve(target.basePath, change.path);
+			const absolute = target.pathIsFile ? target.basePath : path.resolve(target.basePath, change.path);
 			const rebased = path.relative(commonBasePath, absolute).replace(/\\/g, "/");
 			aggregatedChanges.push({ ...change, path: rebased });
 		}
 		for (const fileChange of targetResult.fileChanges) {
-			const absolute = path.resolve(target.basePath, fileChange.path);
+			const absolute = target.pathIsFile ? target.basePath : path.resolve(target.basePath, fileChange.path);
 			const rebased = path.relative(commonBasePath, absolute).replace(/\\/g, "/");
 			fileCounts.set(rebased, (fileCounts.get(rebased) ?? 0) + fileChange.count);
 		}
@@ -138,7 +138,7 @@ async function runAstEditTargets(
 }
 
 function runAstEditOnce(
-	targets: Array<{ basePath: string; glob?: string }> | undefined,
+	targets: ResolvedSearchTarget[] | undefined,
 	resolvedSearchPath: string,
 	globFilter: string | undefined,
 	options: AstEditCallOptions,

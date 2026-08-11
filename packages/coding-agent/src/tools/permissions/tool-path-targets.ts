@@ -435,6 +435,13 @@ function extractReadResultTargets(args: Record<string, unknown>, details: unknow
 	return out;
 }
 
+function extractInspectImageResultTargets(_args: Record<string, unknown>, details: unknown): PathTarget[] {
+	if (!details || typeof details !== "object") return [];
+	const imagePath = (details as Record<string, unknown>).imagePath;
+	if (typeof imagePath !== "string" || imagePath.startsWith("attachment://")) return [];
+	return [{ raw: imagePath, access: "read", field: "imagePath" }];
+}
+
 /**
  * Every regular file beneath `root` `permissions.deny.read` does not block,
  * decided with the exact same {@link decideTarget} the point-path gate uses
@@ -561,7 +568,11 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	},
 	lsp: { kind: "structured", extract: extractLspPaths },
 	debug: { kind: "structured", extract: extractDebugPaths },
-	inspect_image: { kind: "structured", extract: singlePath("path", "read") },
+	inspect_image: {
+		kind: "structured",
+		extract: singlePath("path", "read"),
+		resultTargets: extractInspectImageResultTargets,
+	},
 	security_scan: { kind: "structured", extract: extractSecurityScanPaths },
 
 	// ── Class B: opaque — best-effort literal scan, never a sandbox ───────

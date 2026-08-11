@@ -30,6 +30,7 @@ import {
 	webpExclusionForModel,
 } from "../utils/image-loading";
 import type { ToolSession } from "./index";
+import { enforcePostExecutionResourcePermissions } from "./permissions/gate";
 import { ToolError } from "./tool-errors";
 
 const inspectImageSchema = type({
@@ -143,7 +144,7 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 		params: InspectImageParams,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<InspectImageToolDetails>,
-		_context?: AgentToolContext,
+		context?: AgentToolContext,
 	): Promise<AgentToolResult<InspectImageToolDetails>> {
 		if (this.session.settings.get("images.blockImages")) {
 			throw new ToolError(
@@ -229,6 +230,8 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 		if (!imageInput) {
 			throw new ToolError("inspect_image only supports PNG, JPEG, GIF, and WEBP files detected by file content.");
 		}
+
+		enforcePostExecutionResourcePermissions(this.name, params, { imagePath: imageInput.resolvedPath }, context);
 
 		const telemetry = resolveTelemetry(this.session.getTelemetry?.(), this.session.getSessionId?.() ?? undefined);
 		const timeoutMs = this.session.settings.get("inspect_image.timeoutMs");
