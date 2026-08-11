@@ -499,6 +499,9 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	web_search: { kind: "pathless" },
 	goal: { kind: "pathless" },
 	yield: { kind: "pathless" },
+	// `think` records a private free-text scratchpad, not a path — same
+	// rationale as `task`.
+	think: { kind: "pathless" },
 };
 
 /**
