@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult, RenderResultOptions } from "@oh-my-pi/pi-agent-core";
+import type { AgentToolContext, AgentToolResult, RenderResultOptions } from "@oh-my-pi/pi-agent-core";
 import { arkToWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { preloadPluginRoots } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
@@ -22,6 +22,7 @@ import {
 	type CreateFile,
 	type DeleteFile,
 	type Diagnostic,
+	type Location,
 	type LspClient,
 	type LspToolDetails,
 	lspSchema,
@@ -2799,7 +2800,13 @@ describe("lsp regressions", () => {
 			expect(loadConfigSpy).toHaveBeenCalledTimes(3);
 			expect(starOutput).toContain("Reloaded test-lsp");
 			expect(omittedOutput).toContain("Reloaded test-lsp");
-			expect(lspClient.getOrCreateClient).toHaveBeenCalledWith(server, tempDir.path(), undefined, expect.anything());
+			expect(lspClient.getOrCreateClient).toHaveBeenCalledWith(
+				server,
+				tempDir.path(),
+				undefined,
+				expect.anything(),
+				expect.anything(),
+			);
 		} finally {
 			vi.restoreAllMocks();
 			tempDir.removeSync();
@@ -3480,6 +3487,105 @@ describe("lsp regressions", () => {
 				tempDir.removeSync();
 			}
 		});
+	});
+});
+
+describe("references beyond REFERENCE_CONTEXT_LIMIT respect resource permissions", () => {
+	it("filters a denied plain reference instead of leaking its path and line", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-references-perm-");
+		try {
+			const cwd = tempDir.path();
+			const mainFile = path.join(cwd, "src", "main.ts");
+			await Bun.write(mainFile, "export const value = 1;\n".repeat(60));
+			const secretFile = path.join(cwd, ".env");
+			await Bun.write(secretFile, "SECRET=1\n");
+			const otherFile = path.join(cwd, "src", "other.ts");
+			await Bun.write(otherFile, "export const other = 2;\n");
+
+			const server: ServerConfig = { command: "test-lsp", fileTypes: ["ts"], rootMarkers: [] };
+			const client: LspClient = {
+				name: "test-lsp",
+				cwd,
+				config: server,
+				proc: {
+					stdin: { write() {}, flush: async () => {} },
+				} as unknown as LspClient["proc"],
+				requestId: 0,
+				diagnostics: new Map(),
+				diagnosticsVersion: 0,
+				openFiles: new Map(),
+				pendingRequests: new Map(),
+				messageBuffer: new Uint8Array(),
+				isReading: false,
+				status: "ready",
+				lastActivity: Date.now(),
+				writeQueue: Promise.resolve(),
+				activeProgressTokens: new Set(),
+				projectLoaded: Promise.resolve(),
+				resolveProjectLoaded: () => {},
+			};
+
+			vi.spyOn(lspConfig, "loadConfig").mockReturnValue({
+				servers: { "test-lsp": server },
+				idleTimeoutMs: undefined,
+			});
+			vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([["test-lsp", server]]);
+			vi.spyOn(lspClient, "getOrCreateClient").mockResolvedValue(client);
+			vi.spyOn(lspClient, "ensureFileOpen").mockResolvedValue();
+			vi.spyOn(lspClient, "sendNotification").mockResolvedValue();
+
+			// 50 contextual (opened) references, all in the permitted `mainFile`, plus
+			// two references past REFERENCE_CONTEXT_LIMIT: one in a `strict`-denied
+			// `.env`, one in another permitted file.
+			const contextualLocations: Location[] = Array.from({ length: 50 }, (_, i) => ({
+				uri: fileToUri(mainFile),
+				range: { start: { line: i, character: 0 }, end: { line: i, character: 5 } },
+			}));
+			const deniedPlainLocation: Location = {
+				uri: fileToUri(secretFile),
+				range: { start: { line: 0, character: 0 }, end: { line: 0, character: 6 } },
+			};
+			const permittedPlainLocation: Location = {
+				uri: fileToUri(otherFile),
+				range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+			};
+			vi.spyOn(lspClient, "sendRequest").mockResolvedValue([
+				...contextualLocations,
+				deniedPlainLocation,
+				permittedPlainLocation,
+			]);
+
+			const toolContext = {
+				sessionManager: {
+					getCwd: () => cwd,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "test-session",
+				},
+				settings: Settings.isolated({ "permissions.profile": "strict" }),
+			} as unknown as AgentToolContext;
+
+			const tool = new LspTool(makeLspSession(cwd));
+			const result = await tool.execute(
+				"references-perm-test",
+				{ action: "references", file: mainFile, line: 1, symbol: "value", timeout: 5 },
+				undefined,
+				undefined,
+				toolContext,
+			);
+
+			const output = result.content
+				.filter(block => block.type === "text")
+				.map(block => block.text)
+				.join("\n");
+
+			expect(output).toContain("Found 52 reference(s)");
+			expect(output).toContain("other.ts");
+			expect(output).toContain("... 1 additional reference(s) shown without context");
+			expect(output).not.toContain(".env");
+		} finally {
+			vi.restoreAllMocks();
+			tempDir.removeSync();
+		}
 	});
 });
 

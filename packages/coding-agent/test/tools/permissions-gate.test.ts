@@ -7,7 +7,9 @@ import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { applyGuardedWorkspaceEdit, guardLocationReads } from "@oh-my-pi/pi-coding-agent/lsp";
+import { guardedApplyEditDenial } from "@oh-my-pi/pi-coding-agent/lsp/client";
 import { workspaceEditTargetPaths } from "@oh-my-pi/pi-coding-agent/lsp/edits";
+import type { LspClient } from "@oh-my-pi/pi-coding-agent/lsp/types";
 import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -639,5 +641,54 @@ describe("lsp workspace edits", () => {
 		);
 		expect(applied).toHaveLength(1);
 		expect(fs.existsSync(target)).toBe(true);
+	});
+});
+
+describe("lsp server-initiated workspace/applyEdit", () => {
+	// `guardedApplyEditDenial` is the counterpart to `applyGuardedWorkspaceEdit`
+	// above for the one write surface that has no `AgentToolContext`: a
+	// language server pushing `workspace/applyEdit` unsolicited. It measures
+	// against `LspClient.permissionContext` instead — the calling session's
+	// settings and `workspace.additionalDirectories`, stamped onto the client.
+	function fileUri(absolutePath: string): string {
+		return `file://${absolutePath}`;
+	}
+
+	function clientWith(overrides: Record<string, unknown> | undefined, additionalDirectories?: string[]): LspClient {
+		return {
+			cwd: workspace,
+			permissionContext: overrides && {
+				settings: settingsOf(overrides),
+				additionalDirectories: additionalDirectories ?? [sibling],
+			},
+		} as unknown as LspClient;
+	}
+
+	it("permits every edit when the client has no recorded permission context, same as an absent-settings caller", () => {
+		const denial = guardedApplyEditDenial(clientWith(undefined), {
+			changes: { [fileUri(path.join(outside, "loot.txt"))]: [{ range: RANGE_ZERO, newText: "x" }] },
+		} as never);
+		expect(denial).toBeNull();
+	});
+
+	it("refuses a server-pushed edit to a secret path under the session's strict profile", () => {
+		const denial = guardedApplyEditDenial(clientWith(STRICT), {
+			changes: { [fileUri(path.join(workspace, ".env"))]: [{ range: RANGE_ZERO, newText: "LEAK=1" }] },
+		} as never);
+		expect(denial).toContain("**/.env");
+	});
+
+	it("refuses a server-chosen create target outside every workspace root", () => {
+		const denial = guardedApplyEditDenial(clientWith(WORKSPACE), {
+			documentChanges: [{ kind: "create", uri: fileUri(path.join(outside, "new.ts")) }],
+		} as never);
+		expect(denial).toContain("permissions.confineWrites");
+	});
+
+	it("carries the session's live additionalDirectories, so an edit into an /add-dir root is not falsely denied", () => {
+		const denial = guardedApplyEditDenial(clientWith(WORKSPACE, [sibling]), {
+			documentChanges: [{ kind: "create", uri: fileUri(path.join(sibling, "new.md")) }],
+		} as never);
+		expect(denial).toBeNull();
 	});
 });

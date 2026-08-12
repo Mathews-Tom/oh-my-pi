@@ -1,4 +1,5 @@
 import { type } from "@oh-my-pi/omptype";
+import type { Settings } from "../config/settings";
 import { TOOL_TIMEOUTS } from "../tools/tool-timeouts";
 
 // =============================================================================
@@ -449,6 +450,20 @@ export interface LspClient {
 	projectLoaded: Promise<void>;
 	/** Call to signal that project loading has completed */
 	resolveProjectLoaded: () => void;
+	/**
+	 * The calling session's live resource-permission context, refreshed on
+	 * every `getOrCreateClient`/`getActiveOrPendingClient` call.
+	 *
+	 * A server-initiated `workspace/applyEdit` (`client.ts`'s
+	 * `handleApplyEditRequest`) has no per-call session handle of its own —
+	 * this is how that push path still measures against the calling session's
+	 * current `workspace.additionalDirectories` and permissions settings
+	 * instead of going unguarded. Best-effort when a client outlives the
+	 * session that created it or is shared by cwd across sessions: it reflects
+	 * whichever session most recently touched this client, not a single
+	 * source of truth per client.
+	 */
+	permissionContext?: { readonly settings: Settings; readonly additionalDirectories: readonly string[] };
 }
 
 // =============================================================================

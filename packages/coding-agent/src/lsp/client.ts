@@ -1,8 +1,11 @@
 import * as path from "node:path";
 import { isEnoent, logger, postmortem, ptree, untilAborted } from "@oh-my-pi/pi-utils";
 import { MessageFramer } from "../jsonrpc/message-framing";
+import { loadPermissionsConfig } from "../tools/permissions/config";
+import { checkStructuredTargets } from "../tools/permissions/gate";
+import type { PathTarget, PermissionRoots } from "../tools/permissions/types";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
-import { applyWorkspaceEdit } from "./edits";
+import { applyWorkspaceEdit, workspaceEditTargetPaths } from "./edits";
 import { getLspmuxCommand, isLspmuxSupported } from "./lspmux";
 import { connectSharedLspTransport } from "./mux/daemon";
 import type {
@@ -469,6 +472,38 @@ async function handleConfigurationRequest(client: LspClient, message: LspJsonRpc
 }
 
 /**
+ * Refuse a server-pushed `WorkspaceEdit` that names a path the calling
+ * session's resource permission policy denies, or `null` when it clears.
+ *
+ * This is the server-initiated counterpart to `lsp/tool.ts`'s
+ * `applyGuardedWorkspaceEdit`: same target extraction
+ * ({@link workspaceEditTargetPaths}), same decision procedure
+ * ({@link checkStructuredTargets}), but measured against
+ * {@link LspClient.permissionContext} — the calling session's settings and
+ * `workspace.additionalDirectories`, stamped onto the client — since this push
+ * arrives with no `AgentToolContext` of its own.
+ *
+ * No settings recorded on the client reads as "no policy configured" (`off`),
+ * the same reading `loadPermissionsConfig(undefined)` gives every other
+ * caller — not a weaker default invented for this path.
+ */
+export function guardedApplyEditDenial(client: LspClient, edit: WorkspaceEdit): string | null {
+	const policy = loadPermissionsConfig(client.permissionContext?.settings);
+	if (!policy) return null;
+	const roots: PermissionRoots = {
+		cwd: client.cwd,
+		additionalDirectories: client.permissionContext?.additionalDirectories ?? [],
+	};
+	const targets: PathTarget[] = workspaceEditTargetPaths(edit).map(raw => ({
+		raw,
+		access: "write",
+		field: "workspace edit",
+	}));
+	const denial = checkStructuredTargets(targets, policy, roots);
+	return denial ? denial.reason : null;
+}
+
+/**
  * Handle workspace/applyEdit requests from the server.
  */
 async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequest): Promise<void> {
@@ -480,6 +515,12 @@ async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequ
 			{ applied: false, failureReason: "No edit provided" },
 			"workspace/applyEdit",
 		);
+		return;
+	}
+
+	const denial = guardedApplyEditDenial(client, params.edit);
+	if (denial) {
+		await sendResponse(client, message.id, { applied: false, failureReason: denial }, "workspace/applyEdit");
 		return;
 	}
 
@@ -714,12 +755,18 @@ export function clearInitializationFailure(config: ServerConfig, cwd: string): v
  * @param signal - Optional caller abort signal. Threaded into the initialize `sendRequest`
  *   and the `initialized` notification so a wedged server surfaces the caller's
  *   timeout/cancel instead of falling back to the internal 30s default.
+ * @param permissionContext - The calling session's live resource-permission
+ *   settings and `workspace.additionalDirectories`, stamped onto the client so
+ *   a later server-initiated `workspace/applyEdit` can still be guarded (see
+ *   {@link LspClient.permissionContext}). Every caller that owns a session
+ *   should pass this; omitted only by callers with no session (warmup).
  */
 export async function getOrCreateClient(
 	config: ServerConfig,
 	cwd: string,
 	initTimeoutMs?: number,
 	signal?: AbortSignal,
+	permissionContext?: LspClient["permissionContext"],
 ): Promise<LspClient> {
 	const key = clientKey(config, cwd);
 
@@ -727,6 +774,7 @@ export async function getOrCreateClient(
 	const existingClient = clients.get(key);
 	if (existingClient) {
 		existingClient.lastActivity = Date.now();
+		if (permissionContext) existingClient.permissionContext = permissionContext;
 		return existingClient;
 	}
 
@@ -800,6 +848,7 @@ export async function getOrCreateClient(
 			activeProgressTokens: new Set(),
 			projectLoaded,
 			resolveProjectLoaded,
+			permissionContext,
 		};
 
 		// Register crash recovery - remove client on process exit
