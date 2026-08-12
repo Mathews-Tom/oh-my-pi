@@ -21,14 +21,21 @@ import { readdir, stat } from "node:fs/promises";
 import * as path from "node:path";
 import { Patch } from "@oh-my-pi/hashline";
 import { LSP_READONLY_ACTIONS } from "../../lsp";
+import * as git from "../../utils/git";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
 import type { ResolvedSearchTarget } from "../path-utils";
 import { unwrapHashlineHeaderPath } from "../plan-mode-guard";
 import { decideTarget, isExemptPathArgument } from "./resolve";
 import type { PathAccess, PathTarget, PermissionPolicy, PermissionRoots } from "./types";
 
-/** Pulls the declared path arguments out of one tool call's arguments. */
-export type PathTargetExtractor = (args: Record<string, unknown>) => PathTarget[];
+/**
+ * Pulls the declared path arguments out of one tool call's arguments.
+ * `roots` is the session's confinement roots — most extractors ignore it (a
+ * declared path is already meant to be read relative to the session cwd),
+ * but `security_scan` needs it to find the repository root its own paths
+ * are actually resolved against; see {@link extractSecurityScanPaths}.
+ */
+export type PathTargetExtractor = (args: Record<string, unknown>, roots: PermissionRoots) => PathTarget[];
 
 /**
  * Pulls the files a tool actually touched out of its result details, for the
@@ -313,10 +320,57 @@ const extractLspPaths: PathTargetExtractor = args => {
 	return out;
 };
 
-const extractSecurityScanPaths: PathTargetExtractor = args => {
+/**
+ * The repository root `security_scan`'s own `include_paths`/
+ * `knowledge_base_paths` are actually resolved against, from the same
+ * on-disk `.git` walk `git.repo.root` (`security/preflight.ts`'s
+ * `DEFAULT_SECURITY_GIT_ADAPTER`) falls back to when no subprocess is
+ * needed. `null` when `cwd` is not inside a repository — `createSecurityScanPlan`
+ * throws for that same cwd, so there is no real scan for a stale relative
+ * spelling to affect.
+ */
+function securityScanRoot(cwd: string): string | null {
+	return git.repo.resolveSync(cwd)?.repoRoot ?? null;
+}
+
+/**
+ * `include_paths`/`knowledge_base_paths` entries, resolved against
+ * `scanRoot` rather than the session cwd — see {@link extractSecurityScanPaths}.
+ */
+function pushSecurityScanPaths(
+	out: PathTarget[],
+	raw: unknown,
+	access: PathAccess,
+	field: string,
+	scanRoot: string | null,
+): void {
+	if (!Array.isArray(raw)) return;
+	for (const entry of raw) {
+		if (typeof entry !== "string") continue;
+		const trimmed = entry.trim();
+		if (!trimmed) continue;
+		out.push({ raw: scanRoot ? path.resolve(scanRoot, trimmed) : trimmed, access, field });
+	}
+}
+
+/**
+ * `createSecurityScanPlan` (`security/preflight.ts`) resolves both
+ * `include_paths` and `knowledge_base_paths` against the scan's repository
+ * root (`buildPlanMaterial`'s `canonicalRoot`), not the session cwd that
+ * launched it — the two diverge whenever the session sits in a subdirectory
+ * of the repository. Authorizing the raw relative spelling against
+ * `roots.cwd`, as every other structured extractor does, would then check a
+ * different path than the one the scan actually reads: from `/repo/pkg`,
+ * `include_paths: ["private"]` would clear the gate by checking
+ * `/repo/pkg/private` while the scan digests `/repo/private`. Resolved here
+ * against the same repository root so the gate and the scan can never
+ * disagree about the base.
+ */
+const extractSecurityScanPaths: PathTargetExtractor = (args, roots) => {
 	const out: PathTarget[] = [];
-	pushArray(out, args.include_paths, "read", "include_paths");
-	pushArray(out, args.knowledge_base_paths, "read", "knowledge_base_paths");
+	const scanRoot = securityScanRoot(roots.cwd);
+	pushSecurityScanPaths(out, args.include_paths, "read", "include_paths", scanRoot);
+	pushSecurityScanPaths(out, args.knowledge_base_paths, "read", "knowledge_base_paths", scanRoot);
 	pushPath(out, args.output_root, "write", "output_root");
 	// `exclude_paths` only narrows a scan; it is never opened.
 	return out;
@@ -510,11 +564,24 @@ async function collectAllowedReadFiles(
 		// that can rival the working tree in size.
 		if (entry.name === ".git") continue;
 		const abs = path.join(dir, entry.name);
-		if (decideTarget({ raw: abs, access: "read", field: "grep" }, policy, roots).kind === "deny") continue;
+		const decision = decideTarget({ raw: abs, access: "read", field: "grep" }, policy, roots);
 		if (entry.isDirectory()) {
+			// A deny on this directory does not mean every descendant is
+			// denied too: a trailing `/**` allow pattern (`private/public/**`)
+			// matches files under `private/public` but never the bare
+			// directory spelling itself, so `deny.read: ["private/**"]` denies
+			// this directory's own decision while still meaning to admit
+			// `private/public/file.ts` below it. Pruning on the directory's
+			// own decision would make that carve-out unreachable no matter
+			// what its files decide, so recurse whenever the policy has any
+			// `allow.read` rule that could rescue a descendant — each child
+			// still gets its own independent `decideTarget` check the moment
+			// it is visited.
+			if (decision.kind === "deny" && policy.allow.read.length === 0) continue;
 			await collectAllowedReadFiles(abs, policy, roots, out, root, globFilter, matchBasename);
 			continue;
 		}
+		if (decision.kind === "deny") continue;
 		if (entry.isFile()) {
 			if (
 				!globFilter ||
@@ -530,10 +597,16 @@ async function collectAllowedReadFiles(
 			// `confineReads` that call resolved it exactly as `read`/`grep` would
 			// (realpath, refusing a dangling link) — so what's left here is only
 			// classifying the *kind* of what it points to, not re-authorizing it.
+			//
+			// A symlinked directory is never followed, matching the native
+			// grep/AST walkers' `FollowLinks::Never` (`crates/pi-walker`):
+			// recursing into it here would convert an arbitrarily large linked
+			// tree into explicit file targets and could walk outside the
+			// requested root through the link, exactly what `FollowLinks::Never`
+			// exists to prevent. A symlinked file is still a single bounded
+			// target, same as passing it to `read`/`grep` explicitly.
 			const resolved = await stat(abs).catch(() => null);
-			if (resolved?.isDirectory()) {
-				await collectAllowedReadFiles(abs, policy, roots, out, root, globFilter, matchBasename);
-			} else if (
+			if (
 				resolved?.isFile() &&
 				(!globFilter ||
 					globFilter.match(path.relative(root, abs).replace(/\\/g, "/")) ||

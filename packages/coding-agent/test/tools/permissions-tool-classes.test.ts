@@ -1,11 +1,29 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Patch } from "@oh-my-pi/hashline";
+import type { PermissionRoots } from "@oh-my-pi/pi-coding-agent/tools/permissions";
 import {
 	CLASSIFIED_TOOL_NAMES,
 	classifyTool,
 	extractEmbeddedEditPaths,
 	TOOL_PATH_CLASSES,
 } from "@oh-my-pi/pi-coding-agent/tools/permissions/tool-path-targets";
+
+// A real, non-repository cwd — `git.repo.resolveSync` must not find a `.git`
+// anywhere above it, or `security_scan`'s repo-root resolution would change
+// the raw/relative expectations every other extractor test in this file
+// relies on.
+let nonRepoWorkspace: string;
+
+beforeAll(() => {
+	nonRepoWorkspace = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "omp-tool-classes-")));
+});
+
+afterAll(() => {
+	fs.rmSync(nonRepoWorkspace, { recursive: true, force: true });
+});
 
 describe("classification coverage", () => {
 	it("classifies every built-in and hidden tool", () => {
@@ -72,10 +90,10 @@ describe("lsp action-aware classification", () => {
 });
 
 describe("structured extraction", () => {
-	function extract(tool: string, args: Record<string, unknown>) {
+	function extract(tool: string, args: Record<string, unknown>, roots?: PermissionRoots) {
 		const cls = TOOL_PATH_CLASSES[tool];
 		if (cls?.kind !== "structured") throw new Error(`${tool} is not structured`);
-		return cls.extract(args);
+		return cls.extract(args, roots ?? { cwd: nonRepoWorkspace, additionalDirectories: [] });
 	}
 
 	it("reads read/write single path arguments with the right access", () => {
@@ -136,6 +154,49 @@ describe("structured extraction", () => {
 		const targets = extract("security_scan", { include_paths: ["src"], exclude_paths: [".env"], output_root: "out" });
 		expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual(["read:src", "write:out"]);
 	});
+
+	it("leaves security_scan include/knowledge-base paths relative when the session cwd is not a repository", () => {
+		// `nonRepoWorkspace` has no `.git` anywhere above it, matching what
+		// `createSecurityScanPlan` itself would see — the scan can never
+		// happen either way, so the raw relative spelling passes through.
+		const targets = extract("security_scan", { include_paths: ["src"], knowledge_base_paths: ["docs/kb.md"] });
+		expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual(["read:src", "read:docs/kb.md"]);
+	});
+
+	describe("security_scan repository-root resolution", () => {
+		let repoRoot: string;
+		let nestedCwd: string;
+
+		beforeAll(() => {
+			repoRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "omp-scan-repo-")));
+			fs.mkdirSync(path.join(repoRoot, ".git"), { recursive: true });
+			nestedCwd = path.join(repoRoot, "packages", "app");
+			fs.mkdirSync(nestedCwd, { recursive: true });
+		});
+
+		afterAll(() => {
+			fs.rmSync(repoRoot, { recursive: true, force: true });
+		});
+
+		it("authorizes include_paths/knowledge_base_paths against the repository root, not the session cwd", () => {
+			const roots: PermissionRoots = { cwd: nestedCwd, additionalDirectories: [] };
+			const targets = extract(
+				"security_scan",
+				{ include_paths: ["private"], knowledge_base_paths: ["docs/kb.md"] },
+				roots,
+			);
+			expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual([
+				`read:${path.join(repoRoot, "private")}`,
+				`read:${path.join(repoRoot, "docs/kb.md")}`,
+			]);
+		});
+
+		it("leaves output_root authorized against the session cwd — only include/knowledge-base paths move", () => {
+			const roots: PermissionRoots = { cwd: nestedCwd, additionalDirectories: [] };
+			const targets = extract("security_scan", { output_root: "out" }, roots);
+			expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual(["write:out"]);
+		});
+	});
 });
 
 describe("embedded edit payload paths", () => {
@@ -175,10 +236,11 @@ describe("embedded edit payload paths", () => {
 	it("finds a secret target hidden in a hashline payload with no top-level path", () => {
 		const cls = TOOL_PATH_CLASSES.edit;
 		if (cls?.kind !== "structured") throw new Error("edit is not structured");
-		expect(cls.extract({ input: "[.env#00FF]\nPUT 1.=1:\n+LEAK=1" }).map(t => `${t.access}:${t.raw}`)).toEqual([
-			"write:.env",
-			"read:.env",
-		]);
+		expect(
+			cls
+				.extract({ input: "[.env#00FF]\nPUT 1.=1:\n+LEAK=1" }, { cwd: nonRepoWorkspace, additionalDirectories: [] })
+				.map(t => `${t.access}:${t.raw}`),
+		).toEqual(["write:.env", "read:.env"]);
 	});
 
 	it("extracts a hashline MV destination, which is a write the section performs", () => {
