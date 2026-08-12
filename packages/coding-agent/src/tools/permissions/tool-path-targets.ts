@@ -17,7 +17,7 @@
  * `filesystem/read_file {path: ".env"}` is scanned rather than waved through.
  */
 import type { Dirent } from "node:fs";
-import { readdirSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -31,7 +31,7 @@ import * as git from "../../utils/git";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
 import { normalizePathLikeInput, type ResolvedSearchTarget, toPathList } from "../path-utils";
 import { unwrapHashlineHeaderPath } from "../plan-mode-guard";
-import { decideTarget, isExemptPathArgument } from "./resolve";
+import { decideTarget, isExemptPathArgument, resolveTargetPath } from "./resolve";
 import type { PathAccess, PathTarget, PermissionPolicy, PermissionRoots } from "./types";
 
 /**
@@ -98,13 +98,19 @@ function pushPath(out: PathTarget[], raw: unknown, access: PathAccess, field: st
 	out.push({ raw: trimmed, access, field });
 }
 
-function pushCreateParentDirectories(out: PathTarget[], raw: string): void {
-	for (
-		let parent = path.dirname(raw);
-		parent !== "." && parent !== path.dirname(parent);
-		parent = path.dirname(parent)
-	) {
+/**
+ * The executor uses recursive mkdir immediately before the write. Authorize
+ * exactly the ancestors that are absent at gate time: checking every
+ * filesystem ancestor would reject every absolute create under
+ * `confineWrites`, including safe paths inside the workspace.
+ */
+function pushCreateParentDirectories(out: PathTarget[], raw: string, roots: PermissionRoots): void {
+	const resolvedPath = resolveTargetPath(raw, roots.cwd);
+	if (!resolvedPath) return;
+
+	for (let parent = path.dirname(resolvedPath); !existsSync(parent); parent = path.dirname(parent)) {
 		pushPath(out, parent, "write", "input");
+		if (parent === path.dirname(parent)) break;
 	}
 }
 
@@ -203,7 +209,7 @@ function stripQuotes(value: string): string {
  * outside a well-formed section — strictly more cautious than the real
  * executor, never less.
  */
-export function extractEmbeddedEditPaths(input: string): PathTarget[] {
+export function extractEmbeddedEditPaths(input: string, roots: PermissionRoots): PathTarget[] {
 	const out: PathTarget[] = [];
 	try {
 		for (const section of Patch.parse(input).sections) {
@@ -234,7 +240,7 @@ export function extractEmbeddedEditPaths(input: string): PathTarget[] {
 		const addFile = APPLY_PATCH_ADD_FILE_RE.exec(trimmed);
 		if (addFile) {
 			pushPath(out, addFile[1], "write", "input");
-			pushCreateParentDirectories(out, addFile[1]);
+			pushCreateParentDirectories(out, addFile[1], roots);
 			continue;
 		}
 		const existingFile = APPLY_PATCH_EXISTING_FILE_RE.exec(trimmed);
@@ -246,15 +252,20 @@ export function extractEmbeddedEditPaths(input: string): PathTarget[] {
 		const move = APPLY_PATCH_MOVE_RE.exec(trimmed);
 		if (move) {
 			pushPath(out, move[1], "write", "input");
+			pushCreateParentDirectories(out, move[1], roots);
 			continue;
 		}
 		const hashlineMove = HASHLINE_MOVE_RE.exec(trimmed);
-		if (hashlineMove) pushPath(out, stripQuotes(hashlineMove[1]), "write", "input");
+		if (hashlineMove) {
+			const destination = stripQuotes(hashlineMove[1]);
+			pushPath(out, destination, "write", "input");
+			pushCreateParentDirectories(out, destination, roots);
+		}
 	}
 	return out;
 }
 
-const extractEditPaths: PathTargetExtractor = args => {
+const extractEditPaths: PathTargetExtractor = (args, roots) => {
 	const out: PathTarget[] = [];
 	// patch/replace modes: one top-level target plus per-edit rename destinations.
 	//
@@ -272,6 +283,9 @@ const extractEditPaths: PathTargetExtractor = args => {
 	const pureCreate =
 		edits.length > 0 &&
 		edits.every(edit => edit && typeof edit === "object" && (edit as Record<string, unknown>).op === "create");
+	const containsCreate = edits.some(
+		edit => edit && typeof edit === "object" && (edit as Record<string, unknown>).op === "create",
+	);
 	// Unwrapped before authorization for the same reason as `write`'s path
 	// (see {@link writePath}): `EditTool` resolves the top-level target via
 	// `resolvePlanPath`, which calls `unwrapHashlineHeaderPath` first, so a
@@ -279,16 +293,19 @@ const extractEditPaths: PathTargetExtractor = args => {
 	// that same unwrapped path, not the literal bracketed string.
 	const editPath = typeof args.path === "string" ? unwrapHashlineHeaderPath(args.path) : args.path;
 	pushPath(out, editPath, "write", "path");
+	if (containsCreate && typeof editPath === "string") pushCreateParentDirectories(out, editPath, roots);
 	if (!pureCreate) pushPath(out, editPath, "read", "path");
 	if (Array.isArray(args.edits)) {
 		for (const edit of args.edits) {
 			if (edit && typeof edit === "object") {
-				pushPath(out, (edit as Record<string, unknown>).rename, "write", "edits[].rename");
+				const rename = (edit as Record<string, unknown>).rename;
+				pushPath(out, rename, "write", "edits[].rename");
+				if (typeof rename === "string") pushCreateParentDirectories(out, rename, roots);
 			}
 		}
 	}
 	// hashline / apply_patch modes: targets live inside the payload.
-	if (typeof args.input === "string") out.push(...extractEmbeddedEditPaths(args.input));
+	if (typeof args.input === "string") out.push(...extractEmbeddedEditPaths(args.input, roots));
 	return out;
 };
 

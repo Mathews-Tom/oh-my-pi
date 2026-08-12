@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -234,15 +234,18 @@ describe("structured extraction", () => {
 			).toEqual([]);
 		});
 
-		it("falls back to the default memories-dir path for memory_edit when no mnemopi.dbPath override is configured", () => {
+		it("falls back to the default memories-dir path when no mnemopi.dbPath override is configured", () => {
 			const roots: PermissionRoots = {
 				cwd: nonRepoWorkspace,
 				additionalDirectories: [],
 				agentDir: nonRepoWorkspace,
 				settings: settingsOf({}),
 			};
-			const targets = extract("memory_edit", {}, roots);
-			expect(targets[0]?.raw).toBe(path.join(nonRepoWorkspace, "memories", "mnemopi", "mnemopi.db"));
+			const expectedPath = path.join(nonRepoWorkspace, "memories", "mnemopi", "mnemopi.db");
+			expect(extract("memory_edit", {}, roots)[0]?.raw).toBe(expectedPath);
+			expect(
+				extract("retain", {}, { ...roots, settings: settingsOf({ "memory.backend": "mnemopi" }) })[0]?.raw,
+			).toBe(expectedPath);
 		});
 
 		it("still authorizes the default path when the roots carry no settings at all", () => {
@@ -335,14 +338,25 @@ describe("structured extraction", () => {
 });
 
 describe("embedded edit payload paths", () => {
+	let embeddedEditWorkspace: string;
+	let embeddedEditRoots: PermissionRoots;
+
+	beforeEach(() => {
+		embeddedEditWorkspace = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "omp-embedded-edit-")));
+		embeddedEditRoots = { cwd: embeddedEditWorkspace, additionalDirectories: [] };
+	});
+
+	afterEach(() => {
+		fs.rmSync(embeddedEditWorkspace, { recursive: true, force: true });
+	});
+
 	it("extracts a hashline section header as both a read and a write target", () => {
 		// Every hashline section requires a `#TAG` snapshot hash from a prior
 		// read (`assertSectionHashPresent`) - hashline has no "create" op, so
 		// the section always needs `read` in addition to `write`.
-		expect(extractEmbeddedEditPaths("[src/a.ts#1A2B]\nPUT 1.=1:\n+x").map(t => `${t.access}:${t.raw}`)).toEqual([
-			"write:src/a.ts",
-			"read:src/a.ts",
-		]);
+		expect(
+			extractEmbeddedEditPaths("[src/a.ts#1A2B]\nPUT 1.=1:\n+x", embeddedEditRoots).map(t => `${t.access}:${t.raw}`),
+		).toEqual(["write:src/a.ts", "read:src/a.ts"]);
 	});
 
 	it("extracts apply_patch file and move markers, read+write for Update and write-only for Add", () => {
@@ -354,28 +368,50 @@ describe("embedded edit payload paths", () => {
 			"*** Delete File: src/old.ts",
 			"*** End Patch",
 		].join("\n");
-		expect(extractEmbeddedEditPaths(input).map(t => `${t.access}:${t.raw}`)).toEqual([
+		expect(extractEmbeddedEditPaths(input, embeddedEditRoots).map(t => `${t.access}:${t.raw}`)).toEqual([
 			"write:src/new.ts",
-			"write:src",
+			`write:${path.join(embeddedEditWorkspace, "src")}`,
 			"write:src/a.ts",
 			"read:src/a.ts",
 			"write:src/b.ts",
+			`write:${path.join(embeddedEditWorkspace, "src")}`,
 			"write:src/old.ts",
 			"read:src/old.ts",
 		]);
 	});
 
-	it("extracts every ancestor an apply_patch create can create", () => {
-		const input = "*** Begin Patch\n*** Add File: blocked/nested/file.txt\n+secret\n*** End Patch";
-		expect(extractEmbeddedEditPaths(input).map(t => `${t.access}:${t.raw}`)).toEqual([
+	it("extracts only missing ancestors of an absolute apply_patch create", () => {
+		const cls = TOOL_PATH_CLASSES.edit;
+		if (cls?.kind !== "structured") throw new Error("edit is not structured");
+		const parent = path.join(embeddedEditWorkspace, "created");
+		const target = path.join(parent, "nested", "file.txt");
+		const targets = cls.extract(
+			{ input: `*** Begin Patch\n*** Add File: ${target}\n+secret\n*** End Patch` },
+			embeddedEditRoots,
+		);
+		expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual([
+			`write:${target}`,
+			`write:${path.join(parent, "nested")}`,
+			`write:${parent}`,
+		]);
+	});
+
+	it("extracts every missing ancestor of a relative apply_patch create", () => {
+		const cls = TOOL_PATH_CLASSES.edit;
+		if (cls?.kind !== "structured") throw new Error("edit is not structured");
+		const targets = cls.extract(
+			{ input: "*** Begin Patch\n*** Add File: blocked/nested/file.txt\n+secret\n*** End Patch" },
+			embeddedEditRoots,
+		);
+		expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual([
 			"write:blocked/nested/file.txt",
-			"write:blocked/nested",
-			"write:blocked",
+			`write:${path.join(embeddedEditWorkspace, "blocked", "nested")}`,
+			`write:${path.join(embeddedEditWorkspace, "blocked")}`,
 		]);
 	});
 
 	it("does not mistake a bracketed body line for a header", () => {
-		expect(extractEmbeddedEditPaths("[not a header#zz]")).toEqual([]);
+		expect(extractEmbeddedEditPaths("[not a header#zz]", embeddedEditRoots)).toEqual([]);
 	});
 
 	it("finds a secret target hidden in a hashline payload with no top-level path", () => {
@@ -389,16 +425,20 @@ describe("embedded edit payload paths", () => {
 	});
 
 	it("extracts a hashline MV destination, which is a write the section performs", () => {
-		const input = "[src/a.ts#1A2B]\nCUT 1.=1\nMV ../../outside/escaped.ts";
-		expect(extractEmbeddedEditPaths(input).map(t => t.raw)).toEqual([
+		const input = "[src/a.ts#1A2B]\nCUT 1.=1\nMV created/escaped.ts";
+		expect(extractEmbeddedEditPaths(input, embeddedEditRoots).map(t => t.raw)).toEqual([
 			"src/a.ts",
 			"src/a.ts",
-			"../../outside/escaped.ts",
+			"created/escaped.ts",
+			path.join(embeddedEditWorkspace, "created"),
 		]);
 	});
 
 	it("unquotes an MV destination containing spaces", () => {
-		expect(extractEmbeddedEditPaths('MV "dir with spaces/a.ts"').map(t => t.raw)).toEqual(["dir with spaces/a.ts"]);
+		expect(extractEmbeddedEditPaths('MV "dir with spaces/a.ts"', embeddedEditRoots).map(t => t.raw)).toEqual([
+			"dir with spaces/a.ts",
+			path.join(embeddedEditWorkspace, "dir with spaces"),
+		]);
 	});
 
 	// A hand-rolled `[.+]` header regex could disagree with the real hashline
@@ -408,7 +448,7 @@ describe("embedded edit payload paths", () => {
 	// path inside the header.
 	it("extracts a `..` traversal path from a header exactly as the real parser resolves it", () => {
 		const input = "[../../outside/escaped.ts#1A2B]\nPUT 1.=1:\n+x";
-		expect(extractEmbeddedEditPaths(input).map(t => t.raw)).toEqual([
+		expect(extractEmbeddedEditPaths(input, embeddedEditRoots).map(t => t.raw)).toEqual([
 			"../../outside/escaped.ts",
 			"../../outside/escaped.ts",
 		]);
@@ -420,6 +460,6 @@ describe("embedded edit payload paths", () => {
 		expect(patch.sections.map(s => s.path)).toEqual(["a/one.ts", "b/two.ts"]);
 		// Each section yields a write and a read target, in that order.
 		const expected = patch.sections.flatMap(s => [s.path, s.path]);
-		expect(extractEmbeddedEditPaths(input).map(t => t.raw)).toEqual(expected);
+		expect(extractEmbeddedEditPaths(input, embeddedEditRoots).map(t => t.raw)).toEqual(expected);
 	});
 });

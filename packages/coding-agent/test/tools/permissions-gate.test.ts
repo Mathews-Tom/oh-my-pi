@@ -165,6 +165,37 @@ describe("profile strict", () => {
 		expect(message).toContain('resource permission rule "**/blocked"');
 	});
 
+	it("denies every create or move spelling when a created parent directory is denied", async () => {
+		const context = contextOf({ ...WORKSPACE, "permissions.deny.write": ["**/blocked"] });
+		for (const params of [
+			{ input: "*** Begin Patch\n*** Update File: source.txt\n*** Move to: blocked/file.txt\n*** End Patch" },
+			{ input: "[source.txt#1A2B]\nCUT 1.=1\nMV blocked/file.txt" },
+			{ path: "blocked/file.txt", edits: [{ op: "create", diff: "+secret" }] },
+			{
+				path: "blocked/file.txt",
+				edits: [
+					{ op: "create", diff: "+secret" },
+					{ op: "update", diff: "@@\n-secret\n+secret2" },
+				],
+			},
+			{ path: "source.txt", edits: [{ rename: "blocked/file.txt" }] },
+		]) {
+			expect(await denialOf("edit", params, context)).toContain('resource permission rule "**/blocked"');
+		}
+	});
+
+	it("permits an absolute apply_patch create whose missing parents stay within the workspace", async () => {
+		const target = path.join(workspace, "created", "file.txt");
+		const calls = (
+			await run(
+				"edit",
+				{ input: `*** Begin Patch\n*** Add File: ${target}\n+content\n*** End Patch` },
+				contextOf(WORKSPACE),
+			)
+		).calls;
+		expect(calls).toHaveLength(1);
+	});
+
 	it("denies updating an existing file under a deny.read rule with no matching deny.write rule", async () => {
 		// `edit`'s update/delete ops read the target's current content to
 		// compute the diff and surface it in the result - a `deny.read`-only
