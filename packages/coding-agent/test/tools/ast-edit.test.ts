@@ -403,6 +403,55 @@ describe("ast_edit tool schema", () => {
 		}
 	});
 
+	it("does not parse a denied matching file in a globbed preview", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-perm-glob-"));
+		try {
+			const allowedPath = path.join(tempDir, "allowed.ts");
+			const privatePath = path.join(tempDir, "private.ts");
+			await Bun.write(allowedPath, "legacyWrap(x, value)\n");
+			await Bun.write(privatePath, "legacyWrap(privateValue, c481)\n");
+			const settings = Settings.isolated({
+				"tools.xdev": false,
+				"permissions.profile": "workspace",
+				"permissions.deny.read": ["**/private.ts"],
+			});
+			const queue = new ToolChoiceQueue();
+			const context = {
+				sessionManager: {
+					getCwd: () => tempDir,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "test-session",
+				},
+				settings,
+			};
+			const tools = await createTools(
+				createTestSession(tempDir, {
+					settings,
+					getToolChoiceQueue: () => queue,
+					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
+					steer: () => {},
+				}),
+			);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+
+			const result = await tool!.execute(
+				"ast-edit-glob-read-deny",
+				{ ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }], paths: [path.join(tempDir, "**/*.ts")] },
+				undefined,
+				undefined,
+				context as unknown as Parameters<NonNullable<typeof tool>["execute"]>[4],
+			);
+			const text = result.content.find(content => content.type === "text")?.text ?? "";
+
+			expect(text).toContain("allowed.ts");
+			expect(text).not.toContain("private.ts");
+			expect(queue.hasPendingInvoker).toBe(true);
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
 	it("rechecks live permissions before applying a staged edit, denying if the policy tightened after preview", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-perm-live-"));
 		try {
@@ -453,6 +502,36 @@ describe("ast_edit tool schema", () => {
 			// File must still be untouched - the recheck runs before the real
 			// (non-dry-run) pass, not after it already wrote the file.
 			expect(await Bun.file(filePath).text()).toBe("legacyWrap(x, value)\n");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("keeps the global file cap when deny.read expands a recursive target", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-perm-limit-"));
+		try {
+			await Promise.all(
+				Array.from({ length: 1001 }, (_, index) =>
+					Bun.write(path.join(tempDir, `file-${index}.ts`), `const value${index} = ${index};\n`),
+				),
+			);
+			const settings = Settings.isolated({
+				"tools.xdev": false,
+				"permissions.profile": "workspace",
+				"permissions.deny.read": ["**/private.ts"],
+			});
+			const tools = await createTools(createTestSession(tempDir, { settings }));
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+
+			const result = await tool!.execute("ast-edit-limit", {
+				ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }],
+				paths: [tempDir],
+			});
+			const details = result.details as { filesSearched?: number; limitReached?: boolean } | undefined;
+
+			expect(details?.filesSearched).toBe(1000);
+			expect(details?.limitReached).toBe(true);
 		} finally {
 			await removeWithRetries(tempDir);
 		}

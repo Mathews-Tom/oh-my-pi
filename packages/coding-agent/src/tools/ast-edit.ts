@@ -30,6 +30,7 @@ import type { OutputMeta } from "./output-meta";
 import { isInternalUrlPath, type ResolvedSearchTarget, resolveToolSearchScope } from "./path-utils";
 import {
 	checkStructuredTargets,
+	excludeDenyReadSearchTargets,
 	loadPermissionsConfig,
 	type PathTarget,
 	PermissionDeniedError,
@@ -95,18 +96,24 @@ async function runAstEditTargets(
 	let filesSearched = 0;
 	let limitReached = false;
 	let applied = !options.dryRun;
+	let remainingFiles = options.maxFiles;
 	for (const target of targets) {
+		if (remainingFiles <= 0) {
+			limitReached = true;
+			break;
+		}
 		const targetResult = await astEdit({
 			rewrites: options.rewrites,
 			path: target.basePath,
 			glob: target.glob,
 			dryRun: options.dryRun,
-			maxFiles: options.maxFiles,
+			maxFiles: remainingFiles,
 			failOnParseError: options.failOnParseError,
 			signal: options.signal,
 		});
 		totalReplacements += targetResult.totalReplacements;
 		filesSearched += targetResult.filesSearched;
+		remainingFiles -= targetResult.filesSearched;
 		limitReached = limitReached || targetResult.limitReached;
 		applied = applied && targetResult.applied;
 		if (targetResult.parseErrors) parseErrors.push(...targetResult.parseErrors);
@@ -323,8 +330,21 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				},
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
+			let effectiveTargets = multiTargets;
+			const searchPolicy = loadPermissionsConfig(this.session.settings);
+			const recursiveTargets =
+				multiTargets ??
+				(isDirectory ? [{ basePath: resolvedSearchPath, glob: globFilter, pathIsFile: false }] : undefined);
+			if (searchPolicy && recursiveTargets) {
+				const roots = {
+					cwd: this.session.cwd,
+					additionalDirectories: this.session.additionalDirectories ?? [],
+				};
+				const filteredTargets = await excludeDenyReadSearchTargets(recursiveTargets, searchPolicy, roots);
+				if (filteredTargets) effectiveTargets = filteredTargets;
+			}
 
-			const result = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
+			const result = await runAstEditOnce(effectiveTargets, resolvedSearchPath, globFilter, {
 				rewrites: normalizedRewrites,
 				dryRun: true,
 				maxFiles,
@@ -493,6 +513,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						// xd://resolve` call that invokes this callback - a session that
 						// was `off` when queued but `strict` by resolve time must not let
 						// a stale authorization slip through.
+						let applyTargets = effectiveTargets;
 						const livePolicy = loadPermissionsConfig(context?.settings);
 						if (livePolicy) {
 							const liveRoots = permissionRoots(context);
@@ -507,6 +528,15 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 									};
 							if (liveDenial) throw new PermissionDeniedError(this.name, liveDenial.rule, liveDenial.reason);
 
+							if (liveRoots && recursiveTargets) {
+								const filteredTargets = await excludeDenyReadSearchTargets(
+									recursiveTargets,
+									livePolicy,
+									liveRoots,
+								);
+								if (filteredTargets) applyTargets = filteredTargets;
+							}
+
 							// `fileList` is the preview-time discovery; the real (non-dry-run)
 							// pass below re-runs the recursive glob/path search independently
 							// and can therefore match a file created or renamed into scope
@@ -515,7 +545,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 							// applying and authorize that concrete, current set too, so a
 							// denied file that only now matches the scope is caught before the
 							// real pass ever opens it.
-							const freshPreview = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
+							const freshPreview = await runAstEditOnce(applyTargets, resolvedSearchPath, globFilter, {
 								rewrites: normalizedRewrites,
 								dryRun: true,
 								maxFiles,
@@ -529,7 +559,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 								: undefined;
 							if (freshDenial) throw new PermissionDeniedError(this.name, freshDenial.rule, freshDenial.reason);
 						}
-						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
+						const applyResult = await runAstEditOnce(applyTargets, resolvedSearchPath, globFilter, {
 							rewrites: normalizedRewrites,
 							dryRun: false,
 							maxFiles,

@@ -22,6 +22,7 @@ import * as path from "node:path";
 import { Patch } from "@oh-my-pi/hashline";
 import { LSP_READONLY_ACTIONS } from "../../lsp";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
+import type { ResolvedSearchTarget } from "../path-utils";
 import { unwrapHashlineHeaderPath } from "../plan-mode-guard";
 import { decideTarget, isExemptPathArgument } from "./resolve";
 import type { PathAccess, PathTarget, PermissionPolicy, PermissionRoots } from "./types";
@@ -472,18 +473,30 @@ export async function excludeDenyReadDescendants(
 	root: string,
 	policy: PermissionPolicy,
 	roots: PermissionRoots,
+	globFilter?: string,
+	matchBasename = false,
 ): Promise<string[] | null> {
 	if (policy.deny.read.length === 0) return null;
 	const out: string[] = [];
-	await collectAllowedReadFiles(root, policy, roots, out);
+	await collectAllowedReadFiles(
+		root,
+		policy,
+		roots,
+		out,
+		root,
+		globFilter ? new Bun.Glob(globFilter) : undefined,
+		matchBasename,
+	);
 	return out;
 }
-
 async function collectAllowedReadFiles(
 	dir: string,
 	policy: PermissionPolicy,
 	roots: PermissionRoots,
 	out: string[],
+	root: string,
+	globFilter: Bun.Glob | undefined,
+	matchBasename: boolean,
 ): Promise<void> {
 	let entries: Dirent[];
 	try {
@@ -499,11 +512,17 @@ async function collectAllowedReadFiles(
 		const abs = path.join(dir, entry.name);
 		if (decideTarget({ raw: abs, access: "read", field: "grep" }, policy, roots).kind === "deny") continue;
 		if (entry.isDirectory()) {
-			await collectAllowedReadFiles(abs, policy, roots, out);
+			await collectAllowedReadFiles(abs, policy, roots, out, root, globFilter, matchBasename);
 			continue;
 		}
 		if (entry.isFile()) {
-			out.push(abs);
+			if (
+				!globFilter ||
+				globFilter.match(path.relative(root, abs).replace(/\\/g, "/")) ||
+				(matchBasename && globFilter.match(path.basename(abs)))
+			) {
+				out.push(abs);
+			}
 			continue;
 		}
 		if (entry.isSymbolicLink()) {
@@ -512,10 +531,47 @@ async function collectAllowedReadFiles(
 			// (realpath, refusing a dangling link) — so what's left here is only
 			// classifying the *kind* of what it points to, not re-authorizing it.
 			const resolved = await stat(abs).catch(() => null);
-			if (resolved?.isDirectory()) await collectAllowedReadFiles(abs, policy, roots, out);
-			else if (resolved?.isFile()) out.push(abs);
+			if (resolved?.isDirectory()) {
+				await collectAllowedReadFiles(abs, policy, roots, out, root, globFilter, matchBasename);
+			} else if (
+				resolved?.isFile() &&
+				(!globFilter ||
+					globFilter.match(path.relative(root, abs).replace(/\\/g, "/")) ||
+					(matchBasename && globFilter.match(path.basename(abs))))
+			) {
+				out.push(abs);
+			}
 		}
 	}
+}
+
+/**
+ * Replaces recursive search targets with their individually authorized files
+ * while a `deny.read` rule is active. File targets never recurse, so retain
+ * them unchanged; directory targets must be expanded before native search can
+ * parse or inspect a denied descendant that produces no result.
+ */
+export async function excludeDenyReadSearchTargets(
+	targets: readonly ResolvedSearchTarget[],
+	policy: PermissionPolicy,
+	roots: PermissionRoots,
+	matchBasename = false,
+): Promise<ResolvedSearchTarget[] | null> {
+	if (policy.deny.read.length === 0) return null;
+	const filtered = await Promise.all(
+		targets.map(async target => {
+			if (target.pathIsFile) return [target];
+			const allowedPaths = await excludeDenyReadDescendants(
+				target.basePath,
+				policy,
+				roots,
+				target.glob,
+				matchBasename,
+			);
+			return (allowedPaths ?? []).map(basePath => ({ basePath, pathIsFile: true }));
+		}),
+	);
+	return filtered.flat();
 }
 
 /**

@@ -63,6 +63,47 @@ function assertGitWriteAllowed(targetPath: string, context: AgentToolContext | u
 }
 
 /**
+ * A Git directory is a mutable tree, so authorizing only its root misses
+ * descendant rules. Walk the existing metadata tree and run every path through
+ * the same structured-target matcher as normal writes. The caller also passes
+ * paths that a checkout creates after the scan, before the corresponding Git
+ * command can create them.
+ */
+async function assertGitMetadataWriteAllowed(
+	gitDir: string,
+	commonDir: string,
+	context: AgentToolContext | undefined,
+	prospectivePaths: readonly string[] = [],
+): Promise<void> {
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy) return;
+	const roots = permissionRoots(context);
+	if (!roots) {
+		throw new PermissionDeniedError(
+			"github",
+			"permissions.profile",
+			`Tool "github" is blocked: permissions.profile is "${policy.profile}" but this call has no session, ` +
+				`so the workspace roots the rules are measured against cannot be determined.\n` +
+				`To allow it: set permissions.profile: off.`,
+		);
+	}
+	const targets: PathTarget[] = prospectivePaths.map(raw => ({ raw, access: "write", field: "op" }));
+	for (const metadataRoot of new Set([gitDir, commonDir])) {
+		targets.push({ raw: metadataRoot, access: "write", field: "op" });
+		for await (const metadataPath of new Bun.Glob("**/*").scan({
+			cwd: metadataRoot,
+			absolute: true,
+			dot: true,
+			onlyFiles: false,
+		})) {
+			targets.push({ raw: metadataPath, access: "write", field: "op" });
+		}
+	}
+	const denial = checkStructuredTargets(targets, policy, roots);
+	if (denial) throw new PermissionDeniedError("github", denial.rule, denial.reason);
+}
+
+/**
  * Authorize every file `git.worktree.add` is about to materialize under a
  * *new* worktree. `assertGitWriteAllowed` only ever checked the worktree
  * root itself - sound for confinement (the root either lands under an
@@ -492,23 +533,14 @@ export async function checkoutPullRequest(
 
 			// Authorize before the first Git mutation below: `ensurePrRemote` can
 			// call `git.remote.add`, and `git.fetch`/`git.branch.*`/every
-			// `git.config.setBranch` write into `repoRoot/.git` regardless of
-			// whether a new worktree is created, so `repoRoot` needs the same
-			// check a new worktree gets. `repoRoot` alone only confines the
-			// checkout to allowed roots — a `permissions.deny.write:
-			// ["**/.git/**"]` rule never matches `repoRoot` itself, only the
-			// metadata paths inside it, so `gitDir`/`commonDir` (which can
-			// differ from `repoRoot/.git` for a linked worktree) are resolved
-			// and authorized too. The eventual worktree path is resolved here
-			// too (moved up from after the mutations) so it can be authorized
-			// before anything runs, not after.
+			// `git.config.setBranch` write into metadata regardless of whether a
+			// new worktree is created. Root authorization only proves confinement;
+			// descendant deny rules must be checked against every metadata family
+			// the checkout can mutate.
 			assertGitWriteAllowed(repoRoot, context);
 			const repository = await git.repo.resolve(repoRoot);
 			if (repository) {
-				assertGitWriteAllowed(repository.gitDir, context);
-				if (repository.commonDir !== repository.gitDir) {
-					assertGitWriteAllowed(repository.commonDir, context);
-				}
+				await assertGitMetadataWriteAllowed(repository.gitDir, repository.commonDir, context);
 			}
 			const finalWorktreePath = existingWorktree
 				? existingWorktree.path
@@ -516,6 +548,23 @@ export async function checkoutPullRequest(
 			if (!existingWorktree) assertGitWriteAllowed(finalWorktreePath, context);
 
 			const remote = await ensurePrRemote(repoRoot, data, signal);
+			if (repository) {
+				const commonDir = repository.commonDir;
+				const localRef = path.join("refs", "heads", localBranch);
+				const remoteRef = path.join("refs", "remotes", remote.name, headRefName);
+				const worktreeMetadataPath = path.join(commonDir, "worktrees", path.basename(finalWorktreePath));
+				await assertGitMetadataWriteAllowed(repository.gitDir, commonDir, context, [
+					path.join(commonDir, "FETCH_HEAD"),
+					path.join(commonDir, "ORIG_HEAD"),
+					path.join(commonDir, localRef),
+					path.join(commonDir, "logs", localRef),
+					path.join(commonDir, remoteRef),
+					path.join(commonDir, "logs", remoteRef),
+					path.join(commonDir, "objects", headRefOid.slice(0, 2), headRefOid.slice(2)),
+					path.join(worktreeMetadataPath, "HEAD"),
+					path.join(worktreeMetadataPath, "index"),
+				]);
+			}
 			await git.fetch(
 				repoRoot,
 				remote.name,

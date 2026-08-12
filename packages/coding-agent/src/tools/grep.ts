@@ -59,7 +59,7 @@ import {
 	toPathList,
 } from "./path-utils";
 import { loadPermissionsConfig } from "./permissions/config";
-import { excludeDenyReadDescendants } from "./permissions/tool-path-targets";
+import { excludeDenyReadSearchTargets } from "./permissions/tool-path-targets";
 import type { PermissionRoots } from "./permissions/types";
 import {
 	createCachedComponent,
@@ -1114,22 +1114,23 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						`Path not found: ${missingPaths.join(", ")}; list each target in the semicolon-delimited \`path\`${archiveHint}`,
 					);
 				}
-				// A plain directory recursion (no explicit multi-path fan-out, no
-				// additional `glob` narrowing already in play) is exactly the shape
-				// native grep can only scope by inclusion, never exclusion — so under
-				// an active `deny.read` rule, converting it to the same exact-file
-				// fan-out a multi-path call already uses is the only way to keep a
-				// denied descendant from being opened at all, including when the
-				// search matches nothing in it. See `excludeDenyReadDescendants` for
-				// why a plain recursive call cannot exclude it any other way.
-				if (isDirectory && !exactFilePaths && !multiTargets && !globFilter && searchablePaths.length > 0) {
+				// Native grep only supports inclusive globbing. Convert every recursive
+				// directory scope to exact permitted files while deny.read is active so
+				// it cannot open a denied descendant that ultimately has no match.
+				if (!exactFilePaths && searchablePaths.length > 0 && (isDirectory || multiTargets)) {
 					const policy = loadPermissionsConfig(this.session.settings);
 					if (policy) {
 						const permissionRoots: PermissionRoots = {
 							cwd: this.session.cwd,
 							additionalDirectories: this.session.additionalDirectories ?? [],
 						};
-						exactFilePaths = (await excludeDenyReadDescendants(searchPath, policy, permissionRoots)) ?? undefined;
+						const targets = multiTargets ?? [{ basePath: searchPath, glob: globFilter, pathIsFile: false }];
+						const filteredTargets = await excludeDenyReadSearchTargets(targets, policy, permissionRoots, true);
+						if (filteredTargets) {
+							exactFilePaths = filteredTargets.map(target => target.basePath);
+							multiTargets = undefined;
+							globFilter = undefined;
+						}
 					}
 				}
 				const baseDisplayMode = resolveFileDisplayMode(this.session);

@@ -4,7 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Settings } from "../../src/config/settings";
 import { loadPermissionsConfig } from "../../src/tools/permissions/config";
-import { excludeDenyReadDescendants } from "../../src/tools/permissions/tool-path-targets";
+import {
+	excludeDenyReadDescendants,
+	excludeDenyReadSearchTargets,
+} from "../../src/tools/permissions/tool-path-targets";
 import type { PermissionPolicy, PermissionRoots } from "../../src/tools/permissions/types";
 
 let workspace: string;
@@ -68,6 +71,21 @@ describe("excludeDenyReadDescendants", () => {
 		const files = await excludeDenyReadDescendants(workspace, policy, rootsOf());
 		expect(files).not.toBeNull();
 		const relative = (files ?? []).map(file => path.relative(workspace, file)).sort();
+		expect(relative).toEqual([".env", path.join("src", "main.ts")]);
+	});
+
+	test("filters globbed directory targets while preserving direct file targets", async () => {
+		const policy = policyFor({ "permissions.profile": "workspace", "permissions.deny.read": ["**/nested/**"] });
+		const targets = await excludeDenyReadSearchTargets(
+			[
+				{ basePath: path.join(workspace, "src"), glob: "**/*.ts", pathIsFile: false },
+				{ basePath: path.join(workspace, ".env"), pathIsFile: true },
+			],
+			policy,
+			rootsOf(),
+		);
+		expect(targets).not.toBeNull();
+		const relative = (targets ?? []).map(target => path.relative(workspace, target.basePath)).sort();
 		expect(relative).toEqual([".env", path.join("src", "main.ts")]);
 	});
 });

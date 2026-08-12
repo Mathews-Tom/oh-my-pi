@@ -33,6 +33,9 @@ function textOf(result: { content: Array<{ type: string; text?: string }> }): st
 beforeAll(() => {
 	workspace = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "omp-grep-deny-")));
 	fs.mkdirSync(path.join(workspace, "src"), { recursive: true });
+	fs.mkdirSync(path.join(workspace, "private"), { recursive: true });
+	fs.writeFileSync(path.join(workspace, "private", "secret.txt"), "PRIVATE=glob-only-probe-c481\n");
+	fs.writeFileSync(path.join(workspace, "src", "allowed.txt"), "PUBLIC=glob-visible-probe-c481\n");
 	fs.writeFileSync(path.join(workspace, "src", "main.ts"), "export const marker = 1;\n");
 	// A marker that appears nowhere else, so a match on it can only have come
 	// from opening this exact denied file.
@@ -68,5 +71,21 @@ describe("GrepTool deny.read descendant exclusion", () => {
 		const tool = new GrepTool(sessionOf({ "permissions.profile": "off" }));
 		const result = await tool.execute("grep-deny-3", { path: ".", pattern: "env-only-marker", gitignore: false });
 		expect(textOf(result)).toContain("env-only-marker");
+	});
+
+	test("never opens a denied descendant during a globbed recursive search", async () => {
+		const tool = new GrepTool(
+			sessionOf({
+				"permissions.profile": "workspace",
+				"permissions.deny.read": ["**/secret.txt"],
+			}),
+		);
+		const result = await tool.execute("grep-deny-glob", {
+			path: "*.txt",
+			pattern: "probe-c481",
+			gitignore: false,
+		});
+		expect(textOf(result)).toContain("allowed.txt");
+		expect(textOf(result)).not.toContain("secret.txt");
 	});
 });

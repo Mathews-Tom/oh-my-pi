@@ -1075,6 +1075,44 @@ describe("github tool", () => {
 			// any other in-workspace git.config write this tool already does.
 			expect(runGit(fixture.repoRoot, ["worktree", "list", "--porcelain"])).not.toContain("pr-456");
 		});
+
+		it("blocks checkout before Git metadata mutations under a descendant deny rule", async () => {
+			vi.spyOn(git.github, "json").mockResolvedValueOnce({
+				number: 789,
+				title: "Metadata denied checkout",
+				url: "https://github.com/base/repo/pull/789",
+				baseRefName: "main",
+				headRefName: fixture.headRefName,
+				headRefOid: fixture.headRefOid,
+				headRepository: { nameWithOwner: "contrib/repo" },
+				headRepositoryOwner: { login: "contrib" },
+				isCrossRepository: true,
+				maintainerCanModify: true,
+			});
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			const context = {
+				sessionManager: {
+					getCwd: () => fixture.repoRoot,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "test-session",
+				},
+				settings: Settings.isolated({
+					"permissions.profile": "workspace",
+					"permissions.deny.write": ["**/.git/**"],
+				}),
+			} as unknown as Parameters<typeof tool.execute>[4];
+
+			await expect(
+				tool.execute(
+					"pr-checkout-metadata-denied",
+					{ op: "pr_checkout", pr: "789" },
+					undefined,
+					undefined,
+					context,
+				),
+			).rejects.toThrow(/blocked by the resource permission rule "\*\*\/\.git\/\*\*"/);
+			expect(runGit(fixture.repoRoot, ["branch", "--list", "pr-789"])).toBe("");
+		});
 	});
 
 	// Both assertions are non-mutating (a no-op add and a rejected add), so they

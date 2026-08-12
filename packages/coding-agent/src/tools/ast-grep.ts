@@ -22,7 +22,7 @@ import { formatMatchLine } from "./match-line-format";
 import type { OutputMeta } from "./output-meta";
 import { type ResolvedSearchTarget, resolveToolSearchScope, toPathList } from "./path-utils";
 import { loadPermissionsConfig } from "./permissions/config";
-import { excludeDenyReadDescendants } from "./permissions/tool-path-targets";
+import { excludeDenyReadSearchTargets } from "./permissions/tool-path-targets";
 import {
 	appendParseErrorsBulletList,
 	capParseErrors,
@@ -230,18 +230,18 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
 			let effectiveTargets = multiTargets;
-			// Native AST search only supports inclusive globbing. Turn an unrestricted
-			// directory search into explicit permitted files while deny.read is active,
-			// so no denied descendant is parsed merely because it has no match.
-			if (isDirectory && !effectiveTargets && !globFilter) {
-				const policy = loadPermissionsConfig(this.session.settings);
-				if (policy) {
-					const allowedPaths = await excludeDenyReadDescendants(resolvedSearchPath, policy, {
-						cwd: this.session.cwd,
-						additionalDirectories: this.session.additionalDirectories ?? [],
-					});
-					if (allowedPaths) effectiveTargets = allowedPaths.map(basePath => ({ basePath, pathIsFile: true }));
-				}
+			// Native AST search only supports inclusive globbing. Convert every
+			// recursive target to permitted files while deny.read is active so a
+			// denied descendant is never parsed merely because it has no match.
+			const policy = loadPermissionsConfig(this.session.settings);
+			if (policy && (isDirectory || multiTargets)) {
+				const permissionRoots = {
+					cwd: this.session.cwd,
+					additionalDirectories: this.session.additionalDirectories ?? [],
+				};
+				const targets = multiTargets ?? [{ basePath: resolvedSearchPath, glob: globFilter, pathIsFile: false }];
+				const filteredTargets = await excludeDenyReadSearchTargets(targets, policy, permissionRoots);
+				if (filteredTargets) effectiveTargets = filteredTargets;
 			}
 
 			const DEFAULT_AST_LIMIT = 50;

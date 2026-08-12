@@ -222,7 +222,7 @@ describe("ast_grep parse errors", () => {
 
 			const result = await tool!.execute("ast-grep-permissions", {
 				pat: "const $NAME = 1",
-				path: tempDir,
+				path: path.join(tempDir, "**/*.ts"),
 			});
 			const details = result.details as
 				| { files?: string[]; filesSearched?: number; matchCount?: number }
