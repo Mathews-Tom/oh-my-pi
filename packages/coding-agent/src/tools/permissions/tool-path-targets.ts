@@ -23,7 +23,7 @@ import { Patch } from "@oh-my-pi/hashline";
 import { LSP_READONLY_ACTIONS } from "../../lsp";
 import * as git from "../../utils/git";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
-import type { ResolvedSearchTarget } from "../path-utils";
+import { normalizePathLikeInput, type ResolvedSearchTarget, toPathList } from "../path-utils";
 import { unwrapHashlineHeaderPath } from "../plan-mode-guard";
 import { decideTarget, isExemptPathArgument } from "./resolve";
 import type { PathAccess, PathTarget, PermissionPolicy, PermissionRoots } from "./types";
@@ -92,9 +92,22 @@ function pushPath(out: PathTarget[], raw: unknown, access: PathAccess, field: st
 	out.push({ raw: trimmed, access, field });
 }
 
+/**
+ * `raw` may be a plain string, a `;`-delimited list, a JSON-encoded string
+ * array (`'[".env"]'`), or a single outer-quoted literal (`'".env"'`) — the
+ * same shapes `toPathList`/`normalizePathLikeInput` (`path-utils.ts`) resolve
+ * for the tool itself before it opens anything. Authorizing the raw,
+ * un-normalized string instead would check a different, non-existent
+ * composite spelling than the real target the tool goes on to read: with an
+ * absent search pattern recording no result file, the post-execution recheck
+ * ({@link extractResultFiles}) never sees the mismatch either, so this is the
+ * only gate that can catch it.
+ */
 function pushDelimited(out: PathTarget[], raw: unknown, access: PathAccess, field: string): void {
 	if (typeof raw !== "string") return;
-	for (const part of raw.split(MULTI_PATH_SEPARATOR)) pushPath(out, part, access, field);
+	for (const entry of toPathList(raw)) {
+		for (const part of entry.split(MULTI_PATH_SEPARATOR)) pushPath(out, normalizePathLikeInput(part), access, field);
+	}
 }
 
 function pushArray(out: PathTarget[], raw: unknown, access: PathAccess, field: string): void {

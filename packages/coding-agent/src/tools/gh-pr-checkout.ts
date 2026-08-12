@@ -553,13 +553,27 @@ export async function checkoutPullRequest(
 				const localRef = path.join("refs", "heads", localBranch);
 				const remoteRef = path.join("refs", "remotes", remote.name, headRefName);
 				const worktreeMetadataPath = path.join(commonDir, "worktrees", path.basename(finalWorktreePath));
-				await assertGitMetadataWriteAllowed(repository.gitDir, commonDir, context, [
-					path.join(commonDir, "FETCH_HEAD"),
-					path.join(commonDir, "ORIG_HEAD"),
+				// Every one of these is a `git config`/`update-ref` target the
+				// checkout is about to write, and Git stages every such write
+				// through an `O_EXCL` `<path>.lock` file it creates, writes, then
+				// renames over the real path - `commonDir/config` for the six
+				// `config.setBranch` calls below, the branch/remote-tracking refs
+				// for `branch.create`/`branch.force`/`fetch`. A `deny.write`
+				// rule matching `**/*.lock` must see that transient path too, or
+				// it silently never fires and Git's own `could not lock config
+				// file ...: File exists` is the only signal the write happened.
+				const lockManaged = [
+					path.join(commonDir, "config"),
 					path.join(commonDir, localRef),
 					path.join(commonDir, "logs", localRef),
 					path.join(commonDir, remoteRef),
 					path.join(commonDir, "logs", remoteRef),
+				];
+				await assertGitMetadataWriteAllowed(repository.gitDir, commonDir, context, [
+					path.join(commonDir, "FETCH_HEAD"),
+					path.join(commonDir, "ORIG_HEAD"),
+					...lockManaged,
+					...lockManaged.map(p => `${p}.lock`),
 					path.join(commonDir, "objects", headRefOid.slice(0, 2), headRefOid.slice(2)),
 					path.join(worktreeMetadataPath, "HEAD"),
 					path.join(worktreeMetadataPath, "index"),

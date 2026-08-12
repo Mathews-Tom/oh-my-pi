@@ -1113,6 +1113,54 @@ describe("github tool", () => {
 			).rejects.toThrow(/blocked by the resource permission rule "\*\*\/\.git\/\*\*"/);
 			expect(runGit(fixture.repoRoot, ["branch", "--list", "pr-789"])).toBe("");
 		});
+
+		it("blocks checkout before it can create a transient Git lock file under a deny.write lock rule", async () => {
+			vi.spyOn(git.github, "json")
+				.mockResolvedValueOnce({
+					number: 999,
+					title: "Lock denied checkout",
+					url: "https://github.com/base/repo/pull/999",
+					baseRefName: "main",
+					headRefName: fixture.headRefName,
+					headRefOid: fixture.headRefOid,
+					headRepository: { nameWithOwner: "contrib/repo" },
+					headRepositoryOwner: { login: "contrib" },
+					isCrossRepository: true,
+					maintainerCanModify: true,
+				})
+				.mockResolvedValueOnce({
+					nameWithOwner: "contrib/repo",
+					sshUrl: fixture.forkBare,
+					url: fixture.forkBare,
+				});
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			const context = {
+				sessionManager: {
+					getCwd: () => fixture.repoRoot,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "test-session",
+				},
+				settings: Settings.isolated({
+					"permissions.profile": "workspace",
+					// Confinement is irrelevant to this rule and would otherwise deny
+					// the worktree destination first (it always lands outside
+					// `fixture.repoRoot`, same as the confinement test above) - turned
+					// off so only the `deny.write` lock rule is under test.
+					"permissions.confineWrites": false,
+					"permissions.deny.write": ["**/*.lock"],
+				}),
+			} as unknown as Parameters<typeof tool.execute>[4];
+
+			// `.git/config.lock` (and the ref/log lock siblings alongside it) do not
+			// exist yet, so this must be denied from the *prospective* target list,
+			// not the existing-tree scan — reproducing the finding in review thread
+			// PRRT_kwDOQxs0bc6YnDHD: `git.config.setBranch` invokes `git config`,
+			// which stages every write through that lock file.
+			await expect(
+				tool.execute("pr-checkout-lock-denied", { op: "pr_checkout", pr: "999" }, undefined, undefined, context),
+			).rejects.toThrow(/blocked by the resource permission rule "\*\*\/\*\.lock"/);
+			expect(runGit(fixture.repoRoot, ["branch", "--list", "pr-999"])).toBe("");
+		});
 	});
 
 	// Both assertions are non-mutating (a no-op add and a rejected add), so they

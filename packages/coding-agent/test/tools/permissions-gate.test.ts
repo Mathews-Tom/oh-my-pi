@@ -319,6 +319,19 @@ describe("fail-closed edges", () => {
 		expect(await denialOf("read", { path: ".env:raw" }, contextOf(STRICT))).toContain("**/.env");
 		expect(await denialOf("grep", { pattern: "KEY", path: ".env:1-5" }, contextOf(STRICT))).toContain("**/.env");
 	});
+
+	it("denies the real target behind a JSON-encoded path list, not the literal composite string", async () => {
+		// `grep`/`ast_grep`/`ast_edit` accept `path` as a JSON-encoded string
+		// array (`toPathList` in `path-utils.ts`); authorizing the raw
+		// `'[".env"]'` string instead of the `.env` it expands to would let a
+		// denied file through under a spelling the deny glob never matches.
+		expect(await denialOf("grep", { pattern: "KEY", path: '[".env"]' }, contextOf(STRICT))).toContain("**/.env");
+		expect(await denialOf("glob", { path: '[".env"]' }, contextOf(STRICT))).toContain("**/.env");
+	});
+
+	it("denies the real target behind an outer-quoted path, which execution strips", async () => {
+		expect(await denialOf("grep", { pattern: "KEY", path: '".env"' }, contextOf(STRICT))).toContain("**/.env");
+	});
 });
 
 describe("the layer subtracts, never grants", () => {
