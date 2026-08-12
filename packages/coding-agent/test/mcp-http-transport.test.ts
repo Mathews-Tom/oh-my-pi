@@ -273,9 +273,14 @@ describe("MCP Streamable HTTP POST response resumption", () => {
 					const request = new TextDecoder().decode(data);
 					if (request.startsWith("POST")) {
 						observed.posts++;
-						// Priming event, then close without the terminal 0-chunk.
+						// Priming event, then close without the terminal 0-chunk. The
+						// close is deferred a tick so the client's fetch() has time to
+						// parse the response head and this chunk before the FIN lands —
+						// without it, the two race and the whole fetch occasionally
+						// rejects before headers are parsed instead of failing the body
+						// read mid-stream, which is the case this test means to cover.
 						socket.write(sseChunk("id: stream-1\nretry: 10\ndata:\n\n"));
-						socket.end();
+						setTimeout(() => socket.end(), 10);
 						return;
 					}
 					if (!request.startsWith("GET")) return;
