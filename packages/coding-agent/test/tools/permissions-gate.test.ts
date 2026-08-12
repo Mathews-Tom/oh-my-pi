@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,6 +7,7 @@ import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
 
 let workspace: string;
 let worktree: string;
@@ -282,6 +283,60 @@ describe("autolearn persistence", () => {
 				skillContext,
 			),
 		).toContain("**/managed-skills/**");
+	});
+});
+
+describe("managed-skill delete descendant protection", () => {
+	let agentTmpDir: string;
+	let previousAgentDir: string;
+
+	beforeAll(() => {
+		previousAgentDir = getAgentDir();
+	});
+
+	afterAll(() => {
+		setAgentDir(previousAgentDir);
+	});
+
+	afterEach(() => {
+		if (agentTmpDir) fs.rmSync(agentTmpDir, { recursive: true, force: true });
+	});
+
+	function withManagedSkillDir(name: string, files: Record<string, string>): string {
+		agentTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-gate-managed-skills-"));
+		setAgentDir(agentTmpDir);
+		const dir = path.join(agentTmpDir, "managed-skills", name);
+		fs.mkdirSync(dir, { recursive: true });
+		for (const [relative, content] of Object.entries(files)) {
+			const filePath = path.join(dir, relative);
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, content);
+		}
+		return dir;
+	}
+
+	it("denies a delete when a deny rule matches a descendant the root check alone would miss", async () => {
+		withManagedSkillDir("release-check", {
+			"SKILL.md": "# Release Check\n",
+			"private.key": "-----BEGIN PRIVATE KEY-----\n",
+		});
+		const context = contextOf({
+			...WORKSPACE,
+			"permissions.confineWrites": false,
+			"permissions.deny.write": ["**/private.key"],
+		});
+		expect(await denialOf("manage_skill", { action: "delete", name: "release-check" }, context)).toContain(
+			"**/private.key",
+		);
+	});
+
+	it("still deletes when nothing inside the skill directory is denied", async () => {
+		withManagedSkillDir("release-check", {
+			"SKILL.md": "# Release Check\n",
+			"references/notes.md": "notes",
+		});
+		const context = contextOf({ ...WORKSPACE, "permissions.confineWrites": false });
+		expect((await run("manage_skill", { action: "delete", name: "release-check" }, context)).calls).toHaveLength(1);
 	});
 });
 

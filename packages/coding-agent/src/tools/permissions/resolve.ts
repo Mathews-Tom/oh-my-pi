@@ -154,6 +154,24 @@ export function decidePathTarget(
 	];
 
 	for (const candidates of identities) {
+		// A user's own explicit deny outranks a profile's own default allow
+		// (e.g. `strict`'s `**/.env.example` carve-out): without this, the
+		// merged `policy.allow` check just below would clear the path before
+		// the user's `permissions.deny.*` entry is ever reached, leaving no
+		// way to re-protect a file the profile decided was safe. The user's
+		// own explicit allow is still the one escape hatch that beats it.
+		const explicitlyDenied = matchGlob(policy.explicitDeny[target.access], candidates);
+		if (explicitlyDenied && !matchGlob(policy.explicitAllow[target.access], candidates)) {
+			return {
+				kind: "deny",
+				rule: explicitlyDenied,
+				reason:
+					`${target.access === "write" ? "Writing" : "Reading"} "${target.raw}" is blocked by the ` +
+					`resource permission rule "${explicitlyDenied}" (permissions.profile: ${policy.profile}).\n` +
+					`To allow it: add "${explicitlyDenied}" to permissions.allow.${target.access}, ` +
+					`or set permissions.profile: off.`,
+			};
+		}
 		if (matchGlob(policy.allow[target.access], candidates)) continue;
 		const denied = matchGlob(policy.deny[target.access], candidates);
 		if (denied) {

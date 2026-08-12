@@ -342,6 +342,34 @@ describe("native security coordinator", () => {
 		);
 	});
 
+	test("denies start() when a descendant deny rule matches a generated bundle file, even though output_root itself is approved", async () => {
+		const approvedOutputDir = path.join(temporaryRoot, "approved-reports-3");
+		await fs.mkdir(approvedOutputDir, { recursive: true });
+		const restrictiveSettings = Settings.isolated({
+			"security.enabled": true,
+			"permissions.profile": "workspace",
+			"permissions.deny.write": ["**/*.json"],
+		});
+		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+		const coordinator = new SecurityCoordinator(
+			{
+				cwd: repositoryRoot,
+				additionalDirectories: [approvedOutputDir],
+				settings: restrictiveSettings,
+				authStorage,
+				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
+				activeModel: mock.model,
+			},
+			{ openStore: storeFactory, gitAdapter, deriveOutputWorkRoot },
+		);
+		const outputRoot = path.join(approvedOutputDir, "scan-output");
+		// `output_root` itself passes: it is not a `.json` file. The bundle
+		// writer places `findings.json`/`provenance.json`/`scan.json` directly
+		// under it, and those must still be checked against the same deny rule.
+		const plan = await coordinator.preflight({ credentialId, model: mock.model, outputRoot });
+		await expect(coordinator.start({ planId: plan.id })).rejects.toThrow(PermissionDeniedError);
+	});
+
 	test("cancellation before session launch has no inference side effects", async () => {
 		let sessionCreations = 0;
 		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });

@@ -46,6 +46,22 @@ export interface PermissionPolicy {
 	readonly confineWrites: boolean;
 	readonly deny: AccessGlobs;
 	readonly allow: AccessGlobs;
+	/**
+	 * The `permissions.allow.*`/`permissions.deny.*` globs the user supplied
+	 * directly, kept apart from the profile's own built-in carve-outs even
+	 * though both are folded into {@link allow}/{@link deny} above.
+	 *
+	 * `decidePathTarget` (`resolve.ts`) checks {@link allow} before
+	 * {@link deny}, so a profile-default allow (e.g. `strict`'s
+	 * `**\/.env.example` carve-out) would otherwise silently outrank a user's
+	 * own, more specific `permissions.deny.*` entry for the same path — the
+	 * user has no way to re-protect a file the profile decided was safe. A
+	 * user's own explicit deny must win over the profile's own carve-out,
+	 * with the user's own explicit allow as the one escape hatch that still
+	 * wins over that deny.
+	 */
+	readonly explicitAllow: AccessGlobs;
+	readonly explicitDeny: AccessGlobs;
 	readonly opaqueToolScan: OpaqueToolScanMode;
 }
 

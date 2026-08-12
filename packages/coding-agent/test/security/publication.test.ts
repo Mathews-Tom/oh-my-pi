@@ -52,6 +52,7 @@ describe("security publication", () => {
 				scanId: "secscan_fixture",
 				store,
 				startedAt: "2026-07-29T00:00:00.000Z",
+				assertBundleWriteAllowed: () => {},
 			});
 			await expect(
 				tool.execute(
@@ -85,6 +86,7 @@ describe("security publication", () => {
 			scanId: "secscan_output",
 			store,
 			startedAt: "2026-07-29T00:00:00.000Z",
+			assertBundleWriteAllowed: () => {},
 		});
 		await tool.execute(
 			"publish",
@@ -112,6 +114,39 @@ describe("security publication", () => {
 		expect(JSON.parse(serializedScan)).not.toHaveProperty("plan");
 	});
 
+	test("calls assertBundleWriteAllowed with the output root before writing, and a veto stops the write", async () => {
+		let calledWithRoot: string | undefined;
+		const tool = createSecurityPublicationTool({
+			plan,
+			scanId: "secscan_vetoed",
+			store,
+			startedAt: "2026-07-29T00:00:00.000Z",
+			assertBundleWriteAllowed: root => {
+				calledWithRoot = root;
+				throw new Error("denied by fixture policy");
+			},
+		});
+		await expect(
+			tool.execute(
+				"publish",
+				{
+					findings: [],
+					coverage: { completeness: "complete" },
+					report: "# No findings\n",
+				},
+				undefined,
+				undefined,
+				undefined as never,
+			),
+		).rejects.toThrow("denied by fixture policy");
+		expect(calledWithRoot).toBe(plan.output.root);
+		// `security_publish` has no declared path argument and so is never
+		// gated by the standard tool-call permission check - this is the only
+		// thing standing between it and `writeSecurityBundleToDirectory`, so a
+		// veto here must mean nothing was written.
+		await expect(fs.readdir(plan.output.root)).rejects.toThrow();
+	});
+
 	test("allows only one publication while persistence is in flight", async () => {
 		const putStarted = Promise.withResolvers<void>();
 		const releasePut = Promise.withResolvers<void>();
@@ -129,6 +164,7 @@ describe("security publication", () => {
 			scanId: "secscan_fixture",
 			store: delayedStore,
 			startedAt: "2026-07-29T00:00:00.000Z",
+			assertBundleWriteAllowed: () => {},
 		});
 		const params = {
 			findings: [],

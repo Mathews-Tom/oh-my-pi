@@ -110,6 +110,27 @@ describe("profile strict", () => {
 		expect(decideTarget(target(".env"), relaxed, roots).kind).toBe("deny");
 	});
 
+	it("lets an explicit user deny re-protect a path the profile's own carve-out allows", () => {
+		// `.env.example` is allowed by strict's own built-in carve-out - a user
+		// re-denying it must win, even though `decidePathTarget` checks the
+		// merged allow list (which still contains that carve-out) before deny.
+		const reprotected = buildPermissionPolicy("strict", { denyRead: ["**/.env.example"] });
+		expect(decideTarget(target(".env.example"), reprotected, roots).kind).toBe("deny");
+		// Unrelated carve-out (.env.sample) is untouched.
+		expect(decideTarget(target(".env.sample"), reprotected, roots).kind).toBe("allow");
+	});
+
+	it("still lets an explicit user allow override that same user's own explicit deny", () => {
+		// The one escape hatch: adding both an explicit deny and an explicit
+		// allow for the same path is the user's own contradiction to resolve,
+		// and allow wins - unchanged from today's user-vs-user behavior.
+		const overridden = buildPermissionPolicy("strict", {
+			denyRead: ["**/.env.example"],
+			allowRead: ["**/.env.example"],
+		});
+		expect(decideTarget(target(".env.example"), overridden, roots).kind).toBe("allow");
+	});
+
 	it("merges user deny globs onto the profile floor", () => {
 		const tightened = buildPermissionPolicy("strict", { denyRead: ["**/*.md"] });
 		expect(decideTarget(target("README.md"), tightened, roots).kind).toBe("deny");

@@ -15,9 +15,9 @@ import type { AgentSession } from "../session/agent-session";
 import type { AuthStorage } from "../session/auth-storage";
 import { SessionManager } from "../session/session-manager";
 import { loadPermissionsConfig } from "../tools/permissions/config";
-import { PermissionDeniedError } from "../tools/permissions/gate";
+import { checkStructuredTargets, PermissionDeniedError } from "../tools/permissions/gate";
 import { decideTarget } from "../tools/permissions/resolve";
-import type { PermissionRoots } from "../tools/permissions/types";
+import type { PathTarget, PermissionRoots } from "../tools/permissions/types";
 import * as git from "../utils/git";
 import { createExactSecurityOAuthResolver, selectSecurityAccount } from "./auth";
 import type {
@@ -212,6 +212,44 @@ function assertSecurityWriteAllowed(absolutePath: string, host: SecurityCoordina
 	if (decision.kind === "deny") {
 		throw new PermissionDeniedError("security_scan", decision.rule, decision.reason);
 	}
+}
+
+/** Every filename {@link writeSecurityBundleToDirectory} (`store.ts`) can place directly under the output root. */
+const SECURITY_BUNDLE_FILENAMES = [
+	"findings.json",
+	"report.md",
+	"results.sarif",
+	"provenance.json",
+	"scan.json",
+] as const;
+
+/**
+ * `assertSecurityWriteAllowed` above only clears `output_root` itself; a
+ * `deny.write` rule matching a descendant glob (e.g. `**\/*.json`) still
+ * fires on the exact files `writeSecurityBundleToDirectory` (`store.ts`)
+ * places under that root — every name in {@link SECURITY_BUNDLE_FILENAMES},
+ * written (or `fs.rm`'d, when the bundle carries no report/sarif) through
+ * `writeSecurityFileAtomic`'s `<file>.<pid>.<uuid>.tmp`-then-rename dance.
+ * Authorize both the final path and a representative temp sibling for each —
+ * the pid/uuid are placeholders since glob rules match on shape, not the
+ * literal random suffix — before either `security_publish` (`publication.ts`)
+ * or this coordinator's own re-write (`#run` below) can create them.
+ */
+function assertSecurityBundleWriteAllowed(root: string, host: SecurityCoordinatorHost): void {
+	const policy = loadPermissionsConfig(host.settings);
+	if (!policy) return;
+	const roots: PermissionRoots = { cwd: host.cwd, additionalDirectories: host.additionalDirectories ?? [] };
+	const resolvedRoot = path.resolve(root);
+	const targets: PathTarget[] = SECURITY_BUNDLE_FILENAMES.flatMap(filename => {
+		const filePath = path.join(resolvedRoot, filename);
+		const field = "output_root";
+		return [
+			{ raw: filePath, access: "write", field },
+			{ raw: `${filePath}.0.00000000-0000-0000-0000-000000000000.tmp`, access: "write", field },
+		];
+	});
+	const denial = checkStructuredTargets(targets, policy, roots);
+	if (denial) throw new PermissionDeniedError("security_scan", denial.rule, denial.reason);
 }
 
 function createOperationId(): string {
@@ -566,6 +604,7 @@ export class SecurityCoordinator {
 		// permissions were off (or looser) and started later under a
 		// confining profile must not run on the strength of that stale check.
 		assertSecurityWriteAllowed(path.resolve(this.#host.cwd, plan.output.root), this.#host, "output_root");
+		assertSecurityBundleWriteAllowed(plan.output.root, this.#host);
 		await assertSecurityScanPlanFresh(
 			plan,
 			{
@@ -727,6 +766,11 @@ export class SecurityCoordinator {
 				startedAt,
 				sessionId: `security:${record.snapshot.scanId}`,
 				operationId: record.snapshot.operationId,
+				// `security_publish` is a session-local tool with no declared path
+				// argument, so it never passes through the standard tool-call gate
+				// (`classifyTool`, `tool-path-targets.ts`) - this is the only check
+				// standing between it and `writeSecurityBundleToDirectory`.
+				assertBundleWriteAllowed: root => assertSecurityBundleWriteAllowed(root, this.#host),
 				onPublished: async bundle => {
 					publishedBundle = bundle;
 					record.snapshot.findingCount = bundle.findings.length;
@@ -772,6 +816,11 @@ export class SecurityCoordinator {
 								}
 							: {}),
 					};
+					// Re-check before this coordinator's own re-write for the same
+					// reason `start()` re-checks `output_root` itself: the policy
+					// live in settings can have changed since `security_publish`'s
+					// own write passed this same check.
+					assertSecurityBundleWriteAllowed(plan.output.root, this.#host);
 					await writeSecurityBundleToDirectory(plan.output.root, publishedBundle);
 					await store.putBundle(publishedBundle);
 				}

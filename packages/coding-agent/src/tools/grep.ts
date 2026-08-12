@@ -59,6 +59,7 @@ import {
 	toPathList,
 } from "./path-utils";
 import { loadPermissionsConfig } from "./permissions/config";
+import { isExemptPathArgument } from "./permissions/resolve";
 import { excludeDenyReadSearchTargets } from "./permissions/tool-path-targets";
 import type { PermissionRoots } from "./permissions/types";
 import {
@@ -326,6 +327,16 @@ interface InternalSearchInputResolution {
 	virtualInputIndexes: Set<number>;
 	immutableSourcePaths: Set<string>;
 	virtualScopePath?: string;
+	/**
+	 * Backing filesystem paths (`resource.sourcePath`, resolved) of inputs whose
+	 * *original* raw argument was already exempt from the resource-permission
+	 * gate (`memory://root`, …) - see {@link isExemptPathArgument}. The pre-
+	 * execution gate never sees anything past that raw string, but a
+	 * `confineReads`-active descendant walk over the resolved backing path
+	 * (`excludeDenyReadSearchTargets`) would otherwise reject every descendant
+	 * as outside the workspace, undoing the exemption the gate already granted.
+	 */
+	exemptResolvedPaths: Set<string>;
 }
 
 function isImmutableSourcePath(filePath: string, immutableSourcePaths: ReadonlySet<string>): boolean {
@@ -779,6 +790,7 @@ async function resolveInternalSearchInputs(opts: {
 	const virtualPathSet = new Set<string>();
 	const virtualInputIndexes = new Set<number>();
 	const immutableSourcePaths = new Set<string>();
+	const exemptResolvedPaths = new Set<string>();
 	let virtualScopePath: string | undefined;
 	const context: ResolveContext = {
 		cwd: opts.cwd,
@@ -820,6 +832,9 @@ async function resolveInternalSearchInputs(opts: {
 			if (resource.immutable) {
 				immutableSourcePaths.add(path.resolve(resource.sourcePath));
 			}
+			if (isExemptPathArgument(rawPath)) {
+				exemptResolvedPaths.add(path.resolve(resource.sourcePath));
+			}
 			continue;
 		}
 
@@ -852,6 +867,7 @@ async function resolveInternalSearchInputs(opts: {
 		virtualPathSet,
 		virtualInputIndexes,
 		immutableSourcePaths,
+		exemptResolvedPaths,
 		virtualScopePath,
 	};
 }
@@ -1125,10 +1141,32 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 							additionalDirectories: this.session.additionalDirectories ?? [],
 						};
 						const targets = multiTargets ?? [{ basePath: searchPath, glob: globFilter, pathIsFile: false }];
-						const filteredTargets = await excludeDenyReadSearchTargets(targets, policy, permissionRoots, true);
+						// A target resolved from an already-exempt internal URL
+						// (`memory://root`, …) must not go through the deny-descendant
+						// walk at all: it resolves outside every workspace root by
+						// design, and `excludeDenyReadSearchTargets` would otherwise
+						// reject every descendant under `confineReads`, undoing the
+						// exemption `decideTarget` already granted the raw argument.
+						const exemptTargets = targets.filter(target =>
+							internalResolution.exemptResolvedPaths.has(path.resolve(target.basePath)),
+						);
+						const targetsToFilter =
+							exemptTargets.length > 0
+								? targets.filter(
+										target => !internalResolution.exemptResolvedPaths.has(path.resolve(target.basePath)),
+									)
+								: targets;
+						const filteredTargets =
+							targetsToFilter.length > 0
+								? await excludeDenyReadSearchTargets(targetsToFilter, policy, permissionRoots, true)
+								: [];
 						if (filteredTargets) {
-							exactFilePaths = filteredTargets.map(target => target.basePath);
-							multiTargets = undefined;
+							if (exemptTargets.length > 0) {
+								multiTargets = [...exemptTargets, ...filteredTargets];
+							} else {
+								exactFilePaths = filteredTargets.map(target => target.basePath);
+								multiTargets = undefined;
+							}
 							globFilter = undefined;
 						}
 					}

@@ -64,15 +64,26 @@ export interface PermissionOverrides {
 	readonly opaqueToolScan?: PermissionPolicy["opaqueToolScan"] | undefined;
 }
 
+/** Trim and drop empties, without deduplicating against anything else. */
+function trimmedGlobs(list: readonly string[] | undefined): readonly string[] {
+	if (!list || list.length === 0) return [];
+	const out: string[] = [];
+	for (const glob of list) {
+		const trimmed = glob.trim();
+		if (trimmed) out.push(trimmed);
+	}
+	return out;
+}
+
 function mergeGlobs(base: readonly string[], extra: readonly string[] | undefined): readonly string[] {
-	if (!extra || extra.length === 0) return base;
+	const trimmedExtra = trimmedGlobs(extra);
+	if (trimmedExtra.length === 0) return base;
 	const seen = new Set(base);
 	const out = [...base];
-	for (const glob of extra) {
-		const trimmed = glob.trim();
-		if (!trimmed || seen.has(trimmed)) continue;
-		seen.add(trimmed);
-		out.push(trimmed);
+	for (const glob of trimmedExtra) {
+		if (seen.has(glob)) continue;
+		seen.add(glob);
+		out.push(glob);
 	}
 	return out;
 }
@@ -84,6 +95,10 @@ function mergeGlobs(base: readonly string[], extra: readonly string[] | undefine
  * floor, and `permissions.deny.*` raises it. There is deliberately no way to
  * subtract from a profile's deny list except through `permissions.allow.*`,
  * which is the single, explicit escape hatch.
+ *
+ * `explicitAllow`/`explicitDeny` carry the user's own overrides apart from
+ * the merged lists above, so `decidePathTarget` can let a user's own deny
+ * outrank a profile's own carve-out (see {@link PermissionPolicy.explicitAllow}).
  */
 export function buildPermissionPolicy(
 	profile: PermissionProfile,
@@ -101,6 +116,14 @@ export function buildPermissionPolicy(
 		allow: {
 			read: mergeGlobs(defaults.allow.read, overrides.allowRead),
 			write: mergeGlobs(defaults.allow.write, overrides.allowWrite),
+		},
+		explicitAllow: {
+			read: trimmedGlobs(overrides.allowRead),
+			write: trimmedGlobs(overrides.allowWrite),
+		},
+		explicitDeny: {
+			read: trimmedGlobs(overrides.denyRead),
+			write: trimmedGlobs(overrides.denyWrite),
 		},
 		opaqueToolScan: overrides.opaqueToolScan ?? "deny",
 	};

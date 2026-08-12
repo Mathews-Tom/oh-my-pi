@@ -13,11 +13,12 @@ import {
 	LocalProtocolHandler,
 	type ProtocolHandler,
 } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { getMemoryRoot } from "@oh-my-pi/pi-coding-agent/memories";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import * as sshFileTransfer from "@oh-my-pi/pi-coding-agent/ssh/file-transfer";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { getAgentDir, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { GlobTool } from "../../src/tools/glob";
 import { GrepTool } from "../../src/tools/grep";
 
@@ -640,5 +641,76 @@ describe("GrepTool internal URL resolution", () => {
 		const tool = new GrepTool(createSession());
 		const result = await tool.execute("ssh-ipv6", { pattern: "needle", path: "ssh://[::1]/etc/hosts" });
 		expect(getResultText(result)).toContain("needle");
+	});
+
+	describe("memory:// exemption survives the confineReads descendant filter", () => {
+		let agentTmpDir: string;
+		let previousAgentDir: string;
+
+		beforeEach(async () => {
+			previousAgentDir = getAgentDir();
+			agentTmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "grep-memory-agent-"));
+			setAgentDir(agentTmpDir);
+		});
+
+		afterEach(async () => {
+			setAgentDir(previousAgentDir);
+			await removeWithRetries(agentTmpDir);
+		});
+
+		it("still returns matches under a memory:// directory scope when strict confineReads is active", async () => {
+			// The memory root lives under the agent directory, deliberately
+			// outside `tmpDir` (the workspace cwd) - exactly the shape a
+			// `confineReads`-active descendant walk would otherwise reject.
+			// `memory://root/notes` resolves to a directory (bare `memory://root`
+			// resolves to the single `memory_summary.md` file, which never
+			// recurses), so this exercises the descendant-filtering branch.
+			const memoryRoot = getMemoryRoot(agentTmpDir, tmpDir);
+			await fs.mkdir(path.join(memoryRoot, "notes"), { recursive: true });
+			await fs.writeFile(path.join(memoryRoot, "notes", "entry.md"), "alpha\nmemory-needle-c19a\nomega\n");
+
+			const session = createSession({
+				settings: Settings.isolated({
+					"memory.backend": "local",
+					"permissions.profile": "strict",
+					"permissions.confineReads": true,
+				}),
+			});
+			const tool = new GrepTool(session);
+
+			const result = await tool.execute("memory-exempt", {
+				pattern: "memory-needle-c19a",
+				path: "memory://root/notes",
+			});
+
+			expect(getResultText(result)).toContain("memory-needle-c19a");
+		});
+
+		it("still returns matches for a mixed workspace + memory:// directory search under strict confineReads", async () => {
+			const memoryRoot = getMemoryRoot(agentTmpDir, tmpDir);
+			await fs.mkdir(path.join(memoryRoot, "notes"), { recursive: true });
+			await fs.writeFile(path.join(memoryRoot, "notes", "entry.md"), "memory-mixed-needle-7db2\n");
+			await fs.writeFile(path.join(tmpDir, "workspace.txt"), "memory-mixed-needle-7db2 in workspace\n");
+
+			const session = createSession({
+				settings: Settings.isolated({
+					"memory.backend": "local",
+					"permissions.profile": "strict",
+					"permissions.confineReads": true,
+				}),
+			});
+			const tool = new GrepTool(session);
+
+			const result = await tool.execute("memory-exempt-mixed", {
+				pattern: "memory-mixed-needle-7db2",
+				path: "memory://root/notes; workspace.txt",
+			});
+
+			const text = getResultText(result);
+			expect(text).toContain("workspace.txt");
+			// Two matches: one from the workspace file, one from the exempt
+			// memory root - neither was filtered out by the descendant walk.
+			expect(text.match(/memory-mixed-needle-7db2/g)?.length).toBe(2);
+		});
 	});
 });

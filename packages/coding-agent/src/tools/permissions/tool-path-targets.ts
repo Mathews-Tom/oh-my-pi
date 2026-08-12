@@ -17,10 +17,11 @@
  * `filesystem/read_file {path: ".env"}` is scanned rather than waved through.
  */
 import type { Dirent } from "node:fs";
+import { readdirSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import * as path from "node:path";
 import { Patch } from "@oh-my-pi/hashline";
-import { getAgentDir } from "@oh-my-pi/pi-utils";
+import { getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
 import { getManagedSkillsDir, sanitizeSkillName } from "../../autolearn/managed-skills";
 import { LSP_READONLY_ACTIONS } from "../../lsp";
 import { getMemoryRoot, LEARNED_LESSONS_FILE } from "../../memories";
@@ -417,6 +418,30 @@ function managedSkillPath(name: unknown, leaf: "SKILL.md" | null): string | null
 }
 
 /**
+ * Every existing file/directory already under `dir`, so a `delete` action's
+ * `fs.rm(dir, { recursive: true })` (`deleteManagedSkill`) cannot remove a
+ * descendant a deny rule protects (e.g. `skill/private.key`) just because the
+ * declared target was the directory's own root. Synchronous: this runs
+ * inside {@link extractManageSkillPaths}, a sync {@link PathTargetExtractor}
+ * evaluated before the tool's own (async) delete call ever runs.
+ * `readdirSync`'s `recursive` option matches `fs.rm`'s own traversal —
+ * neither follows a symlinked descendant into whatever it points at.
+ * Empty for a directory that does not exist: `deleteManagedSkill` itself
+ * throws on a missing skill, so there is nothing here for the gate to
+ * protect and no reason to block on it early.
+ */
+function existingManagedSkillDescendants(dir: string): string[] {
+	try {
+		return readdirSync(dir, { recursive: true, withFileTypes: true }).map(entry =>
+			path.join(entry.parentPath, entry.name),
+		);
+	} catch (error) {
+		if (isEnoent(error)) return [];
+		throw error;
+	}
+}
+
+/**
  * `manage_skill`'s only filesystem surface: `create`/`update` write
  * `<managed-skills>/<name>/SKILL.md` (`writeManagedSkill`), `delete` removes
  * the whole `<managed-skills>/<name>` directory (`deleteManagedSkill`).
@@ -424,7 +449,12 @@ function managedSkillPath(name: unknown, leaf: "SKILL.md" | null): string | null
 const extractManageSkillPaths: PathTargetExtractor = args => {
 	const out: PathTarget[] = [];
 	const target = managedSkillPath(args.name, args.action === "delete" ? null : "SKILL.md");
-	if (target) pushPath(out, target, "write", "name");
+	if (target) {
+		pushPath(out, target, "write", "name");
+		if (args.action === "delete") {
+			for (const descendant of existingManagedSkillDescendants(target)) pushPath(out, descendant, "write", "name");
+		}
+	}
 	return out;
 };
 

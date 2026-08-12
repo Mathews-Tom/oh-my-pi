@@ -93,6 +93,15 @@ export interface SecurityPublicationOptions {
 	startedAt: string;
 	sessionId?: string;
 	operationId?: string;
+	/**
+	 * `security_publish` declares no path argument, so it never passes through
+	 * the standard tool-call permission gate (`classifyTool`, `tool-path-
+	 * targets.ts`) - the coordinator supplies this to authorize every file
+	 * {@link writeSecurityBundleToDirectory} is about to place under
+	 * `plan.output.root` (and its atomic temp siblings) before this tool
+	 * writes them.
+	 */
+	assertBundleWriteAllowed: (root: string) => void;
 	onPublished?: (bundle: SecurityScanBundle) => void | Promise<void>;
 }
 
@@ -304,6 +313,7 @@ export function createSecurityPublicationTool(
 				};
 				const provisional: SecurityScanBundle = { scan, findings, report: params.report };
 				const bundle: SecurityScanBundle = { ...provisional, sarif: exportSecurityBundleToSarif(provisional) };
+				options.assertBundleWriteAllowed(options.plan.output.root);
 				await writeSecurityBundleToDirectory(options.plan.output.root, bundle);
 				await options.store.putBundle(bundle);
 				persisted = true;
