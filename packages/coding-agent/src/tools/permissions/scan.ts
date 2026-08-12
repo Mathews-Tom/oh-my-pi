@@ -16,9 +16,9 @@
 
 import * as path from "node:path";
 import { tokenizeShellSegments } from "../shell-tokenize";
-import { relativeToRoots } from "./confine";
+import { relativeSpellingGroups } from "./confine";
 import { matchGlob } from "./matcher";
-import { isExemptPathArgument, permissionRootList, resolveTargetPath } from "./resolve";
+import { isExemptPathArgument, normalizeCandidate, permissionRootList, resolveTargetPath } from "./resolve";
 import type { PathAccess, PermissionPolicy, PermissionRoots } from "./types";
 
 /** A literal in an opaque argument that matched a deny rule. */
@@ -154,20 +154,31 @@ export function scanOpaqueArguments(
 		// declared path argument there is nothing to fail closed about.
 		if (!absolute) continue;
 
-		const relatives = relativeToRoots(absolute, rootList);
-		// Same normalization `decidePathTarget` applies (`resolve.ts`) - permission
-		// globs are written with `/`, but `path.relative`/an absolute path (and
-		// the literal itself, when it is a Windows-spelled path the caller typed
-		// verbatim, e.g. `C:\Users\me\.ssh\config`) use `\` on Windows, which
-		// `Bun.Glob` treats as a distinct, non-equivalent character.
-		const candidates = [...relatives, absolute, path.basename(absolute), literal].map(candidate =>
-			candidate.replaceAll("\\", "/"),
-		);
+		// Checked as two separate identities, not one merged candidate list —
+		// mirrors `decidePathTarget` (`resolve.ts`) exactly, for the same
+		// reason: a symlink alias (`.env.example -> .env`) contributes both the
+		// lexical spelling and the realpath-resolved canonical spelling, and
+		// merging them before matching would let an allow glob on the alias
+		// (`**/.env.example`) short-circuit the whole decision before the
+		// canonical spelling (`**/.env`) - what the command actually reads
+		// through the alias - is ever checked. Each identity gets its own
+		// allow-then-deny pass instead, so an allow on one spelling can never
+		// clear a deny on the other. `normalizeCandidate` matches
+		// `decidePathTarget`'s own normalization: permission globs are written
+		// with `/`, but `path.relative`/an absolute path (and a Windows-spelled
+		// literal the caller typed verbatim) use `\` on Windows.
+		const spellings = relativeSpellingGroups(absolute, rootList);
+		const identities = [
+			[...spellings.lexical, spellings.resolved, path.basename(spellings.resolved), literal].map(normalizeCandidate),
+			[...spellings.canonical, spellings.realTarget, path.basename(spellings.realTarget)].map(normalizeCandidate),
+		];
 
 		for (const access of ["read", "write"] as const) {
-			if (matchGlob(policy.allow[access], candidates)) continue;
-			const rule = matchGlob(policy.deny[access], candidates);
-			if (rule) return { literal, rule, access };
+			for (const candidates of identities) {
+				if (matchGlob(policy.allow[access], candidates)) continue;
+				const rule = matchGlob(policy.deny[access], candidates);
+				if (rule) return { literal, rule, access };
+			}
 		}
 	}
 	return null;

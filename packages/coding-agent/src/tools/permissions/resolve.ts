@@ -114,7 +114,7 @@ const CONFINE_WRITES_RULE = "permissions.confineWrites";
  * `path.basename` alone rescues only filename-only rules; a directory-scoped
  * rule (the common case) is silently bypassed without this.
  */
-function normalizeCandidate(candidate: string): string {
+export function normalizeCandidate(candidate: string): string {
 	return candidate.replaceAll("\\", "/");
 }
 

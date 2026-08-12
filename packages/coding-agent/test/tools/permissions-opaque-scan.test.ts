@@ -118,6 +118,36 @@ describe("policy interaction", () => {
 	});
 });
 
+describe("symlink alias identity separation", () => {
+	// `STRICT_SECRET_ALLOW_GLOBS` carves out `**/.env.example` so the checked-in
+	// template beside a real `.env` stays readable. If `.env.example` is
+	// actually a symlink to `.env`, the alias's own lexical spelling still
+	// matches that allow glob, but the command reads the canonical `.env`
+	// content through it — the allow must not clear the deny on that
+	// canonical spelling too.
+	it("does not let an allowed symlink alias's lexical spelling clear a deny on its canonical target", () => {
+		const aliasPath = path.join(workspace, ".env.example");
+		fs.symlinkSync(path.join(workspace, ".env"), aliasPath);
+		try {
+			const hit = scanOpaqueArguments({ command: "cat .env.example" }, "shell", STRICT, roots);
+			expect(hit?.rule).toBe("**/.env");
+			expect(hit?.literal).toBe(".env.example");
+		} finally {
+			fs.rmSync(aliasPath, { force: true });
+		}
+	});
+
+	it("still honours the allow carve-out for a real (non-symlinked) template file", () => {
+		const templatePath = path.join(workspace, ".env.example");
+		fs.writeFileSync(templatePath, "TEMPLATE=1");
+		try {
+			expect(scanOpaqueArguments({ command: "cat .env.example" }, "shell", STRICT, roots)).toBeNull();
+		} finally {
+			fs.rmSync(templatePath, { force: true });
+		}
+	});
+});
+
 describe("literal cap enforcement within a single string", () => {
 	// The cap used to be checked only before expanding each *source* string,
 	// so one sufficiently long value could grow the literal array without
