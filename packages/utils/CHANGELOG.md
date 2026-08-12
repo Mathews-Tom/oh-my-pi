@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [17.2.15] - 2026-08-12
+
+### Changed
+
+- Extended parsed Server-Sent Events (SSE) to include optional id and retry fields, enabling reconnecting transports to retain stream cursors and respect server-requested retry intervals.
+
 ## [17.2.13] - 2026-08-11
 
 ### Changed

@@ -21,6 +21,7 @@ import { usesCodexTaskPrompt } from "../task/prompt-policy";
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
 import { computerExposureMode } from "../tools/computer/exposure";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
+import { supportsExternalThinking } from "../tools/think";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
 import { isMountableUnderXdev, listXdevTools, type XdevState, xdevDocsFor, xdevEntries } from "../tools/xdev";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
@@ -1171,6 +1172,17 @@ export class SessionTools {
 	 * @returns false when enabling was requested but this session cannot build the tool.
 	 */
 	setThinkToolEnabled(enabled: boolean): Promise<boolean> {
+		return this.#setThinkToolActive(enabled && supportsExternalThinking(this.#host.model()));
+	}
+
+	/** Reconciles the external scratchpad after the active model changes. */
+	reconcileThinkTool(): Promise<boolean> {
+		return this.#setThinkToolActive(
+			this.#host.settings.get("externalThinking") && supportsExternalThinking(this.#host.model()),
+		);
+	}
+
+	#setThinkToolActive(enabled: boolean): Promise<boolean> {
 		return this.runToolRegistryMutation(async () => {
 			const active = this.getEnabledToolNames();
 			if (!enabled) {

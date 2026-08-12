@@ -479,8 +479,9 @@ export interface StreamOptions {
 	 */
 	statefulResponses?: boolean;
 	/**
-	 * Emit `reasoning: { effort: "none" }` for OpenAI Responses and Codex requests.
-	 * Used when a caller supplies an external reasoning scratchpad; other transports ignore it.
+	 * Disable native reasoning when the caller supplies an external scratchpad.
+	 * OpenAI Responses emits `reasoning: { effort: "none" }`; Anthropic and
+	 * Google transports use their native thinking-off controls.
 	 */
 	forceReasoningOff?: boolean;
 	/**

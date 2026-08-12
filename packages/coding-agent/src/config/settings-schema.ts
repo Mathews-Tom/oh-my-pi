@@ -1146,7 +1146,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "model",
 			group: "Thinking",
 			label: "External Thinking",
-			description: "Use a private think tool and send reasoning effort off to GPT Responses models",
+			description: "Private scratchpad; not shown to user. Disables supported GPT, Claude, and Gemini reasoning",
 		},
 	},
 

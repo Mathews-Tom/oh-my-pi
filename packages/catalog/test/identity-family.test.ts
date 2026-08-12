@@ -76,6 +76,21 @@ describe("parseAnthropicModel", () => {
 		});
 		expect(parseAnthropicModel("anthropic--claude-4.8-haiku")).toBeNull();
 	});
+
+	test("parses versions past the precompute table instead of classifying the model unknown", () => {
+		// The semver precompute table gates parsing; a too-small bound silently
+		// downgraded `claude-opus-5-11`-shaped ids to unknown (#8256 class).
+		expect(parseAnthropicModel("claude-opus-5-11")).toEqual({
+			family: "anthropic",
+			kind: "opus",
+			version: { major: 5, minor: 11, patch: 0 },
+		});
+		expect(parseAnthropicModel("claude-sonnet-4.25")).toEqual({
+			family: "anthropic",
+			kind: "sonnet",
+			version: { major: 4, minor: 25, patch: 0 },
+		});
+	});
 });
 
 describe("supportsAdaptiveThinkingDisplay", () => {
