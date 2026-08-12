@@ -1,6 +1,7 @@
 export * from "@oh-my-pi/pi-catalog/effort";
 export * from "@oh-my-pi/pi-catalog/types";
 
+import type { Type } from "@oh-my-pi/omptype";
 import type {
 	DeleteArgs,
 	DeleteResult,
@@ -35,8 +36,6 @@ import type {
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { isOpenAIModelId } from "@oh-my-pi/pi-catalog/identity/family";
 import type { Api, FetchImpl, KnownApi, Model, Provider, ThinkingBudgets, Usage } from "@oh-my-pi/pi-catalog/types";
-import type { Type } from "arktype";
-import type { ZodType, z } from "zod/v4";
 import type { ApiKey } from "./auth-retry";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
@@ -214,23 +213,25 @@ export function resolveModelServiceTier(
 
 /**
  * True when the tier should be sent on the wire as the provider's service-tier
- * request field. OpenAI / OpenAI-Codex accept `flex`/`scale`/`priority`; Google
- * (Gemini API + Vertex) and OpenRouter accept `flex`/`priority`; Fireworks
- * Serverless realizes only its Priority serving path. Anthropic is absent — it
- * realizes `priority` via `speed: "fast"`, not a service-tier field.
+ * request field. `auto` is never forwarded — it is OpenAI's implicit default, so
+ * omitting `service_tier` is identical to requesting `auto`, and the Codex
+ * (ChatGPT OAuth) endpoint rejects an explicit `auto` outright. OpenAI /
+ * OpenAI-Codex accept every other {@link ServiceTier}; Google (Gemini API +
+ * Vertex) and OpenRouter accept `flex`/`priority`; Fireworks Serverless
+ * realizes only its Priority serving path. Anthropic is absent because it
+ * realizes `priority` via `speed: "fast"`.
  */
 export function shouldSendServiceTier(
 	serviceTier: ServiceTier | null | undefined,
 	target: Provider | ServiceTierModel | undefined,
 ): boolean {
-	if (!serviceTier) return false;
+	if (!serviceTier || serviceTier === "auto") return false;
 	const provider = typeof target === "string" ? target : target?.provider;
-	if (provider === "openai" || provider === "openai-codex" || provider === "openrouter") {
+	if (provider === "openai" || provider === "openai-codex") return true;
+	if (provider === "openrouter") {
 		return serviceTier === "flex" || serviceTier === "scale" || serviceTier === "priority";
 	}
-	if (typeof target !== "string" && target && isOpenAIServiceTierModel(target)) {
-		return serviceTier === "flex" || serviceTier === "scale" || serviceTier === "priority";
-	}
+	if (typeof target !== "string" && target && isOpenAIServiceTierModel(target)) return true;
 	if (provider === "google") {
 		return serviceTier === "flex" || serviceTier === "priority";
 	}
@@ -434,6 +435,11 @@ export interface StreamOptions {
 	 * For example, Anthropic uses `user_id` for abuse tracking and rate limiting.
 	 */
 	metadata?: Record<string, unknown>;
+	/**
+	 * Provider-owned request configuration. Provider hooks interpret this bag;
+	 * generic API transports do not forward its fields onto the wire.
+	 */
+	providerOptions?: Readonly<Record<string, unknown>>;
 	/** OpenAI Responses/Codex response fields to include verbatim. */
 	include?: OpenAIResponseInclude[];
 	/**
@@ -472,6 +478,12 @@ export interface StreamOptions {
 	 * `false` so `previous_response_id` cannot explain a result.
 	 */
 	statefulResponses?: boolean;
+	/**
+	 * Disable native reasoning when the caller supplies an external scratchpad.
+	 * OpenAI Responses emits `reasoning: { effort: "none" }`; Anthropic and
+	 * Google transports use their native thinking-off controls.
+	 */
+	forceReasoningOff?: boolean;
 	/**
 	 * Provider-scoped mutable state store for this agent session.
 	 * Providers can use this to persist transport/session state between turns.
@@ -546,6 +558,13 @@ export interface StreamOptions {
 	 * Optional retry delay hook for tests and transports that need custom scheduling.
 	 */
 	providerRetryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
+	/**
+	 * Accept a Google `STOP` response with no visible text or tool call as a
+	 * successful completion. Passive callers such as advisors use this because
+	 * silence is a valid result; interactive agent turns retain empty-response
+	 * retries by default. Ignored by non-Google providers.
+	 */
+	acceptEmptyResponse?: boolean;
 	/**
 	 * Optional `fetch` implementation override. Providers route every HTTP
 	 * request — direct calls, SDK clients, and retry helpers — through this
@@ -824,26 +843,38 @@ export interface DeveloperMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
+/** How an automatic retry recovered or ultimately settled a failed attempt. */
 export type AssistantRetryRecoveryKind = "credential" | "model" | "wait" | "plain";
 
-export interface AssistantRetryRecovery {
-	kind: "auto-retry";
-	status: "recovered";
-	attempt: number;
-	recoveredAt: string;
-	recovery: AssistantRetryRecoveryKind;
-	note: string;
-	supersededBy?: {
-		timestamp: number;
-		responseId?: string;
-		provider: string;
-		model: string;
-	};
-}
+/** Persisted presentation state for an assistant error superseded by an automatic retry saga. */
+export type AssistantRetryRecovery =
+	| {
+			kind: "auto-retry";
+			status: "recovered";
+			attempt: number;
+			recoveredAt: string;
+			recovery: AssistantRetryRecoveryKind;
+			note: string;
+			supersededBy?: {
+				timestamp: number;
+				responseId?: string;
+				provider: string;
+				model: string;
+			};
+	  }
+	| {
+			kind: "auto-retry";
+			status: "superseded";
+			attempt: number;
+			recovery: AssistantRetryRecoveryKind;
+			note: string;
+	  };
 
 export interface ContextSnapshot {
 	promptTokens: number; // authoritative provider prompt/input tokens
 	nonMessageTokens: number; // estimated non-message total at send time
+	/** Estimated prompt tokens removed by local history rewrites after this provider snapshot was recorded. */
+	historyRewriteTokensRemoved?: number;
 	lastMessageTimestamp?: number;
 }
 
@@ -1131,19 +1162,13 @@ export type TJsonSchema = Record<string, unknown>;
 /**
  * Schema type accepted by the {@link Tool} interface.
  *
- * Canonical authoring uses Zod or ArkType. Extension compat may supply a JSON
- * Schema object (including TypeBox static schema objects).
+ * Canonical authoring uses ArkType. Extension compat may supply a JSON Schema
+ * object (including TypeBox static schema objects).
  */
-export type TSchema = ZodType | Type | TJsonSchema;
+export type TSchema = Type | TJsonSchema;
 
 /** Resolve parameter types for tool execution / handlers. */
-export type Static<S> = S extends ZodType
-	? z.infer<S>
-	: S extends Type
-		? S["infer"]
-		: S extends { static: infer T }
-			? T
-			: unknown;
+export type Static<S> = S extends Type ? S["infer"] : S extends { static: infer T } ? T : unknown;
 
 export interface ToolCallExample<TArgs = Record<string, unknown>> {
 	caption?: string;

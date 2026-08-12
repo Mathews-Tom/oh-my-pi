@@ -2,6 +2,115 @@
 
 ## [Unreleased]
 
+## [17.2.15] - 2026-08-12
+
+### Fixed
+
+- Fixed an issue where AWS_BEDROCK_SKIP_AUTH failed to expose Amazon Bedrock models when AWS credential files were unavailable.
+- Fixed an issue where forceReasoningOff was ignored by Anthropic and Google transports, which allowed native thinking alongside a caller-supplied external scratchpad.
+
+## [17.2.14] - 2026-08-11
+
+### Added
+
+- Added `forceReasoningOff` and `disableReasoning` options to disable reasoning in OpenAI and Azure OpenAI models
+
+## [17.2.13] - 2026-08-11
+
+### Changed
+
+- Standardized first-party outbound User-Agent headers on `omp/<version>` via the shared `USER_AGENT` utility.
+
+### Fixed
+
+- Fixed the Amazon Bedrock and Cursor transports ignoring `StreamOptions.headers`; both built their request headers from scratch, so caller-supplied tracing or attribution headers were silently dropped while working on every other provider ([#8107](https://github.com/can1357/oh-my-pi/pull/8107) by [@svperfecta](https://github.com/svperfecta)).
+- Fixed Antigravity Flash turns hanging after successful response headers when the endpoint never emitted an SSE event; the provider now cancels the stalled body and fails over after 60 seconds while retaining the longer allowance for Pro reasoning starts.
+- Fixed Cursor exec-bridge bash/grep calls failing ArkType validation when the server omitted optional frame fields: synthesized and executed tool args now drop `undefined` keys (`cwd`, `case`, `skip`, `timeout`) instead of writing `optional: value || undefined`.
+- Fixed Cursor sessions double-executing settled tools when `tools.format` is an owned dialect (e.g. `gemini`): `wrapInbandToolStream` rebuilt toolCall blocks without copying `kCursorExecResolved`, so agent-loop re-ran bash/grep/todo and appended a second result for the same call id.
+- Fixed Codex Responses Lite requests for opaque model codenames such as Daybreak omitting the required `reasoning.context: "all_turns"` value and failing with HTTP 400.
+- Fixed Cursor personal usage reporting for current Pro / Pro+ / Ultra `/api/usage-summary` payloads that expose `individualUsage.plan` (and optional `onDemand`) instead of the older `individualUsage.overall` bucket ([#7998](https://github.com/can1357/oh-my-pi/pull/7998) by [@dnth](https://github.com/dnth)).
+- Allowed passive Google callers to accept empty or thinking-only `STOP` responses as successful silence instead of exhausting the provider's empty-response retry budget. ([#8223](https://github.com/can1357/oh-my-pi/issues/8223))
+- Fixed the AWS credential resolver ignoring `role_arn` profiles: shared-config role chaining (`source_profile` recursion, `web_identity_token_file`, `credential_source`) now resolves via STS `AssumeRole`/`AssumeRoleWithWebIdentity`, honoring `role_session_name`/`duration_seconds`/`external_id`, so Bedrock is detected on EKS/IRSA and multi-account setups instead of reporting "No models available" ([#8209](https://github.com/can1357/oh-my-pi/issues/8209)).
+- Fixed Bedrock availability being under-detected on Nitro/EKS hosts: the EC2 metadata probe now recognizes Nitro DMI markers (`board_asset_tag` instance ids, `Amazon EC2` vendor fields) in addition to the Xen `ec2` UUID prefix ([#8209](https://github.com/can1357/oh-my-pi/issues/8209)).
+- Fixed DeepSeek Responses targets (opencode-go) rejecting a thinking-mode continuation with `400 The reasoning_text in the thinking mode must be passed back to the API` after a prewalk hand-off plus mid-run compaction: the Responses input builder re-encoded replayed assistant turns without a reasoning item, so the request enabled reasoning but shipped no `reasoning_text`. The encoder now synthesizes a `reasoning_text` reasoning item for every replayed assistant turn when the target requires reasoning replay in thinking mode (`requiresReasoningContentForAllAssistantTurns` / `requiresReasoningContentForToolCalls`), mirroring the chat-completions `reasoning_content` safety net ([#8248](https://github.com/can1357/oh-my-pi/issues/8248)).
+
+## [17.2.12] - 2026-08-08
+
+### Fixed
+
+- Fixed account-scoped Codex cyber-policy denials bypassing sibling credential rotation; replay-safe requests now try every configured account before surfacing the error.
+
+## [17.2.11] - 2026-08-07
+
+### Breaking Changes
+
+- Fixed handling of GitHub Copilot's model_not_available_for_integrator error to prevent unnecessary retries, preserving the actionable available models list.
+
+### Added
+
+- Added support for reporting Cursor personal monthly USD quotas and remaining balances, labeled by verified profile email accounts.
+
+### Fixed
+
+- Fixed an issue where ANTHROPIC_BASE_URL was ignored for Anthropic chat requests, ensuring requests are routed to the configured host and forwarding ANTHROPIC_CUSTOM_HEADERS to non-official gateways.
+- Fixed an issue where a legacy pre-organization login credential could persist and cause a permanent error row in omp usage even after a successful organization-scoped re-login.
+- Fixed an issue where lazy provider streams (including Amazon Bedrock, Google, Cursor, Devin, and Ollama) ignored model-specific idle timeouts, which previously caused healthy but slow reasoning turns to prematurely time out.
+- Improved error classification for Simplified Chinese quota-exhaustion and rate-limit messages, ensuring affected credentials are correctly rotated or backed off instead of being treated as unknown errors.
+- Classified subscription and plan-cap 429 responses as rotatable usage limits rather than transient rate-limit throttles, enabling smoother credential rotation.
+
+## [17.2.10] - 2026-08-06
+
+### Breaking Changes
+
+- Removed the `zod` dependency and `z`/`ZodType` re-exports. Tool schemas now use `omptype` `type()` schemas, with Zod-style authoring still available via `@oh-my-pi/omptype/zod`.
+
+## [17.2.9] - 2026-08-05
+
+### Fixed
+
+- Fixed GitHub Copilot requests failing with a raw `HTTP 400 model_not_available_for_integrator` on roughly half of all turns for recently rolled-out models. Copilot's fleet is not uniform — part of it rejects models that `/models` advertises on the same host — and the transient classifier matched only the older `model_not_supported` code at a fixed envelope depth, so these rejections surfaced as terminal errors instead of entering the existing retry path. Model-availability 400s are now recognized at any envelope depth and rerolled on a flat delay with a dedicated 8-attempt budget on the OpenAI transports; every other retryable failure keeps its previous backoff and attempt count.
+- Fixed Cursor reads with inline OMP range selectors reporting the returned slice length as the source file's `totalLines`, which made sequential reads of an unchanged file appear inconsistent ([#7590](https://github.com/can1357/oh-my-pi/issues/7590)).
+- Made model-scoped usage health ignore Codex accounts that cannot use the requested plan-gated model while retaining conservative unknown-state handling and independent usage-window resets.
+- Fixed OpenAI Codex usage telemetry blocking explicitly allowed ChatGPT Team credentials when a weekly `used_percent` rounded to 100, which could route multi-account sessions to an actually exhausted sibling instead ([#7617](https://github.com/can1357/oh-my-pi/issues/7617)).
+- Fixed OpenAI Codex GPT-5.x requests sending optional `reasoning.summary`, `reasoning.context`, and `text.verbosity` controls by default, reducing Codex `server_error` disconnects from unsupported request shapes. ([#4949](https://github.com/can1357/oh-my-pi/issues/4949))
+- Classified concurrent-request caps separately from quota exhaustion so they use a short retry backoff without burning a credential, and rotate credentials for account-scoped 403 caps such as Devin's overall message limit.
+
+## [17.2.7] - 2026-08-03
+
+### Changed
+
+- Replaced `arktype` with `@oh-my-pi/omptype` for schema validation, delivering up to 100x faster schema construction and 60-100x faster validation while maintaining full compatibility with existing `type`/`Type` exports and the `isArkSchema` contract.
+
+### Fixed
+
+- Fixed OpenAI-Codex (ChatGPT OAuth) requests failing with an `Unsupported service_tier: auto` error on default or legacy sessions by omitting the implicit `auto` service tier on the wire.
+- Fixed an issue where Cursor `kimi-k3` sessions would break permanently when a same-model assistant turn was persisted without thinking blocks, replacing hard errors with graceful warnings.
+
+## [17.2.6] - 2026-08-03
+
+### Added
+
+- Added profile-aware Bedrock Mantle region selection, authenticated model discovery, bearer-token or SigV4 authentication, and credential refresh handling for OpenAI Responses models.
+
+### Fixed
+
+- Fixed an issue where Ollama requests without a user-role message would fail to generate output or silently fail with a misleading error.
+
+## [17.2.5] - 2026-08-03
+
+### Changed
+
+- Standardized tool-call examples in `renderToolExamples` and `renderToolInventory` to use Python keyword-argument syntax (`name(key="value")`) across all models, removing the model-specific dialect parameter and the `DialectRenderOptions.example` flag.
+- Updated `renderToolInventory` to render the tool catalog as a unified OpenAI-Harmony-style `## functions` block using TypeScript type declarations and comments, replacing the previous per-tool Markdown sections.
+- Added a `style: "harmony"` option to `jsonSchemaToTypeScript` for generating compact, comma-delimited TypeScript definitions.
+
+### Fixed
+
+- Fixed a session-blocking issue where unescaped Harmony control tokens in replayed assistant responses and tool inputs caused subsequent requests to be rejected with `invalid_prompt` errors.
+- Fixed an issue where Codex Responses dropped native image-generation results from assistant content and replays due to stale `generating` statuses.
+- Fixed Anthropic stream truncation handling where unexpected connection closures were incorrectly treated as clean stops, causing the agent loop to halt silently mid-sentence.
+- Optimized Anthropic prompt caching to prevent unnecessary cache invalidation of the entire system prefix when volatile project footer details (such as current working directory, date, or workspace tree) change.
+
 ## [17.2.4] - 2026-08-01
 
 ### Fixed

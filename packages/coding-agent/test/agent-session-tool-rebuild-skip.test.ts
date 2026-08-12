@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Message, Model } from "@oh-my-pi/pi-ai";
 import { createMockModel, type MockResponseSource } from "@oh-my-pi/pi-ai/providers/mock";
@@ -15,7 +16,6 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/session-tools";
 import { listXdevTools, XDEV_EXTERNAL_DESCRIPTION_CAP, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { logger } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 
 // Cache-stability invariant: when MCP servers reconnect with byte-identical tool
 // definitions, `refreshMCPTools` must not rebuild the system prompt. A rebuild
@@ -73,7 +73,7 @@ function mountNoticesIn(messages: Message[]): string[] {
 			typeof content === "string"
 				? content
 				: content.flatMap(part => (part.type === "text" ? [part.text] : [])).join("");
-		return text.includes("The xd:// device inventory changed.") ? [text] : [];
+		return text.includes("xd:// device inventory changed.") ? [text] : [];
 	});
 }
 
@@ -264,6 +264,65 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		await Promise.all([olderRefresh, newerRefresh]);
 		expect(rebuildCount).toBe(2);
 		expect(session.systemPrompt).toEqual(["tools:read,mcp__nucleus_search,mcp__nucleus_fetch"]);
+	});
+
+	it("serializes explicit prompt refreshes with registry mutations", async () => {
+		const mutationEntered = Promise.withResolvers<void>();
+		const releaseMutation = Promise.withResolvers<void>();
+		const releaseStaleRefresh = Promise.withResolvers<void>();
+		const lateTool = createBasicTool("late_prompt_tool", "Late Prompt Tool");
+		const { session, toolRegistry } = newSession(async toolNames => {
+			if (!toolNames.includes(lateTool.name)) await releaseStaleRefresh.promise;
+			return `tools:${toolNames.join(",")}`;
+		});
+
+		const mutation = session.runToolRegistryMutation(async () => {
+			mutationEntered.resolve();
+			await releaseMutation.promise;
+			toolRegistry.set(lateTool.name, lateTool);
+			await session.setActiveToolsByName([...session.getEnabledToolNames(), lateTool.name]);
+		});
+		await mutationEntered.promise;
+		const explicitRefresh = session.refreshBaseSystemPrompt();
+		await Promise.resolve();
+
+		releaseMutation.resolve();
+		await mutation;
+		releaseStaleRefresh.resolve();
+		await explicitRefresh;
+
+		expect(session.systemPrompt).toEqual(["tools:read,mcp__nucleus_search,late_prompt_tool"]);
+	});
+
+	it("keeps queued mutations serialized when a waiting caller aborts", async () => {
+		const firstMutationEntered = Promise.withResolvers<void>();
+		const releaseFirstMutation = Promise.withResolvers<void>();
+		const { session } = newSession(async toolNames => `tools:${toolNames.join(",")}`);
+		const firstMutation = session.runToolRegistryMutation(async () => {
+			firstMutationEntered.resolve();
+			await releaseFirstMutation.promise;
+		});
+		await firstMutationEntered.promise;
+
+		const controller = new AbortController();
+		let abortedMutationRan = false;
+		const abortedMutation = session.runToolRegistryMutation(async () => {
+			abortedMutationRan = true;
+		}, controller.signal);
+		controller.abort(new Error("cancel queued mutation"));
+		await expect(abortedMutation).rejects.toThrow("cancel queued mutation");
+
+		let thirdMutationRan = false;
+		const thirdMutation = session.runToolRegistryMutation(async () => {
+			thirdMutationRan = true;
+		});
+		await Promise.resolve();
+		expect(thirdMutationRan).toBe(false);
+
+		releaseFirstMutation.resolve();
+		await Promise.all([firstMutation, thirdMutation]);
+		expect(abortedMutationRan).toBe(false);
+		expect(thirdMutationRan).toBe(true);
 	});
 
 	it("drops queued and in-flight MCP prompt commits when disposal begins", async () => {
@@ -879,10 +938,10 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(contexts).toHaveLength(2);
 		const mountNotices = mountNoticesIn(contexts[1]);
 		expect(mountNotices).toHaveLength(1);
-		expect(mountNotices[0]).toContain("became available");
+		expect(mountNotices[0]).toContain("Available tools.");
 		expect(mountNotices[0]).toContain("xd://mcp__nucleus_search");
 		expect(mountNotices[0]).toContain("xd://mcp__nucleus_fetch");
-		expect(mountNotices[0]).not.toContain("No longer mounted");
+		expect(mountNotices[0]).not.toContain("Unmounted; writes fail:");
 
 		// A later unmount is likewise held for the following user prompt.
 		await session.refreshMCPTools([search]);
@@ -891,9 +950,9 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		await session.prompt("third");
 		const allNotices = mountNoticesIn(contexts[2]);
 		expect(allNotices).toHaveLength(2);
-		expect(allNotices[1]).toContain("No longer mounted");
+		expect(allNotices[1]).toContain("Unmounted; writes fail:");
 		expect(allNotices[1]).toContain("xd://mcp__nucleus_fetch");
-		expect(allNotices[1]).not.toContain("became available");
+		expect(allNotices[1]).not.toContain("Available tools.");
 	});
 
 	it("caps dynamic xd:// mount-notice summaries", async () => {
@@ -950,7 +1009,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(notices).toHaveLength(1);
 		expect(notices[0]).toContain("xd://mcp__nucleus_search");
 		expect(notices[0]).not.toContain("mcp__nucleus_fetch");
-		expect(notices[0]).not.toContain("No longer mounted");
+		expect(notices[0]).not.toContain("Unmounted; writes fail:");
 	});
 
 	it.each([

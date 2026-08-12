@@ -47,6 +47,36 @@ export function piReadPath(readPath: string, offset?: number, limit?: number): s
 	return count === undefined ? `${readPath}:raw:${start}-` : `${readPath}:raw:${start}+${count}`;
 }
 
+const READ_RANGE_CHUNK_RE = /^L?(\d+)(?:(\.\.|[-+])L?(\d+)?)?$/i;
+
+function isReadRangeList(value: string): boolean {
+	return value.split(",").every(chunk => {
+		const match = READ_RANGE_CHUNK_RE.exec(chunk);
+		if (!match) return false;
+		const start = Number.parseInt(match[1]!, 10);
+		if (start < 1) return false;
+		const separator = match[2];
+		if (!separator) return true;
+		const end = match[3] ? Number.parseInt(match[3], 10) : undefined;
+		if (separator === "+") return end !== undefined && end >= 1;
+		return end === undefined || end >= start;
+	});
+}
+
+/**
+ * Whether a read path ends in an OMP line selector, including compound `raw`
+ * forms. Cursor uses this only to describe the operation already executed by
+ * the coding-agent read tool; the selector remains embedded in the path.
+ */
+export function piReadPathHasRange(readPath: string): boolean {
+	const chunks = readPath.split(":");
+	const last = chunks.at(-1);
+	if (last && isReadRangeList(last)) return true;
+	if (last?.toLowerCase() !== "raw") return false;
+	const preceding = chunks.at(-2);
+	return preceding !== undefined && isReadRangeList(preceding);
+}
+
 /**
  * The same range as {@link piReadPath}, rendered for a transcript block rather
  * than for execution.
@@ -132,4 +162,26 @@ export function piLimit(limit: number | undefined): number | undefined {
  */
 export function piTimeout(timeout: number | undefined): number | undefined {
 	return timeout !== undefined && timeout >= 0 ? timeout : undefined;
+}
+
+/**
+ * Drop keys whose value is `undefined` so optional local-tool kwargs stay
+ * absent rather than present-as-undefined.
+ *
+ * The Cursor exec bridge historically wrote forms like
+ * `cwd: workingDirectory || undefined` and
+ * `case: caseInsensitive === true ? false : undefined`. ArkType rejects a
+ * present `undefined` on an optional field (`was undefined`) even though
+ * omitting the key is valid — which flooded Cursor sessions with bash/grep
+ * validation errors for otherwise fine frames.
+ */
+export function omitUndefinedArgs<T extends Record<string, unknown>>(
+	args: T,
+): { [K in keyof T]?: Exclude<T[K], undefined> } {
+	const out: Record<string, unknown> = {};
+	for (const key of Object.keys(args)) {
+		const value = args[key];
+		if (value !== undefined) out[key] = value;
+	}
+	return out as { [K in keyof T]?: Exclude<T[K], undefined> };
 }

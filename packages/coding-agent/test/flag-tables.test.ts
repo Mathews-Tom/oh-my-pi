@@ -56,6 +56,35 @@ describe("OPTIONAL_VALUE_FLAGS table is honored by args.ts parseArgs", () => {
 	}
 });
 
+describe("--external-thinking", () => {
+	it("enables external thinking without consuming the initial message", () => {
+		const result = parseArgs(["--external-thinking", "check this"]);
+
+		expect(result.externalThinking).toBe(true);
+		expect(result.messages).toEqual(["check this"]);
+	});
+
+	it("stays unset when omitted", () => {
+		expect(parseArgs([]).externalThinking).toBeUndefined();
+	});
+});
+describe("--session-dir", () => {
+	it("uses PI_CODING_AGENT_SESSION_DIR unless the CLI flag overrides it", () => {
+		const previous = Bun.env.PI_CODING_AGENT_SESSION_DIR;
+		Bun.env.PI_CODING_AGENT_SESSION_DIR = "/env/sessions";
+		try {
+			expect(parseArgs([]).sessionDir).toBe("/env/sessions");
+			expect(parseArgs(["--session-dir", "/cli/sessions"]).sessionDir).toBe("/cli/sessions");
+		} finally {
+			if (previous === undefined) {
+				delete Bun.env.PI_CODING_AGENT_SESSION_DIR;
+			} else {
+				Bun.env.PI_CODING_AGENT_SESSION_DIR = previous;
+			}
+		}
+	});
+});
+
 describe("--tools legacy aliases", () => {
 	it("maps search and find to grep and glob", () => {
 		const result = parseArgs(["--tools", "search,find,grep"]);

@@ -74,6 +74,7 @@ import type { ToolResultMessage } from "../../types";
  * and their translation are consumed together.
  */
 export {
+	omitUndefinedArgs,
 	piEscapeRegexLiteral,
 	piGrepSkip,
 	piJoinPath,
@@ -81,6 +82,7 @@ export {
 	piLsPath,
 	piReadDisplayPath,
 	piReadPath,
+	piReadPathHasRange,
 	piTimeout,
 } from "../cursor-pi-args";
 

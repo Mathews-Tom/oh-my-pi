@@ -144,6 +144,7 @@ import { isKimiK3ModelId } from "@oh-my-pi/pi-catalog/identity";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import {
 	$env,
+	logger,
 	parseJsonWithRepair,
 	parseStreamingJson,
 	parseStreamingJsonThrottled,
@@ -209,17 +210,80 @@ import {
 	buildPiWriteError,
 	buildPiWriteRejected,
 	buildPiWriteResult,
+	omitUndefinedArgs,
 	piEscapeRegexLiteral,
 	piGrepSkip,
 	piJoinPath,
 	piLimit,
 	piLsPath,
 	piReadDisplayPath,
+	piReadPathHasRange,
 	piTimeout,
 } from "./cursor/exec-modern";
 
 export const CURSOR_API_URL = "https://api2.cursor.sh";
 export const CURSOR_CLIENT_VERSION = "cli-2026.07.23-e383d2b";
+
+/**
+ * HTTP/1 connection-specific headers that HTTP/2 forbids. Node's `http2.request()`
+ * throws `ERR_HTTP2_INVALID_CONNECTION_HEADERS` on these rather than dropping
+ * them, so a caller sending one would kill the request outright.
+ */
+const HTTP2_FORBIDDEN_HEADERS = new Set([
+	"connection",
+	"keep-alive",
+	"proxy-connection",
+	"transfer-encoding",
+	"upgrade",
+	"http2-settings",
+]);
+
+/**
+ * Header names the Cursor request sets for itself. A caller copy in ANY casing
+ * has to go: the spread below adds the fixed lower-case name regardless, and two
+ * spellings of one field are a duplicate rather than an override.
+ */
+const CURSOR_RESERVED_HEADERS = new Set([
+	"content-type",
+	"connect-protocol-version",
+	"te",
+	"authorization",
+	"x-ghost-mode",
+	"x-cursor-client-version",
+	"x-cursor-client-type",
+	"x-request-id",
+	// Transport-owned even though this request never sets it: node's http2 client
+	// suppresses the `:authority` it derives from the URL when a plain `host`
+	// header is present, so a caller value here silently retargets the request at
+	// a different virtual host.
+	"host",
+	// The Connect body is streamed after the headers (initial frame, heartbeats,
+	// tool responses), so no caller-supplied length can describe it and an HTTP/2
+	// peer resets the stream once the body diverges.
+	"content-length",
+]);
+
+/**
+ * Reduce caller-supplied headers to what this HTTP/2 request can legally carry.
+ *
+ * Everything is lower-cased, because HTTP/2 field names are lower-case and node
+ * compares them that way. A caller `Authorization` next to the fixed
+ * `authorization` does not lose to it, it DUPLICATES it, and node throws
+ * `ERR_HTTP2_HEADER_SINGLE_VALUE` before the request goes out. Same for a `TE`
+ * that is not `trailers`. Node throws on all three classes here rather than
+ * ignoring them, so a miss turns a harmless header into a dead request.
+ */
+function sanitizeCursorCallerHeaders(headers: Record<string, string> | undefined): Record<string, string> {
+	const sanitized: Record<string, string> = {};
+	for (const [name, value] of Object.entries(headers ?? {})) {
+		const field = name.toLowerCase();
+		if (field.startsWith(":")) continue;
+		if (HTTP2_FORBIDDEN_HEADERS.has(field)) continue;
+		if (CURSOR_RESERVED_HEADERS.has(field)) continue;
+		sanitized[field] = value;
+	}
+	return sanitized;
+}
 
 const CURSOR_PROXY_TUNNEL_TIMEOUT_MS = 30_000;
 
@@ -233,6 +297,7 @@ const NOT_IMPLEMENTED = `Not implemented by this client`;
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
+const warnedCursorKimiK3ReplayMessages = new Set<string>();
 
 export interface CursorOptions extends StreamOptions {
 	customSystemPrompt?: string;
@@ -542,7 +607,22 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			const baseUrl = model.baseUrl || CURSOR_API_URL;
 			const requestPath = "/agent.v1.AgentService/Run";
+			// Caller headers are additive, and are spread FIRST so the protocol
+			// framing, auth, and request id below always win. Cursor built this map
+			// from scratch and never read `options.headers`, so tracing/attribution
+			// headers set by a caller (or a `before_provider_headers` extension) were
+			// silently dropped here while working on other providers.
+			//
+			// Two classes are stripped because node's http2 client THROWS on them
+			// rather than ignoring them, which would turn a harmless header into a
+			// dead request: pseudo-headers, which belong to the transport, and the
+			// HTTP/1 connection-specific headers HTTP/2 forbids outright
+			// (ERR_HTTP2_INVALID_CONNECTION_HEADERS). `te` needs no filtering here —
+			// HTTP/2 allows it only as `trailers`, which is exactly what the fixed
+			// set below re-applies over anything a caller sent.
+			const callerHeaders = sanitizeCursorCallerHeaders(options?.headers);
 			const requestHeaders = {
+				...callerHeaders,
 				":method": "POST",
 				":path": requestPath,
 				"content-type": "application/connect+proto",
@@ -1320,7 +1400,7 @@ async function handleExecServerMessage(
 					buildReadResultFromToolResult(
 						args.path,
 						toolResult,
-						args.offset !== undefined || args.limit !== undefined,
+						args.offset !== undefined || args.limit !== undefined || piReadPathHasRange(args.path),
 					),
 				reason => buildReadRejectedResult(args.path, reason),
 				error => buildReadErrorResult(args.path, error),
@@ -1816,11 +1896,14 @@ async function handleExecServerMessage(
 		case "piEditArgs": {
 			const args = execMsg.message.value;
 			const toolCallId = crypto.randomUUID();
-			// `PiEditReplacement` is the local `edit` tool's replace mode verbatim:
-			// snake_case `old_text`/`new_text` entries against one path.
+			// `PiEditReplacement` maps onto the local `edit` tool's replace mode:
+			// one snake_case `old_string`/`new_string` per call. Multi-replacement
+			// frames display the first replacement; the exec handler applies all.
+			const firstEdit = args.edits[0];
 			synthesizeCursorExecToolCall(output, stream, state, toolCallId, "edit", {
 				path: args.path,
-				edits: args.edits.map(edit => ({ old_text: edit.oldText, new_text: edit.newText })),
+				old_string: firstEdit?.oldText ?? "",
+				new_string: firstEdit?.newText ?? "",
 			});
 			const { execResult } = await resolveExecHandler(
 				{ args, toolCallId },
@@ -2434,15 +2517,21 @@ function toolResultDetailBoolean(toolResult: ToolResultMessage, key: string): bo
 /**
  * The file's own line count, when the tool recorded one.
  *
- * `details.meta.truncation.totalLines` is the whole file; the flat
- * `details.truncation.totalLines` counts from the window's start line and is
- * deliberately not consulted here. Absent for a read that returned the file
- * whole, where the payload IS the file and counting it is exact.
+ * Read results expose the source-wide count directly when known. Older tool
+ * results carry it at `details.meta.truncation.totalLines`; the flat
+ * `details.truncation.totalLines` counts from a window's start and is
+ * deliberately not consulted here.
  */
 function readTotalLinesFromDetails(toolResult: ToolResultMessage): number | undefined {
-	if (!toolResult.details || typeof toolResult.details !== "object") return undefined;
-	const meta = (toolResult.details as { meta?: { truncation?: { totalLines?: unknown } } }).meta;
-	const totalLines = meta?.truncation?.totalLines;
+	const details = toolResult.details;
+	if (!details || typeof details !== "object") return undefined;
+	const direct = "totalLines" in details ? details.totalLines : undefined;
+	if (typeof direct === "number" && Number.isFinite(direct)) return direct;
+	const meta = "meta" in details ? details.meta : undefined;
+	if (!meta || typeof meta !== "object") return undefined;
+	const truncation = "truncation" in meta ? meta.truncation : undefined;
+	if (!truncation || typeof truncation !== "object") return undefined;
+	const totalLines = "totalLines" in truncation ? truncation.totalLines : undefined;
 	return typeof totalLines === "number" && Number.isFinite(totalLines) ? totalLines : undefined;
 }
 
@@ -2462,7 +2551,7 @@ function buildReadResultFromToolResult(path: string, toolResult: ToolResultMessa
 	// whole file. Under a composed window it is the window's, and answering a
 	// 20-line page of a 100-line file with `total_lines: 20` tells a paginating
 	// server it has reached the end.
-	const totalLines = readTotalLinesFromDetails(toolResult) ?? (text ? text.split("\n").length : 0);
+	const totalLines = readTotalLinesFromDetails(toolResult) ?? (rangeApplied ? 0 : text ? text.split("\n").length : 0);
 	return create(ReadResultSchema, {
 		result: {
 			case: "success",
@@ -3580,11 +3669,14 @@ export function synthesizeCursorExecToolCall(
 ): void {
 	endCurrentTextBlock(output, stream, state);
 	endCurrentThinkingBlock(output, stream, state);
+	// Exec-frame translators often write `optional: value || undefined`. A
+	// present `undefined` fails ArkType optional-field validation; drop those
+	// keys so the transcript block matches what a model-native call would omit.
 	const block: ToolCallState = {
 		type: "toolCall",
 		id: toolCallId,
 		name: toolName,
-		arguments: args,
+		arguments: omitUndefinedArgs(args),
 		[kStreamingBlockIndex]: output.content.length,
 		[kStreamingBlockKind]: "cursor-exec",
 		[kCursorExecResolved]: true,
@@ -3899,6 +3991,15 @@ export function processInteractionUpdate(
 		}
 	} else if (updateCase === "turnEnded") {
 		output.stopReason = "stop";
+		if (
+			isKimiK3ModelId(output.model) &&
+			!output.content.some(item => item.type === "thinking" && item.thinking.length > 0)
+		) {
+			logger.warn(
+				"Cursor kimi-k3 turn completed without thinking blocks; persisted history will replay this turn without reasoning",
+				{ model: output.model, messageTimestamp: output.timestamp },
+			);
+		}
 	} else if (updateCase === "tokenDelta") {
 		const tokenDelta = update.message.value;
 		usageState.sawTokenDelta = true;
@@ -4110,17 +4211,34 @@ function assertCursorKimiK3HistoryReplayable(
 ): void {
 	if (!targetModelId || !isKimiK3ModelId(targetModelId)) return;
 	const historyEnd = activeUserMessageIndex >= 0 ? activeUserMessageIndex : messages.length;
+	const missingThinkingTurns: number[] = [];
+	const newlyWarnedKeys: string[] = [];
+	let assistantTurn = 0;
 	for (let i = 0; i < historyEnd; i++) {
 		const msg = messages[i];
 		if (msg.role !== "assistant") continue;
+		assistantTurn++;
 		const isSameCursorModel = msg.api === "cursor-agent" && msg.provider === "cursor" && msg.model === targetModelId;
-		const hasThinking = msg.content.some(item => item.type === "thinking" && item.thinking.length > 0);
-		if (!isSameCursorModel || !hasThinking) {
+		if (!isSameCursorModel) {
+			// Foreign history genuinely cannot replay K3 thinking: another model's
+			// turns carry no K3-signed reasoning to reconstruct.
 			throw new AIError.ValidationError(
-				`Cursor ${targetModelId} requires complete same-model thinking history; start a new session instead of continuing history from ${msg.provider}/${msg.model}.`,
+				`Cursor ${targetModelId} cannot continue history from a different model (${msg.provider}/${msg.model}); start a new session.`,
 			);
 		}
+		const hasThinking = msg.content.some(item => item.type === "thinking" && item.thinking.length > 0);
+		if (hasThinking) continue;
+		const warningKey = `${msg.api}\0${msg.provider}\0${msg.model}\0${msg.timestamp}`;
+		if (warnedCursorKimiK3ReplayMessages.has(warningKey)) continue;
+		missingThinkingTurns.push(assistantTurn);
+		newlyWarnedKeys.push(warningKey);
 	}
+	if (missingThinkingTurns.length === 0) return;
+	for (const key of newlyWarnedKeys) warnedCursorKimiK3ReplayMessages.add(key);
+	logger.warn(
+		`Cursor kimi-k3 history contains same-model assistant turn(s) ${missingThinkingTurns.join(", ")} without thinking blocks; replaying those spans without reasoning may make generation less stable`,
+		{ model: targetModelId, assistantTurns: missingThinkingTurns },
+	);
 }
 
 /**

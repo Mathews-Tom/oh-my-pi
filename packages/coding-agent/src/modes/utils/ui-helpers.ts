@@ -31,6 +31,8 @@ import {
 	readArgsCollapseIntoGroup,
 } from "../../modes/components/read-tool-group";
 import { SkillMessageComponent } from "../../modes/components/skill-message";
+import { StrippedToolCallsPlaceholder } from "../../modes/components/stripped-tool-calls-placeholder";
+import { ToolActivityContainer } from "../../modes/components/tool-activity";
 import { ToolExecutionComponent } from "../../modes/components/tool-execution";
 import { TranscriptBlock } from "../../modes/components/transcript-container";
 import { createUsageRowBlock } from "../../modes/components/usage-row";
@@ -39,6 +41,7 @@ import { decodeStreamedToolArgs, streamingStringKeysForTool } from "../../modes/
 import { materializeImageReferenceLinksSync } from "../../modes/image-references";
 import { theme } from "../../modes/theme/theme";
 import type { CompactionQueuedMessage, InteractiveModeContext, RenderSessionContextOptions } from "../../modes/types";
+import { LAUNCH_COMPLETION_MESSAGE_TYPE } from "../../session/launch-completion";
 import {
 	BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE,
 	type CustomMessage,
@@ -159,7 +162,8 @@ export class UiHelpers {
 			case "custom": {
 				if (message.display) {
 					if (message.customType === "async-result") {
-						this.ctx.chatContainer.addChild(buildAsyncResultBlock(message));
+						const component = buildAsyncResultBlock(message);
+						this.ctx.chatContainer.addChild(component);
 						break;
 					}
 					if (message.customType === LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE) {
@@ -170,6 +174,16 @@ export class UiHelpers {
 						).details;
 						const component = new LateDiagnosticsMessageComponent(details?.files ?? []);
 						component.setExpanded(this.ctx.toolOutputExpanded);
+						this.ctx.chatContainer.addChild(component);
+						break;
+					}
+					if (message.customType === LAUNCH_COMPLETION_MESSAGE_TYPE) {
+						const messageComponent = new CustomMessageComponent(
+							message as CustomMessage<unknown>,
+							this.ctx.viewSession.extensionRunner?.getMessageRenderer(message.customType),
+						);
+						messageComponent.setExpanded(this.ctx.toolOutputExpanded);
+						const component = new ToolActivityContainer(messageComponent);
 						this.ctx.chatContainer.addChild(component);
 						break;
 					}
@@ -497,6 +511,7 @@ export class UiHelpers {
 						content.name,
 						renderArgs,
 						{
+							useBuiltInRenderer: this.ctx.viewSession.hasBuiltInTool(content.name),
 							snapshots: getFileSnapshotStore(this.ctx.viewSession),
 							clipboard: getEditClipboard(this.ctx.viewSession),
 							showImages: settings.get("terminal.showImages"),
@@ -531,16 +546,7 @@ export class UiHelpers {
 				const strippedToolCalls = (message as AgentMessage & StrippedToolCallsMarker).strippedToolCalls ?? 0;
 				if (strippedToolCalls > 0) {
 					this.ctx.chatContainer.addChild(
-						new Text(
-							theme.fg(
-								"dim",
-								theme.italic(
-									`${strippedToolCalls} tool call${strippedToolCalls === 1 ? "" : "s"} elided — no result on this branch`,
-								),
-							),
-							1,
-							0,
-						),
+						new StrippedToolCallsPlaceholder(strippedToolCalls, !this.ctx.hideToolActivity),
 					);
 				}
 				pendingUsage =
@@ -738,9 +744,10 @@ export class UiHelpers {
 		this.ctx.present([new Spacer(1), text]);
 	}
 
-	showWarning(warningMessage: string): void {
+	showWarning(warningMessage: string, options?: { hideWithToolActivity?: boolean }): void {
 		const text = new Text(`Warning: ${warningMessage}`, 1, 0).setStyleFn(t => theme.fg("warning", t));
-		this.ctx.present([new Spacer(1), text]);
+		const content = [new Spacer(1), text];
+		this.ctx.present(options?.hideWithToolActivity ? new ToolActivityContainer(content) : content);
 	}
 
 	showNewVersionNotification(newVersion: string): void {
