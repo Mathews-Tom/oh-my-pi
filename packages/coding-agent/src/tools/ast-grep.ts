@@ -22,6 +22,7 @@ import { formatMatchLine } from "./match-line-format";
 import type { OutputMeta } from "./output-meta";
 import { type ResolvedSearchTarget, resolveToolSearchScope, toPathList } from "./path-utils";
 import { loadPermissionsConfig } from "./permissions/config";
+import { isExemptPathArgument } from "./permissions/resolve";
 import { excludeDenyReadSearchTargets } from "./permissions/tool-path-targets";
 import {
 	appendParseErrorsBulletList,
@@ -217,6 +218,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				signal,
 				localProtocolOptions: this.session.localProtocolOptions,
 				skills: this.session.skills,
+				isExemptSourceInput: isExemptPathArgument,
 				resolveExternalUrl: async rawPath => {
 					const target = parseReadUrlTarget(rawPath);
 					if (!target) return undefined;
@@ -240,8 +242,16 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 					additionalDirectories: this.session.additionalDirectories ?? [],
 				};
 				const targets = multiTargets ?? [{ basePath: resolvedSearchPath, glob: globFilter, pathIsFile: false }];
-				const filteredTargets = await excludeDenyReadSearchTargets(targets, policy, permissionRoots);
-				if (filteredTargets) effectiveTargets = filteredTargets;
+				const exemptTargets = targets.filter(target => scope.exemptSourcePaths.has(path.resolve(target.basePath)));
+				const targetsToFilter =
+					exemptTargets.length > 0
+						? targets.filter(target => !scope.exemptSourcePaths.has(path.resolve(target.basePath)))
+						: targets;
+				const filteredTargets =
+					targetsToFilter.length > 0
+						? await excludeDenyReadSearchTargets(targetsToFilter, policy, permissionRoots)
+						: [];
+				if (filteredTargets) effectiveTargets = [...exemptTargets, ...filteredTargets];
 			}
 
 			const DEFAULT_AST_LIMIT = 50;

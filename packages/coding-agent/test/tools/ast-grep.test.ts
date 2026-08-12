@@ -238,4 +238,46 @@ describe("ast_grep parse errors", () => {
 			await removeWithRetries(tempDir);
 		}
 	});
+
+	it("searches an exempt local:// directory despite deny.read filtering", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-grep-local-permissions-"));
+		try {
+			const artifactsDir = path.join(tempDir, "artifacts");
+			const localDir = path.join(artifactsDir, "local", "notes");
+			await fs.mkdir(localDir, { recursive: true });
+			await Bun.write(path.join(localDir, "plan.ts"), "const localPlan = 1;\n");
+
+			const settings = Settings.isolated({
+				"astGrep.enabled": true,
+				"tools.xdev": false,
+				"permissions.profile": "strict",
+				"permissions.deny.read": ["**/*"],
+			});
+			const tools = await createTools(
+				createTestSession(tempDir, {
+					settings,
+					localProtocolOptions: {
+						getArtifactsDir: () => artifactsDir,
+						getSessionId: () => "ast-grep-local",
+					},
+				}),
+			);
+			const tool = tools.find(entry => entry.name === "ast_grep");
+			expect(tool).toBeDefined();
+
+			const result = await tool!.execute("ast-grep-local-permissions", {
+				pat: "const $NAME = 1",
+				path: "local://notes",
+			});
+			const details = result.details as
+				| { files?: string[]; filesSearched?: number; matchCount?: number }
+				| undefined;
+
+			expect(details?.filesSearched).toBe(1);
+			expect(details?.matchCount).toBe(1);
+			expect(details?.files?.map(file => path.basename(file))).toEqual(["plan.ts"]);
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
 });

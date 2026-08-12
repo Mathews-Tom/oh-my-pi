@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Patch } from "@oh-my-pi/hashline";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { getMemoryRoot } from "@oh-my-pi/pi-coding-agent/memories";
 import type { PermissionRoots } from "@oh-my-pi/pi-coding-agent/tools/permissions";
 import {
 	CLASSIFIED_TOOL_NAMES,
@@ -157,6 +158,50 @@ describe("structured extraction", () => {
 		expect(extract("read", { path: "   " })).toEqual([]);
 		expect(extract("read", { path: 42 })).toEqual([]);
 		expect(extract("ast_edit", { paths: "not-an-array" })).toEqual([]);
+	});
+
+	it("authorizes learn's backend-specific persistence target", () => {
+		const agentDir = path.join(nonRepoWorkspace, "agent");
+		const localRoots: PermissionRoots = {
+			cwd: nonRepoWorkspace,
+			additionalDirectories: [],
+			agentDir,
+			settings: settingsOf({ "memory.backend": "local" }),
+		};
+		expect(extract("learn", { memory: "Remember this." }, localRoots)).toEqual([
+			{ raw: path.join(getMemoryRoot(agentDir, nonRepoWorkspace), "learned.md"), access: "write", field: "memory" },
+		]);
+
+		const dbPath = path.join(nonRepoWorkspace, "mnemopi.db");
+		const mnemopiRoots: PermissionRoots = {
+			cwd: nonRepoWorkspace,
+			additionalDirectories: [],
+			agentDir,
+			settings: settingsOf({ "memory.backend": "mnemopi", "mnemopi.dbPath": dbPath }),
+		};
+		expect(
+			extract("learn", { memory: "Remember this." }, mnemopiRoots).map(target => `${target.access}:${target.raw}`),
+		).toEqual([
+			`read:${dbPath}`,
+			`write:${dbPath}`,
+			`read:${dbPath}-wal`,
+			`write:${dbPath}-wal`,
+			`read:${dbPath}-shm`,
+			`write:${dbPath}-shm`,
+		]);
+
+		const hindsightRoots: PermissionRoots = {
+			...localRoots,
+			settings: settingsOf({ "memory.backend": "hindsight" }),
+		};
+		expect(extract("learn", { memory: "Remember this." }, hindsightRoots)).toEqual([]);
+	});
+
+	it("authorizes the temporary directory github pr_create uses for a body file", () => {
+		expect(extract("github", { op: "pr_create", body: "Add release notes." })).toEqual([
+			{ raw: os.tmpdir(), access: "write", field: "body" },
+		]);
+		expect(extract("github", { op: "pr_create", body: "" })).toEqual([]);
 	});
 
 	describe("mnemopi persistence targets", () => {

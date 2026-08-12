@@ -19,6 +19,7 @@
 import type { Dirent } from "node:fs";
 import { readdirSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Patch } from "@oh-my-pi/hashline";
 import { getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
@@ -117,7 +118,9 @@ function pushDelimited(out: PathTarget[], raw: unknown, access: PathAccess, fiel
 
 function pushArray(out: PathTarget[], raw: unknown, access: PathAccess, field: string): void {
 	if (!Array.isArray(raw)) return;
-	for (const entry of raw) pushPath(out, entry, access, field);
+	for (const entry of raw) {
+		if (typeof entry === "string") pushPath(out, normalizePathLikeInput(entry), access, field);
+	}
 }
 
 /** A single top-level string argument. */
@@ -506,18 +509,22 @@ const extractManageSkillPaths: PathTargetExtractor = args => {
  *   `<agentDir>/<memories>/<project>/learned.md` (`saveLearnedLesson`,
  *   `memories/index.ts`) — resolved against `roots.agentDir` (the session's
  *   actual `Settings#getAgentDir()`, which can diverge from the process
- *   default) since this is the one branch that is session-scoped. Checked
- *   unconditionally rather than only for the `local` backend: the extractor
- *   has no access to `memory.backend` (only `args`/`roots`), and authorizing
- *   a path the call ends up not writing is at worst an over-cautious denial,
- *   never a bypass.
+ *   default).
+ * - Mnemopi persists through `state.rememberScoped` into the configured SQLite
+ *   database, so the database and WAL/SHM sidecars require the same read/write
+ *   authorization as `memory_edit` and `retain`.
  * - Its optional `skill` payload writes/enhances a managed skill exactly like
  *   `manage_skill` (`writeManagedSkill`), never deletes one.
  */
 const extractLearnPaths: PathTargetExtractor = (args, roots) => {
 	const out: PathTarget[] = [];
-	const agentDir = roots.agentDir ?? getAgentDir();
-	pushPath(out, path.join(getMemoryRoot(agentDir, roots.cwd), LEARNED_LESSONS_FILE), "write", "memory");
+	const backend = roots.settings?.get("memory.backend");
+	if (backend === "mnemopi") {
+		out.push(...extractMnemopiPaths(args, roots));
+	} else if (backend === "local") {
+		const agentDir = roots.agentDir ?? getAgentDir();
+		pushPath(out, path.join(getMemoryRoot(agentDir, roots.cwd), LEARNED_LESSONS_FILE), "write", "memory");
+	}
 	if (args.skill && typeof args.skill === "object" && !Array.isArray(args.skill)) {
 		const target = managedSkillPath((args.skill as Record<string, unknown>).name, "SKILL.md");
 		if (target) pushPath(out, target, "write", "skill");
@@ -562,6 +569,12 @@ const extractMnemopiPaths: PathTargetExtractor = (_args, roots) => {
 		pushPath(out, candidate, "write", "mnemopi.dbPath");
 	}
 	return out;
+};
+
+/** `github pr_create` writes a body file under the process temp root before invoking `gh`. */
+const extractGithubPaths: PathTargetExtractor = args => {
+	if (args.op !== "pr_create" || typeof args.body !== "string" || args.body.length === 0) return [];
+	return [{ raw: os.tmpdir(), access: "write", field: "body" }];
 };
 
 // `hub`, `browser`, `bash`, `eval`, and `computer` all reach arbitrary code —
@@ -891,6 +904,7 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 		resultTargets: extractInspectImageResultTargets,
 	},
 	security_scan: { kind: "structured", extract: extractSecurityScanPaths },
+	github: { kind: "structured", extract: extractGithubPaths },
 	learn: { kind: "structured", extract: extractLearnPaths },
 	manage_skill: { kind: "structured", extract: extractManageSkillPaths },
 	memory_edit: { kind: "structured", extract: extractMnemopiPaths },
@@ -906,7 +920,6 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	// ── No filesystem surface ─────────────────────────────────────────────
 	ask: { kind: "pathless" },
 	checkpoint: { kind: "pathless" },
-	github: { kind: "pathless" },
 	recall: { kind: "pathless" },
 	reflect: { kind: "pathless" },
 	rewind: { kind: "pathless" },

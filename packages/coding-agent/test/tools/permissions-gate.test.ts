@@ -261,6 +261,7 @@ describe("autolearn persistence", () => {
 	it("blocks local lessons and managed skills matched by deny.write", async () => {
 		const lessonContext = contextOf({
 			...WORKSPACE,
+			"memory.backend": "local",
 			"permissions.confineWrites": false,
 			"permissions.deny.write": ["**/learned.md"],
 		});
