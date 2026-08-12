@@ -117,10 +117,10 @@ export async function warmupLspServers(cwd: string, options?: LspWarmupOptions):
 				);
 			}
 			// Passed through to getOrCreateClient so a brand-new client's
-			// permissionsContext is set before its message reader starts —
-			// see the parameter doc on getOrCreateClient. A post-hoc
-			// `client.permissionsContext = options?.context` here would leave
-			// the whole init-handshake window checking against `undefined`.
+			// permissionsContexts is populated before its message reader starts —
+			// see the parameter doc on getOrCreateClient. A post-hoc stamp here
+			// would leave the whole init-handshake window checking against
+			// `undefined`.
 			const client = await getOrCreateClient(
 				serverConfig,
 				cwd,

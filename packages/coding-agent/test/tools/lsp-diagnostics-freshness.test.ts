@@ -59,6 +59,7 @@ function createClient(cwd: string, config: ServerConfig): LspClient {
 		activeProgressTokens: new Set(),
 		projectLoaded: Promise.resolve(),
 		resolveProjectLoaded: () => {},
+		permissionsContexts: new Map(),
 	};
 }
 
