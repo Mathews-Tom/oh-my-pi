@@ -13,6 +13,30 @@
 - Fixed four resource-permission soundness gaps left unfinished by an interrupted prior pass: the last remaining LSP client-creation call site (session-startup warmup) now threads its permission context through client construction instead of stamping it after the client is already reachable by an in-flight server push; workspace-wide `diagnostics` (`file: "*"`) under `permissions.confineReads: true` with no `deny.read` globs is no longer silently unconfined; `ast_edit`'s post-execution recheck of files touched beyond the declared scope (the same defense-in-depth layer `grep`/`ast_grep` get) now authorizes read access in addition to write, matching its own dry-run preview which reads every matched file; `security_scan`'s `preflight()` now authorizes its effective output directory before opening the underlying store, so a denied call can no longer leave store state (index, project directory) already created on disk.
 - Fixed four resource-permission soundness gaps found in a fourth fresh review round: `edit` now requires `read` access (not only `write`) for an `update` or `delete` operation on an existing file — including hashline sections and `apply_patch`'s `*** Update File`/`*** Delete File` markers — since these read the file's current content to compute the returned diff, and a `deny.read`-only rule with no matching `deny.write` previously let that content through; `getOrCreateClient` no longer clears an already-cached LSP client's permission context when a caller omits one (an internal helper call, not a direct tool dispatch), and workspace `symbols`/`reload` now thread their own call's context through instead of omitting it; workspace-symbol search (`action: "symbols"`) now filters its server-returned results against the read policy, the same way `definition`/`references`/etc. already did; and the opaque-tool literal scan now normalizes every candidate spelling to `/` before matching, so a Windows-spelled literal or a `\`-separated relative path is no longer missed by a `/`-written deny rule.
 
+## [17.2.15] - 2026-08-12
+
+### Added
+
+- Added `--external-thinking` CLI flag to force external thinking tool activation.
+- Added `omp compress` command, which uses an isolated, two-tool agent loop to rewrite single or multiple text files (supporting glob patterns and concurrent processing) into dense prompt registers.
+- Expanded tool discovery in `omp cleanse` to support `staticcheck` and `golangci-lint` (Go); `mypy`, `pylint`, `flake8`, `ty`, and `basedpyright` (Python); `oxlint`, `deno lint`, `stylelint`, and `vue-tsc` (JS/TS); and `actionlint` (GitHub Workflows).
+- Added support for natural language requests in `omp cleanse "<request>"`, which launches a discovery subagent to automatically inspect the project, determine the correct commands, and map outputs.
+- Added an interactive picker to `omp cleanse` when run without arguments on a TTY, allowing users to run all checkers, select a specific checker, or describe what to fix.
+
+### Changed
+
+- Restricted the `think` tool to GPT, Claude, and Gemini transports that support native reasoning replacement.
+- Increased the default subagent cap for `omp cleanse` from 8 to 32.
+
+### Fixed
+
+- Fixed a hang in headless `omp -p` runs when `plan.defaultOnStartup: true` is enabled by disabling the startup default in print mode.
+- Fixed `display.hideToolActivity` failing to hide certain activity blocks, such as reminders, diagnostics, and completions.
+- Fixed several issues in the MCP Streamable HTTP transport, including updating the negotiated protocol version to `2025-11-25`, resolving connection drops and SSE resumption gaps, and preventing double-execution of tools during auth refreshes.
+- Fixed `/handoff` losing local artifacts (plans, scratch files, research notes) by copying them across the handoff session boundary.
+- Replaced libarchive-based tar parsing with a hardened, in-process tar reader to prevent crashes and safely handle complex archive structures, symlinks, and sparse metadata.
+- Fixed `Ctrl+O` tool-output expansion failing to reach launch-completion messages wrapped in the hidden tool activity container.
+
 ## [17.2.14] - 2026-08-11
 
 ### Added
