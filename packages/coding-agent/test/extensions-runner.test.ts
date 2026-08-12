@@ -1988,7 +1988,7 @@ describe("ExtensionRunner", () => {
 				hasQueuedMessages: () => false,
 				abort: () => {},
 				settings: {
-					get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}),
+					get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : undefined),
 				} as never,
 				toolCall: {
 					batchId: "batch-preview",
@@ -2790,7 +2790,7 @@ describe("ExtensionRunner", () => {
 			const wrapped = new ExtensionToolWrapper(tool, runner);
 			let effectiveTier: string | undefined;
 			const xdevContext = {
-				settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : {}) },
+				settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : undefined) },
 				xdevApproved: true,
 				xdevTierResolved: (tier: string) => {
 					effectiveTier = tier;
