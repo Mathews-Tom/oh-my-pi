@@ -218,6 +218,26 @@ describe("glob dialect", () => {
 	});
 });
 
+describe("read-path normalization", () => {
+	// `read({ path: "secret\\ file.txt" })` checks the literal-backslash spelling
+	// here, but `resolveReadPath` strips the shell escape before the file is
+	// actually opened, so the on-disk read lands on "secret file.txt" — a
+	// different candidate than the one the deny glob was matched against.
+	it("denies a shell-escaped spelling that resolves to a denied file at open time", () => {
+		fs.writeFileSync(path.join(workspace, "secret file.txt"), "SECRET=1");
+		const policy = buildPermissionPolicy("workspace", { denyRead: ["**/secret file.txt"] });
+		const denied = decideTarget(target("secret\\ file.txt"), policy, roots);
+		expect(denied.kind).toBe("deny");
+		if (denied.kind === "deny") expect(denied.rule).toBe("**/secret file.txt");
+	});
+
+	it("still permits an ordinary escaped path with no denied on-disk variant", () => {
+		fs.writeFileSync(path.join(workspace, "plain file.txt"), "hello");
+		const policy = buildPermissionPolicy("workspace", { denyRead: ["**/secret file.txt"] });
+		expect(decideTarget(target("plain\\ file.txt"), policy, roots).kind).toBe("allow");
+	});
+});
+
 describe("read selector suffixes", () => {
 	const policy = buildPermissionPolicy("strict");
 

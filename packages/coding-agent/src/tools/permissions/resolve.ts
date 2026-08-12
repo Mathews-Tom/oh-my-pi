@@ -7,11 +7,25 @@
  */
 import * as path from "node:path";
 import { extractUriScheme } from "../../internal-urls/parse";
-import { isInternalUrlPath, isReadableUrlPath, isSshUrl, resolveToCwd, splitPathAndSel } from "../path-utils";
+import {
+	isInternalUrlPath,
+	isReadableUrlPath,
+	isSshUrl,
+	resolveReadPath,
+	resolveToCwd,
+	splitPathAndSel,
+} from "../path-utils";
 import { confineToRoots, relativeToRoots } from "./confine";
 import { matchGlob, matchGlobCandidate } from "./matcher";
 import { denySuppressingGlobs } from "./profiles";
-import { ALLOW, type PathTarget, type PermissionDecision, type PermissionPolicy, type PermissionRoots } from "./types";
+import {
+	ALLOW,
+	type PathAccess,
+	type PathTarget,
+	type PermissionDecision,
+	type PermissionPolicy,
+	type PermissionRoots,
+} from "./types";
 
 /**
  * Schemes the {@link InternalUrlRouter} owns that `isInternalUrlPath` does not
@@ -64,14 +78,22 @@ export function permissionRootList(roots: PermissionRoots): string[] {
 /**
  * Resolve a raw tool path argument to the absolute path the tool will act on.
  *
- * Mirrors `resolveToCwd`, which is what every structured-path tool uses, so
- * the guard and the tool cannot disagree about the target. A path that
- * `resolveToCwd` refuses (an internal scheme reaching this far) is reported as
- * unresolvable rather than guessed at, and the caller fails closed.
+ * For `access: "read"`, this calls `resolveReadPath` — the same on-disk
+ * normalization `read`, `inspect_image`, and `grep` apply before opening a
+ * file (shell-escape stripping, macOS NFD, curly-quote, and AM/PM variants).
+ * Without it, a raw spelling that checks clean against a deny glob (the
+ * literal-backslash form `resolveToCwd` sees) can still resolve, at open
+ * time, to a different on-disk file the glob would have matched. Writes keep
+ * the plain `resolveToCwd` behavior: there is no existing file to discover a
+ * variant spelling of.
+ *
+ * A path that resolution refuses (an internal scheme reaching this far) is
+ * reported as unresolvable rather than guessed at, and the caller fails
+ * closed.
  */
-export function resolveTargetPath(raw: string, cwd: string): string | null {
+export function resolveTargetPath(raw: string, cwd: string, access: PathAccess = "write"): string | null {
 	try {
-		return resolveToCwd(raw, cwd);
+		return access === "read" ? resolveReadPath(raw, cwd) : resolveToCwd(raw, cwd);
 	} catch {
 		return null;
 	}
@@ -269,7 +291,7 @@ export function decideTarget(target: PathTarget, policy: PermissionPolicy, roots
 			if (decision.kind === "deny") return decision;
 			continue;
 		}
-		const absolutePath = resolveTargetPath(spelling.raw, roots.cwd);
+		const absolutePath = resolveTargetPath(spelling.raw, roots.cwd, spelling.access);
 		if (!absolutePath) {
 			return {
 				kind: "deny",
