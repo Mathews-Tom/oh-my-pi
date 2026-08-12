@@ -17,8 +17,13 @@
 import * as path from "node:path";
 import { tokenizeShellSegments } from "../shell-tokenize";
 import { relativeSpellingGroups } from "./confine";
-import { matchGlob } from "./matcher";
-import { isExemptPathArgument, normalizeCandidate, permissionRootList, resolveTargetPath } from "./resolve";
+import {
+	isExemptPathArgument,
+	matchAccessRule,
+	normalizeCandidate,
+	permissionRootList,
+	resolveTargetPath,
+} from "./resolve";
 import type { PathAccess, PermissionPolicy, PermissionRoots } from "./types";
 
 /** A literal in an opaque argument that matched a deny rule. */
@@ -161,12 +166,16 @@ export function scanOpaqueArguments(
 		// merging them before matching would let an allow glob on the alias
 		// (`**/.env.example`) short-circuit the whole decision before the
 		// canonical spelling (`**/.env`) - what the command actually reads
-		// through the alias - is ever checked. Each identity gets its own
-		// allow-then-deny pass instead, so an allow on one spelling can never
-		// clear a deny on the other. `normalizeCandidate` matches
-		// `decidePathTarget`'s own normalization: permission globs are written
-		// with `/`, but `path.relative`/an absolute path (and a Windows-spelled
-		// literal the caller typed verbatim) use `\` on Windows.
+		// through the alias - is ever checked. Each identity goes through
+		// `matchAccessRule` instead of a standalone allow-then-deny check, so a
+		// profile's own default allow (e.g. `strict`'s `**/.env.example`
+		// carve-out) can never outrank a user's own, more specific
+		// `permissions.deny.*` entry for the same literal — the same
+		// precedence `decidePathTarget` already applies to a declared path
+		// argument. `normalizeCandidate` matches `decidePathTarget`'s own
+		// normalization: permission globs are written with `/`, but
+		// `path.relative`/an absolute path (and a Windows-spelled literal the
+		// caller typed verbatim) use `\` on Windows.
 		const spellings = relativeSpellingGroups(absolute, rootList);
 		const identities = [
 			[...spellings.lexical, spellings.resolved, path.basename(spellings.resolved), literal].map(normalizeCandidate),
@@ -175,8 +184,12 @@ export function scanOpaqueArguments(
 
 		for (const access of ["read", "write"] as const) {
 			for (const candidates of identities) {
-				if (matchGlob(policy.allow[access], candidates)) continue;
-				const rule = matchGlob(policy.deny[access], candidates);
+				const rule = matchAccessRule(candidates, {
+					allow: policy.allow[access],
+					deny: policy.deny[access],
+					explicitAllow: policy.explicitAllow[access],
+					explicitDeny: policy.explicitDeny[access],
+				});
 				if (rule) return { literal, rule, access };
 			}
 		}

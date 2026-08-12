@@ -306,7 +306,12 @@ const SSH_URL_RE = /^ssh:\/\/[^/]*(\/.*)?$/i;
  *
  * There is no local root to confine against (the file lives on a remote
  * host), so this checks only the deny/allow globs — the same lists a local
- * path faces — against the URL's remote path component and its basename.
+ * path faces — against the URL's remote path component and its basename,
+ * through the shared {@link matchAccessRule} precedence rather than a
+ * standalone allow-then-deny check: without it, a profile's own default
+ * allow (e.g. `strict`'s `**\/.env.example` carve-out) would silently outrank
+ * a user's own, more specific `permissions.deny.*` entry for the same remote
+ * path, exactly the gap {@link decidePathTarget} closes for local targets.
  * Unparseable input (no path component at all, e.g. a bare `ssh://host`)
  * fails closed: there is nothing to verify, and `permissions.profile` being
  * active is not a reason to wave it through.
@@ -331,22 +336,22 @@ function decideSshTarget(target: PathTarget, policy: PermissionPolicy): Permissi
 	}
 	const candidates = [decoded, path.posix.basename(decoded)].filter((c): c is string => !!c);
 
-	const allowed = matchGlob(policy.allow[target.access], candidates);
-	if (allowed) return ALLOW;
-
-	const denied = matchGlob(policy.deny[target.access], candidates);
-	if (denied) {
-		return {
-			kind: "deny",
-			rule: denied,
-			reason:
-				`${target.access === "write" ? "Writing" : "Reading"} "${target.raw}" is blocked by the ` +
-				`resource permission rule "${denied}" (permissions.profile: ${policy.profile}).\n` +
-				`To allow it: add "${denied}" to permissions.allow.${target.access}, ` +
-				`or set permissions.profile: off.`,
-		};
-	}
-	return ALLOW;
+	const rule = matchAccessRule(candidates, {
+		allow: policy.allow[target.access],
+		deny: policy.deny[target.access],
+		explicitAllow: policy.explicitAllow[target.access],
+		explicitDeny: policy.explicitDeny[target.access],
+	});
+	if (!rule) return ALLOW;
+	return {
+		kind: "deny",
+		rule,
+		reason:
+			`${target.access === "write" ? "Writing" : "Reading"} "${target.raw}" is blocked by the ` +
+			`resource permission rule "${rule}" (permissions.profile: ${policy.profile}).\n` +
+			`To allow it: add "${rule}" to permissions.allow.${target.access}, ` +
+			`or set permissions.profile: off.`,
+	};
 }
 
 /**

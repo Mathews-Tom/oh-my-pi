@@ -6,6 +6,7 @@
  * `tools.approvalMode` and `tools.approval.<tool>` exactly as before, so no
  * combination of these settings can auto-approve anything.
  */
+import type { Settings } from "../../config/settings";
 
 /** Whether a resolved path target is about to be read or written. */
 export type PathAccess = "read" | "write";
@@ -79,6 +80,15 @@ export interface PermissionRoots {
 	 * tools they authorize would themselves resolve to in that case.
 	 */
 	readonly agentDir?: string;
+	/**
+	 * The session's `Settings` instance, when the roots were built from a live
+	 * session. Only a handful of extractors need it — a call's own arguments
+	 * are normally the whole story — but a config-derived target like
+	 * `mnemopi.dbPath` (`extractMnemopiPaths`, `tool-path-targets.ts`) has no
+	 * per-call argument to read it from at all. `undefined` for the same
+	 * sessionless callers `agentDir` is already `undefined` for.
+	 */
+	readonly settings?: Settings;
 }
 
 /**

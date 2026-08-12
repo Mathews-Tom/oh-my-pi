@@ -286,6 +286,58 @@ describe("autolearn persistence", () => {
 	});
 });
 
+describe("mnemopi database persistence", () => {
+	// `memory_edit` and `retain` were classified `pathless`, which let
+	// `enforceResourcePermissions` return before ever resolving the configured
+	// Mnemopi SQLite database — a `permissions.deny.write` rule naming the
+	// memories directory did not stop either tool from mutating it.
+	const dbPath = () => path.join(workspace, "memories", "mnemopi", "mnemopi.db");
+
+	it("blocks memory_edit when the configured mnemopi db path is denied", async () => {
+		const context = contextOf({
+			...WORKSPACE,
+			"mnemopi.dbPath": dbPath(),
+			"permissions.deny.write": ["**/mnemopi/**"],
+		});
+		expect(await denialOf("memory_edit", { op: "forget", id: "m1" }, context)).toContain("**/mnemopi/**");
+	});
+
+	it("blocks retain the same way", async () => {
+		const context = contextOf({
+			...WORKSPACE,
+			"mnemopi.dbPath": dbPath(),
+			"permissions.deny.write": ["**/mnemopi/**"],
+		});
+		expect(await denialOf("retain", { items: [{ content: "Remember this." }] }, context)).toContain("**/mnemopi/**");
+	});
+
+	it("also blocks on a deny.read rule with no matching deny.write, since memory_edit looks a memory up before mutating it", async () => {
+		const context = contextOf({
+			...WORKSPACE,
+			"mnemopi.dbPath": dbPath(),
+			"permissions.deny.read": ["**/mnemopi/**"],
+		});
+		expect(await denialOf("memory_edit", { op: "forget", id: "m1" }, context)).toContain("**/mnemopi/**");
+	});
+
+	it("blocks a deny rule matching only the WAL sidecar file", async () => {
+		const context = contextOf({
+			...WORKSPACE,
+			"mnemopi.dbPath": dbPath(),
+			"permissions.deny.write": ["**/mnemopi.db-wal"],
+		});
+		expect(await denialOf("retain", { items: [{ content: "Remember this." }] }, context)).toContain(
+			"**/mnemopi.db-wal",
+		);
+	});
+
+	it("still runs when nothing denies the configured db path", async () => {
+		const context = contextOf({ ...WORKSPACE, "mnemopi.dbPath": dbPath() });
+		expect((await run("retain", { items: [{ content: "Remember this." }] }, context)).calls).toHaveLength(1);
+		expect((await run("memory_edit", { op: "forget", id: "m1" }, context)).calls).toHaveLength(1);
+	});
+});
+
 describe("managed-skill delete descendant protection", () => {
 	let agentTmpDir: string;
 	let previousAgentDir: string;
@@ -591,6 +643,28 @@ describe("debug action-aware classification", () => {
 	it("lets an ordinary launch through", async () => {
 		const params = { action: "launch", program: "./my_app", args: ["--flag"] };
 		expect((await run("debug", params, contextOf(STRICT))).calls).toHaveLength(1);
+	});
+
+	// The opaque literal scan `launch`/`attach` get instead of the plain
+	// structured classification never applies confinement (`scanOpaqueArguments`'s
+	// own doc-comment) — it only matches denied literals by name. Before
+	// `classifyTool` paired the scan with `alsoExtract: extractDebugPaths`, a
+	// caller-supplied `cwd` cleared the gate entirely no matter how far outside
+	// the workspace it pointed, since `extractDebugPaths`'s own `cwd` -> write
+	// target (a debuggee inherits and can write through its cwd) never ran.
+	it("still confines a launch's caller-supplied cwd even though the action is opaque", async () => {
+		const context = contextOf({ ...WORKSPACE, "permissions.confineWrites": true });
+		const message = await denialOf("debug", { action: "launch", program: "./my_app", cwd: outside }, context);
+		expect(message).toContain("permissions.confineWrites");
+	});
+
+	it("still enforces the declared program field's read access for an opaque launch", async () => {
+		const message = await denialOf(
+			"debug",
+			{ action: "launch", program: ".env" },
+			contextOf({ ...STRICT, "permissions.opaqueToolScan": "off" }),
+		);
+		expect(message).toContain("**/.env");
 	});
 });
 

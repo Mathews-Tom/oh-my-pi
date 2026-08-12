@@ -241,6 +241,26 @@ describe("ssh:// is a filesystem target, not an exempt scheme", () => {
 	it("fails closed on an ssh:// URL with no path component", () => {
 		expect(decideTarget(target("ssh://host"), policy, roots).kind).toBe("deny");
 	});
+
+	// Mirrors "lets an explicit user deny re-protect a path the profile's own
+	// carve-out allows" above, but for the ssh:// branch: `decideSshTarget` used
+	// to check `policy.allow` before `policy.deny` directly, ignoring
+	// `explicitAllow`/`explicitDeny` entirely, so strict's own `.env.example`
+	// carve-out silently outranked a user's own re-deny of that same remote path.
+	it("lets an explicit user deny re-protect a remote path the profile's own carve-out allows", () => {
+		const reprotected = buildPermissionPolicy("strict", { denyRead: ["**/.env.example"] });
+		expect(decideTarget(target("ssh://host/repo/.env.example"), reprotected, roots).kind).toBe("deny");
+		// Unrelated carve-out (.env.sample) is untouched.
+		expect(decideTarget(target("ssh://host/repo/.env.sample"), reprotected, roots).kind).toBe("allow");
+	});
+
+	it("still lets an explicit user allow override that same user's own explicit deny on a remote path", () => {
+		const overridden = buildPermissionPolicy("strict", {
+			denyRead: ["**/.env.example"],
+			allowRead: ["**/.env.example"],
+		});
+		expect(decideTarget(target("ssh://host/repo/.env.example"), overridden, roots).kind).toBe("allow");
+	});
 });
 
 describe("symlink alias deny matching", () => {

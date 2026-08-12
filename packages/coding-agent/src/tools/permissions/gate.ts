@@ -61,6 +61,7 @@ export function permissionRoots(context: AgentToolContext | undefined): Permissi
 		cwd: manager.getCwd(),
 		additionalDirectories: manager.getAdditionalDirectories(),
 		agentDir: context?.settings?.getAgentDir?.(),
+		settings: context?.settings,
 	};
 }
 

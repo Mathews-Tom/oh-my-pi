@@ -108,6 +108,28 @@ describe("policy interaction", () => {
 		expect(scanOpaqueArguments({ command: "cat .env" }, "shell", workspaceOnly, roots)).toBeNull();
 	});
 
+	// Mirrors `decidePathTarget`'s own precedence test (`permissions-resolve.test.ts`):
+	// the scan used to check `policy.allow` before `policy.deny` directly,
+	// bypassing `matchAccessRule` and its explicit-deny-over-profile-carve-out
+	// precedence entirely, so strict's own `.env.example` allow carve-out
+	// silently outranked a user's own re-deny of that literal.
+	it("lets an explicit user deny re-protect a literal the profile's own carve-out allows", () => {
+		const reprotected = buildPermissionPolicy("strict", { denyRead: ["**/.env.example"] });
+		expect(scanOpaqueArguments({ command: "cat .env.example" }, "shell", reprotected, roots)?.rule).toBe(
+			"**/.env.example",
+		);
+		// Unrelated carve-out (.env.sample) is untouched.
+		expect(scanOpaqueArguments({ command: "cat .env.sample" }, "shell", reprotected, roots)).toBeNull();
+	});
+
+	it("still lets an explicit user allow override that same user's own explicit deny on a literal", () => {
+		const overridden = buildPermissionPolicy("strict", {
+			denyRead: ["**/.env.example"],
+			allowRead: ["**/.env.example"],
+		});
+		expect(scanOpaqueArguments({ command: "cat .env.example" }, "shell", overridden, roots)).toBeNull();
+	});
+
 	it("leaves internal URLs alone", () => {
 		expect(scanOpaqueArguments({ command: "cat local://plan.md" }, "shell", STRICT, roots)).toBeNull();
 	});

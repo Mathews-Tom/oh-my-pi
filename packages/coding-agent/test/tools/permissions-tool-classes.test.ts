@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Patch } from "@oh-my-pi/hashline";
+import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { PermissionRoots } from "@oh-my-pi/pi-coding-agent/tools/permissions";
 import {
 	CLASSIFIED_TOOL_NAMES,
@@ -10,6 +11,14 @@ import {
 	extractEmbeddedEditPaths,
 	TOOL_PATH_CLASSES,
 } from "@oh-my-pi/pi-coding-agent/tools/permissions/tool-path-targets";
+
+function settingsOf(overrides: Record<string, unknown>): Settings {
+	return {
+		get(key: string): unknown {
+			return Object.hasOwn(overrides, key) ? overrides[key] : undefined;
+		},
+	} as unknown as Settings;
+}
 
 // A real, non-repository cwd — `git.repo.resolveSync` must not find a `.git`
 // anywhere above it, or `security_scan`'s repo-root resolution would change
@@ -148,6 +157,51 @@ describe("structured extraction", () => {
 		expect(extract("read", { path: "   " })).toEqual([]);
 		expect(extract("read", { path: 42 })).toEqual([]);
 		expect(extract("ast_edit", { paths: "not-an-array" })).toEqual([]);
+	});
+
+	describe("mnemopi persistence targets", () => {
+		it("authorizes the configured mnemopi db path plus its WAL/SHM sidecars, for both memory_edit and retain", () => {
+			const dbPath = path.join(nonRepoWorkspace, "custom", "mnemopi.db");
+			const roots: PermissionRoots = {
+				cwd: nonRepoWorkspace,
+				additionalDirectories: [],
+				settings: settingsOf({ "mnemopi.dbPath": dbPath }),
+			};
+			for (const tool of ["memory_edit", "retain"]) {
+				expect(extract(tool, {}, roots).map(t => `${t.access}:${t.raw}`)).toEqual([
+					`read:${dbPath}`,
+					`write:${dbPath}`,
+					`read:${dbPath}-wal`,
+					`write:${dbPath}-wal`,
+					`read:${dbPath}-shm`,
+					`write:${dbPath}-shm`,
+				]);
+			}
+		});
+
+		it("falls back to the default memories-dir path when no mnemopi.dbPath override is configured", () => {
+			const roots: PermissionRoots = {
+				cwd: nonRepoWorkspace,
+				additionalDirectories: [],
+				agentDir: nonRepoWorkspace,
+				settings: settingsOf({}),
+			};
+			const targets = extract("retain", {}, roots);
+			expect(targets[0]?.raw).toBe(path.join(nonRepoWorkspace, "memories", "mnemopi", "mnemopi.db"));
+		});
+
+		it("still authorizes the default path when the roots carry no settings at all", () => {
+			// `roots.settings` is only populated from a live session
+			// (`permissionRoots`, `gate.ts`); a sessionless caller must still get
+			// a real path to check rather than an empty target list.
+			const roots: PermissionRoots = {
+				cwd: nonRepoWorkspace,
+				additionalDirectories: [],
+				agentDir: nonRepoWorkspace,
+			};
+			const targets = extract("memory_edit", {}, roots);
+			expect(targets[0]?.raw).toBe(path.join(nonRepoWorkspace, "memories", "mnemopi", "mnemopi.db"));
+		});
 	});
 
 	it("keeps security_scan exclude_paths out — a filter is never opened", () => {

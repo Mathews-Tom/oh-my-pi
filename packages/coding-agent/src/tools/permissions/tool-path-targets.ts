@@ -25,6 +25,7 @@ import { getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
 import { getManagedSkillsDir, sanitizeSkillName } from "../../autolearn/managed-skills";
 import { LSP_READONLY_ACTIONS } from "../../lsp";
 import { getMemoryRoot, LEARNED_LESSONS_FILE } from "../../memories";
+import { resolveMnemopiDbPath } from "../../mnemopi/config";
 import * as git from "../../utils/git";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
 import { normalizePathLikeInput, type ResolvedSearchTarget, toPathList } from "../path-utils";
@@ -292,11 +293,24 @@ const extractDebugPaths: PathTargetExtractor = args => {
  * (`:954-968`), `write_memory` writes raw bytes, and `custom_request` sends an
  * arbitrary DAP command with an arbitrary `arguments` payload. A call like
  * `debug({ action: "launch", program: "/bin/sh", args: ["-c", "cat .env"] })`
- * only names `/bin/sh` in a declared field, so `extractDebugPaths` would
+ * only names `/bin/sh` in a declared field, so `extractDebugPaths` alone would
  * never see `.env` — these actions get the same best-effort literal scan an
- * opaque tool does instead of a false sense of structured soundness.
- * Breakpoint and inspection actions keep the structured classification: their
- * complete filesystem surface really is `file`/`program`/`cwd`.
+ * opaque tool does, in place of a false sense of structured soundness over
+ * the whole call.
+ *
+ * That scan alone would still miss a caller-supplied `launch`/`attach` `cwd`,
+ * though: the opaque scan only matches denied literals by name and
+ * deliberately never applies confinement (`scanOpaqueArguments`'s own
+ * doc-comment), so `debug({ action: "launch", program: "./app", cwd: "/etc" })`
+ * would clear it even under `permissions.confineWrites`. `classifyTool` pairs
+ * the scan with `alsoExtract: extractDebugPaths` for exactly these actions —
+ * mirroring `lsp`'s `request` action below — so the declared `program`/
+ * `file`/`cwd` fields still get their real structured check (confinement
+ * included) on top of the literal scan, rather than losing it entirely the
+ * moment an action needs the scan too.
+ *
+ * Breakpoint and inspection actions keep the plain structured classification:
+ * their complete filesystem surface really is `file`/`program`/`cwd`.
  */
 const DEBUG_OPAQUE_ACTIONS: ReadonlySet<string> = new Set([
 	"launch",
@@ -507,6 +521,45 @@ const extractLearnPaths: PathTargetExtractor = (args, roots) => {
 	if (args.skill && typeof args.skill === "object" && !Array.isArray(args.skill)) {
 		const target = managedSkillPath((args.skill as Record<string, unknown>).name, "SKILL.md");
 		if (target) pushPath(out, target, "write", "skill");
+	}
+	return out;
+};
+
+/**
+ * WAL/SHM sidecars a live SQLite connection can leave next to its main file,
+ * matching `removeDbFiles`'s own suffix list (`mnemopi/backend.ts`) — the one
+ * other place in the codebase that already treats a Mnemopi db as this
+ * three-file group rather than a single path.
+ */
+const MNEMOPI_DB_SIDECAR_SUFFIXES: readonly string[] = ["-wal", "-shm"];
+
+/**
+ * `memory_edit`'s and `retain`'s effective persistence target: the
+ * configured Mnemopi SQLite database, not a caller-supplied path. Both were
+ * defaulted to `pathless` (`TOOL_PATH_CLASSES`, previously), which let
+ * `enforceResourcePermissions` return before ever resolving that file, so a
+ * `permissions.deny.write` rule naming the memories directory did not stop
+ * either tool from mutating the Mnemopi database inside it.
+ *
+ * The effective path mirrors `loadMnemopiConfig`'s own resolution
+ * (`resolveMnemopiDbPath`, `mnemopi/config.ts`) rather than reimplementing
+ * the `mnemopi.dbPath` override/default fallback here, and deliberately
+ * skips `loadMnemopiConfig`'s bank-scope legacy scan
+ * (`extendRecallWithLegacyBanks` opens every legacy bank's SQLite file to
+ * probe it) — this only needs to know *which file*, not which banks recall
+ * from it. Both `read` and `write` are pushed for the main file and its
+ * WAL/SHM sidecars: `memory_edit` looks a memory up before mutating it, and
+ * either access denying the underlying file must block both tools the same
+ * way a `deny.read`-only rule already blocks `edit`'s read of a file it also
+ * writes (see {@link extractEditPaths}).
+ */
+const extractMnemopiPaths: PathTargetExtractor = (_args, roots) => {
+	const out: PathTarget[] = [];
+	const agentDir = roots.agentDir ?? getAgentDir();
+	const dbPath = resolveMnemopiDbPath(roots.settings, agentDir);
+	for (const candidate of [dbPath, ...MNEMOPI_DB_SIDECAR_SUFFIXES.map(suffix => `${dbPath}${suffix}`)]) {
+		pushPath(out, candidate, "read", "mnemopi.dbPath");
+		pushPath(out, candidate, "write", "mnemopi.dbPath");
 	}
 	return out;
 };
@@ -840,6 +893,8 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	security_scan: { kind: "structured", extract: extractSecurityScanPaths },
 	learn: { kind: "structured", extract: extractLearnPaths },
 	manage_skill: { kind: "structured", extract: extractManageSkillPaths },
+	memory_edit: { kind: "structured", extract: extractMnemopiPaths },
+	retain: { kind: "structured", extract: extractMnemopiPaths },
 
 	// ── Class B: opaque — best-effort literal scan, never a sandbox ───────
 	bash: { kind: "opaque", scan: "shell" },
@@ -852,10 +907,8 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	ask: { kind: "pathless" },
 	checkpoint: { kind: "pathless" },
 	github: { kind: "pathless" },
-	memory_edit: { kind: "pathless" },
 	recall: { kind: "pathless" },
 	reflect: { kind: "pathless" },
-	retain: { kind: "pathless" },
 	rewind: { kind: "pathless" },
 	// `task` carries a free-text prompt, not a path. Scanning it would deny an
 	// ordinary instruction that merely names a secret ("never touch .env"),
@@ -895,7 +948,9 @@ export function classifyTool(toolName: string, args?: Record<string, unknown> | 
 	const normalized = normalizeToolName(toolName);
 	if (normalized === "debug") {
 		const action = args && typeof args.action === "string" ? args.action : undefined;
-		if (action && DEBUG_OPAQUE_ACTIONS.has(action)) return { kind: "opaque", scan: "strings" };
+		if (action && DEBUG_OPAQUE_ACTIONS.has(action)) {
+			return { kind: "opaque", scan: "strings", alsoExtract: extractDebugPaths };
+		}
 	}
 	if (normalized === "lsp") {
 		const action = args && typeof args.action === "string" ? args.action : undefined;

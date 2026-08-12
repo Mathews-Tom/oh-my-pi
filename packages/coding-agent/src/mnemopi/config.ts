@@ -40,11 +40,25 @@ export interface MnemopiBackendConfig {
 	llmModel?: string;
 }
 
+/**
+ * The effective Mnemopi database path: the configured `mnemopi.dbPath`
+ * override, or the same default `<memories>/mnemopi/mnemopi.db` fallback
+ * `loadMnemopiConfig` has always used. Split out so the resource-permission
+ * gate (`tools/permissions/tool-path-targets.ts`) can authorize this exact
+ * file before `memory_edit`/`retain` touch it, without paying for
+ * `loadMnemopiConfig`'s bank-scope legacy scan (`extendRecallWithLegacyBanks`
+ * opens every legacy bank's SQLite file to probe it) just to learn a path.
+ * `settings` is optional so a caller with no live settings store still gets
+ * the real default path rather than nothing to authorize.
+ */
+export function resolveMnemopiDbPath(settings: Settings | undefined, agentDir: string): string {
+	return settings?.get("mnemopi.dbPath") ?? path.join(getMemoriesDir(agentDir), "mnemopi", "mnemopi.db");
+}
+
 export function loadMnemopiConfig(settings: Settings, agentDir: string): MnemopiBackendConfig {
-	const configuredDbPath = settings.get("mnemopi.dbPath");
 	const cwd = settings.getCwd();
 	const scoping = settings.get("mnemopi.scoping");
-	const dbPath = configuredDbPath ?? path.join(getMemoriesDir(agentDir), "mnemopi", "mnemopi.db");
+	const dbPath = resolveMnemopiDbPath(settings, agentDir);
 	const scope = computeMnemopiBankScope(settings.get("mnemopi.bank"), cwd, scoping);
 	const recallBanks =
 		scoping === "global" ? scope.recallBanks : extendRecallWithLegacyBanks(scope.recallBanks, dbPath, cwd);
