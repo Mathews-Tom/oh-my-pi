@@ -191,10 +191,36 @@ describe("structured extraction", () => {
 			]);
 		});
 
-		it("leaves output_root authorized against the session cwd — only include/knowledge-base paths move", () => {
+		it("adds the repository root as a read target when a default scan carries no include_paths", () => {
+			// No `target_kind`/`include_paths` at all — the scan defaults to
+			// scanning the whole repository, not just `nestedCwd`, so the gate
+			// must see `repoRoot` itself or `permissions.confineReads` would never
+			// catch the read once the scan actually walks the tree.
 			const roots: PermissionRoots = { cwd: nestedCwd, additionalDirectories: [] };
 			const targets = extract("security_scan", { output_root: "out" }, roots);
-			expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual(["write:out"]);
+			expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual([`read:${repoRoot}`, "write:out"]);
+		});
+
+		it("omits the repository-root fallback once include_paths narrows the scan", () => {
+			const roots: PermissionRoots = { cwd: nestedCwd, additionalDirectories: [] };
+			const targets = extract("security_scan", { include_paths: ["private"], output_root: "out" }, roots);
+			expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual([
+				`read:${path.join(repoRoot, "private")}`,
+				"write:out",
+			]);
+		});
+
+		it("omits the repository-root fallback for a scoped_path scan, which already requires include_paths", () => {
+			const roots: PermissionRoots = { cwd: nestedCwd, additionalDirectories: [] };
+			const targets = extract(
+				"security_scan",
+				{ target_kind: "scoped_path", include_paths: ["private"], output_root: "out" },
+				roots,
+			);
+			expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual([
+				`read:${path.join(repoRoot, "private")}`,
+				"write:out",
+			]);
 		});
 	});
 });

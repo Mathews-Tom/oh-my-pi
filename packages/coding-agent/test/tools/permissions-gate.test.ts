@@ -359,6 +359,47 @@ describe("read confinement", () => {
 	});
 });
 
+describe("security_scan default scope confinement", () => {
+	// A nested cwd inside a larger repository — `security_scan`'s default
+	// (no `include_paths`) scans the whole repository, not just this
+	// directory, so the gate must see the repository root itself as a read
+	// target or `confineReads` would never catch a scan reading files above
+	// the session's own cwd.
+	let scanRepoRoot: string;
+	let scanNestedCwd: string;
+
+	beforeAll(() => {
+		scanRepoRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "omp-gate-scan-repo-")));
+		fs.mkdirSync(path.join(scanRepoRoot, ".git"), { recursive: true });
+		scanNestedCwd = path.join(scanRepoRoot, "packages", "app");
+		fs.mkdirSync(scanNestedCwd, { recursive: true });
+	});
+
+	afterAll(() => {
+		fs.rmSync(scanRepoRoot, { recursive: true, force: true });
+	});
+
+	it("denies a default whole-repository scan once confineReads sees the repository root escape the nested cwd", async () => {
+		const context = contextOf(
+			{ "permissions.profile": "workspace", "permissions.confineReads": true },
+			{ cwd: scanNestedCwd, additionalDirectories: [] },
+		);
+		expect(await denialOf("security_scan", { output_root: path.join(scanRepoRoot, "out") }, context)).toContain(
+			"permissions.confineReads",
+		);
+	});
+
+	it("still runs once the repository root is an authorized additional directory", async () => {
+		const context = contextOf(
+			{ "permissions.profile": "workspace", "permissions.confineReads": true },
+			{ cwd: scanNestedCwd, additionalDirectories: [scanRepoRoot] },
+		);
+		expect((await run("security_scan", { output_root: path.join(scanRepoRoot, "out") }, context)).calls).toHaveLength(
+			1,
+		);
+	});
+});
+
 describe("opaque tool scan", () => {
 	it("denies a bash command naming a denied path", async () => {
 		const message = await denialOf("bash", { command: "cat .env" }, contextOf(STRICT));

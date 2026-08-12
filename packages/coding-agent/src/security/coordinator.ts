@@ -183,10 +183,21 @@ function securityConfigSnapshot(settings: Settings): Record<string, boolean> {
  * preflight/start pair fingerprints, nor to the diff text a `ref_diff`
  * review session actually reads. `{ deny: [], allow: [] }` under
  * `permissions.profile: off`, matching the gate's own short-circuit.
+ *
+ * `explicitDeny`/`explicitAllow` carry the user-supplied globs apart from
+ * the profile-merged `deny`/`allow` above, so `isPathExcludedBySecurityPolicy`
+ * can give the user's own `permissions.deny.read` entry the same precedence
+ * over a profile's built-in allow carve-out that an ordinary `read` gets
+ * from `decidePathTarget` — see {@link SecurityPathPolicy}.
  */
 function securityPathPolicy(settings: Settings): SecurityPathPolicy {
 	const policy = loadPermissionsConfig(settings);
-	return { deny: policy?.deny.read ?? [], allow: policy?.allow.read ?? [] };
+	return {
+		deny: policy?.deny.read ?? [],
+		allow: policy?.allow.read ?? [],
+		explicitDeny: policy?.explicitDeny.read ?? [],
+		explicitAllow: policy?.explicitAllow.read ?? [],
+	};
 }
 
 /**

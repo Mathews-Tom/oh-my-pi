@@ -118,6 +118,36 @@ export function normalizeCandidate(candidate: string): string {
 	return candidate.replaceAll("\\", "/");
 }
 
+/** One access axis's deny/allow rules, split the same way {@link PermissionPolicy} splits them. */
+export interface AccessRuleSet {
+	readonly allow: readonly string[];
+	readonly deny: readonly string[];
+	readonly explicitAllow: readonly string[];
+	readonly explicitDeny: readonly string[];
+}
+
+/**
+ * The precedence a single candidate-spelling group resolves to, independent
+ * of confinement: a user's own explicit deny outranks a profile's own
+ * default allow (e.g. `strict`'s `**\/.env.example` carve-out) — without
+ * this, the merged `allow` check just below would clear the path before the
+ * user's own `permissions.deny.*` entry (or an equivalent caller-supplied
+ * deny, such as the security-scan digest filter's) is ever reached, leaving
+ * no way to re-protect a file the profile decided was safe. The user's own
+ * explicit allow is still the one escape hatch that beats it.
+ *
+ * Returns the matched rule (for a denial's message), or `null` when nothing
+ * excludes `candidates`. Shared by {@link decidePathTarget} and the
+ * security-scan digest/diff filter (`security/preflight.ts`), so both agree
+ * on which rule wins for the same policy and candidate spelling.
+ */
+export function matchAccessRule(candidates: readonly string[], rules: AccessRuleSet): string | null {
+	const explicitlyDenied = matchGlob(rules.explicitDeny, candidates);
+	if (explicitlyDenied && !matchGlob(rules.explicitAllow, candidates)) return explicitlyDenied;
+	if (matchGlob(rules.allow, candidates)) return null;
+	return matchGlob(rules.deny, candidates);
+}
+
 export function decidePathTarget(
 	target: PathTarget,
 	absolutePath: string,
@@ -154,34 +184,20 @@ export function decidePathTarget(
 	];
 
 	for (const candidates of identities) {
-		// A user's own explicit deny outranks a profile's own default allow
-		// (e.g. `strict`'s `**/.env.example` carve-out): without this, the
-		// merged `policy.allow` check just below would clear the path before
-		// the user's `permissions.deny.*` entry is ever reached, leaving no
-		// way to re-protect a file the profile decided was safe. The user's
-		// own explicit allow is still the one escape hatch that beats it.
-		const explicitlyDenied = matchGlob(policy.explicitDeny[target.access], candidates);
-		if (explicitlyDenied && !matchGlob(policy.explicitAllow[target.access], candidates)) {
+		const rule = matchAccessRule(candidates, {
+			allow: policy.allow[target.access],
+			deny: policy.deny[target.access],
+			explicitAllow: policy.explicitAllow[target.access],
+			explicitDeny: policy.explicitDeny[target.access],
+		});
+		if (rule) {
 			return {
 				kind: "deny",
-				rule: explicitlyDenied,
+				rule,
 				reason:
 					`${target.access === "write" ? "Writing" : "Reading"} "${target.raw}" is blocked by the ` +
-					`resource permission rule "${explicitlyDenied}" (permissions.profile: ${policy.profile}).\n` +
-					`To allow it: add "${explicitlyDenied}" to permissions.allow.${target.access}, ` +
-					`or set permissions.profile: off.`,
-			};
-		}
-		if (matchGlob(policy.allow[target.access], candidates)) continue;
-		const denied = matchGlob(policy.deny[target.access], candidates);
-		if (denied) {
-			return {
-				kind: "deny",
-				rule: denied,
-				reason:
-					`${target.access === "write" ? "Writing" : "Reading"} "${target.raw}" is blocked by the ` +
-					`resource permission rule "${denied}" (permissions.profile: ${policy.profile}).\n` +
-					`To allow it: add "${denied}" to permissions.allow.${target.access}, ` +
+					`resource permission rule "${rule}" (permissions.profile: ${policy.profile}).\n` +
+					`To allow it: add "${rule}" to permissions.allow.${target.access}, ` +
 					`or set permissions.profile: off.`,
 			};
 		}

@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { matchGlob } from "../tools/permissions/matcher";
+import { matchAccessRule } from "../tools/permissions/resolve";
 import * as git from "../utils/git";
 import type {
 	SecurityAccountRef,
@@ -143,10 +143,23 @@ async function validateScopePaths(repositoryRoot: string, paths: readonly string
  * strict's `**\/.env.example` against its own `**\/.env.*` deny rule) must
  * still contribute to the digest and be reachable by the review session —
  * only a file that is denied *and not* separately allowed is excluded.
+ *
+ * `explicitDeny`/`explicitAllow` are the `permissions.deny.read`/
+ * `permissions.allow.read` globs the user supplied directly, kept apart from
+ * `deny`/`allow` above even though both are folded into them — exactly the
+ * split {@link PermissionPolicy} (`tools/permissions/types.ts`) keeps, and
+ * for the same reason: without it, a profile's own carve-out (folded into
+ * `allow`) would silently outrank a user's own, more specific
+ * `permissions.deny.read` entry for the same file (e.g. re-protecting
+ * `.env.example` under `strict`), leaving no way to exclude it from the
+ * digest or the `ref_diff` text a review session reads. Optional — an
+ * omitted axis behaves as empty, matching {@link NO_SECURITY_PATH_POLICY}.
  */
 export interface SecurityPathPolicy {
 	readonly deny: readonly string[];
 	readonly allow: readonly string[];
+	readonly explicitDeny?: readonly string[];
+	readonly explicitAllow?: readonly string[];
 }
 
 const NO_SECURITY_PATH_POLICY: SecurityPathPolicy = { deny: [], allow: [] };
@@ -158,6 +171,13 @@ const NO_SECURITY_PATH_POLICY: SecurityPathPolicy = { deny: [], allow: [] };
  * A repo-relative filename alone only ever matches the first form; resolving
  * it against `repositoryRoot` too lets an absolute rule see the same file an
  * ordinary `read` would deny.
+ *
+ * Delegates the actual precedence to {@link matchAccessRule}, the same
+ * function `decidePathTarget` uses for an ordinary `read` — a hand-rolled
+ * `deny`-then-`allow` check here would silently drop the
+ * explicit-deny-outranks-merged-allow rule that function encodes, letting a
+ * profile's own carve-out (e.g. strict's `**\/.env.example`) survive a
+ * user's own explicit `permissions.deny.read` entry for the same file.
  */
 function isPathExcludedBySecurityPolicy(
 	repositoryRoot: string,
@@ -167,7 +187,14 @@ function isPathExcludedBySecurityPolicy(
 	const candidates = [relativePath, path.resolve(repositoryRoot, relativePath), path.basename(relativePath)].map(
 		candidate => candidate.replaceAll("\\", "/"),
 	);
-	return matchGlob(policy.deny, candidates) !== null && matchGlob(policy.allow, candidates) === null;
+	return (
+		matchAccessRule(candidates, {
+			allow: policy.allow,
+			deny: policy.deny,
+			explicitAllow: policy.explicitAllow ?? [],
+			explicitDeny: policy.explicitDeny ?? [],
+		}) !== null
+	);
 }
 
 /**

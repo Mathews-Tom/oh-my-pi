@@ -292,6 +292,67 @@ describe("security preflight", () => {
 		expect(after.target.treeDigest).not.toBe(before.target.treeDigest);
 	});
 
+	test("an explicit user deny outranks a profile's merged allow, re-excluding .env.example from the digest", async () => {
+		// Same overlapping deny/allow shape as the carve-out test above (strict's
+		// own **/.env.example against its own **/.env.*), but with the user's
+		// own permissions.deny.read entry for the same file layered on top via
+		// explicitDeny — the split PermissionPolicy (tools/permissions/types.ts)
+		// keeps between a profile default and a user override, and the same
+		// precedence decidePathTarget gives an ordinary read.
+		await Bun.write(path.join(repositoryRoot, ".env.example"), "SECRET=\n");
+		const secretAwareAdapter: SecurityGitAdapter = {
+			...adapter,
+			files: async () => ["src/a.ts", "src/b.ts", ".env.example"],
+		};
+		const request = {
+			cwd: repositoryRoot,
+			target: { kind: "repository" as const },
+			outputRoot: stateRoot,
+			model: { provider: "openai-codex", modelId: "fixture" },
+			account: { provider: "openai-codex", credentialId: 1 },
+			config: {},
+			workflowFingerprint: "fixture",
+		};
+		const userReprotected = {
+			deny: ["**/.env.*"],
+			allow: ["**/.env.example"],
+			explicitDeny: ["**/.env.example"],
+		};
+		const before = await createSecurityScanPlan(request, secretAwareAdapter, userReprotected);
+		await Bun.write(path.join(repositoryRoot, ".env.example"), "SECRET=changed\n");
+		const after = await createSecurityScanPlan(request, secretAwareAdapter, userReprotected);
+		// The user's own explicit deny re-excludes the file the profile's allow
+		// carve-out would otherwise keep in — the digest must stay identical.
+		expect(after.target.treeDigest).toBe(before.target.treeDigest);
+	});
+
+	test("the user's own explicit allow is still the escape hatch that beats their own explicit deny", async () => {
+		await Bun.write(path.join(repositoryRoot, ".env.example"), "SECRET=\n");
+		const secretAwareAdapter: SecurityGitAdapter = {
+			...adapter,
+			files: async () => ["src/a.ts", "src/b.ts", ".env.example"],
+		};
+		const request = {
+			cwd: repositoryRoot,
+			target: { kind: "repository" as const },
+			outputRoot: stateRoot,
+			model: { provider: "openai-codex", modelId: "fixture" },
+			account: { provider: "openai-codex", credentialId: 1 },
+			config: {},
+			workflowFingerprint: "fixture",
+		};
+		const explicitlyReallowed = {
+			deny: ["**/.env.*"],
+			allow: ["**/.env.example"],
+			explicitDeny: ["**/.env.example"],
+			explicitAllow: ["**/.env.example"],
+		};
+		const before = await createSecurityScanPlan(request, secretAwareAdapter, explicitlyReallowed);
+		await Bun.write(path.join(repositoryRoot, ".env.example"), "SECRET=changed\n");
+		const after = await createSecurityScanPlan(request, secretAwareAdapter, explicitlyReallowed);
+		expect(after.target.treeDigest).not.toBe(before.target.treeDigest);
+	});
+
 	test("filterDiffByPermissionPolicy strips a denied file's diff and preserves an allowed one", () => {
 		const rawDiff = [
 			"diff --git a/src/a.ts b/src/a.ts",
@@ -327,6 +388,32 @@ describe("security preflight", () => {
 
 		// An empty policy (no deny rules) never touches the diff.
 		expect(filterDiffByPermissionPolicy(rawDiff, repositoryRoot, { deny: [], allow: [] })).toBe(rawDiff);
+	});
+
+	test("filterDiffByPermissionPolicy lets an explicit user deny exclude .env.example from a ref_diff despite a profile allow carve-out", () => {
+		const rawDiff = [
+			"diff --git a/src/a.ts b/src/a.ts",
+			"index 000..111 100644",
+			"--- a/src/a.ts",
+			"+++ b/src/a.ts",
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+			"diff --git a/.env.example b/.env.example",
+			"index 444..555 100644",
+			"--- a/.env.example",
+			"+++ b/.env.example",
+			"@@ -1 +1 @@",
+			"-SECRET=",
+			"+SECRET=changed",
+		].join("\n");
+		const filtered = filterDiffByPermissionPolicy(rawDiff, repositoryRoot, {
+			deny: ["**/.env.*"],
+			allow: ["**/.env.example"],
+			explicitDeny: ["**/.env.example"],
+		});
+		expect(filtered).toContain("src/a.ts");
+		expect(filtered).not.toContain(".env.example");
 	});
 
 	test("filterDiffByPermissionPolicy matches a deny rule written as an absolute path", () => {

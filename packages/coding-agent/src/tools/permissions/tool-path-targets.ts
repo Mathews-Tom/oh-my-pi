@@ -351,6 +351,17 @@ function securityScanRoot(cwd: string): string | null {
 }
 
 /**
+ * True when `raw` (a tool-supplied `include_paths` argument) narrows the
+ * scan to specific paths. Absent, non-array, or made up entirely of blank
+ * strings all mean the same thing as omitting it — `pathMatchesSecurityScope`
+ * (`security/preflight.ts`) treats an empty `includePaths` as "everything".
+ */
+function hasNoSecurityScopeNarrowing(raw: unknown): boolean {
+	if (!Array.isArray(raw)) return true;
+	return !raw.some(entry => typeof entry === "string" && entry.trim().length > 0);
+}
+
+/**
  * `include_paths`/`knowledge_base_paths` entries, resolved against
  * `scanRoot` rather than the session cwd — see {@link extractSecurityScanPaths}.
  */
@@ -382,12 +393,26 @@ function pushSecurityScanPaths(
  * `/repo/pkg/private` while the scan digests `/repo/private`. Resolved here
  * against the same repository root so the gate and the scan can never
  * disagree about the base.
+ *
+ * `scoped_path` is the one `target_kind` that always requires a non-empty
+ * `include_paths` (`security-scan.ts`'s `targetFromParams` throws otherwise),
+ * so it is fully covered by the push above. Every other kind — the default
+ * `repository`, `working_tree`, and `ref_diff` — falls back to the *entire*
+ * repository tree the moment `include_paths` is empty
+ * (`pathMatchesSecurityScope`'s `includePaths.length === 0` case,
+ * `security/preflight.ts`), so the gate must see the repository root itself
+ * as a read target or a nested session cwd with `confineReads` on would
+ * never see the files the scan actually opens.
  */
 const extractSecurityScanPaths: PathTargetExtractor = (args, roots) => {
 	const out: PathTarget[] = [];
 	const scanRoot = securityScanRoot(roots.cwd);
 	pushSecurityScanPaths(out, args.include_paths, "read", "include_paths", scanRoot);
 	pushSecurityScanPaths(out, args.knowledge_base_paths, "read", "knowledge_base_paths", scanRoot);
+	const targetKind = typeof args.target_kind === "string" ? args.target_kind : "repository";
+	if (targetKind !== "scoped_path" && scanRoot && hasNoSecurityScopeNarrowing(args.include_paths)) {
+		pushPath(out, scanRoot, "read", "include_paths");
+	}
 	pushPath(out, args.output_root, "write", "output_root");
 	// `exclude_paths` only narrows a scan; it is never opened.
 	return out;
