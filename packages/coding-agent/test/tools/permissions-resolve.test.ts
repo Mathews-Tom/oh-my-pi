@@ -115,6 +115,21 @@ describe("profile strict", () => {
 		expect(decideTarget(target(".env.example", "write"), policy, roots).kind).toBe("allow");
 	});
 
+	it("does not let a carve-out matching the lexical spelling suppress a deny matching the resolved target", () => {
+		// A workspace symlink literally named `.env.example` but pointing at the
+		// real `.env` must not read as the shipped template: the deny fires on
+		// the resolved spelling (`.env`), and the carve-out is only allowed to
+		// suppress a deny that fired on the *same* spelling it matches.
+		const linkDir = path.join(workspace, "link-carve-out");
+		fs.mkdirSync(linkDir, { recursive: true });
+		const link = path.join(linkDir, ".env.example");
+		fs.rmSync(link, { force: true });
+		fs.symlinkSync(path.join(workspace, ".env"), link);
+		const denied = decideTarget(target(path.join(linkDir, ".env.example")), policy, roots);
+		expect(denied.kind).toBe("deny");
+		if (denied.kind === "deny") expect(denied.rule).toBe("**/.env");
+	});
+
 	it("still lets a user allow rule outrank confinement", () => {
 		// The escape hatch every confinement denial message points at: a path the
 		// user named explicitly is in bounds even outside every root.

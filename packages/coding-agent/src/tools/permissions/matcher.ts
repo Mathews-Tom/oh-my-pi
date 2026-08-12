@@ -58,14 +58,23 @@ const GLOB_CACHE = new Map<string, Bun.Glob>();
 /** Bound so a pathological config cannot grow the cache without limit. */
 const GLOB_CACHE_LIMIT = 512;
 
+/** A pattern match, plus the exact candidate spelling that satisfied it. */
+export interface GlobMatch {
+	readonly pattern: string;
+	readonly candidate: string;
+}
+
 /**
- * The first pattern in `patterns` matching any of `candidates`, or `null`.
+ * The first pattern in `patterns` matching any of `candidates`, alongside the
+ * specific candidate spelling that matched, or `null`.
  *
- * Returning the *pattern* rather than a boolean is what lets a denial name the
- * exact rule the user wrote, which is the difference between a message they can
- * act on and one they have to reverse-engineer.
+ * Surfacing the candidate (not just the pattern) is what lets a caller
+ * re-check a *different* glob list against that exact spelling rather than
+ * the whole candidate set — see {@link matchGlob}'s callers in `resolve.ts`,
+ * where a carve-out must only suppress a deny that matched the same lexical
+ * or resolved spelling, never a deny that matched a different one.
  */
-export function matchGlob(patterns: readonly string[], candidates: readonly string[]): string | null {
+export function matchGlobCandidate(patterns: readonly string[], candidates: readonly string[]): GlobMatch | null {
 	for (const pattern of patterns) {
 		let glob = GLOB_CACHE.get(pattern);
 		if (!glob) {
@@ -75,8 +84,19 @@ export function matchGlob(patterns: readonly string[], candidates: readonly stri
 			if (GLOB_CACHE.size < GLOB_CACHE_LIMIT) GLOB_CACHE.set(pattern, glob);
 		}
 		for (const candidate of candidates) {
-			if (candidate && glob.match(candidate)) return pattern;
+			if (candidate && glob.match(candidate)) return { pattern, candidate };
 		}
 	}
 	return null;
+}
+
+/**
+ * The first pattern in `patterns` matching any of `candidates`, or `null`.
+ *
+ * Returning the *pattern* rather than a boolean is what lets a denial name the
+ * exact rule the user wrote, which is the difference between a message they can
+ * act on and one they have to reverse-engineer.
+ */
+export function matchGlob(patterns: readonly string[], candidates: readonly string[]): string | null {
+	return matchGlobCandidate(patterns, candidates)?.pattern ?? null;
 }

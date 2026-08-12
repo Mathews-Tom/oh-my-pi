@@ -9,7 +9,7 @@ import * as path from "node:path";
 import { extractUriScheme } from "../../internal-urls/parse";
 import { isInternalUrlPath, isReadableUrlPath, isSshUrl, resolveToCwd, splitPathAndSel } from "../path-utils";
 import { confineToRoots, relativeToRoots } from "./confine";
-import { matchGlob } from "./matcher";
+import { matchGlob, matchGlobCandidate } from "./matcher";
 import { denySuppressingGlobs } from "./profiles";
 import { ALLOW, type PathTarget, type PermissionDecision, type PermissionPolicy, type PermissionRoots } from "./types";
 
@@ -124,8 +124,16 @@ export function decidePathTarget(
 		}
 	}
 
-	const denied = matchGlob(policy.deny[target.access], candidates);
-	if (denied && !matchGlob(policy.carveOut[target.access], candidates)) {
+	const deniedMatch = matchGlobCandidate(policy.deny[target.access], candidates);
+	// A carve-out only ever relaxes the exact spelling the deny matched — never
+	// any other candidate in the set. `candidates` mixes a target's lexical
+	// spelling with its symlink-resolved one (see `relativeToRoots`), so a
+	// workspace symlink named `.env.example` that resolves to `.env` would
+	// otherwise have the deny match `.env` (the resolved spelling) suppressed
+	// by the carve-out matching `.env.example` (the lexical spelling) — a
+	// different candidate entirely, not the one the deny actually fired on.
+	if (deniedMatch && !matchGlob(policy.carveOut[target.access], [deniedMatch.candidate])) {
+		const denied = deniedMatch.pattern;
 		return {
 			kind: "deny",
 			rule: denied,
