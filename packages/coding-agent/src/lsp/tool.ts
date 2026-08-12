@@ -13,6 +13,7 @@ import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { truncateForPrompt } from "../tools/approval";
 import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
+import { enforceResourcePathTargets } from "../tools/permissions/gate";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
 import {
@@ -43,7 +44,13 @@ import {
 	WORKSPACE_SYMBOL_LIMIT,
 	waitForDiagnostics,
 } from "./diagnostics";
-import { applyTextEdits, applyWorkspaceEdit, flattenWorkspaceTextEdits, rangesOverlap } from "./edits";
+import {
+	applyTextEdits,
+	applyWorkspaceEdit,
+	flattenWorkspaceTextEdits,
+	rangesOverlap,
+	workspaceEditTargetPaths,
+} from "./edits";
 import { detectLspmux } from "./lspmux";
 import {
 	configCache,
@@ -138,6 +145,60 @@ async function enumerateRenamePairs(
 }
 
 /**
+ * Check every location a server returned before its source lines are read.
+ *
+ * `definition`, `type_definition`, `implementation`, and `references` are
+ * gated on the *initiating* `file`, but the locations that come back are
+ * chosen by the language server and routinely land in other files — a
+ * dependency, a generated file, something outside every workspace root. Each
+ * one is then handed to `formatLocationWithContext`, which opens it and puts
+ * the surrounding source lines in front of the model, so a `deny.read` rule or
+ * `confineReads` has to be applied here or not at all.
+ */
+export function guardLocationReads(locations: readonly Location[], context: AgentToolContext | undefined): void {
+	enforceResourcePathTargets(
+		"lsp",
+		locations.map(location => ({
+			raw: uriToFile(location.uri),
+			access: "read" as const,
+			field: "result location",
+		})),
+		context,
+	);
+}
+
+/**
+ * Apply a server-supplied `WorkspaceEdit` only after every path it names has
+ * cleared the resource permission layer.
+ *
+ * The permission gate classifies `lsp` by its declared arguments, and for
+ * `rename`/`code_actions` those are just the *initiating* file. The edit that
+ * comes back is chosen by the language server and can rename into, create, or
+ * delete any path it likes — including one outside every workspace root, or one
+ * a `permissions.deny.write` rule protects. Checking here, before
+ * `applyWorkspaceEdit` touches the disk, is what makes the declared-argument
+ * gate's guarantee true for this tool rather than merely advertised.
+ *
+ * Not covered here: `workspace/applyEdit`, which a server can push
+ * unsolicited (`lsp/client.ts`). That path has no session handle to resolve
+ * `workspace.additionalDirectories` from, so gating it against `client.cwd`
+ * alone would deny legitimate edits into an `/add-dir` root.
+ */
+export async function applyGuardedWorkspaceEdit(
+	edit: WorkspaceEdit,
+	cwd: string,
+	context: AgentToolContext | undefined,
+): Promise<string[]> {
+	const targets = workspaceEditTargetPaths(edit).map(raw => ({
+		raw,
+		access: "write" as const,
+		field: "workspace edit",
+	}));
+	enforceResourcePathTargets("lsp", targets, context);
+	return applyWorkspaceEdit(edit, cwd);
+}
+
+/**
  * LSP tool for language server protocol operations.
  */
 export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Theme> {
@@ -175,7 +236,9 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		params: LspParams,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<LspToolDetails>,
-		_context?: AgentToolContext,
+		// Not `context`: the `code_actions` branch below binds that name to an
+		// LSP `CodeActionContext`.
+		toolContext?: AgentToolContext,
 	): Promise<AgentToolResult<LspToolDetails>> {
 		const { action, file, line, symbol, query, new_name, apply, timeout } = params;
 		if (this.session.lspReadOnly && !LSP_READONLY_ACTIONS.has(action)) {
@@ -453,6 +516,14 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				};
 			}
 			const { pairs } = enumerated;
+			enforceResourcePathTargets(
+				"lsp",
+				pairs.flatMap(pair => [
+					{ raw: uriToFile(pair.oldUri), access: "write" as const, field: "rename_file source" },
+					{ raw: uriToFile(pair.newUri), access: "write" as const, field: "rename_file destination" },
+				]),
+				toolContext,
+			);
 			if (pairs.length === 0) {
 				return {
 					content: [{ type: "text", text: "Error: no files to rename" }],
@@ -613,6 +684,20 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				}
 			}
 
+			// `willRenameFiles` answers with edits for whatever URIs the server
+			// chooses, which need not be `file` or `new_name` — the only two paths
+			// the permission gate saw. Same surface `applyGuardedWorkspaceEdit`
+			// covers for `rename`/`code_actions`, so it faces the same check here
+			// before any of it is written.
+			enforceResourcePathTargets(
+				"lsp",
+				[...acceptedByUri.keys()].map(uri => ({
+					raw: uriToFile(uri),
+					access: "write" as const,
+					field: "willRenameFiles edit",
+				})),
+				toolContext,
+			);
 			for (const [uri, bucket] of acceptedByUri) {
 				const filePath = uriToFile(uri);
 				await applyTextEdits(filePath, bucket.edits);
@@ -1036,6 +1121,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						output = "No definition found";
 						useless = true;
 					} else {
+						guardLocationReads(locations, toolContext);
 						const lines = await Promise.all(
 							locations.map(location => formatLocationWithContext(location, this.session.cwd)),
 						);
@@ -1061,6 +1147,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						output = "No type definition found";
 						useless = true;
 					} else {
+						guardLocationReads(locations, toolContext);
 						const lines = await Promise.all(
 							locations.map(location => formatLocationWithContext(location, this.session.cwd)),
 						);
@@ -1086,6 +1173,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						output = "No implementation found";
 						useless = true;
 					} else {
+						guardLocationReads(locations, toolContext);
 						const lines = await Promise.all(
 							locations.map(location => formatLocationWithContext(location, this.session.cwd)),
 						);
@@ -1126,6 +1214,9 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					} else {
 						const contextualReferences = result.slice(0, REFERENCE_CONTEXT_LIMIT);
 						const plainReferences = result.slice(REFERENCE_CONTEXT_LIMIT);
+						// Only the contextual slice is opened; the rest is rendered as
+						// bare `path:line` headers, which name no contents.
+						guardLocationReads(contextualReferences, toolContext);
 						const contextualLines = await Promise.all(
 							contextualReferences.map(location => formatLocationWithContext(location, this.session.cwd)),
 						);
@@ -1208,7 +1299,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						const appliedAction = await applyCodeAction(selectedAction, {
 							resolveCodeAction: async actionItem =>
 								(await sendRequest(client, "codeAction/resolve", actionItem, signal)) as CodeAction,
-							applyWorkspaceEdit: async edit => applyWorkspaceEdit(edit, this.session.cwd),
+							applyWorkspaceEdit: async edit => applyGuardedWorkspaceEdit(edit, this.session.cwd, toolContext),
 							executeCommand: async commandItem => {
 								await sendRequest(
 									client,
@@ -1304,7 +1395,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					} else {
 						const shouldApply = apply !== false;
 						if (shouldApply) {
-							const applied = await applyWorkspaceEdit(result, this.session.cwd);
+							const applied = await applyGuardedWorkspaceEdit(result, this.session.cwd, toolContext);
 							output = `Applied rename:\n${applied.map(a => `  ${a}`).join("\n")}`;
 						} else {
 							const preview = formatWorkspaceEdit(result, this.session.cwd);

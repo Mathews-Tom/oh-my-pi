@@ -17,22 +17,7 @@ import { getServersForFile, type LspConfig, loadConfig } from "./config";
 import { MUX_RESTART_METHOD } from "./mux/protocol";
 import type { LspClient, ServerConfig } from "./types";
 
-/**
- * LSP actions that do not mutate the workspace or language-server state.
- * Anything not in this set (rename, code_actions with apply, rename_file,
- * reload, raw request, etc.) is classified as write-tier.
- */
-export const LSP_READONLY_ACTIONS: ReadonlySet<string> = new Set([
-	"diagnostics",
-	"definition",
-	"type_definition",
-	"implementation",
-	"references",
-	"hover",
-	"symbols",
-	"status",
-	"capabilities",
-]);
+export { LSP_READONLY_ACTIONS } from "./actions";
 
 export interface LspStartupServerInfo {
 	name: string;

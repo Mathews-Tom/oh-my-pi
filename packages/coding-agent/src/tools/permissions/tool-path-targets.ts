@@ -412,6 +412,7 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	todo: { kind: "pathless" },
 	web_search: { kind: "pathless" },
 	goal: { kind: "pathless" },
+	think: { kind: "pathless" },
 	yield: { kind: "pathless" },
 };
 
