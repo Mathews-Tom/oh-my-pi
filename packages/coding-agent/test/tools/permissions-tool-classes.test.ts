@@ -210,7 +210,7 @@ describe("structured extraction", () => {
 			const roots: PermissionRoots = {
 				cwd: nonRepoWorkspace,
 				additionalDirectories: [],
-				settings: settingsOf({ "mnemopi.dbPath": dbPath }),
+				settings: settingsOf({ "memory.backend": "mnemopi", "mnemopi.dbPath": dbPath }),
 			};
 			for (const tool of ["memory_edit", "retain"]) {
 				expect(extract(tool, {}, roots).map(t => `${t.access}:${t.raw}`)).toEqual([
@@ -222,16 +222,26 @@ describe("structured extraction", () => {
 					`write:${dbPath}-shm`,
 				]);
 			}
+			expect(
+				extract(
+					"retain",
+					{},
+					{
+						...roots,
+						settings: settingsOf({ "memory.backend": "hindsight", "mnemopi.dbPath": dbPath }),
+					},
+				),
+			).toEqual([]);
 		});
 
-		it("falls back to the default memories-dir path when no mnemopi.dbPath override is configured", () => {
+		it("falls back to the default memories-dir path for memory_edit when no mnemopi.dbPath override is configured", () => {
 			const roots: PermissionRoots = {
 				cwd: nonRepoWorkspace,
 				additionalDirectories: [],
 				agentDir: nonRepoWorkspace,
 				settings: settingsOf({}),
 			};
-			const targets = extract("retain", {}, roots);
+			const targets = extract("memory_edit", {}, roots);
 			expect(targets[0]?.raw).toBe(path.join(nonRepoWorkspace, "memories", "mnemopi", "mnemopi.db"));
 		});
 
@@ -346,11 +356,21 @@ describe("embedded edit payload paths", () => {
 		].join("\n");
 		expect(extractEmbeddedEditPaths(input).map(t => `${t.access}:${t.raw}`)).toEqual([
 			"write:src/new.ts",
+			"write:src",
 			"write:src/a.ts",
 			"read:src/a.ts",
 			"write:src/b.ts",
 			"write:src/old.ts",
 			"read:src/old.ts",
+		]);
+	});
+
+	it("extracts every ancestor an apply_patch create can create", () => {
+		const input = "*** Begin Patch\n*** Add File: blocked/nested/file.txt\n+secret\n*** End Patch";
+		expect(extractEmbeddedEditPaths(input).map(t => `${t.access}:${t.raw}`)).toEqual([
+			"write:blocked/nested/file.txt",
+			"write:blocked/nested",
+			"write:blocked",
 		]);
 	});
 

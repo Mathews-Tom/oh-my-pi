@@ -155,6 +155,16 @@ describe("profile strict", () => {
 		expect(message).toContain("**/.env");
 	});
 
+	it("denies an apply_patch create when a deny rule matches a parent directory it will create", async () => {
+		const context = contextOf({ ...WORKSPACE, "permissions.deny.write": ["**/blocked"] });
+		const message = await denialOf(
+			"edit",
+			{ input: "*** Begin Patch\n*** Add File: blocked/file.txt\n+secret\n*** End Patch" },
+			context,
+		);
+		expect(message).toContain('resource permission rule "**/blocked"');
+	});
+
 	it("denies updating an existing file under a deny.read rule with no matching deny.write rule", async () => {
 		// `edit`'s update/delete ops read the target's current content to
 		// compute the diff and surface it in the result - a `deny.read`-only
@@ -306,6 +316,7 @@ describe("mnemopi database persistence", () => {
 	it("blocks retain the same way", async () => {
 		const context = contextOf({
 			...WORKSPACE,
+			"memory.backend": "mnemopi",
 			"mnemopi.dbPath": dbPath(),
 			"permissions.deny.write": ["**/mnemopi/**"],
 		});
@@ -324,6 +335,7 @@ describe("mnemopi database persistence", () => {
 	it("blocks a deny rule matching only the WAL sidecar file", async () => {
 		const context = contextOf({
 			...WORKSPACE,
+			"memory.backend": "mnemopi",
 			"mnemopi.dbPath": dbPath(),
 			"permissions.deny.write": ["**/mnemopi.db-wal"],
 		});
@@ -332,8 +344,17 @@ describe("mnemopi database persistence", () => {
 		);
 	});
 
-	it("still runs when nothing denies the configured db path", async () => {
-		const context = contextOf({ ...WORKSPACE, "mnemopi.dbPath": dbPath() });
+	it("does not gate a Hindsight retain against an unrelated Mnemopi database", async () => {
+		const context = contextOf({
+			...WORKSPACE,
+			"memory.backend": "hindsight",
+			"mnemopi.dbPath": path.join(outside, "mnemopi.db"),
+		});
+		expect((await run("retain", { items: [{ content: "Remember this." }] }, context)).calls).toHaveLength(1);
+	});
+
+	it("still runs Mnemopi persistence when nothing denies the configured db path", async () => {
+		const context = contextOf({ ...WORKSPACE, "memory.backend": "mnemopi", "mnemopi.dbPath": dbPath() });
 		expect((await run("retain", { items: [{ content: "Remember this." }] }, context)).calls).toHaveLength(1);
 		expect((await run("memory_edit", { op: "forget", id: "m1" }, context)).calls).toHaveLength(1);
 	});

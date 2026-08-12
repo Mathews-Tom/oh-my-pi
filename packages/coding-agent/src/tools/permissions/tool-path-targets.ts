@@ -98,6 +98,16 @@ function pushPath(out: PathTarget[], raw: unknown, access: PathAccess, field: st
 	out.push({ raw: trimmed, access, field });
 }
 
+function pushCreateParentDirectories(out: PathTarget[], raw: string): void {
+	for (
+		let parent = path.dirname(raw);
+		parent !== "." && parent !== path.dirname(parent);
+		parent = path.dirname(parent)
+	) {
+		pushPath(out, parent, "write", "input");
+	}
+}
+
 /**
  * `raw` may be a plain string, a `;`-delimited list, a JSON-encoded string
  * array (`'[".env"]'`), or a single outer-quoted literal (`'".env"'`) — the
@@ -215,13 +225,16 @@ export function extractEmbeddedEditPaths(input: string): PathTarget[] {
 		const trimmed = line.trim();
 		if (!trimmed) continue;
 		// `*** Add File` creates a file with no pre-existing content to read -
-		// write-only. `*** Update File` and `*** Delete File` both read the
-		// current file (`modes/patch.ts` populates `oldContent` for either) and
-		// can surface it back through the diff or a context-mismatch error, so
-		// both need `read` too.
+		// write-only. Its ancestor directories can be created before writing
+		// the file, so those write targets must clear deny rules too.
+		// `*** Update File` and `*** Delete File` both read the current file
+		// (`modes/patch.ts` populates `oldContent` for either) and can surface it
+		// back through the diff or a context-mismatch error, so both need `read`
+		// too.
 		const addFile = APPLY_PATCH_ADD_FILE_RE.exec(trimmed);
 		if (addFile) {
 			pushPath(out, addFile[1], "write", "input");
+			pushCreateParentDirectories(out, addFile[1]);
 			continue;
 		}
 		const existingFile = APPLY_PATCH_EXISTING_FILE_RE.exec(trimmed);
@@ -541,24 +554,19 @@ const extractLearnPaths: PathTargetExtractor = (args, roots) => {
 const MNEMOPI_DB_SIDECAR_SUFFIXES: readonly string[] = ["-wal", "-shm"];
 
 /**
- * `memory_edit`'s and `retain`'s effective persistence target: the
- * configured Mnemopi SQLite database, not a caller-supplied path. Both were
- * defaulted to `pathless` (`TOOL_PATH_CLASSES`, previously), which let
- * `enforceResourcePermissions` return before ever resolving that file, so a
- * `permissions.deny.write` rule naming the memories directory did not stop
- * either tool from mutating the Mnemopi database inside it.
+ * `memory_edit` always persists through Mnemopi. `retain` does so only under
+ * `memory.backend: "mnemopi"`; the Hindsight backend queues a remote request
+ * and has no local Mnemopi filesystem surface.
  *
- * The effective path mirrors `loadMnemopiConfig`'s own resolution
- * (`resolveMnemopiDbPath`, `mnemopi/config.ts`) rather than reimplementing
- * the `mnemopi.dbPath` override/default fallback here, and deliberately
- * skips `loadMnemopiConfig`'s bank-scope legacy scan
- * (`extendRecallWithLegacyBanks` opens every legacy bank's SQLite file to
- * probe it) — this only needs to know *which file*, not which banks recall
- * from it. Both `read` and `write` are pushed for the main file and its
- * WAL/SHM sidecars: `memory_edit` looks a memory up before mutating it, and
- * either access denying the underlying file must block both tools the same
- * way a `deny.read`-only rule already blocks `edit`'s read of a file it also
- * writes (see {@link extractEditPaths}).
+ * Mnemopi's effective persistence target is the configured SQLite database,
+ * not a caller-supplied path. Its resolution mirrors `loadMnemopiConfig`'s
+ * (`resolveMnemopiDbPath`, `mnemopi/config.ts`) rather than reimplementing its
+ * override/default fallback here, and deliberately skips its bank-scope legacy
+ * scan — this only needs to know which file, not which banks recall from it.
+ * Both `read` and `write` are pushed for the main file and its WAL/SHM
+ * sidecars: `memory_edit` looks a memory up before mutating it, and either
+ * access denying the underlying file must block both tools the same way a
+ * `deny.read`-only rule already blocks `edit`'s read of a file it also writes.
  */
 const extractMnemopiPaths: PathTargetExtractor = (_args, roots) => {
 	const out: PathTarget[] = [];
@@ -908,7 +916,11 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	learn: { kind: "structured", extract: extractLearnPaths },
 	manage_skill: { kind: "structured", extract: extractManageSkillPaths },
 	memory_edit: { kind: "structured", extract: extractMnemopiPaths },
-	retain: { kind: "structured", extract: extractMnemopiPaths },
+	retain: {
+		kind: "structured",
+		extract: (args, roots) =>
+			roots.settings?.get("memory.backend") === "mnemopi" ? extractMnemopiPaths(args, roots) : [],
+	},
 
 	// ── Class B: opaque — best-effort literal scan, never a sandbox ───────
 	bash: { kind: "opaque", scan: "shell" },
