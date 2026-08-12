@@ -3,9 +3,11 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import "@oh-my-pi/pi-coding-agent/tools/renderers";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import {
 	listTables,
@@ -39,6 +41,15 @@ function createSession(cwd: string, overrides: Partial<SessionLike> = {}): Sessi
 		settings: Settings.isolated(),
 		...overrides,
 	} as SessionLike;
+}
+
+function permissionContext(cwd: string, settings: Settings): AgentToolContext {
+	const sessionManager = {
+		getCwd: () => cwd,
+		getAdditionalDirectories: () => [],
+		getSessionId: () => "sqlite-permission-test",
+	} as unknown as ReadonlySessionManager;
+	return { sessionManager, settings } as unknown as AgentToolContext;
 }
 
 /**
@@ -422,6 +433,39 @@ describe("SQLite tool support", () => {
 		});
 
 		expect(readUserEmail(dbPath, 2)).toBe("bob+new@example.com");
+	});
+
+	it("refuses a WAL update when its sidecar is denied before the row mutates", async () => {
+		const dbPath = await stampFreshDb("write-wal-permission.sqlite");
+		const db = new Database(dbPath);
+		try {
+			db.run("PRAGMA journal_mode = WAL");
+		} finally {
+			db.close();
+		}
+		const settings = Settings.isolated({
+			"permissions.profile": "workspace",
+			"permissions.deny.write": ["**/*-wal"],
+		});
+		const protectedWriteTool = new WriteTool(createSession(tmpDir, { settings }));
+
+		await expect(
+			protectedWriteTool.execute(
+				"sqlite-wal-permission",
+				{ path: `${dbPath}:users:2`, content: "{ email: 'blocked@example.com' }" },
+				undefined,
+				undefined,
+				permissionContext(tmpDir, settings),
+			),
+		).rejects.toThrow("**/*-wal");
+		const verify = new Database(dbPath, { create: false, strict: true });
+		try {
+			expect(verify.prepare<{ email: string }, [number]>("SELECT email FROM users WHERE id = ?").get(2)?.email).toBe(
+				"bob@example.com",
+			);
+		} finally {
+			verify.close();
+		}
 	});
 
 	it("deletes rows through the write tool with empty content", async () => {

@@ -57,7 +57,11 @@ function toArgsRecord(params: unknown): Record<string, unknown> | null {
 export function permissionRoots(context: AgentToolContext | undefined): PermissionRoots | null {
 	const manager = context?.sessionManager;
 	if (!manager) return null;
-	return { cwd: manager.getCwd(), additionalDirectories: manager.getAdditionalDirectories() };
+	return {
+		cwd: manager.getCwd(),
+		additionalDirectories: manager.getAdditionalDirectories(),
+		agentDir: context?.settings?.getAgentDir?.(),
+	};
 }
 
 /**

@@ -241,6 +241,50 @@ describe("write confinement", () => {
 	});
 });
 
+describe("autolearn persistence", () => {
+	it("blocks managed-skill mutations matched by deny.write", async () => {
+		const context = contextOf({
+			...WORKSPACE,
+			"permissions.confineWrites": false,
+			"permissions.deny.write": ["**/managed-skills/**"],
+		});
+		expect(
+			await denialOf(
+				"manage_skill",
+				{ action: "create", name: "release-check", description: "Verify releases", body: "Run checks." },
+				context,
+			),
+		).toContain("**/managed-skills/**");
+	});
+
+	it("blocks local lessons and managed skills matched by deny.write", async () => {
+		const lessonContext = contextOf({
+			...WORKSPACE,
+			"permissions.confineWrites": false,
+			"permissions.deny.write": ["**/learned.md"],
+		});
+		expect(await denialOf("learn", { memory: "Run release checks before publishing." }, lessonContext)).toContain(
+			"**/learned.md",
+		);
+
+		const skillContext = contextOf({
+			...WORKSPACE,
+			"permissions.confineWrites": false,
+			"permissions.deny.write": ["**/managed-skills/**"],
+		});
+		expect(
+			await denialOf(
+				"learn",
+				{
+					memory: "Use the release checklist.",
+					skill: { action: "create", name: "release-check", description: "Verify releases", body: "Run checks." },
+				},
+				skillContext,
+			),
+		).toContain("**/managed-skills/**");
+	});
+});
+
 describe("worktree subagent roots", () => {
 	// `task/executor.ts` clears `workspace.additionalDirectories` for an
 	// isolated run, so the roots collapse to the worktree alone.

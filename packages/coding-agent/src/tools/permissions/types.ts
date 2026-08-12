@@ -55,6 +55,14 @@ export interface PermissionRoots {
 	readonly cwd: string;
 	/** `workspace.additionalDirectories`, absolute. */
 	readonly additionalDirectories: readonly string[];
+	/**
+	 * The session's resolved agent directory (`Settings#getAgentDir`), absolute.
+	 * `undefined` when the roots were built without a settings-bearing context
+	 * (e.g. `security/coordinator.ts`'s sessionless path) — extractors that need
+	 * it fall back to the process-global `getAgentDir()`, matching what the
+	 * tools they authorize would themselves resolve to in that case.
+	 */
+	readonly agentDir?: string;
 }
 
 /**

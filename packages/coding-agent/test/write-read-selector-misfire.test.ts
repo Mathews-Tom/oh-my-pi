@@ -2,7 +2,9 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { readArchiveEntries, writeArchive } from "@oh-my-pi/pi-coding-agent/utils/zip";
@@ -13,15 +15,24 @@ import { readArchiveEntries, writeArchive } from "@oh-my-pi/pi-coding-agent/util
 // creation and report success, leaving a stray zero-byte file the model could
 // not recover from (issue #6387 — local analogue of the #6123 xd:// guard).
 
-function session(cwd: string): ToolSession {
+function session(cwd: string, settings = Settings.isolated({})): ToolSession {
 	return {
 		cwd,
 		hasUI: false,
 		enableLsp: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
-		settings: Settings.isolated({}),
+		settings,
 	} as ToolSession;
+}
+
+function permissionContext(cwd: string, settings: Settings): AgentToolContext {
+	const sessionManager = {
+		getCwd: () => cwd,
+		getAdditionalDirectories: () => [],
+		getSessionId: () => "write-permission-test",
+	} as unknown as ReadonlySessionManager;
+	return { sessionManager, settings } as unknown as AgentToolContext;
 }
 
 async function makeWorkspace(): Promise<string> {
@@ -101,6 +112,31 @@ describe("write refuses read-selector misfires", () => {
 		expect(result.isError).toBeUndefined();
 		const entries = await readArchiveEntries({ bytes: await Bun.file(archivePath).bytes(), format: "zip" });
 		expect(entries.get(member)).toEqual(new Uint8Array());
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	it("refuses an archive rewrite that would create a denied temporary file", async () => {
+		const dir = await makeWorkspace();
+		const archivePath = path.join(dir, "bundle.zip");
+		await writeArchive(archivePath, "zip", [["entry.txt", "before"]]);
+		const settings = Settings.isolated({
+			"permissions.profile": "workspace",
+			"permissions.deny.write": ["**/*.tmp-*"],
+		});
+		const write = new WriteTool(session(dir, settings));
+
+		await expect(
+			write.execute(
+				"archive-temp-permission",
+				{ path: "bundle.zip:entry.txt", content: "after" },
+				undefined,
+				undefined,
+				permissionContext(dir, settings),
+			),
+		).rejects.toThrow("**/*.tmp-*");
+		const entries = await readArchiveEntries({ path: archivePath, format: "zip" });
+		expect(entries.get("entry.txt")).toEqual(new TextEncoder().encode("before"));
+		expect(await Bun.file(`${archivePath}.tmp-${process.pid}`).exists()).toBe(false);
 		await fs.rm(dir, { recursive: true, force: true });
 	});
 

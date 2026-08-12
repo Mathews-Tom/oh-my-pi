@@ -662,6 +662,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		// Rewrites are whole-archive: write to a temp file and rename so a
 		// crash/disk-full mid-write can't destroy the original archive.
 		const tmpPath = `${finalPath}.tmp-${process.pid}`;
+		// `tmpPath` is a distinct path from `finalPath` — a deny rule that
+		// matches generated temp files (`**/*.tmp-*`) but permits the archive
+		// itself would otherwise never see this create+rename, letting
+		// `writeArchive` below create and then remove a denied path unchecked.
+		this.#assertResolvedWriteAllowed(tmpPath, context);
 
 		const parentDir = path.dirname(resolvedArchivePath.absolutePath);
 		if (parentDir && parentDir !== ".") {
@@ -783,6 +788,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			// updating or deleting, so `read` is required too, not just `write`.
 			this.#assertResolvedWriteAllowed(resolvedSqlitePath.absolutePath, context);
 			this.#assertResolvedReadAllowed(resolvedSqlitePath.absolutePath, context);
+			this.#assertSqliteSidecarPathsAllowed(resolvedSqlitePath.absolutePath, context);
 			db = new Database(resolvedSqlitePath.absolutePath, { create: false, strict: true });
 			db.run("PRAGMA busy_timeout = 3000");
 
@@ -904,6 +910,19 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		if (decision.kind === "deny") {
 			throw new PermissionDeniedError("write", decision.rule, decision.reason);
 		}
+	}
+
+	/**
+	 * Authorize every file SQLite may create beside a mutating database before
+	 * opening its read-write connection. Reading `PRAGMA journal_mode` through a
+	 * read-only connection is not reliable for a WAL database whose transient
+	 * sidecars do not exist yet, and opening a writable connection first can
+	 * create them. This conservative preflight prevents either bypass.
+	 */
+	#assertSqliteSidecarPathsAllowed(absolutePath: string, context: AgentToolContext | undefined): void {
+		this.#assertResolvedWriteAllowed(`${absolutePath}-wal`, context);
+		this.#assertResolvedWriteAllowed(`${absolutePath}-shm`, context);
+		this.#assertResolvedWriteAllowed(`${absolutePath}-journal`, context);
 	}
 
 	/**

@@ -20,7 +20,10 @@ import type { Dirent } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import * as path from "node:path";
 import { Patch } from "@oh-my-pi/hashline";
+import { getAgentDir } from "@oh-my-pi/pi-utils";
+import { getManagedSkillsDir, sanitizeSkillName } from "../../autolearn/managed-skills";
 import { LSP_READONLY_ACTIONS } from "../../lsp";
+import { getMemoryRoot, LEARNED_LESSONS_FILE } from "../../memories";
 import * as git from "../../utils/git";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
 import { normalizePathLikeInput, type ResolvedSearchTarget, toPathList } from "../path-utils";
@@ -389,6 +392,70 @@ const extractSecurityScanPaths: PathTargetExtractor = (args, roots) => {
 	return out;
 };
 
+/**
+ * Resolve a managed-skill `name` argument to the on-disk path
+ * `writeManagedSkill`/`deleteManagedSkill` (`autolearn/managed-skills.ts`)
+ * actually operate on, or `null` when the name is not a string or fails
+ * `sanitizeSkillName`. An unsanitizable name never reaches a real mutation —
+ * both functions call `sanitizeSkillName` themselves and throw first — so
+ * skipping the target here costs nothing: the call fails before any write,
+ * exactly as if the gate had never seen it. Deliberately not per-session:
+ * `getManagedSkillsDir()`'s default (`getAgentDir()`, no override) is what
+ * both callers actually resolve against, so authorizing anything else would
+ * check a path the tool never touches.
+ */
+function managedSkillPath(name: unknown, leaf: "SKILL.md" | null): string | null {
+	if (typeof name !== "string") return null;
+	let safe: string;
+	try {
+		safe = sanitizeSkillName(name);
+	} catch {
+		return null;
+	}
+	const dir = path.join(getManagedSkillsDir(), safe);
+	return leaf ? path.join(dir, leaf) : dir;
+}
+
+/**
+ * `manage_skill`'s only filesystem surface: `create`/`update` write
+ * `<managed-skills>/<name>/SKILL.md` (`writeManagedSkill`), `delete` removes
+ * the whole `<managed-skills>/<name>` directory (`deleteManagedSkill`).
+ */
+const extractManageSkillPaths: PathTargetExtractor = args => {
+	const out: PathTarget[] = [];
+	const target = managedSkillPath(args.name, args.action === "delete" ? null : "SKILL.md");
+	if (target) pushPath(out, target, "write", "name");
+	return out;
+};
+
+/**
+ * `learn`'s effective persistence targets — both defaulted to `pathless`
+ * (`TOOL_PATH_CLASSES`, previously), which let `enforceResourcePermissions`
+ * return before checking either:
+ *
+ * - Its lesson write, when `memory.backend: "local"`, appends to
+ *   `<agentDir>/<memories>/<project>/learned.md` (`saveLearnedLesson`,
+ *   `memories/index.ts`) — resolved against `roots.agentDir` (the session's
+ *   actual `Settings#getAgentDir()`, which can diverge from the process
+ *   default) since this is the one branch that is session-scoped. Checked
+ *   unconditionally rather than only for the `local` backend: the extractor
+ *   has no access to `memory.backend` (only `args`/`roots`), and authorizing
+ *   a path the call ends up not writing is at worst an over-cautious denial,
+ *   never a bypass.
+ * - Its optional `skill` payload writes/enhances a managed skill exactly like
+ *   `manage_skill` (`writeManagedSkill`), never deletes one.
+ */
+const extractLearnPaths: PathTargetExtractor = (args, roots) => {
+	const out: PathTarget[] = [];
+	const agentDir = roots.agentDir ?? getAgentDir();
+	pushPath(out, path.join(getMemoryRoot(agentDir, roots.cwd), LEARNED_LESSONS_FILE), "write", "memory");
+	if (args.skill && typeof args.skill === "object" && !Array.isArray(args.skill)) {
+		const target = managedSkillPath((args.skill as Record<string, unknown>).name, "SKILL.md");
+		if (target) pushPath(out, target, "write", "skill");
+	}
+	return out;
+};
+
 // `hub`, `browser`, `bash`, `eval`, and `computer` all reach arbitrary code —
 // a spawned application, an evaluated script, a shell line — so none of them
 // gets a structured extractor. Declaring one would imply a soundness the class
@@ -716,6 +783,8 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 		resultTargets: extractInspectImageResultTargets,
 	},
 	security_scan: { kind: "structured", extract: extractSecurityScanPaths },
+	learn: { kind: "structured", extract: extractLearnPaths },
+	manage_skill: { kind: "structured", extract: extractManageSkillPaths },
 
 	// ── Class B: opaque — best-effort literal scan, never a sandbox ───────
 	bash: { kind: "opaque", scan: "shell" },
@@ -728,8 +797,6 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	ask: { kind: "pathless" },
 	checkpoint: { kind: "pathless" },
 	github: { kind: "pathless" },
-	learn: { kind: "pathless" },
-	manage_skill: { kind: "pathless" },
 	memory_edit: { kind: "pathless" },
 	recall: { kind: "pathless" },
 	reflect: { kind: "pathless" },
