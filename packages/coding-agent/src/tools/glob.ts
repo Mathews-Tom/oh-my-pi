@@ -101,6 +101,17 @@ interface GlobTarget {
 	searchPath: string;
 	globPattern: string;
 	hasGlob: boolean;
+	/**
+	 * True when this target's search root came from resolving an internal URL
+	 * (`memory://`, `xd://`, …) to its backing filesystem path. `decideTarget`
+	 * (`tools/permissions/resolve.ts`) treats the *original* URL argument as
+	 * fully exempt — it is not a user filesystem target at all — but by the
+	 * time a match reaches result filtering it has already been converted to
+	 * that backing path, which typically lives outside every workspace root.
+	 * Carrying the exemption forward here is what keeps a `confineReads`
+	 * denial from silently dropping every match under an exempt root.
+	 */
+	exempt: boolean;
 }
 
 export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
@@ -169,8 +180,8 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 		// in the default configuration.
 		const permissionsPolicy = loadPermissionsConfig(context?.settings);
 		const permissionsRoots = permissionsPolicy ? permissionRoots(context) : null;
-		const isPathDenied = (relativePath: string): boolean => {
-			if (!permissionsPolicy) return false;
+		const isPathDenied = (relativePath: string, exempt: boolean): boolean => {
+			if (!permissionsPolicy || exempt) return false;
 			// An active profile with no resolvable session roots fails closed.
 			if (!permissionsRoots) return true;
 			return (
@@ -195,6 +206,13 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 			}
 			const internalRouter = InternalUrlRouter.instance();
 			const normalizedPatterns: string[] = [];
+			// Patterns resolved from an internal URL (`memory://`, `xd://`, …) to
+			// their backing filesystem path. `decideTarget` treats the *original*
+			// URL as fully exempt (it is not a user filesystem target), but the
+			// exemption is keyed on that raw argument — once resolved, the
+			// backing path itself must still carry the exemption forward, or
+			// result filtering below rejects it as a plain out-of-workspace path.
+			const exemptPatterns = new Set<string>();
 			for (const rawPattern of aliasResolvedPatterns) {
 				if (!internalRouter.canHandle(rawPattern)) {
 					normalizedPatterns.push(rawPattern);
@@ -221,9 +239,9 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 					if (!resource.sourcePath) {
 						throw new ToolError(`Cannot find internal URL without a backing file: ${memoryGlob.baseUrl}`);
 					}
-					normalizedPatterns.push(
-						path.join(resource.sourcePath.replace(/[*?[{]/g, "[$&]"), memoryGlob.globPattern),
-					);
+					const resolved = path.join(resource.sourcePath.replace(/[*?[{]/g, "[$&]"), memoryGlob.globPattern);
+					normalizedPatterns.push(resolved);
+					exemptPatterns.add(resolved);
 					continue;
 				}
 				const resource = await internalRouter.resolve(rawPattern, {
@@ -238,6 +256,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 					throw new ToolError(`Cannot find internal URL without a backing file: ${rawPattern}`);
 				}
 				normalizedPatterns.push(resource.sourcePath);
+				exemptPatterns.add(resource.sourcePath);
 			}
 			if (normalizedPatterns.some(pattern => pattern.length === 0)) {
 				throw new ToolError("`path` must contain non-empty globs or paths");
@@ -260,19 +279,25 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 
 			const multiPattern = await resolveExplicitFindPatterns(effectivePatterns, this.session.cwd);
 			const isSingle = !multiPattern;
+			// `resolveExplicitFindPatterns` dedups via the same `[...new Set(...)]`
+			// internally, so its targets line up index-for-index with this array.
+			const uniqueEffectivePatterns = [...new Set(effectivePatterns)];
 			const targets: GlobTarget[] = multiPattern
-				? multiPattern.targets.map(target => ({
+				? multiPattern.targets.map((target, index) => ({
 						searchPath: resolveToCwd(target.basePath, this.session.cwd),
 						globPattern: target.globPattern,
 						hasGlob: target.hasGlob,
+						exempt: exemptPatterns.has(uniqueEffectivePatterns[index] ?? ""),
 					}))
 				: [
 						(() => {
-							const parsed = parseFindPattern(effectivePatterns[0] ?? ".");
+							const patternItem = effectivePatterns[0] ?? ".";
+							const parsed = parseFindPattern(patternItem);
 							return {
 								searchPath: resolveToCwd(parsed.basePath, this.session.cwd),
 								globPattern: parsed.globPattern,
 								hasGlob: parsed.hasGlob,
+								exempt: exemptPatterns.has(patternItem),
 							};
 						})(),
 					];
@@ -384,7 +409,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 						});
 						return results
 							.map(matchPath => formatMatchPath(matchPath, target.searchPath))
-							.filter(entry => !isPathDenied(entry));
+							.filter(entry => !isPathDenied(entry, target.exempt));
 					}),
 				);
 				const seen = new Set<string>();
@@ -421,11 +446,11 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 			};
 			const streamed = new Set<string>();
 			const makeOnMatch =
-				(base: string) =>
+				(base: string, exempt: boolean) =>
 				(err: Error | null, match: natives.GlobMatch | null): void => {
 					if (err || combinedSignal.aborted || !match?.path) return;
 					const relativePath = formatMatchPath(match.path, base, match.fileType);
-					if (streamed.has(relativePath) || isPathDenied(relativePath)) return;
+					if (streamed.has(relativePath) || isPathDenied(relativePath, exempt)) return;
 					streamed.add(relativePath);
 					onUpdateMatches.push(relativePath);
 					onUpdateMtimes.push(match.mtime ?? 0);
@@ -473,7 +498,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 								recursive: false,
 								signal: combinedSignal,
 							},
-							makeOnMatch(target.searchPath),
+							makeOnMatch(target.searchPath, target.exempt),
 						),
 					);
 					throwIfAborted(signal);
@@ -481,7 +506,7 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 					for (const match of result.matches) {
 						if (!match.path) continue;
 						const formatted = formatMatchPath(match.path, target.searchPath, match.fileType);
-						if (isPathDenied(formatted)) continue;
+						if (isPathDenied(formatted, target.exempt)) continue;
 						out.push({ path: formatted, mtime: match.mtime ?? 0 });
 					}
 					return out;

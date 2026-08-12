@@ -404,6 +404,7 @@ async function prepareSecurityExecutionTarget(
 		// actually reads would silently diverge.
 		const diffText = filterDiffByPermissionPolicy(
 			await adapter.diffTree(plan.repositoryRoot, baseRevision, headRevision, signal),
+			plan.repositoryRoot,
 			policy,
 		);
 		return {

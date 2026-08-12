@@ -316,14 +316,37 @@ describe("security preflight", () => {
 			"-SECRET=",
 			"+SECRET=changed",
 		].join("\n");
-		const filtered = filterDiffByPermissionPolicy(rawDiff, { deny: ["**/.env*"], allow: ["**/.env.example"] });
+		const filtered = filterDiffByPermissionPolicy(rawDiff, repositoryRoot, {
+			deny: ["**/.env*"],
+			allow: ["**/.env.example"],
+		});
 		expect(filtered).toContain("src/a.ts");
 		expect(filtered).toContain(".env.example");
 		expect(filtered).not.toContain("SECRET=old");
 		expect(filtered).not.toContain("SECRET=new\n");
 
 		// An empty policy (no deny rules) never touches the diff.
-		expect(filterDiffByPermissionPolicy(rawDiff, { deny: [], allow: [] })).toBe(rawDiff);
+		expect(filterDiffByPermissionPolicy(rawDiff, repositoryRoot, { deny: [], allow: [] })).toBe(rawDiff);
+	});
+
+	test("filterDiffByPermissionPolicy matches a deny rule written as an absolute path", () => {
+		const rawDiff = [
+			"diff --git a/private/secret b/private/secret",
+			"index 000..111 100644",
+			"--- a/private/secret",
+			"+++ b/private/secret",
+			"@@ -1 +1 @@",
+			"-old",
+			"+new",
+		].join("\n");
+		// A rule anchored to the repository root only ever matches a
+		// repo-relative filename's resolved absolute spelling — the same
+		// candidate an ordinary `read` checks (`decidePathTarget`).
+		const filtered = filterDiffByPermissionPolicy(rawDiff, repositoryRoot, {
+			deny: [`${path.join(repositoryRoot, "private").replaceAll("\\", "/")}/**`],
+			allow: [],
+		});
+		expect(filtered).not.toContain("private/secret");
 	});
 
 	test("a ref_diff target's fingerprint reflects a filtered diff, not the raw one", async () => {

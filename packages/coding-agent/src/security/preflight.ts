@@ -151,7 +151,22 @@ export interface SecurityPathPolicy {
 
 const NO_SECURITY_PATH_POLICY: SecurityPathPolicy = { deny: [], allow: [] };
 
-function isPathExcludedBySecurityPolicy(candidates: readonly string[], policy: SecurityPathPolicy): boolean {
+/**
+ * `deny`/`allow` glob rules are written and documented root-relative
+ * (`**\/.env.*`) but also absolute (`/repo/private/**`), same as
+ * `permissions.deny.read` (`decidePathTarget`, `tools/permissions/resolve.ts`).
+ * A repo-relative filename alone only ever matches the first form; resolving
+ * it against `repositoryRoot` too lets an absolute rule see the same file an
+ * ordinary `read` would deny.
+ */
+function isPathExcludedBySecurityPolicy(
+	repositoryRoot: string,
+	relativePath: string,
+	policy: SecurityPathPolicy,
+): boolean {
+	const candidates = [relativePath, path.resolve(repositoryRoot, relativePath), path.basename(relativePath)].map(
+		candidate => candidate.replaceAll("\\", "/"),
+	);
 	return matchGlob(policy.deny, candidates) !== null && matchGlob(policy.allow, candidates) === null;
 }
 
@@ -164,12 +179,14 @@ function isPathExcludedBySecurityPolicy(candidates: readonly string[], policy: S
  * separately sending the filtered text to the model would let the two
  * diverge, defeating the point of fingerprinting what the session sees.
  */
-export function filterDiffByPermissionPolicy(rawDiff: string, policy: SecurityPathPolicy): string {
+export function filterDiffByPermissionPolicy(
+	rawDiff: string,
+	repositoryRoot: string,
+	policy: SecurityPathPolicy,
+): string {
 	if (policy.deny.length === 0) return rawDiff;
 	const files = git.diff.parseFiles(rawDiff);
-	const kept = files.filter(
-		file => !isPathExcludedBySecurityPolicy([file.filename, path.basename(file.filename)], policy),
-	);
+	const kept = files.filter(file => !isPathExcludedBySecurityPolicy(repositoryRoot, file.filename, policy));
 	if (kept.length === files.length) return rawDiff;
 	return kept.map(file => file.content).join("\n");
 }
@@ -187,7 +204,7 @@ async function digestWorkingTree(
 	const files = [...new Set([...tracked, ...untracked])]
 		.map(normalizeRelativePath)
 		.filter(candidate => pathMatchesSecurityScope(candidate, includePaths, excludePaths))
-		.filter(candidate => !isPathExcludedBySecurityPolicy([candidate, path.basename(candidate)], policy))
+		.filter(candidate => !isPathExcludedBySecurityPolicy(repositoryRoot, candidate, policy))
 		.sort();
 	const hasher = new Bun.CryptoHasher("sha256");
 	for (const relativePath of files) {
@@ -239,6 +256,7 @@ async function normalizeTarget(
 		if (!headRevision) throw new Error(`Unknown security scan head revision: ${request.headRevision}`);
 		const rawDiff = filterDiffByPermissionPolicy(
 			await adapter.diffTree(repositoryRoot, baseRevision, headRevision, signal),
+			repositoryRoot,
 			policy,
 		);
 		return {

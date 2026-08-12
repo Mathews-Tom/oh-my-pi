@@ -27,13 +27,14 @@ function contextOf(overrides: Record<string, unknown>): AgentToolContext {
 	return { sessionManager, settings: settingsOf(overrides) } as unknown as AgentToolContext;
 }
 
-function sessionOf(): ToolSession {
+function sessionOf(overrides: Record<string, unknown> = {}): ToolSession {
 	return {
 		cwd: workspace,
 		hasUI: false,
 		settings: settingsOf({}),
 		getSessionFile: () => null,
 		getSessionSpawns: () => null,
+		...overrides,
 	} as unknown as ToolSession;
 }
 
@@ -81,5 +82,46 @@ describe("GlobTool resource permissions", () => {
 			}),
 		);
 		expect(result.details?.files).toContain(".env");
+	});
+
+	// An internal URL (`skill://`, `memory://`, …) is fully exempt from the
+	// permission decision (`isExemptPathArgument`), because it is not a user
+	// filesystem target. By the time a match is filtered here it has already
+	// been converted to its backing filesystem path — often outside every
+	// workspace root — so without carrying the exemption forward, a
+	// `confineReads` denial would silently drop every match under it.
+	test("keeps matches under an internal URL whose backing directory is outside the workspace under strict", async () => {
+		const backingDir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "omp-glob-perm-skill-")));
+		fs.mkdirSync(path.join(backingDir, "references"), { recursive: true });
+		fs.writeFileSync(path.join(backingDir, "SKILL.md"), "# Demo\n");
+		fs.writeFileSync(path.join(backingDir, "references", "guide.md"), "guide\n");
+		try {
+			const tool = new GlobTool(
+				sessionOf({
+					skills: [
+						{
+							name: "demo",
+							description: "demo skill",
+							filePath: path.join(backingDir, "SKILL.md"),
+							baseDir: backingDir,
+							source: "test",
+						},
+					],
+				}),
+			);
+			const result = await tool.execute(
+				"glob-perm-skill",
+				{ path: "skill://demo/references" },
+				undefined,
+				undefined,
+				contextOf({
+					"permissions.profile": "strict",
+					"permissions.confineReads": true,
+				}),
+			);
+			expect(result.details?.files).toContain(path.join(backingDir, "references", "guide.md"));
+		} finally {
+			fs.rmSync(backingDir, { recursive: true, force: true });
+		}
 	});
 });
