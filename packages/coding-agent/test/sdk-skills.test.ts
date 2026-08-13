@@ -300,6 +300,58 @@ This skill is added after session creation.
 		}
 	});
 
+	it("manage_skill refresh drops a skill denied by permissions.deny.read from session state", async () => {
+		const originalAgentDir = getAgentDir();
+		const managedAgentDir = path.join(tempHomeDir, ".omp", "agent");
+		setAgentDir(managedAgentDir);
+
+		const secretSkillDir = path.join(tempDir, ".omp", "skills", "secret-skill");
+		fs.mkdirSync(secretSkillDir, { recursive: true });
+		const secretSkillFile = path.join(secretSkillDir, "SKILL.md");
+		fs.writeFileSync(
+			secretSkillFile,
+			"---\nname: secret-skill\ndescription: Should never survive a denied refresh.\n---\n\nSecret body.\n",
+		);
+
+		const settings = createIsolatedSkillsSettings();
+		settings.set("autolearn.enabled", true);
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: managedAgentDir,
+			sessionManager: SessionManager.inMemory(tempDir),
+			modelRegistry: sharedModelRegistry,
+			settings,
+		});
+
+		try {
+			// Discovered normally before any deny rule exists.
+			expect(session.skills.some(skill => skill.name === "secret-skill")).toBe(true);
+
+			settings.set("permissions.profile", "workspace");
+			settings.set("permissions.deny.read", [secretSkillFile]);
+
+			const manageSkill = session.getToolByName("manage_skill");
+			expect(manageSkill).toBeDefined();
+			await manageSkill!.execute("manage-skill-create-denied-sibling", {
+				action: "create",
+				name: "runtime-managed-skill-2",
+				description: "Created while a sibling skill is denied.",
+				body: "# Runtime Managed Skill 2\n\nUse this immediately.",
+			});
+
+			// The write this call declared is still allowed and discoverable...
+			expect(session.skills.some(skill => skill.name === "runtime-managed-skill-2")).toBe(true);
+			// ...but the refresh's rescan of every enabled SKILL.md must not let a
+			// denied sibling's frontmatter back into session state.
+			expect(session.skills.some(skill => skill.name === "secret-skill")).toBe(false);
+			expect(getActiveSkills().some(skill => skill.name === "secret-skill")).toBe(false);
+			expect(session.agent.state.systemPrompt.join("\n")).not.toContain("secret-skill");
+		} finally {
+			await session.dispose();
+			setAgentDir(originalAgentDir);
+		}
+	});
+
 	it("should have empty skills when options.skills is empty array (--no-skills)", async () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,

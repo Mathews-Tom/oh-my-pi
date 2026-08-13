@@ -21,6 +21,9 @@ import { usesCodexTaskPrompt } from "../task/prompt-policy";
 import { isMCPToolName, normalizeToolNames } from "../tools/builtin-names";
 import { computerExposureMode } from "../tools/computer/exposure";
 import { wrapToolWithMetaNotice } from "../tools/output-meta";
+import { loadPermissionsConfig } from "../tools/permissions/config";
+import { decideTarget } from "../tools/permissions/resolve";
+import type { PermissionRoots } from "../tools/permissions/types";
 import { supportsExternalThinking } from "../tools/think";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
 import { isMountableUnderXdev, listXdevTools, type XdevState, xdevDocsFor, xdevEntries } from "../tools/xdev";
@@ -130,6 +133,31 @@ export function* collectMountedMCPToolRoutes(
 			name: tool.name,
 		};
 	}
+}
+
+/**
+ * Skills whose backing file matches `permissions.deny.read` never enter
+ * session state.
+ *
+ * `refreshSkills` rescans and reads every enabled `SKILL.md` on each call —
+ * not just the file a caller (`manage_skill`, `learn`) just wrote — so a deny
+ * rule scoped to an unrelated authored or managed skill would otherwise be
+ * defeated by that rescan's side effect: the denied skill's frontmatter would
+ * still land in `#skills`/`setActiveSkills` and surface in the system prompt.
+ * Filtering the discovered set here, before it is ever stored, protects every
+ * `refreshSkills` caller uniformly rather than gating only the one write path
+ * a given tool call declared.
+ */
+function filterReadableSkills(skills: Skill[], host: SessionToolsHost): Skill[] {
+	const policy = loadPermissionsConfig(host.settings);
+	if (!policy) return skills;
+	const roots: PermissionRoots = {
+		cwd: host.sessionManager.getCwd(),
+		additionalDirectories: host.sessionManager.getAdditionalDirectories(),
+	};
+	return skills.filter(
+		skill => decideTarget({ raw: skill.filePath, access: "read", field: "skill" }, policy, roots).kind !== "deny",
+	);
 }
 
 function formatMCPXdevGuidanceLabel(label: string): string {
@@ -1002,7 +1030,7 @@ export class SessionTools {
 				cwd: this.#host.sessionManager.getCwd(),
 				disabledExtensions: this.#host.settings.get("disabledExtensions") ?? [],
 			});
-			this.#skills = discovered.skills;
+			this.#skills = filterReadableSkills(discovered.skills, this.#host);
 			this.#skillWarnings = discovered.warnings;
 			this.#skillsSettings = skillsSettings;
 
