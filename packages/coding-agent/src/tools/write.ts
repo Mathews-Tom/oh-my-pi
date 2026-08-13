@@ -744,7 +744,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		};
 	}
 
-	async #resolveSqliteWritePath(writePath: string): Promise<ResolvedSqliteWritePath | null> {
+	async #resolveSqliteWritePath(
+		writePath: string,
+		context: AgentToolContext | undefined,
+	): Promise<ResolvedSqliteWritePath | null> {
 		const candidates = parseSqlitePathCandidates(writePath).filter(candidate => candidate.sqlitePath !== writePath);
 		if (candidates.length === 0) {
 			return null;
@@ -764,6 +767,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		for (const candidate of candidates) {
 			const target = parseSqliteWriteTarget(candidate.subPath, candidate.queryString);
 			const absolutePath = resolvePlanPath(this.session, candidate.sqlitePath);
+			// As with the archive resolver above, skip the stat/header-sniff for a
+			// candidate the caller has no read access to instead of probing it —
+			// otherwise a deny.read/confineReads rule is bypassed by the mere act
+			// of resolving which candidate is the real sqlite file.
+			if (!isResourcePathPermitted({ raw: absolutePath, access: "read", field: "path" }, context)) {
+				continue;
+			}
 			try {
 				const stat = await Bun.file(absolutePath).stat();
 				if (stat.isDirectory()) {
@@ -1316,7 +1326,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				return archiveResult;
 			}
 
-			const resolvedSqlitePath = await this.#resolveSqliteWritePath(path);
+			const resolvedSqlitePath = await this.#resolveSqliteWritePath(path, context);
 			if (resolvedSqlitePath) {
 				enforcePlanModeWrite(this.session, resolvedSqlitePath.sqlitePath, { op: "update" });
 				enforceResourcePathTargets(

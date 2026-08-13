@@ -7,7 +7,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
-import { $env, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, prompt } from "@oh-my-pi/pi-utils";
 import { resolveAgentModelSelection } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
@@ -427,22 +427,56 @@ interface ArtifactLease {
 	unregister: (() => void) | undefined;
 }
 
+/**
+ * Authorize the artifact-lease directory {@link leaseArtifacts} is about to
+ * materialize, against the same resource permission policy every other tool
+ * call faces — the artifact-directory sibling of {@link authorizeIsolationTargets}.
+ *
+ * `task`/`eval` are classified pathless (`tool-path-targets.ts`) because their
+ * free-text prompt carries no path, on the theory that enforcement belongs to
+ * the subagent's own later tool calls. That theory doesn't hold for this
+ * directory: `leaseArtifacts` creates it — a session-artifacts sibling when a
+ * session file exists, otherwise a fresh directory under `os.tmpdir()` —
+ * before the isolation gate above ever runs and for every invocation,
+ * isolated or not, so a later tool call never gets a chance to authorize it.
+ * Checked here, before `fs.mkdir` runs, closes that gap for both cases
+ * (finding under review).
+ */
+function authorizeArtifactsDirectory(session: ToolSession, artifactsDir: string): void {
+	const policy = loadPermissionsConfig(session.settings);
+	if (!policy) return;
+	const roots: PermissionRoots = {
+		cwd: session.cwd,
+		additionalDirectories: [...(session.additionalDirectories ?? [])],
+	};
+	const denial = checkStructuredTargets(
+		[{ raw: artifactsDir, access: "write", field: "task.artifacts.directory" }],
+		policy,
+		roots,
+	);
+	if (denial) throw new PermissionDeniedError("task", denial.rule, denial.reason);
+}
+
+/**
+ * `id` is the same id {@link reserveStructuredSubagentId} already allocated for
+ * this run, reused (rather than minting a fresh random suffix here) so the
+ * directory this authorizes and creates is the exact one the caller reads
+ * back from the returned lease — not an approximation of it.
+ */
 async function leaseArtifacts(
 	session: ToolSession,
 	invocationKind: StructuredSubagentRequest["invocationKind"],
+	id: string,
 ): Promise<ArtifactLease> {
 	const sessionFile = session.getSessionFile();
-	if (sessionFile) {
-		const artifactsDir = sessionFile.slice(0, -6);
-		await fs.mkdir(artifactsDir, { recursive: true });
-		return { sessionFile, artifactsDir, temporary: false, unregister: undefined };
-	}
-	const artifactsDir = path.join(
-		os.tmpdir(),
-		`${invocationKind === "eval" ? "omp-eval-agent" : "omp-task"}-${Snowflake.next()}`,
-	);
+	const artifactsDir = sessionFile
+		? sessionFile.slice(0, -6)
+		: path.join(os.tmpdir(), `${invocationKind === "eval" ? "omp-eval-agent" : "omp-task"}-${id}`);
+	authorizeArtifactsDirectory(session, artifactsDir);
 	await fs.mkdir(artifactsDir, { recursive: true });
-	return { sessionFile: null, artifactsDir, temporary: true, unregister: registerArtifactsDir(artifactsDir) };
+	return sessionFile
+		? { sessionFile, artifactsDir, temporary: false, unregister: undefined }
+		: { sessionFile: null, artifactsDir, temporary: true, unregister: registerArtifactsDir(artifactsDir) };
 }
 
 function resolveAutoloadSkills(session: ToolSession, agent: AgentDefinition) {
@@ -629,7 +663,7 @@ function attachStructuredOutputMetadata(result: SingleResult, schema: Structured
  */
 export async function runStructuredSubagent(request: StructuredSubagentRequest): Promise<StructuredSubagentResult> {
 	const policy = await resolveEffectiveSubagentPolicy(request);
-	const lease = await leaseArtifacts(request.session, request.invocationKind);
+	let lease: ArtifactLease | undefined;
 	let changesApplied: boolean | null = null;
 	let mergeSummary = "";
 	let requiresRecoveryArtifacts = false;
@@ -640,6 +674,16 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			...request.identity,
 			label: request.identity?.label ?? (request.invocationKind === "eval" ? "EvalAgent" : undefined),
 		});
+		// Reuses `id` (see `leaseArtifacts`'s doc comment) and authorizes the
+		// resulting directory before creating it, ahead of the isolation gate
+		// below and regardless of whether this run is isolated.
+		try {
+			lease = await leaseArtifacts(request.session, request.invocationKind, id);
+		} catch (error) {
+			throw new StructuredSubagentError("preflight", error instanceof Error ? error.message : String(error), {
+				cause: error,
+			});
+		}
 		const baseOptions = buildExecutorOptions(request, policy, lease, id);
 		baseOptions.onCleanupDeferred = completion => {
 			deferredCleanup = completion;
@@ -755,22 +799,28 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			{ cause: error },
 		);
 	} finally {
-		const shouldRetainArtifacts =
-			(request.retainArtifacts && completedSuccessfully) ||
-			(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
-		const shouldCleanup = lease.temporary && !shouldRetainArtifacts;
-		if (shouldCleanup) {
-			const cleanupArtifacts = async (): Promise<void> => {
-				await fs.rm(lease.artifactsDir, { recursive: true, force: true });
-				lease.unregister?.();
-			};
-			if (deferredCleanup) {
-				trackLateCleanup(deferredCleanup.then(cleanupArtifacts), {
-					resource: "artifacts",
-					artifactsDir: lease.artifactsDir,
-				});
-			} else {
-				await cleanupArtifacts();
+		// `lease` is unset when `reserveStructuredSubagentId`/`leaseArtifacts`
+		// itself threw (including an artifacts-directory permission denial) —
+		// nothing was created, so there is nothing to clean up.
+		if (lease) {
+			const activeLease = lease;
+			const shouldRetainArtifacts =
+				(request.retainArtifacts && completedSuccessfully) ||
+				(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
+			const shouldCleanup = activeLease.temporary && !shouldRetainArtifacts;
+			if (shouldCleanup) {
+				const cleanupArtifacts = async (): Promise<void> => {
+					await fs.rm(activeLease.artifactsDir, { recursive: true, force: true });
+					activeLease.unregister?.();
+				};
+				if (deferredCleanup) {
+					trackLateCleanup(deferredCleanup.then(cleanupArtifacts), {
+						resource: "artifacts",
+						artifactsDir: activeLease.artifactsDir,
+					});
+				} else {
+					await cleanupArtifacts();
+				}
 			}
 		}
 	}

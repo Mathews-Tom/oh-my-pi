@@ -468,7 +468,13 @@ describe("structured subagent primitive", () => {
 		await fs.rm(restrictedRun.artifactsDir, { recursive: true, force: true });
 	});
 
-	it("unregisters and removes a temporary lease when output ID allocation fails", async () => {
+	it("does not lease or clean up an artifacts directory when output ID allocation fails before one is created", async () => {
+		// Id allocation now runs before `leaseArtifacts` — the artifacts
+		// directory reuses that id (see `leaseArtifacts`'s doc comment) rather
+		// than minting its own random suffix, so a permission gate over the
+		// resulting path can authorize it before creation. An allocation
+		// failure here means the directory was never created, so there is
+		// nothing to unregister or remove.
 		mockDiscovery();
 		const failingSession = session();
 		failingSession.agentOutputManager = {
@@ -482,10 +488,8 @@ describe("structured subagent primitive", () => {
 			"Subagent execution failed: allocate failed",
 		);
 
-		const artifactsDir = remove.mock.calls[0]?.[0];
-		expect(typeof artifactsDir).toBe("string");
+		expect(remove).not.toHaveBeenCalled();
 		expect(artifactsDirsFromRegistry()).toEqual([]);
-		await expect(fs.stat(artifactsDir as string)).rejects.toThrow();
 	});
 
 	it("unregisters and removes a temporary lease when plan reference loading fails", async () => {

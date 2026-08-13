@@ -1,11 +1,12 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { isEexist, isEnotempty, readImageMetadata, untilAborted } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../sdk";
 import { loadImageInput, MAX_IMAGE_INPUT_BYTES, webpExclusionForModel } from "../utils/image-loading";
 import { convertFileWithMarkit } from "../utils/markit";
+import { enforceResourcePathTargets } from "./permissions/gate";
 import type { ReadToolDetails } from "./read";
 import { prependSuffixResolutionNotice } from "./read-format";
 import { isNotFoundError } from "./read-path-resolution";
@@ -72,7 +73,17 @@ function pdfImageCacheDir(session: ToolSession, absolutePdfPath: string, content
 	return path.join(root, "read-pdf-images", `${basename}-${pathDigest}-${contentDigest}`);
 }
 
-async function snapshotPdfSource(absolutePdfPath: string, signal?: AbortSignal): Promise<PdfImageSnapshot> {
+async function snapshotPdfSource(
+	absolutePdfPath: string,
+	context: AgentToolContext | undefined,
+	signal?: AbortSignal,
+): Promise<PdfImageSnapshot> {
+	// The snapshot directory's own name is minted by `mkdtemp` (OS-random, not
+	// knowable ahead of the call that creates it), so its stable, checkable
+	// ancestor — `os.tmpdir()` itself — is what's authorized: any rule that
+	// would deny or fail to confine a write under system temp denies every
+	// possible mkdtemp leaf beneath it identically (finding under review).
+	enforceResourcePathTargets("read", [{ raw: os.tmpdir(), access: "write", field: "path" }], context);
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-read-pdf-"));
 	try {
 		const bytes = await untilAborted(signal, () => Bun.file(absolutePdfPath).bytes());
@@ -173,10 +184,41 @@ async function waitForPdfImageExtraction(
 async function ensurePdfImageCache(
 	session: ToolSession,
 	absolutePdfPath: string,
+	context: AgentToolContext | undefined,
 	signal?: AbortSignal,
 ): Promise<string> {
-	const snapshot = await snapshotPdfSource(absolutePdfPath, signal);
+	const snapshot = await snapshotPdfSource(absolutePdfPath, context, signal);
 	const imageDir = pdfImageCacheDir(session, absolutePdfPath, snapshot.digest);
+	// `imageDir` is deterministic (a content digest of the snapshot plus a hash
+	// of the source path — no randomness), so it is authorized by its exact
+	// spelling rather than a stand-in. Read as well as write: a cache hit
+	// below returns previously extracted images straight from this directory
+	// without writing anything, so a read-denied/confineReads-excluded
+	// destination must refuse that path too, not just a fresh extraction.
+	// `path.dirname(imageDir)` is authorized too — `extractPdfImages` stages
+	// the real work at a `${imageDir}.tmp-*` sibling minted by `mkdtemp`
+	// (random, unknowable ahead of that call) before renaming it onto
+	// `imageDir`, so the sibling's own stable, checkable ancestor is what's
+	// authorized, exactly as `os.tmpdir()` stands in for the snapshot
+	// directory above (finding under review).
+	//
+	// `snapshotPdfSource` already wrote the pdf's bytes to `snapshot.directory`
+	// by this point, so a denial here must still clean that up rather than
+	// leaking the temp snapshot.
+	try {
+		enforceResourcePathTargets(
+			"read",
+			[
+				{ raw: imageDir, access: "read", field: "path" },
+				{ raw: imageDir, access: "write", field: "path" },
+				{ raw: path.dirname(imageDir), access: "write", field: "path" },
+			],
+			context,
+		);
+	} catch (error) {
+		await fs.rm(snapshot.directory, { recursive: true, force: true });
+		throw error;
+	}
 	const existing = pdfImageExtractions.get(imageDir);
 	if (existing && !existing.settled && !existing.controller.signal.aborted) {
 		await fs.rm(snapshot.directory, { recursive: true, force: true });
@@ -195,9 +237,10 @@ export async function readPdfImageMember(
 	pdfDisplayPath: string,
 	member: string,
 	suffixResolution: { from: string; to: string } | undefined,
+	context: AgentToolContext | undefined,
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<ReadToolDetails>> {
-	const imageDir = await ensurePdfImageCache(session, absolutePdfPath, signal);
+	const imageDir = await ensurePdfImageCache(session, absolutePdfPath, context, signal);
 	const members = await listPdfImageMembers(imageDir);
 	if (member.length === 0) {
 		const text =

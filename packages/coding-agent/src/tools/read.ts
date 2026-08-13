@@ -971,6 +971,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					pdfImageMemberPath.pdfPath,
 					pdfImageMemberPath.member,
 					suffixResolution,
+					_toolContext,
 					signal,
 				);
 			}

@@ -295,17 +295,56 @@ describe("task isolation permission gate", () => {
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
 
-	it("leaves non-isolated task execution unaffected under a confining profile", async () => {
+	it("denies non-isolated task execution whose ephemeral artifacts directory falls outside workspace roots under a confining profile", async () => {
+		// `leaseArtifacts` creates its artifacts directory (a session-file
+		// sibling, or here — no session file — a fresh directory under
+		// `os.tmpdir()`) before any subagent tool call gets a chance to
+		// authorize anything, for isolated *and* non-isolated runs alike. This
+		// mirrors the isolated case above (`authorizeIsolationTargets`) rather
+		// than leaving non-isolated execution as the one path that bypasses the
+		// gate (finding under review).
 		mockDiscovery();
 		const getRepoRoot = vi.spyOn(worktreeModule, "getRepoRoot");
+		const runSubprocess = vi.spyOn(executorModule, "runSubprocess");
+		const mkdir = vi.spyOn(fs, "mkdir");
+
+		const denied = runStructuredSubagent(
+			request({
+				session: session({ "permissions.profile": "strict" }),
+			}),
+		);
+
+		await expect(denied).rejects.toThrow(StructuredSubagentError);
+		await expect(denied).rejects.toThrow(/permissions\.confineWrites/);
+		expect(getRepoRoot).not.toHaveBeenCalled();
+		expect(runSubprocess).not.toHaveBeenCalled();
+		// The gate must run before `leaseArtifacts` creates anything — not just
+		// before the subagent dispatches — so the ephemeral directory is never
+		// materialized on disk for a denied call.
+		expect(mkdir).not.toHaveBeenCalled();
+	});
+
+	it("does not merely block every non-isolated task call — an explicit allow rule still lets it through", async () => {
+		mockDiscovery();
 		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(result());
 
 		const settled = await runStructuredSubagent(
 			request({
-				session: session({ "permissions.profile": "strict" }),
+				session: session({ "permissions.profile": "strict", "permissions.allow.write": ["**"] }),
 				retainArtifacts: true,
 			}),
 		);
+
+		expect(settled.result.exitCode).toBe(0);
+		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+	});
+
+	it("leaves non-isolated task execution unaffected when the permission profile is off (the default)", async () => {
+		mockDiscovery();
+		const getRepoRoot = vi.spyOn(worktreeModule, "getRepoRoot");
+		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(result());
+
+		const settled = await runStructuredSubagent(request({ session: session(), retainArtifacts: true }));
 
 		expect(settled.result.exitCode).toBe(0);
 		expect(getRepoRoot).not.toHaveBeenCalled();
