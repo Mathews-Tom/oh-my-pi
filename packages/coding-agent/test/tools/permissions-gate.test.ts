@@ -259,6 +259,45 @@ describe("write confinement", () => {
 		const message = await denialOf("write", { path: "[../outside/loot.txt#ABCD]" }, contextOf(WORKSPACE));
 		expect(message).toContain("permissions.confineWrites");
 	});
+
+	it("authorizes a SQLite database's journal/WAL/SHM siblings, not just the database an exact rule allows", async () => {
+		const dbPath = path.join(outside, "vault.db");
+		const db = new Database(dbPath, { create: true, strict: true });
+		db.run("CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
+		db.run("INSERT INTO items (id, value) VALUES (1, 'a')");
+		db.close();
+
+		const session = {
+			cwd: workspace,
+			hasUI: false,
+			enableLsp: false,
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			settings: settingsOf({}),
+		} as ToolSession;
+		// The exact allow rule carves out only the database itself, so
+		// `permissions.confineWrites` still applies to every other outside
+		// path — including the `-journal`/`-wal`/`-shm` siblings a writable
+		// open can create next to it.
+		const context = contextOf({
+			"permissions.profile": "workspace",
+			"permissions.allow.write": [dbPath],
+		});
+
+		await expect(
+			new WriteTool(session).execute(
+				"write-sqlite-aux-siblings",
+				{ path: `${dbPath}:items:1`, content: "{ value: 'b' }" },
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toThrow("permissions.confineWrites");
+
+		expect(fs.existsSync(`${dbPath}-journal`)).toBe(false);
+		expect(fs.existsSync(`${dbPath}-wal`)).toBe(false);
+		expect(fs.existsSync(`${dbPath}-shm`)).toBe(false);
+	});
 });
 
 describe("worktree subagent roots", () => {

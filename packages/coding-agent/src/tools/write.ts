@@ -58,6 +58,7 @@ import {
 	splitPathAndSel,
 } from "./path-utils";
 import { enforceResourcePathTargets, isResourcePathPermitted } from "./permissions/gate";
+import type { PathTarget } from "./permissions/types";
 import { enforcePlanModeWrite, resolvePlanPath, unwrapHashlineHeaderPath } from "./plan-mode-guard";
 import {
 	cachedRenderedString,
@@ -438,6 +439,22 @@ interface ResolvedSqliteWritePath {
 	table: string;
 	key?: string;
 	exists: boolean;
+}
+
+/**
+ * SQLite's rollback-journal and WAL sibling files. A writable open can create
+ * or mutate any of these next to the database itself, depending on the
+ * journal mode persisted in the file, so they need authorizing alongside the
+ * database path itself rather than after the fact.
+ */
+const SQLITE_AUXILIARY_SUFFIXES = ["-journal", "-wal", "-shm"] as const;
+
+function sqliteAuxiliaryPathTargets(sqlitePath: string): PathTarget[] {
+	return SQLITE_AUXILIARY_SUFFIXES.map(suffix => ({
+		raw: `${sqlitePath}${suffix}`,
+		access: "write" as const,
+		field: "path",
+	}));
 }
 
 function isArchivePathNotFound(error: unknown): boolean {
@@ -1309,6 +1326,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 						...(resolvedSqlitePath.exists
 							? [{ raw: resolvedSqlitePath.sqlitePath, access: "read" as const, field: "path" }]
 							: []),
+						...sqliteAuxiliaryPathTargets(resolvedSqlitePath.sqlitePath),
 					],
 					context,
 				);
