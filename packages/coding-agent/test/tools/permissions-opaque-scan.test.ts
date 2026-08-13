@@ -103,4 +103,21 @@ describe("policy interaction", () => {
 		const confined = buildPermissionPolicy("workspace", { confineWrites: true });
 		expect(scanOpaqueArguments({ command: "ls /usr/bin" }, "shell", confined, roots)).toBeNull();
 	});
+
+	it("does not let a carve-out matching the lexical spelling suppress a deny matching the resolved target", () => {
+		// Mirrors the structured-path fix (`permissions-resolve.test.ts`): a
+		// workspace symlink literally named `.env.example` but pointing at the
+		// real `.env` must not read as the shipped template. The candidate set
+		// for `cat .env.example` mixes the lexical spelling (which the carve-out
+		// matches) with the symlink-resolved one (which the deny glob matches);
+		// the carve-out may only suppress a deny that fired on the same
+		// candidate it matches, never the whole set.
+		const linkDir = path.join(workspace, "link-carve-out");
+		fs.mkdirSync(linkDir, { recursive: true });
+		const link = path.join(linkDir, ".env.example");
+		fs.rmSync(link, { force: true });
+		fs.symlinkSync(path.join(workspace, ".env"), link);
+		const hit = scanOpaqueArguments({ command: `cat ${link}` }, "shell", STRICT, roots);
+		expect(hit?.rule).toBe("**/.env");
+	});
 });

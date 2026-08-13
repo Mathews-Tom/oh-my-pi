@@ -17,7 +17,7 @@
 import * as path from "node:path";
 import { tokenizeShellSegments } from "../shell-tokenize";
 import { relativeToRoots } from "./confine";
-import { matchGlob } from "./matcher";
+import { matchGlob, matchGlobCandidate } from "./matcher";
 import { denySuppressingGlobs } from "./profiles";
 import { isExemptPathArgument, permissionRootList, resolveTargetPath } from "./resolve";
 import type { PathAccess, PermissionPolicy, PermissionRoots } from "./types";
@@ -162,9 +162,17 @@ export function scanOpaqueArguments(
 		const candidates = [...relatives, absolute, path.basename(absolute), literal];
 
 		for (const access of ["read", "write"] as const) {
-			if (matchGlob(suppressing[access], candidates)) continue;
-			const rule = matchGlob(policy.deny[access], candidates);
-			if (rule) return { literal, rule, access };
+			const deniedMatch = matchGlobCandidate(policy.deny[access], candidates);
+			if (!deniedMatch) continue;
+			// A carve-out only ever relaxes the exact candidate the deny matched —
+			// never the whole set (`decidePathTarget`, resolve.ts, has the same
+			// fix). `candidates` mixes a literal's lexical spelling with its
+			// symlink-resolved one, so a workspace symlink named `.env.example`
+			// that resolves to `.env` would otherwise have the deny match on
+			// `.env` suppressed by the carve-out matching `.env.example` — a
+			// different candidate entirely, not the one the deny actually fired on.
+			if (matchGlob(suppressing[access], [deniedMatch.candidate])) continue;
+			return { literal, rule: deniedMatch.pattern, access };
 		}
 	}
 	return null;
