@@ -19,7 +19,7 @@ import { createSecurityEvidenceId, type SecurityEvidence, type SecurityValidatio
 import type { SecurityOperationSnapshot } from "../security/coordinator";
 import { getSecurityCoordinator } from "../security/coordinator";
 import type { SecurityScanGuard, SecurityTargetRequest } from "../security/preflight";
-import { SecurityStore } from "../security/store";
+import { resolveSecurityProjectDirectoryForCwd, SecurityStore } from "../security/store";
 import type { ToolSession } from "./index";
 import { enforceResourcePathTargets } from "./permissions/gate";
 import { ToolError } from "./tool-errors";
@@ -117,6 +117,25 @@ function resourcePermissionGuard(context: AgentToolContext | undefined): Securit
 			);
 		},
 	};
+}
+
+/**
+ * Open the `SecurityStore` for `cwd`, authorizing the resolved project state
+ * directory first. `cloud_pull` and `validate` open the store directly
+ * (there is no `SecurityCoordinator` action for either), so each needs this
+ * same pre-open gate `SecurityCoordinator#gateStateDirectory` runs for
+ * `preflight`/`start` — otherwise a plan saved while permissions were off,
+ * then `workspace` enabled before one of these actions, would mutate the
+ * state store unauthorized.
+ */
+async function openGatedSecurityStore(
+	cwd: string,
+	guard: SecurityScanGuard | undefined,
+	signal?: AbortSignal,
+): Promise<SecurityStore> {
+	const { projectDirectory } = await resolveSecurityProjectDirectoryForCwd(cwd, { signal });
+	guard?.stateDirectory?.(projectDirectory);
+	return SecurityStore.openForCwd(cwd, { signal });
 }
 
 function targetFromParams(params: SecurityScanParams): SecurityTargetRequest {
@@ -299,7 +318,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 				);
 			}
 			case "cloud_pull": {
-				const store = await SecurityStore.openForCwd(this.session.cwd, { signal });
+				const store = await openGatedSecurityStore(this.session.cwd, resourcePermissionGuard(context), signal);
 				const bundle = await pullCodexSecurityCloudResults({
 					client: cloudClientForSession(this.session, params.credential_id),
 					configurationId: requireValue(params.cloud_configuration_id, "cloud_configuration_id"),
@@ -320,7 +339,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 				const status = params.validation_status;
 				if (!status) throw new ToolError("validation_status is required for this action");
 				const summary = requireValue(params.validation_summary, "validation_summary");
-				const store = await SecurityStore.openForCwd(this.session.cwd, { signal });
+				const store = await openGatedSecurityStore(this.session.cwd, resourcePermissionGuard(context), signal);
 				const finding = await store.getFinding(scanId, findingId);
 				if (!finding) throw new ToolError(`Unknown security finding: ${findingId}`);
 				const evidence: SecurityEvidence[] = (params.validation_evidence ?? []).map((item, index) => ({

@@ -401,6 +401,19 @@ export class SecurityCoordinator {
 		await this.#recovery;
 	}
 
+	/**
+	 * Authorize the resolved `SecurityStore` project directory before an
+	 * action opens or mutates it. Re-resolves and re-checks on every call —
+	 * unlike `#ensureRecovered`'s memoized promise, this must never cache an
+	 * authorization decision, since permissions can change between calls
+	 * (e.g. a plan saved while permissions were off, then `start` called
+	 * after `workspace` confinement is enabled).
+	 */
+	async #gateStateDirectory(guard: SecurityScanGuard | undefined): Promise<void> {
+		const projectDirectory = await this.#resolveProjectDirectory(this.#host.cwd);
+		guard?.stateDirectory?.(projectDirectory);
+	}
+
 	async #recoverInterruptedOperations(): Promise<void> {
 		const store = await this.#openStore(this.#host.cwd);
 		for (const summary of await store.listScans()) {
@@ -478,6 +491,7 @@ export class SecurityCoordinator {
 		if (!this.#host.settings.get("security.enabled")) {
 			throw new Error("Security is disabled; enable security.enabled before starting a scan");
 		}
+		await this.#gateStateDirectory(input.guard);
 		await this.#ensureRecovered();
 		const store = await this.#openStore(this.#host.cwd);
 		const plan = await store.getPlan(input.planId);
