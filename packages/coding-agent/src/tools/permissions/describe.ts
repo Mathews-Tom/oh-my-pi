@@ -86,15 +86,21 @@ function ruleLine(label: string, globs: readonly string[]): string | null {
  *
  * `opaqueToolScan` is folded into the Class B label because `off` turns that
  * best-effort scan into no check at all, and a reader who sees "Class B" while
- * the scan is disabled would otherwise assume some residual protection.
+ * the scan is disabled would otherwise assume some residual protection. A
+ * `null` policy gets its own wording rather than falling back to the
+ * `opaqueToolScan` default: `policy` is `null` exactly when the permission
+ * profile itself is `off`, so the gate short-circuits before the opaque scan
+ * ever runs — reporting `scan=deny` there would tell an operator that
+ * bash/MCP literals are checked when nothing is enforced at all.
  */
 function toolCoverageLines(policy: PermissionPolicy | null): string[] {
 	const guards = summarizeToolGuards();
-	const scan = policy?.opaqueToolScan ?? "deny";
 	const classB =
-		scan === "off"
-			? "not checked at all, permissions.opaqueToolScan is off"
-			: `best-effort literal scan only, never a sandbox; scan=${scan}`;
+		policy === null
+			? "not checked at all, permission profile is off"
+			: policy.opaqueToolScan === "off"
+				? "not checked at all, permissions.opaqueToolScan is off"
+				: `best-effort literal scan only, never a sandbox; scan=${policy.opaqueToolScan}`;
 	const mixed = guards.mixed.map(entry => `${entry.name} (${entry.opaqueActions.join(", ")})`).join("; ");
 	return [
 		"Tool coverage:",

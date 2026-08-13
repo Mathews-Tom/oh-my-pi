@@ -29,9 +29,12 @@ describe("/perm slash command", () => {
 		expect(h.override).not.toHaveBeenCalled();
 		const text = String(h.output.mock.calls.at(-1)?.[0] ?? "");
 		expect(text).toContain("Permission profile: off");
-		// The honesty surface: Class B tools are named, and the report says the
-		// scan is not a sandbox rather than implying the profile covers them.
-		expect(text).toContain("never a sandbox");
+		// The honesty surface: Class B tools are named, and — since the gate
+		// short-circuits before the opaque scan ever runs when the profile is
+		// off — the report says they are not checked at all rather than
+		// implying the (never-invoked) literal scan covers them.
+		expect(text).toContain("not checked at all, permission profile is off");
+		expect(text).not.toContain("never a sandbox");
 		expect(text).toContain("bash, browser, computer, eval, hub");
 		expect(text).toContain("MCP, extension, and any other tool absent from the table is treated as Class B.");
 		expect(text).toContain("permissions.profile");
