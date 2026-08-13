@@ -11,6 +11,7 @@ import {
 	loadMnemopiCore,
 	type MnemopiSessionState,
 } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
+import { buildPermissionPolicy, checkStructuredTargets } from "@oh-my-pi/pi-coding-agent/tools/permissions";
 import {
 	CLASSIFIED_TOOL_NAMES,
 	classifyTool,
@@ -226,21 +227,56 @@ describe("mnemopi memory tool paths", () => {
 		expect(extract("memory_edit")).toEqual([]);
 	});
 
-	it("gates retain's write to wherever mnemopi.dbPath is configured, not a fixed default", () => {
+	it("gates retain's read and write to wherever mnemopi.dbPath is configured, not a fixed default", () => {
 		const customDbPath = path.join(path.sep, "vault", "elsewhere", "mnemopi.db");
 		const context = mnemopiContext({
 			"memory.backend": "mnemopi",
 			"mnemopi.scoping": "global",
 			"mnemopi.dbPath": customDbPath,
 		});
-		expect(extract("retain", context)).toEqual([{ raw: customDbPath, access: "write", field: "memory" }]);
+		expect(extract("retain", context)).toEqual([
+			{ raw: customDbPath, access: "read", field: "memory" },
+			{ raw: customDbPath, access: "write", field: "memory" },
+		]);
 	});
 
 	it("derives retain's target the same way the tool's own execution path resolves it", () => {
 		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
 		const context = { settings } as unknown as AgentToolContext;
 		const expected = getMnemopiRetainDbPath(loadMnemopiConfig(settings, settings.getAgentDir()));
-		expect(extract("retain", context)).toEqual([{ raw: expected, access: "write", field: "memory" }]);
+		expect(extract("retain", context)).toEqual([
+			{ raw: expected, access: "read", field: "memory" },
+			{ raw: expected, access: "write", field: "memory" },
+		]);
+	});
+
+	// `rememberScoped` opens the database through the same SQLite handle
+	// `memory_edit` uses, and its underlying `remember` call reads existing
+	// pages/indexes as part of the insert. A write-only target let a
+	// `permissions.deny.read`/`confineReads` rule that blocks the database pass
+	// `retain` while the equivalent `memory_edit` call was correctly refused —
+	// register both the same way so a read-only denial cannot be bypassed by
+	// retaining a value instead of editing one (finding under review).
+	it("denies retain exactly where it denies memory_edit under a read-only block on the database", () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const context = { settings } as unknown as AgentToolContext;
+		const dbPath = getMnemopiRetainDbPath(loadMnemopiConfig(settings, settings.getAgentDir()));
+
+		const policy = buildPermissionPolicy("workspace", {
+			confineReads: false,
+			confineWrites: false,
+			denyRead: [dbPath],
+			denyWrite: [],
+			allowRead: [],
+			allowWrite: [],
+			opaqueToolScan: "deny",
+		});
+		const roots = { cwd: path.sep, additionalDirectories: [] };
+
+		const retainDenial = checkStructuredTargets(extract("retain", context), policy, roots);
+		const memoryEditDenial = checkStructuredTargets(extract("memory_edit", context), policy, roots);
+		expect(retainDenial).not.toBeNull();
+		expect(memoryEditDenial).not.toBeNull();
 	});
 
 	it("gates memory_edit as a read and a write on every bank it can touch, since it looks an id up across all of them before writing", () => {
@@ -279,6 +315,7 @@ describe("mnemopi memory tool paths", () => {
 		} as unknown as AgentToolContext;
 
 		expect(extract("retain", context)).toEqual([
+			{ raw: getMnemopiRetainDbPath(startupConfig), access: "read", field: "memory" },
 			{ raw: getMnemopiRetainDbPath(startupConfig), access: "write", field: "memory" },
 		]);
 		expect(extract("retain", context)).not.toEqual([

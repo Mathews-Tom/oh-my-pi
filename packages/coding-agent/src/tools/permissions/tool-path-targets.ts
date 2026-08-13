@@ -340,13 +340,20 @@ function resolveMnemopiPathConfig(context: AgentToolContext | undefined) {
  * writes subject to `permissions.confineWrites`/`deny.write` instead of
  * silently bypassing them as "pathless". Any other `memory.backend` (e.g.
  * `hindsight`) touches no mnemopi database, so this contributes no targets.
+ *
+ * Registered as read+write, not write-only: `rememberScoped` opens the
+ * database through the same SQLite handle `memory_edit` uses and its
+ * `remember` call reads existing pages/indexes as part of the insert, so a
+ * write-only target would let a `permissions.deny.read`/`confineReads` rule
+ * that blocks the database pass `retain` while `memory_edit` (already
+ * read+write) is correctly refused.
  */
 const extractRetainPaths: PathTargetExtractor = (_args, context) => {
 	if (context?.settings?.get("memory.backend") !== "mnemopi") return [];
 	const config = resolveMnemopiPathConfig(context);
 	if (!config) return [];
 	const out: PathTarget[] = [];
-	pushPath(out, getMnemopiRetainDbPath(config), "write", "memory");
+	pushReadWrite(out, getMnemopiRetainDbPath(config), "memory");
 	return out;
 };
 
