@@ -18,7 +18,15 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/gh";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 import * as piUtils from "@oh-my-pi/pi-utils";
-import { $which, getAgentDir, hashPath, removeWithRetries, setAgentDir, WhichCachePolicy } from "@oh-my-pi/pi-utils";
+import {
+	$which,
+	getAgentDir,
+	getWorktreeDir,
+	hashPath,
+	removeWithRetries,
+	setAgentDir,
+	WhichCachePolicy,
+} from "@oh-my-pi/pi-utils";
 
 // Isolate every `git` invocation in this file from the developer's host
 // configuration. The fixture spawns dozens of git subprocesses against tiny
@@ -1407,6 +1415,55 @@ echo ok
 			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
 			expect(text).toContain("Checked Out Pull Request #322");
 			expect(runGit(fixture.repoRoot, ["branch", "--list", "pr-322"])).toContain("pr-322");
+		});
+
+		it("re-gates the disambiguated worktree path when the nominal path is already occupied", async () => {
+			// The pre-lock gate above only ever sees the *nominal* `worktreePath`.
+			// `resolveAvailableWorktreePath` walks past it to a `-2`, `-3`, …
+			// sibling when the nominal path is already registered or present on
+			// disk (finding under review). Grant write access to the exact nominal
+			// path — no glob — then occupy it before checkout runs, forcing
+			// resolution onto the unauthorized `-2` sibling. That sibling must be
+			// refused, not silently created.
+			vi.spyOn(git.github, "json").mockResolvedValueOnce({
+				number: 324,
+				title: "Disambiguated checkout",
+				url: "https://github.com/owner/repo/pull/324",
+				baseRefName: "main",
+				headRefName: fixture.headRefName,
+				headRefOid: fixture.headRefOid,
+				isCrossRepository: false,
+				maintainerCanModify: true,
+			});
+
+			const repoRoot = await git.repo.root(fixture.repoRoot, undefined);
+			if (!repoRoot) throw new Error("repo root unavailable");
+			const primaryRepoRoot = await git.repo.primaryRoot(repoRoot, undefined);
+			if (!primaryRepoRoot) throw new Error("primary repo root unavailable");
+			const basePath = getWorktreeDir(`324-${hashPath(primaryRepoRoot)}`);
+			await fs.mkdir(basePath, { recursive: true });
+
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			await expect(
+				tool.execute(
+					"pr-checkout",
+					{ op: "pr_checkout", pr: "324" },
+					undefined,
+					undefined,
+					contextOf({
+						"permissions.profile": "workspace",
+						"permissions.allow.write": [basePath],
+					}),
+				),
+			).rejects.toThrow(/permissions\.confineWrites/);
+
+			// The unauthorized `-2` sibling must never be materialized: the deny
+			// fires before `fs.mkdir`/`git.worktree.add` run against it, so no
+			// worktree registration for the PR exists either. (Branch creation
+			// under `repoRoot` is a separate, already-authorized write target —
+			// unaffected by this check.)
+			await expect(fs.stat(`${basePath}-2`)).rejects.toThrow();
+			expect(runGit(fixture.repoRoot, ["worktree", "list", "--porcelain"])).not.toContain("pr-324");
 		});
 
 		it("leaves pr_checkout unaffected when the permission profile is off (the default)", async () => {

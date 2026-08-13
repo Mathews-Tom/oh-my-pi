@@ -484,6 +484,20 @@ export async function checkoutPullRequest(
 			let finalWorktreePath = existingWorktree?.path ?? worktreePath;
 			if (!existingWorktree) {
 				finalWorktreePath = await resolveAvailableWorktreePath(worktreePath, existingWorktrees);
+				// `resolveAvailableWorktreePath` can walk past `worktreePath` to a
+				// `-2`, `-3`, … sibling when the nominal path is already registered
+				// or present on disk. The pre-lock gate above only authorized the
+				// nominal path, so a confining profile that allows exactly
+				// `worktreePath` and nothing else must not let the disambiguated
+				// sibling slip through unchecked — re-gate the effective path before
+				// it is created.
+				if (finalWorktreePath !== worktreePath) {
+					enforceResourcePathTargets(
+						"github",
+						[{ raw: finalWorktreePath, access: "write", field: "pr_checkout.worktree" }],
+						context,
+					);
+				}
 				await fs.mkdir(path.dirname(finalWorktreePath), { recursive: true });
 				await git.worktree.add(repoRoot, finalWorktreePath, localBranch, { signal });
 			}
