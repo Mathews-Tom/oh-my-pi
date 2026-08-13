@@ -246,7 +246,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 	 * next time a pushed edit is checked, not just the next time this tool
 	 * runs.
 	 */
-	private permissionContext(): {
+	#permissionContext(): {
 		settings: ToolSession["settings"];
 		getAdditionalDirectories: () => readonly string[];
 	} {
@@ -416,7 +416,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							this.session.cwd,
 							undefined,
 							signal,
-							this.permissionContext(),
+							this.#permissionContext(),
 						);
 						if (isProjectAwareLspServer(serverConfig)) {
 							await waitForProjectLoaded(client, signal);
@@ -653,7 +653,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						this.session.cwd,
 						undefined,
 						signal,
-						this.permissionContext(),
+						this.#permissionContext(),
 					);
 					if (isProjectAwareLspServer(serverConfig)) {
 						await waitForProjectLoaded(client, signal);
@@ -870,7 +870,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						this.session.cwd,
 						undefined,
 						signal,
-						this.permissionContext(),
+						this.#permissionContext(),
 					);
 					for (const { oldUri } of pairs) {
 						if (client.openFiles.has(oldUri)) {
@@ -937,7 +937,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						this.session.cwd,
 						undefined,
 						signal,
-						this.permissionContext(),
+						this.#permissionContext(),
 					);
 					respondingServers.add(serverName);
 					const caps = client.serverCapabilities ?? {};
@@ -1029,7 +1029,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					this.session.cwd,
 					undefined,
 					signal,
-					this.permissionContext(),
+					this.#permissionContext(),
 				);
 				if (resolvedTarget) {
 					await ensureFileOpen(client, resolvedTarget, signal);
@@ -1106,7 +1106,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						this.session.cwd,
 						undefined,
 						signal,
-						this.permissionContext(),
+						this.#permissionContext(),
 					);
 					const workspaceResult = (await sendRequest(
 						workspaceClient,
@@ -1184,7 +1184,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						this.session.cwd,
 						undefined,
 						signal,
-						this.permissionContext(),
+						this.#permissionContext(),
 					);
 					outputs.push(await reloadServer(workspaceClient, workspaceServerName, signal));
 				} catch (err) {
@@ -1219,7 +1219,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 				this.session.cwd,
 				undefined,
 				signal,
-				this.permissionContext(),
+				this.#permissionContext(),
 			);
 			const targetFile = resolvedFile;
 			const isRustAnalyzerServer =
@@ -1487,7 +1487,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 									actionItem,
 									signal,
 									undefined,
-									this.permissionContext(),
+									this.#permissionContext(),
 								)) as CodeAction,
 							applyWorkspaceEdit: async edit =>
 								applyGuardedWorkspaceEdit(edit, this.session.cwd, toolContext, signal),
@@ -1507,7 +1507,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 									},
 									signal,
 									undefined,
-									this.permissionContext(),
+									this.#permissionContext(),
 								);
 							},
 						});
