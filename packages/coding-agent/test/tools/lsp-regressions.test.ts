@@ -470,6 +470,48 @@ describe("lsp regressions", () => {
 		}
 	});
 
+	it("stamps the latest caller's permission context onto a client still initializing under another session's lock", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-pending-context-");
+		const initialize = Promise.withResolvers<void>();
+		try {
+			const server = installFakeLsp(async (message, srv) => {
+				if (message.method === "initialize") {
+					await initialize.promise;
+					srv.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+				} else if (message.method === "shutdown") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: null });
+				} else if (message.method === "exit") {
+					srv.exit(0);
+				}
+			});
+			const config: ServerConfig = {
+				command: "fake-pending-context-lsp",
+				fileTypes: ["ts"],
+				rootMarkers: [],
+			};
+
+			const firstContext = { settings: Settings.isolated(), getAdditionalDirectories: () => [] };
+			const secondContext = { settings: Settings.isolated(), getAdditionalDirectories: () => [] };
+
+			const startingClient = lspClient.getOrCreateClient(config, tempDir.path(), 1_000, undefined, firstContext);
+			await server.waitFor(message => message.method === "initialize");
+			// Second session overlaps during init and takes the existingLock branch.
+			const overlappingClient = lspClient.getOrCreateClient(config, tempDir.path(), 1_000, undefined, secondContext);
+
+			initialize.resolve();
+			const [first, second] = await Promise.all([startingClient, overlappingClient]);
+			expect(second).toBe(first);
+			// The client the second session receives must be checked against its own
+			// context on the next server-pushed workspace/applyEdit, not the first
+			// session's — otherwise a stricter session inherits a laxer one's grants.
+			expect(first.permissionContext).toBe(secondContext);
+		} finally {
+			initialize.resolve();
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
 	it("stops waiting for a pending client on caller abort without cancelling its initialization", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-pending-abort-");
 		const initialize = Promise.withResolvers<void>();

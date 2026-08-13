@@ -879,7 +879,9 @@ export async function getOrCreateClient(
 	// Check if another coroutine is already creating this client
 	const existingLock = clientLocks.get(key);
 	if (existingLock) {
-		return existingLock;
+		const client = await existingLock;
+		if (permissionContext) client.permissionContext = permissionContext;
+		return client;
 	}
 
 	// Fail fast on a recent deterministic init failure instead of re-spawning
