@@ -36,6 +36,8 @@ export interface BuildDirectoryTreeOptions {
 	rootLimit?: number | null;
 	/** Hard rendered line cap. `null` disables. Default: `null`. */
 	lineCap?: number | null;
+	/** Return false to omit an entry and every descendant from the rendered tree. */
+	includePath?: (absolutePath: string) => boolean;
 }
 
 export interface BuildWorkspaceTreeOptions {
@@ -70,7 +72,20 @@ export async function buildDirectoryTree(cwd: string, options: BuildDirectoryTre
 		return emptyTree(rootPath);
 	}
 
-	return assembleTree(rootPath, entries, {
+	const filteredEntries = options.includePath
+		? entries.filter(entry => {
+				let relativePath = entry.path;
+				while (relativePath && relativePath !== ".") {
+					if (!options.includePath!(path.resolve(rootPath, relativePath))) return false;
+					const parent = path.dirname(relativePath);
+					if (parent === relativePath) break;
+					relativePath = parent;
+				}
+				return true;
+			})
+		: entries;
+
+	return assembleTree(rootPath, filteredEntries, {
 		perDirLimit,
 		rootLimit,
 		lineCap: options.lineCap === undefined ? null : options.lineCap,

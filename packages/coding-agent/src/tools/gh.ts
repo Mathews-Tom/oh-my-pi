@@ -189,7 +189,7 @@ export class GithubTool implements AgentTool<typeof githubSchema, GhToolDetails>
 				case "file_read":
 					return executeFileRead(this.session, params, signal);
 				case "pr_create":
-					return executePrCreate(this.session, params, signal);
+					return executePrCreate(this.session, params, signal, context);
 				case "pr_checkout":
 					return executePrCheckout(this.session, params, signal, context);
 				case "pr_push":

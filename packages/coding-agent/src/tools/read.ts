@@ -72,7 +72,7 @@ import {
 	splitPathAndSel,
 	splitPathAndSelPreferringLiteral,
 } from "./path-utils";
-import { enforceResourcePathTargets } from "./permissions/gate";
+import { enforceResourcePathTargets, isResourcePathPermitted } from "./permissions/gate";
 import { readArchive, resolveArchiveReadPath } from "./read-archive";
 import {
 	BRACKET_CONTEXT_ELLIPSIS,
@@ -1037,7 +1037,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			const { offset, limit } = selToOffsetLimit(parsed);
 			// Directory listings are deterministic and fast; never abort them mid-scan
 			// (an interrupt would otherwise surface a misleading "Operation aborted").
-			const dirResult = await this.#readDirectory(absolutePath, offset, limit, undefined);
+			const dirResult = await this.#readDirectory(absolutePath, offset, limit, undefined, _toolContext);
 			if (suffixResolution) {
 				dirResult.details ??= {};
 				dirResult.details.suffixResolution = suffixResolution;
@@ -1968,6 +1968,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		offset: number | undefined,
 		limit: number | undefined,
 		signal?: AbortSignal,
+		context?: AgentToolContext,
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		const READ_DIRECTORY_MAX_DEPTH = 2;
 		const READ_DIRECTORY_CHILD_LIMIT = 12;
@@ -1982,6 +1983,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				// `lineCap` truncates the rendered tree itself, so apply it only when the caller
 				// did not request an offset — otherwise we'd cap the first N lines before slicing.
 				lineCap: offset === undefined && limit !== undefined ? limit : null,
+				includePath: candidatePath =>
+					isResourcePathPermitted({ raw: candidatePath, access: "read", field: "path" }, context),
 			});
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);

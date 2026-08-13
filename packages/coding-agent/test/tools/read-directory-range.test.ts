@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
@@ -84,5 +85,28 @@ describe("read tool directory listings honor line selectors (regression: was sil
 
 		expect(output).toMatch(/Line 9999 is beyond end of listing/);
 		expect(output).toMatch(/lines total/);
+	});
+	it("omits descendants denied by permissions.deny.read", async () => {
+		fs.writeFileSync(path.join(testDir, ".env"), "SECRET=1");
+		fs.mkdirSync(path.join(testDir, "src"));
+		fs.writeFileSync(path.join(testDir, "src", "main.ts"), "export {}");
+		const settings = Settings.isolated({
+			"permissions.profile": "workspace",
+			"permissions.deny.read": ["**/.env"],
+		});
+		const context = {
+			settings,
+			sessionManager: {
+				getCwd: () => testDir,
+				getAdditionalDirectories: () => [],
+			},
+		} as unknown as AgentToolContext;
+
+		const result = await tool.execute("directory-permissions", { path: testDir }, undefined, undefined, context);
+		const output = getTextOutput(result);
+
+		expect(output).toContain("src/");
+		expect(output).toContain("main.ts");
+		expect(output).not.toContain(".env");
 	});
 });

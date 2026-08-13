@@ -2232,12 +2232,13 @@ export async function clean(
 // ════════════════════════════════════════════════════════════════════════════
 
 export const ls = {
-	/** List files tracked or untracked by git. */
+	/** List tracked and/or non-ignored untracked files. */
 	async files(
 		cwd: string,
-		options: { others?: boolean; excludeStandard?: boolean; signal?: AbortSignal } = {},
+		options: { cached?: boolean; others?: boolean; excludeStandard?: boolean; signal?: AbortSignal } = {},
 	): Promise<string[]> {
 		const args = ["ls-files"];
+		if (options.cached) args.push("--cached");
 		if (options.others) args.push("--others");
 		if (options.excludeStandard) args.push("--exclude-standard");
 		return splitLines(await runText(cwd, args, { readOnly: true, signal: options.signal }));

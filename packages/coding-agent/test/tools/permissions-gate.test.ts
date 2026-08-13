@@ -15,6 +15,7 @@ import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-q
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { collectPermittedSearchPaths, enforceResourcePathTargets } from "@oh-my-pi/pi-coding-agent/tools/permissions";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
+import { hashPath } from "@oh-my-pi/pi-utils";
 
 /** A zero-width range at the start of the document, for text-edit fixtures. */
 const RANGE_ZERO = { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } };
@@ -624,26 +625,33 @@ describe("lsp workspace edits", () => {
 
 	it("expands a directory rename to every existing descendant, mapping each to its destination", async () => {
 		const dirPath = path.join(workspace, "pkg-targets");
-		fs.mkdirSync(path.join(dirPath, "nested"), { recursive: true });
+		fs.mkdirSync(path.join(dirPath, "nested", "empty"), { recursive: true });
 		fs.writeFileSync(path.join(dirPath, "index.ts"), "export {};");
 		fs.writeFileSync(path.join(dirPath, "nested", "inner.ts"), "export {};");
+		const linkPath = path.join(dirPath, "nested", "secret-link");
+		fs.symlinkSync("missing-target", linkPath);
 		const destination = path.join(workspace, "pkg-targets-renamed");
 
 		const targets = await workspaceEditPathTargets({
 			documentChanges: [{ kind: "rename", oldUri: fileUri(dirPath), newUri: fileUri(destination) }],
 		} as never);
 
-		expect(targets.every(t => t.access === "write")).toBe(true);
-		const raws = new Set(targets.map(t => t.raw));
+		const raws = targets.map(target => target.raw).sort();
 		expect(raws).toEqual(
-			new Set([
+			[
 				dirPath,
 				destination,
 				path.join(dirPath, "index.ts"),
 				path.join(destination, "index.ts"),
+				path.join(dirPath, "nested"),
+				path.join(destination, "nested"),
+				path.join(dirPath, "nested", "empty"),
+				path.join(destination, "nested", "empty"),
 				path.join(dirPath, "nested", "inner.ts"),
 				path.join(destination, "nested", "inner.ts"),
-			]),
+				linkPath,
+				path.join(destination, "nested", "secret-link"),
+			].sort(),
 		);
 	});
 
@@ -720,6 +728,27 @@ describe("lsp workspace edits", () => {
 		expect(fs.existsSync(destination)).toBe(false);
 	});
 
+	it("refuses a directory delete whose symlink descendant is individually denied", async () => {
+		const dirPath = path.join(workspace, "pkg-apply-symlink");
+		const linkPath = path.join(dirPath, "secret-link");
+		fs.mkdirSync(dirPath, { recursive: true });
+		fs.symlinkSync("missing-target", linkPath);
+
+		await expect(
+			applyGuardedWorkspaceEdit(
+				{ documentChanges: [{ kind: "delete", uri: fileUri(dirPath) }] } as never,
+				workspace,
+				contextOf({
+					"permissions.profile": "workspace",
+					"permissions.confineWrites": false,
+					"permissions.deny.write": ["**/secret-link"],
+				}),
+			),
+		).rejects.toThrow("**/secret-link");
+		expect(fs.existsSync(dirPath)).toBe(true);
+		expect(fs.lstatSync(linkPath).isSymbolicLink()).toBe(true);
+	});
+
 	it("refuses a directory delete whose descendant is individually denied, leaving the tree untouched", async () => {
 		const dirPath = path.join(workspace, "pkg-apply-del");
 		fs.mkdirSync(dirPath, { recursive: true });
@@ -735,6 +764,89 @@ describe("lsp workspace edits", () => {
 		).rejects.toThrow("**/protected.txt");
 		expect(fs.existsSync(dirPath)).toBe(true);
 		expect(fs.existsSync(path.join(dirPath, "protected.txt"))).toBe(true);
+	});
+
+	it("refuses overwrite rename when an existing destination descendant is individually denied", async () => {
+		const source = path.join(workspace, "pkg-overwrite-source");
+		const destination = path.join(workspace, "pkg-overwrite-destination");
+		fs.mkdirSync(source, { recursive: true });
+		fs.mkdirSync(destination, { recursive: true });
+		fs.writeFileSync(path.join(source, "index.ts"), "SOURCE");
+		const protectedDestination = path.join(destination, "protected.txt");
+		fs.writeFileSync(protectedDestination, "DESTINATION");
+
+		await expect(
+			applyGuardedWorkspaceEdit(
+				{
+					documentChanges: [
+						{
+							kind: "rename",
+							oldUri: fileUri(source),
+							newUri: fileUri(destination),
+							options: { overwrite: true },
+						},
+					],
+				} as never,
+				workspace,
+				contextOf({ "permissions.profile": "workspace", "permissions.deny.write": ["**/protected.txt"] }),
+			),
+		).rejects.toThrow("**/protected.txt");
+		expect(fs.readFileSync(path.join(source, "index.ts"), "utf8")).toBe("SOURCE");
+		expect(fs.readFileSync(protectedDestination, "utf8")).toBe("DESTINATION");
+	});
+
+	it("refuses overwrite rename before creating its denied displacement sibling", async () => {
+		const source = path.join(workspace, "src", "overwrite-source.ts");
+		const destination = path.join(workspace, "src", "overwrite-destination.ts");
+		fs.writeFileSync(source, "SOURCE");
+		fs.writeFileSync(destination, "DESTINATION");
+
+		await expect(
+			applyGuardedWorkspaceEdit(
+				{
+					documentChanges: [
+						{
+							kind: "rename",
+							oldUri: fileUri(source),
+							newUri: fileUri(destination),
+							options: { overwrite: true },
+						},
+					],
+				} as never,
+				workspace,
+				contextOf({ "permissions.profile": "workspace", "permissions.deny.write": ["**/.omp-displaced-*"] }),
+			),
+		).rejects.toThrow("**/.omp-displaced-*");
+		expect(fs.readFileSync(source, "utf8")).toBe("SOURCE");
+		expect(fs.readFileSync(destination, "utf8")).toBe("DESTINATION");
+	});
+
+	it("reclaims an interrupted overwrite displacement before retrying the rename", async () => {
+		const source = path.join(workspace, "src", "retry-source.ts");
+		const destination = path.join(workspace, "src", "retry-destination.ts");
+		const holdDir = path.join(path.dirname(destination), `.omp-displaced-${hashPath(destination)}`);
+		fs.mkdirSync(holdDir, { recursive: true });
+		fs.writeFileSync(source, "SOURCE");
+		fs.writeFileSync(destination, "DESTINATION");
+
+		await applyGuardedWorkspaceEdit(
+			{
+				documentChanges: [
+					{
+						kind: "rename",
+						oldUri: fileUri(source),
+						newUri: fileUri(destination),
+						options: { overwrite: true },
+					},
+				],
+			} as never,
+			workspace,
+			contextOf({ "permissions.profile": "workspace" }),
+		);
+
+		expect(fs.existsSync(source)).toBe(false);
+		expect(fs.readFileSync(destination, "utf8")).toBe("SOURCE");
+		expect(fs.existsSync(holdDir)).toBe(false);
 	});
 });
 

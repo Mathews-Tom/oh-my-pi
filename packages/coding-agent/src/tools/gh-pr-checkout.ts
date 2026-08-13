@@ -1,5 +1,4 @@
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { getWorktreeDir, hashPath, isEnoent } from "@oh-my-pi/pi-utils";
@@ -582,6 +581,7 @@ export async function executePrCreate(
 	session: ToolSession,
 	params: GithubInput,
 	signal: AbortSignal | undefined,
+	_context?: AgentToolContext,
 ): Promise<AgentToolResult<GhToolDetails>> {
 	const repo = normalizeOptionalString(params.repo);
 	const title = normalizeOptionalString(params.title);
@@ -612,70 +612,56 @@ export async function executePrCreate(
 	for (const assignee of assignees) args.push("--assignee", assignee);
 	for (const label of labels) args.push("--label", label);
 
-	let bodyDir: string | undefined;
-	try {
-		if (!fill) {
-			if (body !== undefined && body.length > 0) {
-				// Route through a temp file so multi-KB bodies stay clear of any
-				// argv-length limits and shell-quoting hazards on uncommon platforms.
-				bodyDir = await fs.mkdtemp(path.join(os.tmpdir(), "gh-pr-body-"));
-				const bodyFile = path.join(bodyDir, "body.md");
-				await Bun.write(bodyFile, body);
-				args.push("--body-file", bodyFile);
-			} else {
-				// Avoid gh dropping into an interactive editor when no body is given.
-				args.push("--body", "");
-			}
-		}
+	if (!fill) {
+		// Keep the body in the GitHub CLI invocation. A private temp file would
+		// require broad write access outside the requested workspace even though
+		// PR creation itself has no agent-directed filesystem side effect.
+		args.push("--body", body ?? "");
+	}
 
-		const output = await git.github.text(session.cwd, args, signal, {
-			repoProvided: Boolean(repo),
-		});
-		const url =
-			output
-				.split("\n")
-				.map(line => line.trim())
-				.find(line => line.startsWith("https://github.com/")) ?? output.trim();
-		const parsed = parsePullRequestUrl(url);
-		const resolvedRepo = repo ?? parsed.repo;
+	const output = await git.github.text(session.cwd, args, signal, {
+		repoProvided: Boolean(repo),
+	});
+	const url =
+		output
+			.split("\n")
+			.map(line => line.trim())
+			.find(line => line.startsWith("https://github.com/")) ?? output.trim();
+	const parsed = parsePullRequestUrl(url);
+	const resolvedRepo = repo ?? parsed.repo;
 
-		let prView: GhPrViewData | undefined;
-		if (resolvedRepo && parsed.prNumber !== undefined) {
-			try {
-				prView = await git.github.json<GhPrViewData>(
-					session.cwd,
-					[
-						"pr",
-						"view",
-						String(parsed.prNumber),
-						"--repo",
-						resolvedRepo,
-						"--json",
-						GH_PR_FIELDS_NO_COMMENTS.join(","),
-					],
-					signal,
-					{ repoProvided: true },
-				);
-			} catch {
-				// Best-effort summary; PR creation already succeeded.
-			}
-		}
-
-		const text = formatPrCreateResult({
-			url,
-			prNumber: parsed.prNumber,
-			data: prView,
-			title,
-			base,
-			head,
-			draft,
-		});
-		return buildTextResult(text, url || prView?.url);
-	} finally {
-		if (bodyDir) {
-			await fs.rm(bodyDir, { recursive: true, force: true }).catch(() => {});
+	let prView: GhPrViewData | undefined;
+	if (resolvedRepo && parsed.prNumber !== undefined) {
+		try {
+			prView = await git.github.json<GhPrViewData>(
+				session.cwd,
+				[
+					"pr",
+					"view",
+					String(parsed.prNumber),
+					"--repo",
+					resolvedRepo,
+					"--json",
+					GH_PR_FIELDS_NO_COMMENTS.join(","),
+				],
+				signal,
+				{ repoProvided: true },
+			);
+		} catch {
+			// Best-effort summary; PR creation already succeeded.
 		}
 	}
+
+	const text = formatPrCreateResult({
+		url,
+		prNumber: parsed.prNumber,
+		data: prView,
+		title,
+		base,
+		head,
+		draft,
+	});
+	return buildTextResult(text, url || prView?.url);
 }
 
 export function formatPrCreateResult(options: {

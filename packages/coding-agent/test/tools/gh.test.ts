@@ -516,8 +516,8 @@ describe("github tool", () => {
 		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
 
 		// gh pr create invocation: must pass --repo, --title, --base, --head,
-		// --draft, --reviewer, --label, and route the body through --body-file
-		// (not --body, to keep multi-KB bodies clear of argv-length limits).
+		// --draft, --reviewer, --label, and preserve the supplied body without
+		// creating an out-of-workspace temporary file.
 		expect(textSpy).toHaveBeenCalledTimes(1);
 		const createArgs = textCalls[0];
 		expect(createArgs.slice(0, 2)).toEqual(["pr", "create"]);
@@ -528,11 +528,8 @@ describe("github tool", () => {
 		expect(createArgs).toContain("--draft");
 		expect(createArgs).toEqual(expect.arrayContaining(["--reviewer", "reviewer1"]));
 		expect(createArgs).toEqual(expect.arrayContaining(["--label", "enhancement"]));
-		const bodyFlagIndex = createArgs.indexOf("--body-file");
-		expect(bodyFlagIndex).toBeGreaterThanOrEqual(0);
-		const bodyFilePath = createArgs[bodyFlagIndex + 1];
-		expect(bodyFilePath).toMatch(/gh-pr-body-/);
-		expect(createArgs).not.toContain("--body");
+		expect(createArgs).toEqual(expect.arrayContaining(["--body", "Adds a gizmo."]));
+		expect(createArgs).not.toContain("--body-file");
 
 		// Follow-up summary fetch must target the parsed PR number/repo.
 		expect(jsonSpy).toHaveBeenCalledTimes(1);
@@ -548,6 +545,42 @@ describe("github tool", () => {
 		expect(text).toContain("Head: feature/gizmo");
 		expect(text).toContain("Labels: enhancement");
 		expect(text).toContain("Adds a gizmo.");
+	});
+
+	it("creates a pull request body without an out-of-workspace temporary file under strict permissions", async () => {
+		const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "gh-pr-permission-"));
+		try {
+			const settings = Settings.isolated({ "github.enabled": true, "permissions.profile": "strict" });
+			const tool = new GithubTool(createSession(workspace, settings));
+			const mkdtempSpy = vi.spyOn(fs, "mkdtemp");
+			const githubSpy = vi.spyOn(git.github, "text").mockResolvedValue("https://github.com/owner/repo/pull/77\n");
+			const context = {
+				settings,
+				sessionManager: {
+					getCwd: () => workspace,
+					getAdditionalDirectories: () => [],
+				},
+			} as unknown as AgentToolContext;
+
+			await expect(
+				tool.execute(
+					"pr-create-permission",
+					{ op: "pr_create", repo: "owner/repo", title: "Add gizmo", body: "restricted" },
+					undefined,
+					undefined,
+					context,
+				),
+			).resolves.toBeDefined();
+			expect(mkdtempSpy).not.toHaveBeenCalled();
+			expect(githubSpy).toHaveBeenCalledWith(
+				workspace,
+				expect.arrayContaining(["--body", "restricted"]),
+				undefined,
+				{ repoProvided: true },
+			);
+		} finally {
+			await fs.rm(workspace, { recursive: true, force: true });
+		}
 	});
 
 	it("rejects pr_create when neither title nor fill is supplied", async () => {

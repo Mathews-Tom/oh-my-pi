@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import * as natives from "@oh-my-pi/pi-natives";
 import { Settings } from "../../src/config/settings";
 import type { ReadonlySessionManager } from "../../src/session/session-manager";
 import type { ToolSession } from "../../src/tools";
@@ -42,6 +43,12 @@ describe("GlobTool.execute", () => {
 
 	test("returns permitted matches when denied files saturate the native result page", async () => {
 		const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "omp-glob-perm-")));
+		const nativeResultLimits: Array<number | undefined> = [];
+		const nativeGlob = natives.glob;
+		const globSpy = vi.spyOn(natives, "glob").mockImplementation(async (...args) => {
+			nativeResultLimits.push(args[0].maxResults);
+			return nativeGlob(...args);
+		});
 		try {
 			const limit = 3;
 			const denyDir = path.join(base, "deny");
@@ -97,7 +104,58 @@ describe("GlobTool.execute", () => {
 
 			const details = result.details as GlobToolDetails | undefined;
 			expect((details?.files ?? []).slice().sort()).toEqual(allowedNames.slice().sort());
+			expect(nativeResultLimits).toEqual([limit, limit * 2]);
+			expect(nativeResultLimits).not.toContain(undefined);
 		} finally {
+			globSpy.mockRestore();
+			fs.rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	test("marks a capped permission fallback as incomplete instead of reporting no matches", async () => {
+		const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "omp-glob-perm-cap-")));
+		const nativeGlob = vi.spyOn(natives, "glob").mockImplementation(async options => ({
+			matches: Array.from({ length: options.maxResults ?? 0 }, (_, index) => ({
+				path: `deny/${index}.txt`,
+				fileType: natives.FileType.File,
+				mtime: index,
+			})),
+			totalMatches: options.maxResults ?? 0,
+		}));
+		try {
+			const sessionManager = {
+				getCwd: () => base,
+				getAdditionalDirectories: () => [],
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager;
+			const toolContext = {
+				sessionManager,
+				settings: Settings.isolated({
+					"permissions.profile": "workspace",
+					"permissions.deny.read": ["deny/**"],
+				}),
+			} as unknown as AgentToolContext;
+			const session: ToolSession = {
+				cwd: base,
+				hasUI: false,
+				settings: Settings.isolated({}),
+				getSessionFile: () => null,
+				getSessionSpawns: () => null,
+			};
+
+			const result = await new GlobTool(session).execute(
+				"glob-perm-cap-regression",
+				{ path: "**/*.txt", limit: 200 },
+				undefined,
+				undefined,
+				toolContext,
+			);
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+			expect(result.details?.truncated).toBe(true);
+			expect(text).toContain("permission scan cap");
+			expect(text).not.toContain("No files found matching pattern");
+		} finally {
+			nativeGlob.mockRestore();
 			fs.rmSync(base, { recursive: true, force: true });
 		}
 	});

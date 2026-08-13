@@ -23,6 +23,7 @@ import { buildOutputValidator } from "../tools/output-schema-validator";
 import { loadPermissionsConfig } from "../tools/permissions/config";
 import { checkStructuredTargets, PermissionDeniedError } from "../tools/permissions/gate";
 import type { PathTarget, PermissionRoots } from "../tools/permissions/types";
+import * as git from "../utils/git";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { type ExecutorOptions, runSubprocess } from "./executor";
@@ -184,28 +185,34 @@ function sanitizeAgentId(value: string | undefined): string | undefined {
  * `task` is classified pathless (`tool-path-targets.ts`) because its own
  * free-text prompt carries no path — the subagent's later tool calls are
  * normally where enforcement belongs. Isolated execution breaks that: before
- * any of the subagent's own calls run, `ensureIsolation` (`worktree.ts`)
- * copies or clones `repoRoot` into a directory under the agent-managed
- * worktree root (normally `~/.omp/wt`), which sits outside the session's
- * workspace roots and, for a copy-based backend, duplicates `repoRoot` in
- * full regardless of `permissions.deny.read`. Both sides of that operation
- * are declared here as an ordinary read and write target and run through the
- * unmodified decision procedure, so `permissions.confineWrites`,
- * `permissions.deny.read`/`.write`, and the user's own `permissions.allow.*`
- * escape hatch all apply exactly as they would to a declared tool argument.
+ * `ensureIsolation` materializes the Git-tracked and non-ignored untracked
+ * paths from `repoRoot` into a directory under the agent-managed worktree root
+ * (normally `~/.omp/wt`), which sits outside the session's workspace roots.
+ * Both sides of that operation — the root plus each source file the Git
+ * worktree backend can materialize — are declared as ordinary read/write
+ * targets and run through the unmodified decision procedure, so
+ * `permissions.confineWrites`, `permissions.deny.read`/`.write`, and the
+ * user's own `permissions.allow.*` escape hatch all apply exactly as they
+ * would to a declared tool argument.
  *
  * A no-op under `permissions.profile: off` (the default), like every other
  * entry point into this layer.
  */
-function authorizeIsolationTargets(session: ToolSession, repoRoot: string, isolationDir: string): void {
+async function authorizeIsolationTargets(session: ToolSession, repoRoot: string, isolationDir: string): Promise<void> {
 	const policy = loadPermissionsConfig(session.settings);
 	if (!policy) return;
 	const roots: PermissionRoots = {
 		cwd: session.cwd,
 		additionalDirectories: [...(session.additionalDirectories ?? [])],
 	};
+	const sourcePaths = await git.ls.files(repoRoot, { cached: true, others: true, excludeStandard: true });
 	const targets: PathTarget[] = [
 		{ raw: repoRoot, access: "read", field: "task.isolation.source" },
+		...sourcePaths.map(sourcePath => ({
+			raw: path.join(repoRoot, sourcePath),
+			access: "read" as const,
+			field: "task.isolation.source",
+		})),
 		{ raw: isolationDir, access: "write", field: "task.isolation.directory" },
 	];
 	const denial = checkStructuredTargets(targets, policy, roots);
@@ -614,7 +621,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 				);
 			}
 			try {
-				authorizeIsolationTargets(
+				await authorizeIsolationTargets(
 					request.session,
 					isolationContext.repoRoot,
 					getTaskIsolationBaseDir(isolationContext.repoRoot, id),

@@ -89,6 +89,36 @@ describe("debug tool DAP path redaction", () => {
 		expect(textOf(allowed)).toContain(DENIED_PATH);
 	});
 
+	it("redacts a denied disassembly source path in both rendered output and details", async () => {
+		spyOn(dapModule.dapSessionManager, "getActiveSession").mockReturnValue(makeSnapshot());
+		spyOn(dapModule.dapSessionManager, "getCapabilities").mockReturnValue({ supportsDisassembleRequest: true });
+		spyOn(dapModule.dapSessionManager, "disassemble").mockResolvedValue({
+			snapshot: makeSnapshot(),
+			instructions: [
+				{
+					address: "0x1",
+					instruction: "ret",
+					location: { path: DENIED_PATH, name: "secret.js" },
+					line: 3,
+					column: 1,
+				},
+			],
+		});
+		const tool = new DebugTool(makeSession());
+
+		const denied = await tool.execute(
+			"call-1",
+			{ action: "disassemble", memory_reference: "0x1", instruction_count: 1 },
+			undefined,
+			undefined,
+			makeContext([DENIED_PATH]),
+		);
+		const deniedText = textOf(denied);
+		expect(deniedText).not.toContain(DENIED_PATH);
+		expect(deniedText).toContain("blocked by permissions.deny.read");
+		expect(denied.details?.disassembly?.[0]?.location?.path).not.toBe(DENIED_PATH);
+	});
+
 	it("redacts a denied module path while preserving module id and name", async () => {
 		spyOn(dapModule.dapSessionManager, "getActiveSession").mockReturnValue(makeSnapshot());
 		spyOn(dapModule.dapSessionManager, "getCapabilities").mockReturnValue({ supportsModulesRequest: true });

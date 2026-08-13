@@ -220,6 +220,14 @@ function sanitizeDapStackFrame(frame: DapStackFrame, context: AgentToolContext |
 	return source === frame.source ? frame : { ...frame, source };
 }
 
+function sanitizeDapDisassembledInstruction(
+	instruction: DapDisassembledInstruction,
+	context: AgentToolContext | undefined,
+): DapDisassembledInstruction {
+	const location = sanitizeDapSource(instruction.location, context);
+	return location === instruction.location ? instruction : { ...instruction, location };
+}
+
 /**
  * The single choke point every action's `.snapshot` passes through — set by
  * every DAP action (`launch` through `sessions`) — so sanitizing here, rather
@@ -1080,9 +1088,12 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
+				const instructions = response.instructions.map(instruction =>
+					sanitizeDapDisassembledInstruction(instruction, context),
+				);
 				details.snapshot = sanitizeSnapshot(response.snapshot);
-				details.disassembly = response.instructions;
-				return result.text(formatDisassembly(response.instructions)).done();
+				details.disassembly = instructions;
+				return result.text(formatDisassembly(instructions)).done();
 			}
 			case "read_memory": {
 				requireCapability("supportsReadMemoryRequest", "memory reads");
