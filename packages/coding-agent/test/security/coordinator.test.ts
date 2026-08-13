@@ -409,3 +409,93 @@ describe("native security coordinator", () => {
 		expect((await restarted.listOperations()).map(operation => operation.operationId)).toContain(operationId);
 	});
 });
+
+describe("preflight authorizes the security state directory before opening it", () => {
+	// `preflight` used to call `openStore` (which creates the project index and
+	// `work` directory under the security state root) before `createSecurityScanPlan`
+	// ever ran the caller's guard, so a denied scan still mutated outside every
+	// workspace root and an allowed scan persisted there without the directory
+	// ever being authorized (finding under review). These use stub `openStore`/
+	// `resolveProjectDirectory` dependencies rather than the real `SecurityStore`
+	// so the assertions exercise only the coordinator's own call ordering.
+	function fakeStore(projectDirectory: string): SecurityStore {
+		return { projectDirectory, putPlan: async () => undefined } as unknown as SecurityStore;
+	}
+
+	test("never opens the store or creates the state directory when the guard refuses it", async () => {
+		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+		const projectDirectory = path.join(temporaryRoot, "state", "denied-project");
+		let openStoreCalls = 0;
+		const coordinator = new SecurityCoordinator(
+			{
+				cwd: repositoryRoot,
+				settings,
+				authStorage,
+				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
+				activeModel: mock.model,
+			},
+			{
+				openStore: async () => {
+					openStoreCalls += 1;
+					return fakeStore(projectDirectory);
+				},
+				resolveProjectDirectory: async () => projectDirectory,
+				gitAdapter,
+			},
+		);
+
+		await expect(
+			coordinator.preflight({
+				credentialId,
+				model: mock.model,
+				guard: {
+					stateDirectory: () => {
+						throw new Error("resource permission denied: state directory");
+					},
+				},
+			}),
+		).rejects.toThrow("resource permission denied: state directory");
+
+		expect(openStoreCalls).toBe(0);
+		await expect(fs.stat(projectDirectory)).rejects.toThrow();
+	});
+
+	test("authorizes the resolved project directory before opening the store, and still plans a legitimate scan", async () => {
+		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
+		const projectDirectory = path.join(temporaryRoot, "state", "allowed-project");
+		const order: string[] = [];
+		const authorizedPaths: string[] = [];
+		const coordinator = new SecurityCoordinator(
+			{
+				cwd: repositoryRoot,
+				settings,
+				authStorage,
+				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
+				activeModel: mock.model,
+			},
+			{
+				openStore: async () => {
+					order.push("openStore");
+					return fakeStore(projectDirectory);
+				},
+				resolveProjectDirectory: async () => projectDirectory,
+				gitAdapter,
+			},
+		);
+
+		const plan = await coordinator.preflight({
+			credentialId,
+			model: mock.model,
+			guard: {
+				stateDirectory: absolutePath => {
+					authorizedPaths.push(absolutePath);
+					order.push("guard");
+				},
+			},
+		});
+
+		expect(authorizedPaths).toEqual([projectDirectory]);
+		expect(order).toEqual(["guard", "openStore"]);
+		expect(plan.id).toBeTruthy();
+	});
+});

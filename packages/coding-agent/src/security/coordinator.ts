@@ -39,7 +39,7 @@ import {
 	createSecurityWorkflowFingerprint,
 } from "./provenance";
 import { createSecurityPublicationTool } from "./publication";
-import { SecurityStore, writeSecurityBundleToDirectory } from "./store";
+import { resolveSecurityProjectDirectoryForCwd, SecurityStore, writeSecurityBundleToDirectory } from "./store";
 
 const SECURITY_SESSION_TOOLS = ["read", "grep", "glob", "lsp", "ast_grep", "task", "security_publish"];
 const SECURITY_WORKFLOW_FINGERPRINT = createSecurityWorkflowFingerprint([
@@ -140,6 +140,14 @@ export type SecurityScanSessionFactory = (input: SecurityScanSessionFactoryInput
 export interface SecurityCoordinatorDependencies {
 	createSession?: SecurityScanSessionFactory;
 	openStore?: (repositoryRoot: string) => Promise<SecurityStore>;
+	/**
+	 * Resolve the `SecurityStore` project directory `openStore` will use, without
+	 * opening or creating it. Kept alongside `openStore` (rather than derived
+	 * independently) so a caller overriding one keeps the other consistent —
+	 * `preflight`'s pre-open gate must see the same path `openStore` actually
+	 * commits to disk.
+	 */
+	resolveProjectDirectory?: (cwd: string) => Promise<string>;
 	gitAdapter?: SecurityGitAdapter;
 	now?: () => Date;
 	createOperationId?: () => string;
@@ -370,6 +378,7 @@ export class SecurityCoordinator {
 	readonly #host: SecurityCoordinatorHost;
 	readonly #createSession: SecurityScanSessionFactory;
 	readonly #openStore: (repositoryRoot: string) => Promise<SecurityStore>;
+	readonly #resolveProjectDirectory: (cwd: string) => Promise<string>;
 	readonly #gitAdapter: SecurityGitAdapter;
 	readonly #now: () => Date;
 	readonly #createOperationId: () => string;
@@ -380,6 +389,9 @@ export class SecurityCoordinator {
 		this.#host = host;
 		this.#createSession = dependencies.createSession ?? createDefaultSecuritySession;
 		this.#openStore = dependencies.openStore ?? (cwd => SecurityStore.openForCwd(cwd));
+		this.#resolveProjectDirectory =
+			dependencies.resolveProjectDirectory ??
+			(async cwd => (await resolveSecurityProjectDirectoryForCwd(cwd)).projectDirectory);
 		this.#gitAdapter = dependencies.gitAdapter ?? DEFAULT_SECURITY_GIT_ADAPTER;
 		this.#now = dependencies.now ?? (() => new Date());
 		this.#createOperationId = dependencies.createOperationId ?? createOperationId;
@@ -434,6 +446,8 @@ export class SecurityCoordinator {
 			input.credentialId,
 			this.#host.sessionId,
 		);
+		const projectDirectory = await this.#resolveProjectDirectory(this.#host.cwd);
+		input.guard?.stateDirectory?.(projectDirectory);
 		const store = await this.#openStore(this.#host.cwd);
 		const workRoot = path.join(store.projectDirectory, "work");
 		await fs.mkdir(workRoot, { recursive: true, mode: 0o700 });

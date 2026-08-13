@@ -69,6 +69,40 @@ export interface SecurityStoreOptions {
 	signal?: AbortSignal;
 }
 
+export interface SecurityProjectLocation {
+	repositoryRoot: string;
+	projectKey: string;
+	projectDirectory: string;
+}
+
+/** The pure path derivation `SecurityStore.open` commits to disk — shared so a caller can gate the same directory before any store I/O runs. */
+async function resolveSecurityProjectLocation(
+	repositoryRoot: string,
+	options: SecurityStoreOptions,
+): Promise<SecurityProjectLocation> {
+	const canonicalRoot = await fs.realpath(path.resolve(repositoryRoot)).catch(() => path.resolve(repositoryRoot));
+	const projectKey = encodeSecurityProjectKey(canonicalRoot);
+	const projectDirectory = options.stateRoot
+		? path.join(path.resolve(options.stateRoot), projectKey)
+		: getSecurityProjectDir(projectKey);
+	return { repositoryRoot: canonicalRoot, projectKey, projectDirectory };
+}
+
+/**
+ * Resolve the effective `SecurityStore` project directory for `cwd` without
+ * creating it — the same repository-root and project-key derivation
+ * `SecurityStore.openForCwd` uses internally, exposed so a caller can
+ * authorize the directory before `open` creates it and writes the index.
+ */
+export async function resolveSecurityProjectDirectoryForCwd(
+	cwd: string,
+	options: SecurityStoreOptions = {},
+): Promise<SecurityProjectLocation> {
+	const resolvedCwd = path.resolve(cwd);
+	const repositoryRoot = (await git.repo.root(resolvedCwd, options.signal)) ?? resolvedCwd;
+	return resolveSecurityProjectLocation(repositoryRoot, options);
+}
+
 async function ensurePrivateDirectory(directory: string): Promise<void> {
 	await fs.mkdir(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
 	if (process.platform !== "win32") await fs.chmod(directory, PRIVATE_DIRECTORY_MODE);
@@ -156,11 +190,11 @@ export class SecurityStore {
 	}
 
 	static async open(repositoryRoot: string, options: SecurityStoreOptions = {}): Promise<SecurityStore> {
-		const canonicalRoot = await fs.realpath(path.resolve(repositoryRoot)).catch(() => path.resolve(repositoryRoot));
-		const projectKey = encodeSecurityProjectKey(canonicalRoot);
-		const projectDirectory = options.stateRoot
-			? path.join(path.resolve(options.stateRoot), projectKey)
-			: getSecurityProjectDir(projectKey);
+		const {
+			repositoryRoot: canonicalRoot,
+			projectKey,
+			projectDirectory,
+		} = await resolveSecurityProjectLocation(repositoryRoot, options);
 		await ensurePrivateDirectory(projectDirectory);
 		const store = new SecurityStore(canonicalRoot, projectKey, projectDirectory);
 		await withSecurityStoreWrite(projectDirectory, () => store.#ensureIndex());
@@ -168,8 +202,7 @@ export class SecurityStore {
 	}
 
 	static async openForCwd(cwd: string, options: SecurityStoreOptions = {}): Promise<SecurityStore> {
-		const resolvedCwd = path.resolve(cwd);
-		const repositoryRoot = (await git.repo.root(resolvedCwd, options.signal)) ?? resolvedCwd;
+		const { repositoryRoot } = await resolveSecurityProjectDirectoryForCwd(cwd, options);
 		return SecurityStore.open(repositoryRoot, options);
 	}
 

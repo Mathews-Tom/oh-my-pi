@@ -65,16 +65,18 @@ export interface SecurityScanToolDetails {
 }
 
 /**
- * Resource-permission hooks for the two scan surfaces the tool's own arguments
+ * Resource-permission hooks for the scan surfaces the tool's own arguments
  * never name.
  *
  * `TOOL_PATH_CLASSES.security_scan` can only extract what the call declares —
  * `include_paths`, `knowledge_base_paths`, `output_root`. A default
  * `target_kind: "repository"` scan declares no read path at all yet hashes and
  * reviews every tracked and untracked in-scope file, and an omitted
- * `output_root` is defaulted deep inside the coordinator. Both are resolved
- * mid-preflight, so this is the only layer that holds the session context *and*
- * runs late enough to see the effective values.
+ * `output_root` is defaulted deep inside the coordinator. The `SecurityStore`
+ * project directory is never named at all — it is derived from `cwd` and
+ * opened (creating state on disk) before the plan is built. All three are
+ * resolved mid-preflight, so this is the only layer that holds the session
+ * context *and* runs late enough to see the effective values.
  *
  * Returns `undefined` when there is no context to measure against, matching how
  * every other gate entry point behaves outside a live session.
@@ -104,6 +106,13 @@ function resourcePermissionGuard(context: AgentToolContext | undefined): Securit
 			enforceResourcePathTargets(
 				"security_scan",
 				[{ raw: absolutePath, access: "write" as const, field: "output_root" }],
+				context,
+			);
+		},
+		stateDirectory: absolutePath => {
+			enforceResourcePathTargets(
+				"security_scan",
+				[{ raw: absolutePath, access: "write" as const, field: "state directory" }],
 				context,
 			);
 		},
