@@ -46,6 +46,7 @@ import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
 import type { OutputMeta } from "./output-meta";
 import { formatPathRelativeToCwd, resolveToCwd } from "./path-utils";
+import { isResourcePathPermitted } from "./permissions/gate";
 import {
 	formatExpandHint,
 	formatStatusIcon,
@@ -178,6 +179,65 @@ interface DebugToolDetails {
 	state?: DapContinueOutcome["state"];
 	timedOut?: boolean;
 	meta?: OutputMeta;
+}
+
+const REDACTED_DAP_PATH = "<redacted: blocked by permissions.deny.read>";
+
+/**
+ * A source/module/program path the debuggee itself reported — not one the
+ * caller supplied this call — so `extractDebugPaths`'s pre-execution gate
+ * never saw it: `loaded_sources`, `stack_trace`, `modules`, and `sessions`
+ * usually take no `file`/`program` argument at all, and even actions that do
+ * (`continue`, `step_in`, ...) can stop somewhere the caller never named. This
+ * re-checks each DAP-reported path against `permissions.deny.read` before any
+ * `format*` helper renders it, mirroring the same read check `glob.ts` runs
+ * per match and `lsp/tool.ts` runs per reported location.
+ */
+function permittedDapPath(rawPath: string | undefined, context: AgentToolContext | undefined): string | undefined {
+	if (!rawPath) return rawPath;
+	const permitted = isResourcePathPermitted({ raw: rawPath, access: "read", field: "dap" }, context);
+	return permitted ? rawPath : REDACTED_DAP_PATH;
+}
+
+function sanitizeDapSource(
+	source: DapSource | undefined,
+	context: AgentToolContext | undefined,
+): DapSource | undefined {
+	if (!source) return source;
+	const path = permittedDapPath(source.path, context);
+	return path === source.path ? source : { ...source, path };
+}
+
+function sanitizeDapModule(module: DapModule, context: AgentToolContext | undefined): DapModule {
+	const path = permittedDapPath(module.path, context);
+	const symbolFilePath = permittedDapPath(module.symbolFilePath, context);
+	if (path === module.path && symbolFilePath === module.symbolFilePath) return module;
+	return { ...module, path, symbolFilePath };
+}
+
+function sanitizeDapStackFrame(frame: DapStackFrame, context: AgentToolContext | undefined): DapStackFrame {
+	const source = sanitizeDapSource(frame.source, context);
+	return source === frame.source ? frame : { ...frame, source };
+}
+
+/**
+ * The single choke point every action's `.snapshot` passes through — set by
+ * every DAP action (`launch` through `sessions`) — so sanitizing here, rather
+ * than only in the four actions named in review, covers `continue`/`step_*`/
+ * `pause` stopping somewhere denied exactly the same way.
+ */
+function sanitizeDapSnapshot(snapshot: DapSessionSummary, context: AgentToolContext | undefined): DapSessionSummary {
+	const program = permittedDapPath(snapshot.program, context);
+	const source = sanitizeDapSource(snapshot.source, context);
+	if (program === snapshot.program && source === snapshot.source) return snapshot;
+	return { ...snapshot, program, source };
+}
+
+function sanitizeDapSnapshots(
+	snapshots: DapSessionSummary[],
+	context: AgentToolContext | undefined,
+): DapSessionSummary[] {
+	return snapshots.map(snapshot => sanitizeDapSnapshot(snapshot, context));
 }
 
 function formatLocation(snapshot: DapSessionSummary | undefined): string | null {
@@ -727,8 +787,10 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 		params: DebugParams,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<DebugToolDetails>,
-		_context?: AgentToolContext,
+		context?: AgentToolContext,
 	): Promise<AgentToolResult<DebugToolDetails>> {
+		const sanitizeSnapshot = (snapshot: DapSessionSummary): DapSessionSummary =>
+			sanitizeDapSnapshot(snapshot, context);
 		const timeoutSec = clampTimeout("debug", params.timeout, this.session.settings.get("tools.maxTimeout"));
 		const timeoutSignal = AbortSignal.timeout(timeoutSec * 1000);
 		const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
@@ -754,10 +816,12 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 				const { adapter } = selection;
 				validateLaunchProgram(program, commandCwd, programKind, adapter);
 				const extraLaunchArguments = resolveLaunchOverrides(adapter, program, programKind);
-				const snapshot = await dapSessionManager.launch(
-					{ adapter, program, args: params.args, cwd: commandCwd, extraLaunchArguments },
-					combinedSignal,
-					timeoutSec * 1000,
+				const snapshot = sanitizeSnapshot(
+					await dapSessionManager.launch(
+						{ adapter, program, args: params.args, cwd: commandCwd, extraLaunchArguments },
+						combinedSignal,
+						timeoutSec * 1000,
+					),
 				);
 				details.snapshot = snapshot;
 				details.adapter = adapter.name;
@@ -778,10 +842,12 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 						`No debugger adapter available. Installed adapters: ${getConfiguredAdapters(commandCwd)}`,
 					);
 				}
-				const snapshot = await dapSessionManager.attach(
-					{ adapter, cwd: commandCwd, pid: params.pid, port: params.port, host: params.host },
-					combinedSignal,
-					timeoutSec * 1000,
+				const snapshot = sanitizeSnapshot(
+					await dapSessionManager.attach(
+						{ adapter, cwd: commandCwd, pid: params.pid, port: params.port, host: params.host },
+						combinedSignal,
+						timeoutSec * 1000,
+					),
 				);
 				details.snapshot = snapshot;
 				details.adapter = adapter.name;
@@ -795,7 +861,7 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 						combinedSignal,
 						timeoutSec * 1000,
 					);
-					details.snapshot = response.snapshot;
+					details.snapshot = sanitizeSnapshot(response.snapshot);
 					details.functionBreakpoints = response.breakpoints;
 					return result.text(formatFunctionBreakpoints(response.breakpoints)).done();
 				}
@@ -810,7 +876,7 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.breakpoints = response.breakpoints;
 				return result.text(formatBreakpoints(response.sourcePath, response.breakpoints)).done();
 			}
@@ -821,7 +887,7 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 						combinedSignal,
 						timeoutSec * 1000,
 					);
-					details.snapshot = response.snapshot;
+					details.snapshot = sanitizeSnapshot(response.snapshot);
 					details.functionBreakpoints = response.breakpoints;
 					return result.text(formatFunctionBreakpoints(response.breakpoints)).done();
 				}
@@ -835,7 +901,7 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.breakpoints = response.breakpoints;
 				return result.text(formatBreakpoints(response.sourcePath, response.breakpoints)).done();
 			}
@@ -852,7 +918,7 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.instructionBreakpoints = response.breakpoints;
 				return result.text(formatInstructionBreakpoints(response.breakpoints)).done();
 			}
@@ -867,7 +933,7 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.instructionBreakpoints = response.breakpoints;
 				return result.text(formatInstructionBreakpoints(response.breakpoints)).done();
 			}
@@ -883,7 +949,7 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.dataBreakpointInfo = response.info;
 				return result.text(formatDataBreakpointInfo(response.info)).done();
 			}
@@ -900,7 +966,7 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.dataBreakpoints = response.breakpoints;
 				return result.text(formatDataBreakpoints(response.breakpoints)).done();
 			}
@@ -914,40 +980,44 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.dataBreakpoints = response.breakpoints;
 				return result.text(formatDataBreakpoints(response.breakpoints)).done();
 			}
 			case "continue": {
-				const outcome = await dapSessionManager.continue(combinedSignal, timeoutSec * 1000);
+				const rawOutcome = await dapSessionManager.continue(combinedSignal, timeoutSec * 1000);
+				const outcome = { ...rawOutcome, snapshot: sanitizeSnapshot(rawOutcome.snapshot) };
 				details.snapshot = outcome.snapshot;
 				details.state = outcome.state;
 				details.timedOut = outcome.timedOut;
 				return result.text(buildOutcomeText(outcome, timeoutSec, "Continue")).done();
 			}
 			case "step_over": {
-				const outcome = await dapSessionManager.stepOver(combinedSignal, timeoutSec * 1000);
+				const rawOutcome = await dapSessionManager.stepOver(combinedSignal, timeoutSec * 1000);
+				const outcome = { ...rawOutcome, snapshot: sanitizeSnapshot(rawOutcome.snapshot) };
 				details.snapshot = outcome.snapshot;
 				details.state = outcome.state;
 				details.timedOut = outcome.timedOut;
 				return result.text(buildOutcomeText(outcome, timeoutSec, "Step over")).done();
 			}
 			case "step_in": {
-				const outcome = await dapSessionManager.stepIn(combinedSignal, timeoutSec * 1000);
+				const rawOutcome = await dapSessionManager.stepIn(combinedSignal, timeoutSec * 1000);
+				const outcome = { ...rawOutcome, snapshot: sanitizeSnapshot(rawOutcome.snapshot) };
 				details.snapshot = outcome.snapshot;
 				details.state = outcome.state;
 				details.timedOut = outcome.timedOut;
 				return result.text(buildOutcomeText(outcome, timeoutSec, "Step in")).done();
 			}
 			case "step_out": {
-				const outcome = await dapSessionManager.stepOut(combinedSignal, timeoutSec * 1000);
+				const rawOutcome = await dapSessionManager.stepOut(combinedSignal, timeoutSec * 1000);
+				const outcome = { ...rawOutcome, snapshot: sanitizeSnapshot(rawOutcome.snapshot) };
 				details.snapshot = outcome.snapshot;
 				details.state = outcome.state;
 				details.timedOut = outcome.timedOut;
 				return result.text(buildOutcomeText(outcome, timeoutSec, "Step out")).done();
 			}
 			case "pause": {
-				const snapshot = await dapSessionManager.pause(combinedSignal, timeoutSec * 1000);
+				const snapshot = sanitizeSnapshot(await dapSessionManager.pause(combinedSignal, timeoutSec * 1000));
 				details.snapshot = snapshot;
 				return result.text(formatSessionSnapshot(snapshot).concat("Program paused.").join("\n")).done();
 			}
@@ -963,25 +1033,26 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.evaluation = response.evaluation;
 				return result.text(formatEvaluation(response.evaluation)).done();
 			}
 			case "stack_trace": {
 				const response = await dapSessionManager.stackTrace(params.levels, combinedSignal, timeoutSec * 1000);
-				details.snapshot = response.snapshot;
-				details.stackFrames = response.stackFrames;
-				return result.text(formatStackFrames(response.stackFrames)).done();
+				const stackFrames = response.stackFrames.map(frame => sanitizeDapStackFrame(frame, context));
+				details.snapshot = sanitizeSnapshot(response.snapshot);
+				details.stackFrames = stackFrames;
+				return result.text(formatStackFrames(stackFrames)).done();
 			}
 			case "threads": {
 				const response = await dapSessionManager.threads(combinedSignal, timeoutSec * 1000);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.threads = response.threads;
 				return result.text(formatThreads(response.threads)).done();
 			}
 			case "scopes": {
 				const response = await dapSessionManager.scopes(params.frame_id, combinedSignal, timeoutSec * 1000);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.scopes = response.scopes;
 				return result.text(formatScopes(response.scopes)).done();
 			}
@@ -991,7 +1062,7 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					throw new ToolError("variables requires variable_ref or scope_id");
 				}
 				const response = await dapSessionManager.variables(variableReference, combinedSignal, timeoutSec * 1000);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.variables = response.variables;
 				return result.text(formatVariables(response.variables)).done();
 			}
@@ -1009,7 +1080,7 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.disassembly = response.instructions;
 				return result.text(formatDisassembly(response.instructions)).done();
 			}
@@ -1028,7 +1099,7 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.memoryAddress = response.address;
 				details.memoryData = response.data;
 				details.unreadableBytes = response.unreadableBytes;
@@ -1050,7 +1121,7 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.bytesWritten = response.bytesWritten;
 				return result
 					.text(
@@ -1070,16 +1141,18 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
-				details.snapshot = response.snapshot;
-				details.modules = response.modules;
-				return result.text(formatModules(response.modules)).done();
+				const modules = response.modules.map(module => sanitizeDapModule(module, context));
+				details.snapshot = sanitizeSnapshot(response.snapshot);
+				details.modules = modules;
+				return result.text(formatModules(modules)).done();
 			}
 			case "loaded_sources": {
 				requireCapability("supportsLoadedSourcesRequest", "loaded sources");
 				const response = await dapSessionManager.loadedSources(combinedSignal, timeoutSec * 1000);
-				details.snapshot = response.snapshot;
-				details.sources = response.sources;
-				return result.text(formatLoadedSources(response.sources)).done();
+				const sources = response.sources.map(source => sanitizeDapSource(source, context) ?? source);
+				details.snapshot = sanitizeSnapshot(response.snapshot);
+				details.sources = sources;
+				return result.text(formatLoadedSources(sources)).done();
 			}
 			case "custom_request": {
 				if (!params.command) {
@@ -1091,26 +1164,27 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 					combinedSignal,
 					timeoutSec * 1000,
 				);
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.customBody = response.body;
 				return result.text(formatCustomResponse(params.command, response.body)).done();
 			}
 			case "output": {
 				const response = dapSessionManager.getOutput();
-				details.snapshot = response.snapshot;
+				details.snapshot = sanitizeSnapshot(response.snapshot);
 				details.output = response.output;
 				return result.text(response.output.length > 0 ? response.output : "(no output captured)").done();
 			}
 			case "terminate": {
-				const snapshot = await dapSessionManager.terminate(combinedSignal, timeoutSec * 1000);
-				if (!snapshot) {
+				const rawSnapshot = await dapSessionManager.terminate(combinedSignal, timeoutSec * 1000);
+				if (!rawSnapshot) {
 					return result.text("No debug session to terminate.").done();
 				}
+				const snapshot = sanitizeSnapshot(rawSnapshot);
 				details.snapshot = snapshot;
 				return result.text(formatSessionSnapshot(snapshot).concat("Debug session terminated.").join("\n")).done();
 			}
 			case "sessions": {
-				const sessions = dapSessionManager.listSessions();
+				const sessions = sanitizeDapSnapshots(dapSessionManager.listSessions(), context);
 				details.sessions = sessions;
 				return result.text(formatSessions(sessions)).done();
 			}
