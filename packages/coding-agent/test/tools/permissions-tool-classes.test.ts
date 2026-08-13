@@ -331,4 +331,104 @@ describe("mnemopi memory tool paths", () => {
 			scopedPaths.flatMap(p => [`read:${p}`, `write:${p}`]),
 		);
 	});
+
+	// `learn` had no mnemopi handling at all: `tool-path-targets.ts` only
+	// special-cased `memory.backend: local`, so under mnemopi `LearnTool.execute`
+	// called `state.rememberScoped` — the same call `retain` makes — while the
+	// gate contributed zero targets for it, silently bypassing
+	// `confineWrites`/`confineReads`/`deny` rules on the database (finding under
+	// review).
+	it("gates learn's mnemopi write the same way retain's is gated", () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const context = { settings } as unknown as AgentToolContext;
+		expect(extract("learn", context)).toEqual(extract("retain", context));
+	});
+
+	it("denies learn's mnemopi write exactly where it denies retain under a read-only block on the database", () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const context = { settings } as unknown as AgentToolContext;
+		const dbPath = getMnemopiRetainDbPath(loadMnemopiConfig(settings, settings.getAgentDir()));
+
+		const policy = buildPermissionPolicy("workspace", {
+			confineReads: false,
+			confineWrites: false,
+			denyRead: [dbPath],
+			denyWrite: [],
+			allowRead: [],
+			allowWrite: [],
+			opaqueToolScan: "deny",
+		});
+		const roots = { cwd: path.sep, additionalDirectories: [] };
+
+		const learnDenial = checkStructuredTargets(extract("learn", context), policy, roots);
+		const retainDenial = checkStructuredTargets(extract("retain", context), policy, roots);
+		expect(learnDenial).not.toBeNull();
+		expect(retainDenial).not.toBeNull();
+	});
+
+	it("contributes no mnemopi target for learn under a non-mnemopi backend, so hindsight-backed learn is unaffected", () => {
+		const context = mnemopiContext({ "memory.backend": "hindsight" });
+		expect(extract("learn", context)).toEqual([]);
+	});
+
+	it("combines learn's mnemopi write target with an optional skill write, in that order", () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const context = { settings } as unknown as AgentToolContext;
+		const dbPath = getMnemopiRetainDbPath(loadMnemopiConfig(settings, settings.getAgentDir()));
+		const cls = TOOL_PATH_CLASSES.learn;
+		if (cls?.kind !== "structured") throw new Error("learn is not structured");
+		const targets = cls.extract(
+			{ skill: { action: "create", name: "persistent-instruction", description: "test", body: "body" } },
+			context,
+		);
+		expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual([
+			`read:${dbPath}`,
+			`write:${dbPath}`,
+			`write:${path.join(getManagedSkillsDir(), "persistent-instruction", "SKILL.md")}`,
+		]);
+	});
+
+	// `recall`/`reflect` were classified `pathless`, so the gate returned
+	// immediately for both even though `state.recallResultsScoped` — the call
+	// both tools make under mnemopi — reads every bank the session recalls from
+	// and returns their content to the model, bypassing `confineReads` and
+	// database-specific `deny.read` rules (finding under review).
+	it("gates recall and reflect as reads across the same scoped bank set memory_edit touches", () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const context = { settings } as unknown as AgentToolContext;
+		const scopedPaths = getMnemopiScopedDbPaths(loadMnemopiConfig(settings, settings.getAgentDir()));
+		expect(scopedPaths.length).toBeGreaterThan(0);
+		for (const tool of ["recall", "reflect"]) {
+			expect(extract(tool, context).map(t => `${t.access}:${t.raw}`)).toEqual(scopedPaths.map(p => `read:${p}`));
+		}
+	});
+
+	it("denies recall and reflect exactly where a read-only deny rule blocks the scoped database", () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const context = { settings } as unknown as AgentToolContext;
+		const scopedPaths = getMnemopiScopedDbPaths(loadMnemopiConfig(settings, settings.getAgentDir()));
+
+		const policy = buildPermissionPolicy("workspace", {
+			confineReads: false,
+			confineWrites: false,
+			denyRead: [scopedPaths[0]],
+			denyWrite: [],
+			allowRead: [],
+			allowWrite: [],
+			opaqueToolScan: "deny",
+		});
+		const roots = { cwd: path.sep, additionalDirectories: [] };
+
+		for (const tool of ["recall", "reflect"]) {
+			expect(checkStructuredTargets(extract(tool, context), policy, roots)).not.toBeNull();
+		}
+	});
+
+	it("contributes no targets for recall and reflect under a non-mnemopi backend or with no context at all", () => {
+		const context = mnemopiContext({ "memory.backend": "hindsight" });
+		expect(extract("recall", context)).toEqual([]);
+		expect(extract("reflect", context)).toEqual([]);
+		expect(extract("recall")).toEqual([]);
+		expect(extract("reflect")).toEqual([]);
+	});
 });

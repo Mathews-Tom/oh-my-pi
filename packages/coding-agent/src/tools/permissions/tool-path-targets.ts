@@ -332,30 +332,35 @@ function resolveMnemopiPathConfig(context: AgentToolContext | undefined) {
 }
 
 /**
- * `retain` and `memory_edit` take no path argument at all, but under
- * `memory.backend: mnemopi` they mutate the mnemopi SQLite database(s)
+ * `retain` and `learn` take no path argument at all, but under
+ * `memory.backend: mnemopi` both write through the same `rememberScoped` call
+ * (`MnemopiSessionState.rememberScoped`, which `LearnTool.execute` calls
+ * exactly like `MemoryRetainTool` does) onto the mnemopi SQLite database(s)
  * `resolveBankDbPath` resolves — under the agent memory directory by default,
  * but anywhere `mnemopi.dbPath` points. Deriving that path here (the same
  * config resolution the tools' own execution path uses) is what makes those
  * writes subject to `permissions.confineWrites`/`deny.write` instead of
- * silently bypassing them as "pathless". Any other `memory.backend` (e.g.
- * `hindsight`) touches no mnemopi database, so this contributes no targets.
+ * silently bypassing them as "pathless"/local-only. Any other `memory.backend`
+ * (e.g. `hindsight`) touches no mnemopi database, so this contributes no
+ * targets.
  *
  * Registered as read+write, not write-only: `rememberScoped` opens the
  * database through the same SQLite handle `memory_edit` uses and its
  * `remember` call reads existing pages/indexes as part of the insert, so a
  * write-only target would let a `permissions.deny.read`/`confineReads` rule
- * that blocks the database pass `retain` while `memory_edit` (already
+ * that blocks the database pass `retain`/`learn` while `memory_edit` (already
  * read+write) is correctly refused.
  */
-const extractRetainPaths: PathTargetExtractor = (_args, context) => {
+function extractMnemopiRetainPaths(context: AgentToolContext | undefined): PathTarget[] {
 	if (context?.settings?.get("memory.backend") !== "mnemopi") return [];
 	const config = resolveMnemopiPathConfig(context);
 	if (!config) return [];
 	const out: PathTarget[] = [];
 	pushReadWrite(out, getMnemopiRetainDbPath(config), "memory");
 	return out;
-};
+}
+
+const extractRetainPaths: PathTargetExtractor = (_args, context) => extractMnemopiRetainPaths(context);
 
 /**
  * `memory_edit` looks an id up across every bank the session recalls from
@@ -371,6 +376,27 @@ const extractMemoryEditPaths: PathTargetExtractor = (_args, context) => {
 	const out: PathTarget[] = [];
 	for (const dbPath of getMnemopiScopedDbPaths(config)) {
 		pushReadWrite(out, dbPath, "memory");
+	}
+	return out;
+};
+
+/**
+ * `recall` and `reflect` take no path argument either, but under
+ * `memory.backend: mnemopi` both resolve to `state.recallResultsScoped`
+ * (`MemoryRecallTool.execute` / `MemoryReflectTool.execute`), which reads
+ * every bank the session recalls from and returns their content to the model.
+ * Registered as read-only across the same scoped database set `memory_edit`
+ * uses — the superset of banks a scoped lookup can touch — so
+ * `confineReads`/`deny.read` on those databases actually apply instead of
+ * these two tools passing the gate as pathless.
+ */
+const extractMnemopiScopedReadPaths: PathTargetExtractor = (_args, context) => {
+	if (context?.settings?.get("memory.backend") !== "mnemopi") return [];
+	const config = resolveMnemopiPathConfig(context);
+	if (!config) return [];
+	const out: PathTarget[] = [];
+	for (const dbPath of getMnemopiScopedDbPaths(config)) {
+		pushPath(out, dbPath, "read", "memory");
 	}
 	return out;
 };
@@ -460,6 +486,7 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 					"memory",
 				);
 			}
+			out.push(...extractMnemopiRetainPaths(context));
 			const skill = args.skill;
 			if (skill && typeof skill === "object") {
 				out.push(...extractManagedSkillPaths(skill as Record<string, unknown>, "skill.name"));
@@ -469,8 +496,8 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	},
 	manage_skill: { kind: "structured", extract: args => extractManagedSkillPaths(args) },
 	memory_edit: { kind: "structured", extract: extractMemoryEditPaths },
-	recall: { kind: "pathless" },
-	reflect: { kind: "pathless" },
+	recall: { kind: "structured", extract: extractMnemopiScopedReadPaths },
+	reflect: { kind: "structured", extract: extractMnemopiScopedReadPaths },
 	retain: { kind: "structured", extract: extractRetainPaths },
 	rewind: { kind: "pathless" },
 	// `task` carries a free-text prompt, not a path. Scanning it would deny an
