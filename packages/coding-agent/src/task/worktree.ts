@@ -55,8 +55,21 @@ export function getGitNoIndexNullPath(): string {
 	return GIT_NO_INDEX_NULL_PATH;
 }
 
-/** Find nested git repositories (non-submodule) under the given root. */
-async function discoverNestedRepos(repoRoot: string): Promise<string[]> {
+/**
+ * Find nested git repositories (non-submodule) under the given root.
+ *
+ * Walks the real filesystem rather than `git ls-files` — a nested repo (its
+ * own untracked `.git` directory) is invisible to `git ls-files` run at
+ * `repoRoot` regardless of `--others`/`--exclude-standard`, the same way a
+ * submodule is, and it can sit under a directory the root's own `.gitignore`
+ * excludes entirely. {@link captureBaseline} relies on this exact discovery
+ * to find every repo it captures a baseline for; a caller authorizing what
+ * baseline capture is about to read (`structured-subagent.ts`'s
+ * `authorizeIsolationTargets`) must enumerate the same set, or a nested
+ * repo's untracked sources get captured — and their bytes read off disk —
+ * without ever having been declared as a read target.
+ */
+export async function discoverNestedRepos(repoRoot: string): Promise<string[]> {
 	// Get submodule paths so we can exclude them
 	const submodulePaths = new Set(await git.ls.submodules(repoRoot));
 

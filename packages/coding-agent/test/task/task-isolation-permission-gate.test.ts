@@ -87,6 +87,10 @@ function mockIsolationContext(): void {
 beforeEach(async () => {
 	repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-permission-"));
 	vi.spyOn(git.ls, "files").mockResolvedValue([]);
+	// `repoRoot` is a plain temp dir, not a real git checkout — `discoverNestedRepos`
+	// (now part of authorization, not just baseline capture) calls this for real
+	// otherwise, which fails outside a git repository.
+	vi.spyOn(git.ls, "submodules").mockResolvedValue([]);
 });
 
 afterEach(async () => {
@@ -176,6 +180,48 @@ describe("task isolation permission gate", () => {
 		mockRepoRoot();
 		const captureBaseline = vi.spyOn(worktreeModule, "captureBaseline");
 		const runIsolated = vi.spyOn(isolationRunner, "runIsolatedSubprocess");
+
+		await expect(
+			runStructuredSubagent(
+				request({
+					session: session({
+						"permissions.profile": "workspace",
+						"permissions.confineWrites": false,
+						"permissions.deny.read": [deniedFile],
+					}),
+					isolation: { requested: true },
+				}),
+			),
+		).rejects.toThrow(deniedFile);
+
+		expect(captureBaseline).not.toHaveBeenCalled();
+		expect(runIsolated).not.toHaveBeenCalled();
+	});
+
+	it("denies isolated execution when a nested repo's untracked source matches permissions.deny.read", async () => {
+		// `git ls-files` at `repoRoot` never sees into a nested repo (its own
+		// untracked `.git` directory is invisible to it, like a submodule).
+		// `captureBaseline` discovers and reads nested repos' working trees via
+		// `discoverNestedRepos`, so the gate must enumerate the identical set of
+		// nested repos as read targets or a denied source inside one is captured
+		// before the gate ever sees it (finding under review).
+		const nestedRel = "vendor";
+		const nestedDir = path.join(repoRoot, nestedRel);
+		await fs.mkdir(path.join(nestedDir, ".git"), { recursive: true });
+		const deniedFile = path.join(nestedDir, ".env");
+		await fs.writeFile(deniedFile, "SECRET=1");
+		mockDiscovery();
+		vi.spyOn(git.ls, "files").mockImplementation(async (cwd, options) => {
+			if (!(options?.cached && options.others && options.excludeStandard)) return [];
+			return cwd === nestedDir ? [".env"] : [];
+		});
+		mockRepoRoot();
+		// Stubbed like `mockIsolationContext`'s `captureBaseline`, so that if
+		// authorization fails to deny, the run proceeds all the way to
+		// `runIsolated` instead of failing for an unrelated reason (real
+		// baseline capture needs an actual git checkout, not this fixture).
+		const captureBaseline = vi.spyOn(worktreeModule, "captureBaseline").mockResolvedValue({} as never);
+		const runIsolated = vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockResolvedValue(result());
 
 		await expect(
 			runStructuredSubagent(

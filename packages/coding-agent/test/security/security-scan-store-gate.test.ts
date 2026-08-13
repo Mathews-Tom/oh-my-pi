@@ -37,6 +37,14 @@ function toolSession(): ToolSession {
 	return { cwd: repositoryRoot, settings } as ToolSession;
 }
 
+// `status`/`cancel` route through `coordinatorForSession()`, which requires
+// truthy `modelRegistry`/`authStorage` references before it will even build a
+// `SecurityCoordinator` — neither action ever calls a method on either, so
+// opaque stubs are enough to reach the gate under test.
+function toolSessionWithRegistries(): ToolSession {
+	return { cwd: repositoryRoot, settings, authStorage: {}, modelRegistry: {} } as unknown as ToolSession;
+}
+
 function workspaceContext(): AgentToolContext {
 	return {
 		sessionManager: {
@@ -121,6 +129,81 @@ describe("security_scan store actions authorize the state directory before openi
 
 		// The refusal happened before the store touched disk: no project
 		// directory was ever created.
+		await expect(fs.stat(projectDirectory)).rejects.toThrow();
+	});
+
+	// `status`/`cancel` reach the coordinator's `#ensureRecovered()`, which opens
+	// (and, for any interrupted operation, mutates) the store the same as
+	// `start` — but unlike `start` they never ran `#gateStateDirectory` first
+	// (finding under review). A `workspace`-confined session refusing the state
+	// directory (which always lives outside every workspace root) on write
+	// proves the guard now runs; the directory never existing afterward proves
+	// it ran before `#ensureRecovered` touched disk.
+	test("status refuses before the store is opened", async () => {
+		const { projectDirectory } = await resolveSecurityProjectDirectoryForCwd(repositoryRoot);
+		const tool = new SecurityScanTool(toolSessionWithRegistries());
+		await expect(
+			tool.execute(
+				"call-1",
+				{ action: "status", operation_id: "secop_fixture" } as never,
+				undefined,
+				undefined,
+				workspaceContext(),
+			),
+		).rejects.toThrow("permissions.confineWrites");
+		await expect(fs.stat(projectDirectory)).rejects.toThrow();
+	});
+
+	test("cancel refuses before the store is opened", async () => {
+		const { projectDirectory } = await resolveSecurityProjectDirectoryForCwd(repositoryRoot);
+		const tool = new SecurityScanTool(toolSessionWithRegistries());
+		await expect(
+			tool.execute(
+				"call-1",
+				{ action: "cancel", operation_id: "secop_fixture" } as never,
+				undefined,
+				undefined,
+				workspaceContext(),
+			),
+		).rejects.toThrow("permissions.confineWrites");
+		await expect(fs.stat(projectDirectory)).rejects.toThrow();
+	});
+
+	// Same read/write asymmetry as the `cloud_pull` case above: a state
+	// directory explicitly allowed for write but denied for read must still stop
+	// `status` before `#ensureRecovered` opens the store to read its index.
+	test("status refuses a state directory that permits write but denies read, before the store is opened", async () => {
+		const { projectDirectory } = await resolveSecurityProjectDirectoryForCwd(repositoryRoot);
+		const readDeniedSettings = Settings.isolated({
+			"security.enabled": true,
+			"permissions.profile": "workspace",
+			"permissions.allow.write": [projectDirectory],
+			"permissions.deny.read": [projectDirectory],
+		});
+		const tool = new SecurityScanTool({
+			cwd: repositoryRoot,
+			settings: readDeniedSettings,
+			authStorage: {},
+			modelRegistry: {},
+		} as unknown as ToolSession);
+		const context = {
+			sessionManager: {
+				getCwd: () => repositoryRoot,
+				getAdditionalDirectories: () => [],
+				getSessionId: () => "test-session",
+			},
+			settings: readDeniedSettings,
+		} as unknown as AgentToolContext;
+
+		await expect(
+			tool.execute(
+				"call-1",
+				{ action: "status", operation_id: "secop_fixture" } as never,
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toThrow("permissions.allow.read");
 		await expect(fs.stat(projectDirectory)).rejects.toThrow();
 	});
 });

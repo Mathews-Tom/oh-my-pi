@@ -258,7 +258,7 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 			}
 			case "status": {
 				const operationId = requireValue(params.operation_id, "operation_id");
-				const operation = await coordinatorForSession().status(operationId);
+				const operation = await coordinatorForSession().status(operationId, resourcePermissionGuard(context));
 				if (!operation) throw new ToolError(`Unknown security operation: ${operationId}`);
 				return textResult(
 					`Security scan ${operation.scanId}: ${operation.phase}; ${operation.findingCount} finding(s).`,
@@ -267,13 +267,14 @@ export class SecurityScanTool implements AgentTool<typeof securityScanSchema, Se
 			}
 			case "cancel": {
 				const operationId = requireValue(params.operation_id, "operation_id");
-				const cancelled = await coordinatorForSession().cancel(operationId);
+				const guard = resourcePermissionGuard(context);
+				const cancelled = await coordinatorForSession().cancel(operationId, guard);
 				return textResult(
 					cancelled ? `Cancellation requested for ${operationId}.` : `No running operation ${operationId}.`,
 					{
 						action: params.action,
 						cancelled,
-						operation: (await coordinatorForSession().status(operationId)) ?? undefined,
+						operation: (await coordinatorForSession().status(operationId, guard)) ?? undefined,
 					},
 				);
 			}

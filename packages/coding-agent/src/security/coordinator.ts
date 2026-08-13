@@ -544,7 +544,8 @@ export class SecurityCoordinator {
 		return { ...record.snapshot };
 	}
 
-	async status(operationId: string): Promise<SecurityOperationSnapshot | null> {
+	async status(operationId: string, guard?: SecurityScanGuard): Promise<SecurityOperationSnapshot | null> {
+		await this.#gateStateDirectory(guard);
 		await this.#ensureRecovered();
 		let record = this.#operations.get(operationId);
 		if (!record && !ACTIVE_SECURITY_OPERATIONS.has(operationId)) {
@@ -563,7 +564,8 @@ export class SecurityCoordinator {
 			.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 	}
 
-	async cancel(operationId: string): Promise<boolean> {
+	async cancel(operationId: string, guard?: SecurityScanGuard): Promise<boolean> {
+		await this.#gateStateDirectory(guard);
 		await this.#ensureRecovered();
 		const record = this.#operations.get(operationId);
 		if (!record) return false;

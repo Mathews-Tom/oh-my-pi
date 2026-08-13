@@ -46,6 +46,7 @@ import {
 } from "./types";
 import {
 	captureBaseline,
+	discoverNestedRepos,
 	getRepoRoot,
 	getTaskIsolationBaseDir,
 	type NestedRepoPatch,
@@ -200,6 +201,15 @@ function sanitizeAgentId(value: string | undefined): string | undefined {
  * user's own `permissions.allow.*` escape hatch all apply exactly as they
  * would to a declared tool argument.
  *
+ * `git ls-files` at `repoRoot` alone under-enumerates: a nested git repo
+ * (untracked `.git` directory, not a submodule) is invisible to it exactly
+ * like a submodule is, whether or not the nested repo's directory is itself
+ * gitignored. `captureBaseline` ({@link discoverNestedRepos}) walks the real
+ * filesystem to find these and reads their working trees too, so this must
+ * enumerate the identical set of nested repos and their own tracked/untracked
+ * files as additional read targets — otherwise a denied source inside one is
+ * captured (and its bytes read off disk) before the gate ever sees it.
+ *
  * A no-op under `permissions.profile: off` (the default), like every other
  * entry point into this layer.
  */
@@ -210,7 +220,28 @@ async function authorizeIsolationTargets(session: ToolSession, repoRoot: string,
 		cwd: session.cwd,
 		additionalDirectories: [...(session.additionalDirectories ?? [])],
 	};
-	const sourcePaths = await git.ls.files(repoRoot, { cached: true, others: true, excludeStandard: true });
+	const [sourcePaths, nestedRepoPaths] = await Promise.all([
+		git.ls.files(repoRoot, { cached: true, others: true, excludeStandard: true }),
+		discoverNestedRepos(repoRoot),
+	]);
+	const nestedTargets = await Promise.all(
+		nestedRepoPaths.map(async nestedRelativePath => {
+			const nestedRoot = path.join(repoRoot, nestedRelativePath);
+			const nestedSourcePaths = await git.ls.files(nestedRoot, {
+				cached: true,
+				others: true,
+				excludeStandard: true,
+			});
+			return [
+				{ raw: nestedRoot, access: "read" as const, field: "task.isolation.source" },
+				...nestedSourcePaths.map(sourcePath => ({
+					raw: path.join(nestedRoot, sourcePath),
+					access: "read" as const,
+					field: "task.isolation.source",
+				})),
+			];
+		}),
+	);
 	const targets: PathTarget[] = [
 		{ raw: repoRoot, access: "read", field: "task.isolation.source" },
 		...sourcePaths.map(sourcePath => ({
@@ -218,6 +249,7 @@ async function authorizeIsolationTargets(session: ToolSession, repoRoot: string,
 			access: "read" as const,
 			field: "task.isolation.source",
 		})),
+		...nestedTargets.flat(),
 		{ raw: isolationDir, access: "write", field: "task.isolation.directory" },
 	];
 	const denial = checkStructuredTargets(targets, policy, roots);
