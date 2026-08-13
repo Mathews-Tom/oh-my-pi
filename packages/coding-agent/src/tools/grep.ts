@@ -58,7 +58,7 @@ import {
 	splitPathAndSelPreferringLiteral,
 	toPathList,
 } from "./path-utils";
-import { collectPermittedSearchPaths } from "./permissions/gate";
+import { collectPermittedSearchPaths, enforceResourcePathTargets } from "./permissions/gate";
 import {
 	createCachedComponent,
 	formatCodeFrameLine,
@@ -231,10 +231,18 @@ function matchAbsolutePath(matchPath: string, searchPath: string): string {
  * from absolute scratch path → original selector, a list of entries we
  * could not materialize (binary member, missing archive, etc.), and a
  * cleanup hook the caller MUST invoke in a `finally`.
+ *
+ * `path: "bundle.zip:member.txt"` reaches this function verbatim — the
+ * pre-execution structural gate (`TOOL_PATH_CLASSES.grep`) checks that exact
+ * selector-bearing string, which a container-only rule like `deny.read:
+ * ["**​/bundle.zip"]` does not match. Authorizing the resolved container path
+ * here, before {@link openArchive} reads it, is what actually enforces that
+ * rule — checking the selector string again post-hoc would keep missing it.
  */
 async function resolveArchiveSearchPaths(
 	pathSpecs: readonly GrepPathSpec[],
 	cwd: string,
+	context: AgentToolContext | undefined,
 ): Promise<{
 	resolvedPaths: string[];
 	displayMap: Map<string, string>;
@@ -260,6 +268,7 @@ async function resolveArchiveSearchPaths(
 		const archiveAbs = resolveReadPath(member.archivePath, cwd);
 		let archive = archiveCache.get(archiveAbs);
 		if (!archive) {
+			enforceResourcePathTargets("grep", [{ raw: archiveAbs, access: "read", field: "path" }], context);
 			try {
 				archive = await openArchive(archiveAbs);
 			} catch (err) {
@@ -982,7 +991,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				displaySet: archiveDisplaySet,
 				unreadable: archiveUnreadable,
 				cleanup: cleanupArchiveScratch,
-			} = await resolveArchiveSearchPaths(pathSpecs, this.session.cwd);
+			} = await resolveArchiveSearchPaths(pathSpecs, this.session.cwd, toolContext);
 			try {
 				const internalResolution = await resolveInternalSearchInputs({
 					pathSpecs,
