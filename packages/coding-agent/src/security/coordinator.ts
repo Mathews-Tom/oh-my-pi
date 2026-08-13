@@ -642,6 +642,7 @@ export class SecurityCoordinator {
 					this.#update(record, "publishing");
 				},
 			});
+			if (signal.aborted) throw signal.reason ?? new Error("Security scan cancelled");
 			session = await this.#createSession({
 				host: this.#host,
 				plan,
