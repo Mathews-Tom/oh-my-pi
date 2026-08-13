@@ -364,7 +364,7 @@ export function compareSkillOrder(aName: string, aPath: string, bName: string, b
 }
 
 export async function scanSkillsFromDir(
-	_ctx: LoadContext,
+	ctx: LoadContext,
 	options: ScanSkillsFromDirOptions,
 ): Promise<LoadResult<Skill>> {
 	const items: Skill[] = [];
@@ -381,6 +381,7 @@ export async function scanSkillsFromDir(
 		return { items, warnings };
 	}
 	const loadSkill = async (skillPath: string) => {
+		if (ctx.canReadSkill?.(skillPath) === false) return;
 		try {
 			const content = await readFile(skillPath);
 			if (!content) return;

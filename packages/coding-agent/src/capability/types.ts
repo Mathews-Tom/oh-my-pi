@@ -16,6 +16,8 @@ export interface LoadContext {
 	home: string;
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
+	/** Reject a discovered skill before its backing file is read. */
+	canReadSkill?: (skillPath: string) => boolean;
 }
 
 /**
@@ -72,6 +74,8 @@ export interface LoadOptions<T = unknown> {
 	includeDisabled?: boolean;
 	/** Explicit disabled extension IDs to apply instead of settings. */
 	disabledExtensions?: string[];
+	/** Reject a discovered skill before its backing file is read. */
+	canReadSkill?: (skillPath: string) => boolean;
 	/**
 	 * Drop items before deduplication as if they never existed (e.g. scope
 	 * exclusions). A dropped item neither survives nor claims its dedupe key,

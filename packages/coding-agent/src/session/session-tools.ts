@@ -148,16 +148,14 @@ export function* collectMountedMCPToolRoutes(
  * `refreshSkills` caller uniformly rather than gating only the one write path
  * a given tool call declared.
  */
-function filterReadableSkills(skills: Skill[], host: SessionToolsHost): Skill[] {
+function skillReadPermission(host: SessionToolsHost): ((skillPath: string) => boolean) | undefined {
 	const policy = loadPermissionsConfig(host.settings);
-	if (!policy) return skills;
+	if (!policy) return undefined;
 	const roots: PermissionRoots = {
 		cwd: host.sessionManager.getCwd(),
 		additionalDirectories: host.sessionManager.getAdditionalDirectories(),
 	};
-	return skills.filter(
-		skill => decideTarget({ raw: skill.filePath, access: "read", field: "skill" }, policy, roots).kind !== "deny",
-	);
+	return skillPath => decideTarget({ raw: skillPath, access: "read", field: "skill" }, policy, roots).kind !== "deny";
 }
 
 function formatMCPXdevGuidanceLabel(label: string): string {
@@ -1025,12 +1023,16 @@ export class SessionTools {
 		resetCapabilities();
 		if (this.#skillsReloadable) {
 			const skillsSettings = this.#host.settings.getGroup("skills");
+			const canReadSkill = skillReadPermission(this.#host);
 			const discovered = await loadSkills({
 				...skillsSettings,
 				cwd: this.#host.sessionManager.getCwd(),
 				disabledExtensions: this.#host.settings.get("disabledExtensions") ?? [],
+				...(canReadSkill && { canReadSkill }),
 			});
-			this.#skills = filterReadableSkills(discovered.skills, this.#host);
+			this.#skills = canReadSkill
+				? discovered.skills.filter(skill => canReadSkill(skill.filePath))
+				: discovered.skills;
 			this.#skillWarnings = discovered.warnings;
 			this.#skillsSettings = skillsSettings;
 
