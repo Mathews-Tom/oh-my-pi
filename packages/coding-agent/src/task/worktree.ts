@@ -419,6 +419,19 @@ function getTaskIsolationSegment(repoRoot: string, id: string): string {
 	return `${TASK_ISOLATION_DIR_PREFIX}${digest}`;
 }
 
+/**
+ * The directory {@link ensureIsolation} materialises `id`'s isolation copy
+ * under, computed with no filesystem access.
+ *
+ * Exposed so a caller can authorize this exact write target — and the
+ * `mergedDir` beneath it — against the resource permission layer *before*
+ * `ensureIsolation` spawns and starts copying, rather than only checking the
+ * subagent's own later tool calls once the copy already exists on disk.
+ */
+export function getTaskIsolationBaseDir(repoRoot: string, id: string): string {
+	return getWorktreeDir(getTaskIsolationSegment(repoRoot, id));
+}
+
 export async function ensureIsolation(
 	baseCwd: string,
 	id: string,
@@ -427,7 +440,7 @@ export async function ensureIsolation(
 	const repoRoot = await getRepoRoot(baseCwd);
 	const repository = await git.repo.resolve(repoRoot);
 	const sourceCommonDir = repository?.commonDir ?? path.join(repoRoot, ".git");
-	const baseDir = getWorktreeDir(getTaskIsolationSegment(repoRoot, id));
+	const baseDir = getTaskIsolationBaseDir(repoRoot, id);
 	const mergedDir = path.join(baseDir, TASK_ISOLATION_MOUNT_DIR);
 	const resolution = natives.isoResolve(preferred ?? null);
 	const candidates = resolution.candidates.length > 0 ? resolution.candidates : [resolution.kind];

@@ -20,6 +20,9 @@ import type { TaskEffort } from "../thinking";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../tools/hub";
 import { buildOutputValidator } from "../tools/output-schema-validator";
+import { loadPermissionsConfig } from "../tools/permissions/config";
+import { checkStructuredTargets, PermissionDeniedError } from "../tools/permissions/gate";
+import type { PathTarget, PermissionRoots } from "../tools/permissions/types";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { type ExecutorOptions, runSubprocess } from "./executor";
@@ -41,7 +44,7 @@ import {
 	type SingleResult,
 	type StructuredSubagentOutput,
 } from "./types";
-import { type NestedRepoPatch, parseIsolationMode } from "./worktree";
+import { getTaskIsolationBaseDir, type NestedRepoPatch, parseIsolationMode } from "./worktree";
 
 /** Validation behavior requested for an effective output schema. */
 export type StructuredSubagentSchemaMode = "permissive" | "strict";
@@ -171,6 +174,42 @@ function sanitizeAgentId(value: string | undefined): string | undefined {
 	const trimmed = trimToUndefined(value);
 	const sanitized = trimmed?.replace(/[^A-Za-z0-9_-]+/g, "").slice(0, 48);
 	return sanitized || undefined;
+}
+
+/**
+ * Authorize the source repo and the isolation directory `ensureIsolation` is
+ * about to materialize, against the same resource permission policy every
+ * other tool call faces.
+ *
+ * `task` is classified pathless (`tool-path-targets.ts`) because its own
+ * free-text prompt carries no path — the subagent's later tool calls are
+ * normally where enforcement belongs. Isolated execution breaks that: before
+ * any of the subagent's own calls run, `ensureIsolation` (`worktree.ts`)
+ * copies or clones `repoRoot` into a directory under the agent-managed
+ * worktree root (normally `~/.omp/wt`), which sits outside the session's
+ * workspace roots and, for a copy-based backend, duplicates `repoRoot` in
+ * full regardless of `permissions.deny.read`. Both sides of that operation
+ * are declared here as an ordinary read and write target and run through the
+ * unmodified decision procedure, so `permissions.confineWrites`,
+ * `permissions.deny.read`/`.write`, and the user's own `permissions.allow.*`
+ * escape hatch all apply exactly as they would to a declared tool argument.
+ *
+ * A no-op under `permissions.profile: off` (the default), like every other
+ * entry point into this layer.
+ */
+function authorizeIsolationTargets(session: ToolSession, repoRoot: string, isolationDir: string): void {
+	const policy = loadPermissionsConfig(session.settings);
+	if (!policy) return;
+	const roots: PermissionRoots = {
+		cwd: session.cwd,
+		additionalDirectories: [...(session.additionalDirectories ?? [])],
+	};
+	const targets: PathTarget[] = [
+		{ raw: repoRoot, access: "read", field: "task.isolation.source" },
+		{ raw: isolationDir, access: "write", field: "task.isolation.directory" },
+	];
+	const denial = checkStructuredTargets(targets, policy, roots);
+	if (denial) throw new PermissionDeniedError("task", denial.rule, denial.reason);
 }
 
 function resolveSchema(request: StructuredSubagentRequest, agent: AgentDefinition): StructuredSubagentSchemaResolution {
@@ -573,6 +612,17 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 					`Isolated subagent execution requires a git repository. ${message}`,
 					{ cause: error },
 				);
+			}
+			try {
+				authorizeIsolationTargets(
+					request.session,
+					isolationContext.repoRoot,
+					getTaskIsolationBaseDir(isolationContext.repoRoot, id),
+				);
+			} catch (error) {
+				throw new StructuredSubagentError("isolation", error instanceof Error ? error.message : String(error), {
+					cause: error,
+				});
 			}
 		}
 		const result = !isolationContext
