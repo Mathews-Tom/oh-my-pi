@@ -1333,8 +1333,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	};
 	const canReadSkill = skillPermissionPolicy
 		? (skillPath: string) =>
-				decideTarget({ raw: skillPath, access: "read", field: "skill" }, skillPermissionPolicy, skillPermissionRoots)
-					.kind !== "deny"
+				decideTarget(
+					{ raw: skillPath, access: "read", field: "skill" },
+					skillPermissionPolicy,
+					skillPermissionRoots,
+				).kind !== "deny"
 		: undefined;
 	const discoveredSkillsPromise =
 		options.skills === undefined
