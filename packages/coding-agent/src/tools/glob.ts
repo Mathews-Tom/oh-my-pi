@@ -449,14 +449,16 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 					if (isSingle) throw new ToolError(`Path is not a directory: ${target.searchPath}`);
 					return [];
 				}
-				try {
+				const collectMatches = async (
+					nativeMaxResults: number | undefined,
+				): Promise<{ matches: Array<{ path: string; mtime: number }>; nativeCount: number }> => {
 					const result = await untilAborted(combinedSignal, () =>
 						natives.glob(
 							{
 								pattern: target.globPattern,
 								path: target.searchPath,
 								hidden: includeHidden,
-								maxResults: effectiveLimit,
+								maxResults: nativeMaxResults,
 								sortByMtime: true,
 								gitignore: useGitignore,
 								// parseFindPattern explicitly prepends "**/" when the user's
@@ -480,7 +482,20 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 							mtime: match.mtime ?? 0,
 						});
 					}
-					return out;
+					return { matches: out, nativeCount: result.matches.length };
+				};
+				try {
+					let { matches: permitted, nativeCount } = await collectMatches(effectiveLimit);
+					// natives.glob ranks by mtime and truncates to maxResults before this
+					// permission filter ever runs. When denied entries saturate that
+					// truncated page, permitted matches further down the ranked list are
+					// never returned even though they exist. Re-walk once, uncapped, but
+					// only when the first page came back completely full and still left
+					// us short — the common case (nothing denied) never pays this cost.
+					if (permitted.length < effectiveLimit && nativeCount >= effectiveLimit) {
+						({ matches: permitted } = await collectMatches(undefined));
+					}
+					return permitted;
 				} catch (error) {
 					if (error instanceof Error && error.name === "AbortError") {
 						if (timeoutSignal.aborted && !signal?.aborted) {
