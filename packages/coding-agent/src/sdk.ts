@@ -2582,6 +2582,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				headId: () => session.toolChoiceQueue.peekPendingHead()?.id,
 				removeSince: (id: string | undefined) => session.toolChoiceQueue.removePendingInvokersSince(id),
 			},
+			getMnemopiSessionState: () => session.getMnemopiSessionState(),
 		});
 		const toolContextStore = new ToolContextStore(getSessionContext);
 		const setSessionActiveToolNames = (names: Iterable<string>): void => {

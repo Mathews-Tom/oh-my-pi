@@ -9,6 +9,7 @@ import {
 	getMnemopiScopedDbPaths,
 	loadMnemopi,
 	loadMnemopiCore,
+	type MnemopiSessionState,
 } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import {
 	CLASSIFIED_TOOL_NAMES,
@@ -249,5 +250,48 @@ describe("mnemopi memory tool paths", () => {
 		expect(scopedPaths.length).toBeGreaterThan(0);
 		const targets = extract("memory_edit", context);
 		expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual(scopedPaths.flatMap(p => [`read:${p}`, `write:${p}`]));
+	});
+
+	// The session's `MnemopiSessionState` opens its SQLite handles from the
+	// config captured at backend startup and does not reopen them on a later
+	// `mnemopi.dbPath`/scoping settings change (only `memory.backend` changing
+	// reinitializes it — `mnemopi/backend.ts`). Authorizing from live settings
+	// here would let a mid-session config change point the gate at a path the
+	// tool never actually opens, while the real write lands in the untouched
+	// startup database (finding under review).
+	it("authorizes the session's initialized database, not settings changed after backend startup", () => {
+		const startupSettings = Settings.isolated({
+			"memory.backend": "mnemopi",
+			"mnemopi.scoping": "global",
+			"mnemopi.dbPath": path.join(path.sep, "vault", "startup", "mnemopi.db"),
+		});
+		const startupConfig = loadMnemopiConfig(startupSettings, startupSettings.getAgentDir());
+		const initializedState = { config: startupConfig } as unknown as MnemopiSessionState;
+
+		const driftedSettings = Settings.isolated({
+			"memory.backend": "mnemopi",
+			"mnemopi.scoping": "global",
+			"mnemopi.dbPath": path.join(path.sep, "vault", "drifted", "mnemopi.db"),
+		});
+		const context = {
+			settings: driftedSettings,
+			getMnemopiSessionState: () => initializedState,
+		} as unknown as AgentToolContext;
+
+		expect(extract("retain", context)).toEqual([
+			{ raw: getMnemopiRetainDbPath(startupConfig), access: "write", field: "memory" },
+		]);
+		expect(extract("retain", context)).not.toEqual([
+			{
+				raw: getMnemopiRetainDbPath(loadMnemopiConfig(driftedSettings, driftedSettings.getAgentDir())),
+				access: "write",
+				field: "memory",
+			},
+		]);
+
+		const scopedPaths = getMnemopiScopedDbPaths(startupConfig);
+		expect(extract("memory_edit", context).map(t => `${t.access}:${t.raw}`)).toEqual(
+			scopedPaths.flatMap(p => [`read:${p}`, `write:${p}`]),
+		);
 	});
 });

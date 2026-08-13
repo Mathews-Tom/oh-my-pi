@@ -309,6 +309,29 @@ const extractSecurityScanPaths: PathTargetExtractor = args => {
 };
 
 /**
+ * `retain`/`memory_edit`'s config for path derivation: the exact config their
+ * own execution path resolves against.
+ *
+ * When the session already has an initialized `MnemopiSessionState`, its
+ * `config` is what actually opened the session's SQLite handles — captured
+ * once at backend startup, per {@link MnemopiSessionState}'s docs, and NOT
+ * re-read on later `mnemopi.dbPath`/bank/scoping setting changes (only a
+ * `memory.backend` change reinitializes it). Deriving from live settings
+ * instead would authorize wherever the *new* settings point while the tool
+ * keeps writing the *already-open* database — a settings-drift mismatch that
+ * lets a write bypass `confineWrites`/`deny.write` (finding under review).
+ * Only fall back to a live config resolution when no session state exists
+ * yet: both tools throw before touching any database in that case, so no
+ * write happens for a live-settings target to under- or over-authorize.
+ */
+function resolveMnemopiPathConfig(context: AgentToolContext | undefined) {
+	const state = context?.getMnemopiSessionState?.();
+	if (state) return state.config;
+	const settings = context?.settings;
+	return settings ? loadMnemopiConfig(settings, settings.getAgentDir()) : undefined;
+}
+
+/**
  * `retain` and `memory_edit` take no path argument at all, but under
  * `memory.backend: mnemopi` they mutate the mnemopi SQLite database(s)
  * `resolveBankDbPath` resolves — under the agent memory directory by default,
@@ -319,10 +342,11 @@ const extractSecurityScanPaths: PathTargetExtractor = args => {
  * `hindsight`) touches no mnemopi database, so this contributes no targets.
  */
 const extractRetainPaths: PathTargetExtractor = (_args, context) => {
-	const settings = context?.settings;
-	if (settings?.get("memory.backend") !== "mnemopi") return [];
+	if (context?.settings?.get("memory.backend") !== "mnemopi") return [];
+	const config = resolveMnemopiPathConfig(context);
+	if (!config) return [];
 	const out: PathTarget[] = [];
-	pushPath(out, getMnemopiRetainDbPath(loadMnemopiConfig(settings, settings.getAgentDir())), "write", "memory");
+	pushPath(out, getMnemopiRetainDbPath(config), "write", "memory");
 	return out;
 };
 
@@ -334,10 +358,11 @@ const extractRetainPaths: PathTargetExtractor = (_args, context) => {
  * without doing that lookup.
  */
 const extractMemoryEditPaths: PathTargetExtractor = (_args, context) => {
-	const settings = context?.settings;
-	if (settings?.get("memory.backend") !== "mnemopi") return [];
+	if (context?.settings?.get("memory.backend") !== "mnemopi") return [];
+	const config = resolveMnemopiPathConfig(context);
+	if (!config) return [];
 	const out: PathTarget[] = [];
-	for (const dbPath of getMnemopiScopedDbPaths(loadMnemopiConfig(settings, settings.getAgentDir()))) {
+	for (const dbPath of getMnemopiScopedDbPaths(config)) {
 		pushReadWrite(out, dbPath, "memory");
 	}
 	return out;
