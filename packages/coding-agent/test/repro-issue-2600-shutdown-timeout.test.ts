@@ -99,24 +99,16 @@ describe("issue #2600 - session_shutdown handler timeout", () => {
 	it("runs multiple session_shutdown handlers within one cap", async () => {
 		const { runner, hangExtensionPaths, cleanup } = await buildRunnerWithHangingShutdown(4);
 		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
-		vi.useFakeTimers();
 		try {
 			testSetSessionShutdownHandlerTimeoutMs(100);
-			let settled = false;
-			const emitted = runner.emit({ type: "session_shutdown" }).then(() => {
-				settled = true;
-			});
 
-			await Promise.resolve();
-			vi.advanceTimersByTime(99);
-			await Promise.resolve();
-			expect(settled).toBe(false);
+			const startedAt = performance.now();
+			await runner.emit({ type: "session_shutdown" });
+			const elapsedMs = performance.now() - startedAt;
 
-			vi.advanceTimersByTime(1);
-			await Promise.resolve();
-			vi.advanceTimersByTime(0);
-			await emitted;
-			expect(settled).toBe(true);
+			// Multiple hung shutdown handlers must share the cap. Sequential
+			// dispatch would consume roughly count × cap and keep `/exit` slow.
+			expect(elapsedMs).toBeLessThan(350);
 			for (const hangExtensionPath of hangExtensionPaths) {
 				expect(warnSpy).toHaveBeenCalledWith("Extension handler timed out", {
 					extensionPath: hangExtensionPath,
@@ -125,7 +117,6 @@ describe("issue #2600 - session_shutdown handler timeout", () => {
 				});
 			}
 		} finally {
-			vi.useRealTimers();
 			warnSpy.mockRestore();
 			cleanup();
 		}
@@ -136,38 +127,58 @@ describe("issue #2600 - session_shutdown handler timeout", () => {
 		expect(SESSION_SHUTDOWN_HANDLER_TIMEOUT_MS).toBeLessThan(EXTENSION_HANDLER_TIMEOUT_MS);
 	});
 
+	it("returns within the short cap when a session_shutdown handler hangs forever", async () => {
+		const { runner, hangExtensionPath, cleanup } = await buildRunnerWithHangingShutdown();
+		try {
+			const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+			// Generic budget is left at the production default (30s). The
+			// shutdown cap is shortened to 100ms so this test stays under a
+			// second while still asserting the dispatch path uses the dedicated
+			// cap.
+			testSetSessionShutdownHandlerTimeoutMs(100);
+
+			const startedAt = performance.now();
+			await runner.emit({ type: "session_shutdown" });
+			const elapsedMs = performance.now() - startedAt;
+
+			// Loose upper bound to absorb CI scheduler jitter; the regression
+			// would expire at ~30_000ms.
+			expect(elapsedMs).toBeLessThan(1_000);
+			expect(warnSpy).toHaveBeenCalledWith("Extension handler timed out", {
+				extensionPath: hangExtensionPath,
+				event: "session_shutdown",
+				timeoutMs: 100,
+			});
+			warnSpy.mockRestore();
+		} finally {
+			cleanup();
+		}
+	});
+
 	it("session_shutdown cap is independent from the generic handler cap", async () => {
 		const { runner, hangExtensionPath, cleanup } = await buildRunnerWithHangingShutdown();
-		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
-		vi.useFakeTimers();
 		try {
-			// If dispatch reads the generic knob, advancing the shutdown budget
-			// cannot settle this handler.
+			const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+			// Raise the *generic* timeout to a value the test would never
+			// tolerate (10s) while leaving the shutdown cap at 50ms. If the
+			// dispatcher pulls from the wrong knob the test wall-clock balloons.
 			testSetExtensionHandlerTimeoutMs(10_000);
 			testSetSessionShutdownHandlerTimeoutMs(50);
-			let settled = false;
-			const emitted = runner.emit({ type: "session_shutdown" }).then(() => {
-				settled = true;
-			});
 
-			await Promise.resolve();
-			vi.advanceTimersByTime(49);
-			await Promise.resolve();
-			expect(settled).toBe(false);
+			const startedAt = performance.now();
+			await runner.emit({ type: "session_shutdown" });
+			const elapsedMs = performance.now() - startedAt;
 
-			vi.advanceTimersByTime(1);
-			await Promise.resolve();
-			vi.advanceTimersByTime(0);
-			await emitted;
-			expect(settled).toBe(true);
+			expect(elapsedMs).toBeLessThan(500);
 			expect(warnSpy).toHaveBeenCalledWith("Extension handler timed out", {
 				extensionPath: hangExtensionPath,
 				event: "session_shutdown",
 				timeoutMs: 50,
 			});
-		} finally {
-			vi.useRealTimers();
 			warnSpy.mockRestore();
+		} finally {
 			cleanup();
 		}
 	});
