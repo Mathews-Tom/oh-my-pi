@@ -774,6 +774,11 @@ export function getMnemopiScopedDbPaths(config: MnemopiBackendConfig): readonly 
 	return getMnemopiScopedBanks(config).map(bank => resolveBankDbPath(config, bank));
 }
 
+/** The single bank `retain`/`rememberScoped` writes to — see {@link MnemopiSessionState.rememberScoped}. */
+export function getMnemopiRetainDbPath(config: MnemopiBackendConfig): string {
+	return resolveBankDbPath(config, resolveScopedBanks(config).retainBank);
+}
+
 export function getMnemopiScopedBanks(config: MnemopiBackendConfig): readonly string[] {
 	const banks = resolveScopedBanks(config);
 	return uniqueBanks([banks.retainBank, banks.globalBank, ...banks.recallBanks]);

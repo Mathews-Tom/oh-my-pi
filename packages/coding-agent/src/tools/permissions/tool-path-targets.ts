@@ -25,6 +25,8 @@ import { getManagedSkillsDir, sanitizeSkillName } from "../../autolearn/managed-
 // barrel in here would close an import cycle.
 import { LSP_READONLY_ACTIONS } from "../../lsp/actions";
 import { getMemoryRoot, LEARNED_LESSONS_FILE } from "../../memories";
+import { loadMnemopiConfig } from "../../mnemopi/config";
+import { getMnemopiRetainDbPath, getMnemopiScopedDbPaths } from "../../mnemopi/state";
 import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
 import { unwrapHashlineHeaderPath } from "../plan-mode-guard";
 import type { PathAccess, PathTarget } from "./types";
@@ -306,6 +308,41 @@ const extractSecurityScanPaths: PathTargetExtractor = args => {
 	return out;
 };
 
+/**
+ * `retain` and `memory_edit` take no path argument at all, but under
+ * `memory.backend: mnemopi` they mutate the mnemopi SQLite database(s)
+ * `resolveBankDbPath` resolves — under the agent memory directory by default,
+ * but anywhere `mnemopi.dbPath` points. Deriving that path here (the same
+ * config resolution the tools' own execution path uses) is what makes those
+ * writes subject to `permissions.confineWrites`/`deny.write` instead of
+ * silently bypassing them as "pathless". Any other `memory.backend` (e.g.
+ * `hindsight`) touches no mnemopi database, so this contributes no targets.
+ */
+const extractRetainPaths: PathTargetExtractor = (_args, context) => {
+	const settings = context?.settings;
+	if (settings?.get("memory.backend") !== "mnemopi") return [];
+	const out: PathTarget[] = [];
+	pushPath(out, getMnemopiRetainDbPath(loadMnemopiConfig(settings, settings.getAgentDir())), "write", "memory");
+	return out;
+};
+
+/**
+ * `memory_edit` looks an id up across every bank the session recalls from
+ * (retain, recall, global — see `MnemopiSessionState.editScopedMemory`)
+ * before writing to whichever one has it, so every scoped database is both a
+ * read and a write target: which one actually gets touched is not knowable
+ * without doing that lookup.
+ */
+const extractMemoryEditPaths: PathTargetExtractor = (_args, context) => {
+	const settings = context?.settings;
+	if (settings?.get("memory.backend") !== "mnemopi") return [];
+	const out: PathTarget[] = [];
+	for (const dbPath of getMnemopiScopedDbPaths(loadMnemopiConfig(settings, settings.getAgentDir()))) {
+		pushReadWrite(out, dbPath, "memory");
+	}
+	return out;
+};
+
 // `hub`, `browser`, `bash`, `eval`, and `computer` all reach arbitrary code —
 // a spawned application, an evaluated script, a shell line — so none of them
 // gets a structured extractor. Declaring one would imply a soundness the class
@@ -399,10 +436,10 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 		},
 	},
 	manage_skill: { kind: "structured", extract: args => extractManagedSkillPaths(args) },
-	memory_edit: { kind: "pathless" },
+	memory_edit: { kind: "structured", extract: extractMemoryEditPaths },
 	recall: { kind: "pathless" },
 	reflect: { kind: "pathless" },
-	retain: { kind: "pathless" },
+	retain: { kind: "structured", extract: extractRetainPaths },
 	rewind: { kind: "pathless" },
 	// `task` carries a free-text prompt, not a path. Scanning it would deny an
 	// ordinary instruction that merely names a secret ("never touch .env"),

@@ -1,12 +1,24 @@
 import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { getManagedSkillsDir } from "@oh-my-pi/pi-coding-agent/autolearn/managed-skills";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { loadMnemopiConfig } from "@oh-my-pi/pi-coding-agent/mnemopi/config";
+import {
+	getMnemopiRetainDbPath,
+	getMnemopiScopedDbPaths,
+	loadMnemopi,
+	loadMnemopiCore,
+} from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import {
 	CLASSIFIED_TOOL_NAMES,
 	classifyTool,
 	extractEmbeddedEditPaths,
 	TOOL_PATH_CLASSES,
 } from "@oh-my-pi/pi-coding-agent/tools/permissions/tool-path-targets";
+
+// Mnemopi is lazy-loaded at runtime; preload it for synchronous bank-path resolution.
+await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 
 describe("classification coverage", () => {
 	it("classifies every built-in and hidden tool", () => {
@@ -29,10 +41,10 @@ describe("classification coverage", () => {
 });
 
 describe("structured extraction", () => {
-	function extract(tool: string, args: Record<string, unknown>) {
+	function extract(tool: string, args: Record<string, unknown>, context?: AgentToolContext) {
 		const cls = TOOL_PATH_CLASSES[tool];
 		if (cls?.kind !== "structured") throw new Error(`${tool} is not structured`);
-		return cls.extract(args);
+		return cls.extract(args, context);
 	}
 
 	it("normalizes hashline write headers before extracting their target", () => {
@@ -182,5 +194,60 @@ describe("embedded edit payload paths", () => {
 		expect(extractEmbeddedEditPaths('MV "dir with spaces/a.ts"').map(t => `${t.access}:${t.raw}`)).toEqual([
 			"write:dir with spaces/a.ts",
 		]);
+	});
+});
+
+describe("mnemopi memory tool paths", () => {
+	// `retain`/`memory_edit` carry no path argument; under `memory.backend:
+	// mnemopi` they mutate whatever `mnemopi.dbPath` resolves to, which is not
+	// the fixed default agent-memory location — it "may point anywhere"
+	// (finding under review). A gate that only ever checks the default location
+	// would miss a database an administrator moved.
+	function mnemopiContext(overrides: Parameters<typeof Settings.isolated>[0]): AgentToolContext {
+		const settings = Settings.isolated(overrides);
+		return { settings } as unknown as AgentToolContext;
+	}
+
+	function extract(tool: string, context?: AgentToolContext) {
+		const cls = TOOL_PATH_CLASSES[tool];
+		if (cls?.kind !== "structured") throw new Error(`${tool} is not structured`);
+		return cls.extract({}, context);
+	}
+
+	it("contributes no targets for a non-mnemopi backend, so hindsight-backed retain is unaffected", () => {
+		const context = mnemopiContext({ "memory.backend": "hindsight" });
+		expect(extract("retain", context)).toEqual([]);
+		expect(extract("memory_edit", context)).toEqual([]);
+	});
+
+	it("contributes no targets when called with no context at all", () => {
+		expect(extract("retain")).toEqual([]);
+		expect(extract("memory_edit")).toEqual([]);
+	});
+
+	it("gates retain's write to wherever mnemopi.dbPath is configured, not a fixed default", () => {
+		const customDbPath = path.join(path.sep, "vault", "elsewhere", "mnemopi.db");
+		const context = mnemopiContext({
+			"memory.backend": "mnemopi",
+			"mnemopi.scoping": "global",
+			"mnemopi.dbPath": customDbPath,
+		});
+		expect(extract("retain", context)).toEqual([{ raw: customDbPath, access: "write", field: "memory" }]);
+	});
+
+	it("derives retain's target the same way the tool's own execution path resolves it", () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const context = { settings } as unknown as AgentToolContext;
+		const expected = getMnemopiRetainDbPath(loadMnemopiConfig(settings, settings.getAgentDir()));
+		expect(extract("retain", context)).toEqual([{ raw: expected, access: "write", field: "memory" }]);
+	});
+
+	it("gates memory_edit as a read and a write on every bank it can touch, since it looks an id up across all of them before writing", () => {
+		const settings = Settings.isolated({ "memory.backend": "mnemopi" });
+		const context = { settings } as unknown as AgentToolContext;
+		const scopedPaths = getMnemopiScopedDbPaths(loadMnemopiConfig(settings, settings.getAgentDir()));
+		expect(scopedPaths.length).toBeGreaterThan(0);
+		const targets = extract("memory_edit", context);
+		expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual(scopedPaths.flatMap(p => [`read:${p}`, `write:${p}`]));
 	});
 });
