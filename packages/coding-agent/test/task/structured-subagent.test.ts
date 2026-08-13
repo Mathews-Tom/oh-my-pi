@@ -19,6 +19,7 @@ import {
 	type StructuredSubagentRequest,
 } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { AgentDefinition, SingleResult } from "@oh-my-pi/pi-coding-agent/task/types";
+import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 const AGENT: AgentDefinition = {
@@ -369,7 +370,7 @@ describe("structured subagent primitive", () => {
 
 	it("cleans ephemeral artifacts when isolation setup fails without recovery", async () => {
 		mockDiscovery();
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockRejectedValue(new Error("not a repository"));
+		vi.spyOn(worktreeModule, "getRepoRoot").mockRejectedValue(new Error("not a repository"));
 
 		await expect(
 			runStructuredSubagent(
@@ -517,7 +518,8 @@ describe("structured subagent primitive", () => {
 	it("retains isolated failure artifacts needed for recovery", async () => {
 		mockDiscovery();
 		let artifactsDir: string | undefined;
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/tmp" } as never);
+		vi.spyOn(worktreeModule, "getRepoRoot").mockResolvedValue("/tmp");
+		vi.spyOn(worktreeModule, "captureBaseline").mockResolvedValue({} as never);
 		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async ({ baseOptions }) => {
 			artifactsDir = baseOptions.artifactsDir;
 			return { ...result(), exitCode: 1, error: "agent failed", patchPath: "/recovery/Worker.patch" };
@@ -560,7 +562,8 @@ describe("structured subagent primitive", () => {
 	it("retains successful isolated task artifacts when auto-apply is disabled", async () => {
 		mockDiscovery();
 		let artifactsDir: string | undefined;
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/tmp" } as never);
+		vi.spyOn(worktreeModule, "getRepoRoot").mockResolvedValue("/tmp");
+		vi.spyOn(worktreeModule, "captureBaseline").mockResolvedValue({} as never);
 		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async ({ baseOptions }) => {
 			artifactsDir = baseOptions.artifactsDir;
 			return { ...result(), patchPath: "/recovery/Worker.patch" };

@@ -32,7 +32,6 @@ import {
 	type IsolationContext,
 	makeIsolationCommitMessage,
 	mergeIsolatedChanges,
-	prepareIsolationContext,
 	runIsolatedSubprocess,
 } from "./isolation-runner";
 import { generateTaskName } from "./name-generator";
@@ -45,7 +44,13 @@ import {
 	type SingleResult,
 	type StructuredSubagentOutput,
 } from "./types";
-import { getTaskIsolationBaseDir, type NestedRepoPatch, parseIsolationMode } from "./worktree";
+import {
+	captureBaseline,
+	getRepoRoot,
+	getTaskIsolationBaseDir,
+	type NestedRepoPatch,
+	parseIsolationMode,
+} from "./worktree";
 
 /** Validation behavior requested for an effective output schema. */
 export type StructuredSubagentSchemaMode = "permissive" | "strict";
@@ -610,8 +615,9 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 		baseOptions.planReference = await loadPlanReference(request, policy);
 		let isolationContext: IsolationContext | null = null;
 		if (policy.isIsolated) {
+			let repoRoot: string;
 			try {
-				isolationContext = await prepareIsolationContext(request.session.cwd);
+				repoRoot = await getRepoRoot(request.session.cwd);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				throw new StructuredSubagentError(
@@ -621,15 +627,26 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 				);
 			}
 			try {
-				await authorizeIsolationTargets(
-					request.session,
-					isolationContext.repoRoot,
-					getTaskIsolationBaseDir(isolationContext.repoRoot, id),
-				);
+				await authorizeIsolationTargets(request.session, repoRoot, getTaskIsolationBaseDir(repoRoot, id));
 			} catch (error) {
 				throw new StructuredSubagentError("isolation", error instanceof Error ? error.message : String(error), {
 					cause: error,
 				});
+			}
+			// Baseline capture reads the working tree (staged/unstaged diffs, and
+			// untracked file *contents* via `git diff --no-index`) — it must run
+			// only after the read authorization above, never before, or a denied
+			// untracked source's bytes are already read into the baseline patch
+			// by the time the denial throws (finding under review).
+			try {
+				isolationContext = { repoRoot, baseline: await captureBaseline(repoRoot) };
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				throw new StructuredSubagentError(
+					"isolation",
+					`Isolated subagent execution requires a git repository. ${message}`,
+					{ cause: error },
+				);
 			}
 		}
 		const result = !isolationContext

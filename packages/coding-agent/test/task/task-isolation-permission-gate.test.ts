@@ -13,6 +13,7 @@ import {
 	type StructuredSubagentRequest,
 } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { AgentDefinition, SingleResult } from "@oh-my-pi/pi-coding-agent/task/types";
+import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
 
@@ -72,6 +73,17 @@ function mockDiscovery(): void {
 	vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({ agents: [AGENT], projectAgentsDir: null });
 }
 
+/** Stub repo-root resolution without a real git checkout under `repoRoot`. */
+function mockRepoRoot(): void {
+	vi.spyOn(worktreeModule, "getRepoRoot").mockResolvedValue(repoRoot);
+}
+
+/** For success paths that must reach isolation setup: stub root + baseline capture, since `repoRoot` is a plain temp dir, not a real git checkout. */
+function mockIsolationContext(): void {
+	mockRepoRoot();
+	vi.spyOn(worktreeModule, "captureBaseline").mockResolvedValue({} as never);
+}
+
 beforeEach(async () => {
 	repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolation-permission-"));
 	vi.spyOn(git.ls, "files").mockResolvedValue([]);
@@ -86,7 +98,7 @@ afterEach(async () => {
 describe("task isolation permission gate", () => {
 	it("denies isolated execution whose isolation directory falls outside workspace roots under a confining profile", async () => {
 		mockDiscovery();
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot } as never);
+		mockRepoRoot();
 		const runIsolated = vi.spyOn(isolationRunner, "runIsolatedSubprocess");
 
 		const denied = runStructuredSubagent(
@@ -103,7 +115,7 @@ describe("task isolation permission gate", () => {
 
 	it("denies isolated execution when the source repo matches an explicit deny.read rule", async () => {
 		mockDiscovery();
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot } as never);
+		mockRepoRoot();
 		const runIsolated = vi.spyOn(isolationRunner, "runIsolatedSubprocess");
 
 		const denied = runStructuredSubagent(
@@ -129,7 +141,7 @@ describe("task isolation permission gate", () => {
 		vi.spyOn(git.ls, "files").mockImplementation(async (_cwd, options) =>
 			options?.cached && options.others && options.excludeStandard ? [".env"] : [],
 		);
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot } as never);
+		mockRepoRoot();
 		const runIsolated = vi.spyOn(isolationRunner, "runIsolatedSubprocess");
 
 		await expect(
@@ -147,12 +159,47 @@ describe("task isolation permission gate", () => {
 		expect(runIsolated).not.toHaveBeenCalled();
 	});
 
+	it("never captures the repository baseline when a denied untracked source blocks isolation setup", async () => {
+		// Baseline capture (`captureBaseline`) reads staged/unstaged diffs and
+		// untracked file *content* straight off disk — it must never run before
+		// the source-read permission gate has had a chance to deny. Previously
+		// `prepareIsolationContext` (root resolution + baseline capture) ran as
+		// one call before `authorizeIsolationTargets`, so a denied untracked
+		// file's bytes were already read into the baseline patch by the time the
+		// denial threw (finding under review).
+		const deniedFile = path.join(repoRoot, ".env");
+		await fs.writeFile(deniedFile, "SECRET=1");
+		mockDiscovery();
+		vi.spyOn(git.ls, "files").mockImplementation(async (_cwd, options) =>
+			options?.cached && options.others && options.excludeStandard ? [".env"] : [],
+		);
+		mockRepoRoot();
+		const captureBaseline = vi.spyOn(worktreeModule, "captureBaseline");
+		const runIsolated = vi.spyOn(isolationRunner, "runIsolatedSubprocess");
+
+		await expect(
+			runStructuredSubagent(
+				request({
+					session: session({
+						"permissions.profile": "workspace",
+						"permissions.confineWrites": false,
+						"permissions.deny.read": [deniedFile],
+					}),
+					isolation: { requested: true },
+				}),
+			),
+		).rejects.toThrow(deniedFile);
+
+		expect(captureBaseline).not.toHaveBeenCalled();
+		expect(runIsolated).not.toHaveBeenCalled();
+	});
+
 	it("does not deny a gitignored file that a git worktree isolation will not materialize", async () => {
 		const ignoredFile = path.join(repoRoot, ".env");
 		await fs.writeFile(ignoredFile, "SECRET=1");
 		mockDiscovery();
 		vi.spyOn(git.ls, "files").mockResolvedValue(["tracked.ts"]);
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot } as never);
+		mockIsolationContext();
 		const runIsolated = vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockResolvedValue(result());
 
 		const settled = await runStructuredSubagent(
@@ -174,7 +221,7 @@ describe("task isolation permission gate", () => {
 
 	it("does not merely block every isolated task call — an explicit allow rule still lets it through", async () => {
 		mockDiscovery();
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot } as never);
+		mockIsolationContext();
 		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockResolvedValue(result());
 
 		const settled = await runStructuredSubagent(
@@ -191,7 +238,7 @@ describe("task isolation permission gate", () => {
 
 	it("leaves isolated execution unaffected when the permission profile is off (the default)", async () => {
 		mockDiscovery();
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot } as never);
+		mockIsolationContext();
 		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockResolvedValue(result());
 
 		const settled = await runStructuredSubagent(
@@ -204,7 +251,7 @@ describe("task isolation permission gate", () => {
 
 	it("leaves non-isolated task execution unaffected under a confining profile", async () => {
 		mockDiscovery();
-		const prepareIsolation = vi.spyOn(isolationRunner, "prepareIsolationContext");
+		const getRepoRoot = vi.spyOn(worktreeModule, "getRepoRoot");
 		vi.spyOn(executorModule, "runSubprocess").mockResolvedValue(result());
 
 		const settled = await runStructuredSubagent(
@@ -215,7 +262,7 @@ describe("task isolation permission gate", () => {
 		);
 
 		expect(settled.result.exitCode).toBe(0);
-		expect(prepareIsolation).not.toHaveBeenCalled();
+		expect(getRepoRoot).not.toHaveBeenCalled();
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
 });
