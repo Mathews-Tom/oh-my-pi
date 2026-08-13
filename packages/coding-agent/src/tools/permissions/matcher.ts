@@ -19,28 +19,41 @@
  * Cheap, conservative validity check for a glob pattern, independent of
  * `Bun.Glob`'s own (silently-permissive) behavior.
  *
- * Checks only bracket/brace balance — `[...]` character classes and
- * `{...}` brace expansion — the two constructs a truncated pattern most
- * commonly leaves open (`[a-`, `{a,b`). Not a full glob-grammar parser; a
- * pattern that balances but is otherwise nonsensical still compiles (as
- * always) and is the user's own concern. Returns a human-readable problem
- * description, or `null` when the pattern is well-formed.
+ * Walks brace expansion (`{...}`) and character-class (`[...]`) grammar well
+ * enough to catch the ways a truncated or typo'd pattern most commonly goes
+ * wrong: `{a,b` (unterminated brace), `[a-` (unterminated class), and two
+ * subtler cases that compile without error yet match nothing at all —
+ * `[]`/`[!]`/`[^]` (an empty class: per the POSIX dialect `Bun.Glob` follows,
+ * a `]` immediately after `[`, `[!`, or `[^` is a literal class member, not
+ * the closer, so an empty-looking class has no real closer and is dead) and
+ * a trailing `\` with nothing left to escape. Not a full glob-grammar parser;
+ * a pattern that parses cleanly but is otherwise nonsensical still compiles
+ * (as always) and is the user's own concern. Returns a human-readable
+ * problem description, or `null` when the pattern is well-formed.
  */
 export function validateGlobPattern(pattern: string): string | null {
-	let bracketDepth = 0;
 	let braceDepth = 0;
 	for (let i = 0; i < pattern.length; i++) {
 		const ch = pattern[i];
 		if (ch === "\\") {
+			if (i === pattern.length - 1) return `dangling "\\" escape at end of pattern`;
 			i++; // an escaped char is a literal, even if it's a bracket/brace
 			continue;
 		}
-		if (ch === "[") bracketDepth++;
-		else if (ch === "]") bracketDepth = Math.max(0, bracketDepth - 1);
-		else if (ch === "{") braceDepth++;
+		if (ch === "[") {
+			i++;
+			if (pattern[i] === "!" || pattern[i] === "^") i++;
+			if (pattern[i] === "]") i++; // a "]" right after "[" (or "[!"/"[^") is a literal member
+			while (i < pattern.length && pattern[i] !== "]") {
+				if (pattern[i] === "\\") i++;
+				i++;
+			}
+			if (i >= pattern.length) return `unterminated "[" character class`;
+			continue; // outer loop's increment steps past the closing "]"
+		}
+		if (ch === "{") braceDepth++;
 		else if (ch === "}") braceDepth = Math.max(0, braceDepth - 1);
 	}
-	if (bracketDepth > 0) return `unterminated "[" character class`;
 	if (braceDepth > 0) return `unterminated "{" brace expansion`;
 	return null;
 }
