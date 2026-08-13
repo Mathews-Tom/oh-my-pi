@@ -112,7 +112,10 @@ function resourcePermissionGuard(context: AgentToolContext | undefined): Securit
 		stateDirectory: absolutePath => {
 			enforceResourcePathTargets(
 				"security_scan",
-				[{ raw: absolutePath, access: "write" as const, field: "state directory" }],
+				[
+					{ raw: absolutePath, access: "read" as const, field: "state directory" },
+					{ raw: absolutePath, access: "write" as const, field: "state directory" },
+				],
 				context,
 			);
 		},

@@ -36,7 +36,7 @@ export interface SecurityScanGuard {
 	knowledgeBase?(absolutePath: string): void;
 	/** The effective output directory, resolved and absolute, before it is created. */
 	outputRoot?(absolutePath: string): void;
-	/** The `SecurityStore` project state directory, resolved and absolute, before it is opened or created. */
+	/** The `SecurityStore` project state directory, resolved and absolute, before it is read, opened, or created — the coordinator/store reads index/plan/finding state from it as part of opening. */
 	stateDirectory?(absolutePath: string): void;
 }
 
