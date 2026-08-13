@@ -1,9 +1,10 @@
 import { Database } from "bun:sqlite";
-import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { ToolSession } from "../sdk";
 import { DEFAULT_MAX_LINES, truncateHead } from "../session/streaming-output";
 import { applyListLimit } from "./list-limit";
 import { resolveReadPath } from "./path-utils";
+import { enforceResourcePathTargets } from "./permissions/gate";
 import type { ReadToolDetails } from "./read";
 import { prependSuffixResolutionNotice } from "./read-format";
 import {
@@ -43,12 +44,14 @@ export async function resolveSqliteReadPath(
 	readPath: string,
 	suffixCache: SuffixMatchCache,
 	signal?: AbortSignal,
+	context?: AgentToolContext,
 ): Promise<ResolvedSqliteReadPath | null> {
 	const candidates = parseSqlitePathCandidates(readPath);
 	for (const candidate of candidates) {
 		let absolutePath = resolveReadPath(candidate.sqlitePath, session.cwd);
 		let suffixResolution: { from: string; to: string } | undefined;
 
+		enforceResourcePathTargets("read", [{ raw: absolutePath, access: "read", field: "path" }], context);
 		try {
 			const stat = await Bun.file(absolutePath).stat();
 			if (stat.isDirectory()) continue;
@@ -67,6 +70,11 @@ export async function resolveSqliteReadPath(
 			if (!suffixMatch) continue;
 
 			try {
+				enforceResourcePathTargets(
+					"read",
+					[{ raw: suffixMatch.absolutePath, access: "read", field: "path" }],
+					context,
+				);
 				const retryStat = await Bun.file(suffixMatch.absolutePath).stat();
 				if (retryStat.isDirectory()) continue;
 				if (!(await isSqliteFile(suffixMatch.absolutePath))) continue;

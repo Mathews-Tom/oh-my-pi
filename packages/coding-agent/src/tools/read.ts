@@ -917,7 +917,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				: literalSplit.sel === undefined && splitPathAndSel(readPath).sel !== undefined;
 
 		if (!rawPathIsLiteral) {
-			const archivePath = await resolveArchiveReadPath(this.session, readPath, suffixCache, signal);
+			const archivePath = await resolveArchiveReadPath(this.session, readPath, suffixCache, signal, _toolContext);
 			if (archivePath) {
 				const archiveSubPath =
 					promotedSelector === undefined
@@ -933,7 +933,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				);
 			}
 
-			const sqlitePath = await resolveSqliteReadPath(this.session, readPath, suffixCache, signal);
+			const sqlitePath = await resolveSqliteReadPath(this.session, readPath, suffixCache, signal, _toolContext);
 			if (sqlitePath) {
 				return readSqlite(sqlitePath, signal);
 			}
@@ -942,6 +942,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			if (pdfImageMemberPath) {
 				let absolutePdfPath = resolveReadPath(pdfImageMemberPath.pdfPath, this.session.cwd);
 				let suffixResolution: { from: string; to: string } | undefined;
+				enforceResourcePathTargets("read", [{ raw: absolutePdfPath, access: "read", field: "path" }], _toolContext);
 				try {
 					const stat = await Bun.file(absolutePdfPath).stat();
 					if (stat.isDirectory())
@@ -956,6 +957,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					);
 					if (!suffixMatch) throw new ToolError(`Path '${pdfImageMemberPath.pdfPath}' not found`);
 					absolutePdfPath = suffixMatch.absolutePath;
+					enforceResourcePathTargets(
+						"read",
+						[{ raw: absolutePdfPath, access: "read", field: "path" }],
+						_toolContext,
+					);
 					suffixResolution = { from: pdfImageMemberPath.pdfPath, to: suffixMatch.displayPath };
 				}
 				return readPdfImageMember(
@@ -979,6 +985,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		let isDirectory = false;
 		let fileSize = 0;
+		enforceResourcePathTargets("read", [{ raw: absolutePath, access: "read", field: "path" }], _toolContext);
 		try {
 			const stat = await Bun.file(absolutePath).stat();
 			fileSize = stat.size;
@@ -990,6 +997,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				if (!isRemoteMountPath(absolutePath)) {
 					const suffixMatch = await findSuffixMatchCached(this.session, suffixCache, localReadPath, signal);
 					if (suffixMatch) {
+						enforceResourcePathTargets(
+							"read",
+							[{ raw: suffixMatch.absolutePath, access: "read", field: "path" }],
+							_toolContext,
+						);
 						try {
 							const retryStat = await Bun.file(suffixMatch.absolutePath).stat();
 							absolutePath = suffixMatch.absolutePath;
@@ -1007,6 +1019,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				if (!suffixResolution) {
 					const approvedPlanPath = this.#approvedPlanAlias(absolutePath);
 					if (approvedPlanPath) {
+						enforceResourcePathTargets(
+							"read",
+							[{ raw: approvedPlanPath, access: "read", field: "path" }],
+							_toolContext,
+						);
 						try {
 							const approvedPlanStat = await Bun.file(approvedPlanPath).stat();
 							absolutePath = approvedPlanPath;

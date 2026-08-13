@@ -58,8 +58,8 @@ import { renderResult as renderLocalResult } from "../../src/lsp/render";
 import { getLanguageFromPath } from "../../src/utils/lang-from-path";
 
 /** Minimal LSP tool session: production always supplies `settings`; these tests only need cwd + a default settings stub. */
-function makeLspSession(cwd: string): ToolSession {
-	return { cwd, settings: Settings.isolated() } as ToolSession;
+function makeLspSession(cwd: string, settings = Settings.isolated()): ToolSession {
+	return { cwd, settings } as ToolSession;
 }
 
 interface RpcMessage {
@@ -4303,6 +4303,38 @@ describe("references beyond REFERENCE_CONTEXT_LIMIT respect resource permissions
 			expect(output).not.toContain(".env");
 		} finally {
 			vi.restoreAllMocks();
+			tempDir.removeSync();
+		}
+	});
+});
+
+describe("LSP configuration permissions", () => {
+	it("rejects an existing denied configuration file before loading it for a pathless status request", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-config-permissions-");
+		const cwd = tempDir.path();
+		const configPath = path.join(cwd, ".omp", "lsp.json");
+		const settings = Settings.isolated({
+			"permissions.profile": "workspace",
+			"permissions.deny.read": [configPath],
+		});
+		try {
+			fs.mkdirSync(path.dirname(configPath), { recursive: true });
+			fs.writeFileSync(configPath, JSON.stringify({ servers: {} }));
+			const toolContext = {
+				sessionManager: {
+					getCwd: () => cwd,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "lsp-config-permissions",
+				},
+				settings,
+			} as unknown as AgentToolContext;
+			const tool = new LspTool(makeLspSession(cwd, settings));
+
+			await expect(
+				tool.execute("lsp-config-permissions", { action: "status" }, undefined, undefined, toolContext),
+			).rejects.toThrow(configPath);
+		} finally {
+			configCache.delete(cwd);
 			tempDir.removeSync();
 		}
 	});

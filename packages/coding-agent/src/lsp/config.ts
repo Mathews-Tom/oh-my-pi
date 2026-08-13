@@ -102,7 +102,9 @@ function normalizeServerConfig(name: string, config: RawServerConfig): ServerCon
 	};
 }
 
-function readConfigFile(filePath: string): NormalizedConfig | null {
+function readConfigFile(filePath: string, beforeRead?: (filePath: string) => void): NormalizedConfig | null {
+	if (!fs.existsSync(filePath)) return null;
+	beforeRead?.(filePath);
 	try {
 		const content = fs.readFileSync(filePath, "utf-8");
 		const parsed = parseConfigContent(content, filePath);
@@ -310,22 +312,27 @@ export function resolveCommand(command: string, cwd: string, options?: ResolveCo
 }
 
 interface ConfigSource {
-	read(): NormalizedConfig | null;
+	read(beforeRead?: (filePath: string) => void): NormalizedConfig | null;
 }
 
 function fileConfigSource(filePath: string): ConfigSource {
 	return {
-		read: () => readConfigFile(filePath),
+		read: beforeRead => readConfigFile(filePath, beforeRead),
 	};
 }
 
-function readMarketplaceLspConfig(root: ClaudePluginRoot): NormalizedConfig | null {
+function readMarketplaceLspConfig(
+	root: ClaudePluginRoot,
+	beforeRead?: (filePath: string) => void,
+): NormalizedConfig | null {
 	const catalogPaths = [
 		path.resolve(root.path, "..", "..", "marketplace.json"),
 		path.resolve(root.path, "..", "..", ".claude-plugin", "marketplace.json"),
 	];
 
 	for (const catalogPath of catalogPaths) {
+		if (!fs.existsSync(catalogPath)) continue;
+		beforeRead?.(catalogPath);
 		try {
 			const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")) as unknown;
 			if (!isRecord(catalog) || !Array.isArray(catalog.plugins)) continue;
@@ -337,7 +344,7 @@ function readMarketplaceLspConfig(root: ClaudePluginRoot): NormalizedConfig | nu
 				if (typeof lspServers === "string") {
 					const configPath = path.resolve(root.path, lspServers);
 					if (!pathIsWithin(root.path, configPath)) return null;
-					return readConfigFile(configPath);
+					return readConfigFile(configPath, beforeRead);
 				}
 				if (isRecord(lspServers)) {
 					return normalizeConfig({ servers: lspServers });
@@ -352,7 +359,7 @@ function readMarketplaceLspConfig(root: ClaudePluginRoot): NormalizedConfig | nu
 
 function marketplaceConfigSource(root: ClaudePluginRoot): ConfigSource {
 	return {
-		read: () => readMarketplaceLspConfig(root),
+		read: beforeRead => readMarketplaceLspConfig(root, beforeRead),
 	};
 }
 
@@ -434,7 +441,7 @@ function getConfigSources(cwd: string): ConfigSource[] {
  * }
  * ```
  */
-export function loadConfig(cwd: string): LspConfig {
+export function loadConfig(cwd: string, beforeRead?: (filePath: string) => void): LspConfig {
 	let mergedServers = coerceServerConfigs(DEFAULTS);
 
 	const configSources = getConfigSources(cwd).reverse();
@@ -442,7 +449,7 @@ export function loadConfig(cwd: string): LspConfig {
 
 	let idleTimeoutMs: number | undefined;
 	for (const source of configSources) {
-		const parsed = source.read();
+		const parsed = source.read(beforeRead);
 		if (!parsed) continue;
 		const hasServerOverrides = Object.keys(parsed.servers).length > 0;
 		if (hasServerOverrides) {

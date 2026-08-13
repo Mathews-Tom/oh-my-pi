@@ -1,9 +1,10 @@
+import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { applyGuardedWorkspaceEdit, guardLocationReads } from "@oh-my-pi/pi-coding-agent/lsp";
@@ -14,6 +15,7 @@ import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent/session/s
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { collectPermittedSearchPaths, enforceResourcePathTargets } from "@oh-my-pi/pi-coding-agent/tools/permissions";
+import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { WriteTool } from "@oh-my-pi/pi-coding-agent/tools/write";
 import { hashPath } from "@oh-my-pi/pi-utils";
 
@@ -589,6 +591,32 @@ describe("lsp result locations", () => {
 	});
 });
 
+describe("resolved read selectors", () => {
+	it("rejects a SQLite selector whose resolved database container is denied", async () => {
+		const databasePath = path.join(workspace, "vault.db");
+		const database = new Database(databasePath);
+		database.run("CREATE TABLE users (id INTEGER PRIMARY KEY)");
+		database.close();
+		const tool = new ReadTool({
+			cwd: workspace,
+			hasUI: false,
+			getSessionFile: () => path.join(workspace, "session.jsonl"),
+			getSessionSpawns: () => "*",
+			getArtifactsDir: () => path.join(workspace, "session"),
+			settings: Settings.isolated(),
+		} as ToolSession);
+
+		await expect(
+			tool.execute(
+				"read-selector-denied-container",
+				{ path: "vault.db:users" },
+				undefined,
+				undefined,
+				contextOf({ "permissions.profile": "workspace", "permissions.deny.read": [databasePath] }),
+			),
+		).rejects.toThrow(databasePath);
+	});
+});
 describe("lsp workspace edits", () => {
 	function fileUri(absolutePath: string): string {
 		return `file://${absolutePath}`;

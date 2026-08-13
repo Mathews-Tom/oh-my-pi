@@ -275,7 +275,9 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		signal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
 		throwIfAborted(signal);
 
-		const config = getConfig(this.session.cwd);
+		const authorizeConfigRead = (filePath: string) =>
+			enforceResourcePathTargets("lsp", [{ raw: filePath, access: "read", field: "configuration" }], toolContext);
+		const config = getConfig(this.session.cwd, authorizeConfigRead);
 
 		// Status action doesn't need a file
 		if (action === "status") {
@@ -1164,7 +1166,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			// otherwise `getConfig` returns the first observation for the rest of
 			// the process lifetime (#3546).
 			configCache.delete(this.session.cwd);
-			const refreshedConfig = getConfig(this.session.cwd);
+			const refreshedConfig = getConfig(this.session.cwd, authorizeConfigRead);
 			const servers = getLspServers(refreshedConfig);
 			if (servers.length === 0) {
 				return {

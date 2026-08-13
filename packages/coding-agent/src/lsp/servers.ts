@@ -178,10 +178,10 @@ export async function notifyFileSaved(
 // Cache config per cwd to avoid repeated file I/O
 export const configCache = new Map<string, LspConfig>();
 
-export function getConfig(cwd: string): LspConfig {
+export function getConfig(cwd: string, beforeRead?: (filePath: string) => void): LspConfig {
 	let config = configCache.get(cwd);
 	if (!config) {
-		config = loadConfig(cwd);
+		config = loadConfig(cwd, beforeRead);
 		configCache.set(cwd, config);
 	}
 	setIdleTimeout(config.idleTimeoutMs);
