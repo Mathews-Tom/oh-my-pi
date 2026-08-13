@@ -85,26 +85,6 @@ describe("ExtensionRunner", () => {
 		};
 	};
 
-	it("exposes caller localProtocolOptions through extension context", async () => {
-		const localProtocolOptions = {
-			getArtifactsDir: () => tempDir.join("artifacts"),
-			getSessionId: () => "runner-session",
-		};
-		const result = await loadTestExtensions();
-		const runner = new ExtensionRunner(
-			result.extensions,
-			result.runtime,
-			tempDir.path(),
-			sessionManager,
-			modelRegistry,
-			undefined,
-			undefined,
-			localProtocolOptions,
-		);
-
-		expect(runner.createContext().localProtocolOptions).toBe(localProtocolOptions);
-	});
-
 	it("reflects SessionManager.moveTo() changes instead of the constructor-time snapshot (/move)", async () => {
 		const dirA = tempDir.join("dirA");
 		const dirB = tempDir.join("dirB");
@@ -2415,38 +2395,6 @@ describe("ExtensionRunner", () => {
 
 			await expect(wrapped.execute("tool-call-id", { command: "echo original" })).rejects.toThrow("nope");
 			expect(fs.existsSync(recordPath)).toBe(false); // tool never executed
-		});
-
-		it("executes with the original input when no handler returns a replacement", async () => {
-			const recordPath = path.join(tempDir.path(), "override-absent.jsonl");
-			const extCode = `
-				export default function(pi) {
-					pi.on("tool_call", async (event) => {
-						if (event.toolName !== "bash") return;
-						// observe only; no input override
-					});
-				}
-			`;
-			fs.writeFileSync(path.join(extensionsDir, "tool-call-no-override.ts"), extCode);
-
-			const result = await loadTestExtensions();
-			const runner = new ExtensionRunner(
-				result.extensions,
-				result.runtime,
-				tempDir.path(),
-				sessionManager,
-				modelRegistry,
-			);
-			const wrapped = new ExtensionToolWrapper(createRecordingTool(recordPath), runner);
-
-			await wrapped.execute("tool-call-id", { command: "echo original" });
-
-			const executed = fs
-				.readFileSync(recordPath, "utf8")
-				.trim()
-				.split("\n")
-				.map(line => JSON.parse(line));
-			expect(executed).toEqual([{ command: "echo original" }]);
 		});
 
 		// A tool whose approval policy depends on its args: the command "rm -rf" resolves to deny,

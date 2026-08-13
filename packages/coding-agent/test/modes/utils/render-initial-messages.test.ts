@@ -13,13 +13,13 @@
 
 import { afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, ImageContent, Usage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ImageContent, Message, Usage } from "@oh-my-pi/pi-ai";
 import { kStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
 import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/transcript-container";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import type { InteractiveModeContext, RenderSessionContextOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import type { SessionContext, StrippedToolCallsMarker } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -61,11 +61,11 @@ function makeCtx(): {
 	ctx: InteractiveModeContext;
 	transcriptSpy: Mock<(options?: { collapseCompactedHistory?: boolean }) => SessionContext>;
 	llmContextSpy: Mock<() => SessionContext>;
-	renderSessionContextSpy: Mock<(...args: unknown[]) => void>;
+	renderSessionContextSpy: Mock<(...args: unknown[]) => Promise<void>>;
 } {
 	const transcriptSpy = vi.fn(() => makeEmptyContext());
 	const llmContextSpy = vi.fn(() => makeEmptyContext());
-	const renderSessionContextSpy = vi.fn();
+	const renderSessionContextSpy = vi.fn(async () => {});
 
 	const ctx = {
 		chatContainer: { clear: vi.fn(), addChild: vi.fn() },
@@ -87,7 +87,7 @@ function makeCtx(): {
 			getEntries: vi.fn(() => []),
 			getCwd: vi.fn(() => "/tmp"),
 		},
-		renderSessionContext: renderSessionContextSpy,
+		renderSessionContextIncrementally: renderSessionContextSpy,
 		showStatus: vi.fn(),
 		ui: { requestRender: vi.fn() },
 		resetTranscript: () => ctx.chatContainer.clear(),
@@ -184,6 +184,12 @@ function makeRenderCtx(
 			sessionManager: {
 				getEntries: vi.fn(() => []),
 				getCwd: vi.fn(() => "/tmp"),
+				putBlobSync: vi.fn(() => ({
+					hash: "hash",
+					path: "/tmp/hash",
+					displayPath: "/tmp/hash.png",
+					ref: "blob:sha256:hash",
+				})),
 			},
 		},
 		sessionManager: {
@@ -198,10 +204,14 @@ function makeRenderCtx(
 		},
 		addMessageToChat: (message: AgentMessage, options?: { populateHistory?: boolean }) =>
 			helpers.addMessageToChat(message, options),
-		renderSessionContext: (
+		getUserMessageText: (message: Message) => helpers.getUserMessageText(message),
+		renderSessionContext: (context: SessionContext, options?: RenderSessionContextOptions) =>
+			helpers.renderSessionContext(context, options),
+		renderSessionContextIncrementally: (
 			context: SessionContext,
-			options?: { updateFooter?: boolean; populateHistory?: boolean },
-		) => helpers.renderSessionContext(context, options),
+			options: RenderSessionContextOptions,
+			renderChunk?: () => void,
+		) => helpers.renderSessionContextIncrementally(context, options, renderChunk),
 		showStatus: vi.fn(),
 	} as unknown as InteractiveModeContext;
 	helpers = new UiHelpers(ctx);
@@ -215,13 +225,13 @@ describe("UiHelpers.renderInitialMessages — transcript source", () => {
 		const transcript = makeEmptyContext();
 		transcriptSpy.mockReturnValue(transcript);
 
-		new UiHelpers(ctx).renderInitialMessages();
+		await new UiHelpers(ctx).renderInitialMessages();
 
 		expect(transcriptSpy).toHaveBeenCalledWith({ collapseCompactedHistory: true });
 		expect(llmContextSpy).not.toHaveBeenCalled();
 		expect(renderSessionContextSpy).toHaveBeenCalledWith(transcript, {
 			updateFooter: true,
-			populateHistory: true,
+			populateHistory: false,
 		});
 	});
 });
@@ -230,18 +240,88 @@ describe("UiHelpers.renderInitialMessages — clearTerminalHistory", () => {
 	it("requests a scrollback-clearing repaint when clearTerminalHistory is set", async () => {
 		await Settings.init({ inMemory: true });
 		const { ctx } = makeCtx();
-		new UiHelpers(ctx).renderInitialMessages({ clearTerminalHistory: true });
+		await new UiHelpers(ctx).renderInitialMessages({ clearTerminalHistory: true });
 		expect(ctx.ui.requestRender).toHaveBeenCalledWith(true, { clearScrollback: true });
 	});
 
 	it("never clears scrollback when clearTerminalHistory is unset", async () => {
 		await Settings.init({ inMemory: true });
 		const { ctx } = makeCtx();
-		new UiHelpers(ctx).renderInitialMessages();
+		await new UiHelpers(ctx).renderInitialMessages();
 		const clearedCall = (ctx.ui.requestRender as Mock<(...a: unknown[]) => void>).mock.calls.find(
 			([force, opts]) => force === true && (opts as { clearScrollback?: boolean } | undefined)?.clearScrollback,
 		);
 		expect(clearedCall).toBeUndefined();
+	});
+});
+
+describe("UiHelpers.renderInitialMessages — responsiveness", () => {
+	// Count the chunk boundaries an idle rebuild produces: each boundary calls
+	// `renderChunk` and then awaits a macrotask, so a positive count proves the
+	// rebuild handed control back to the event loop mid-replay instead of
+	// running as one uninterruptible turn. Drives `renderSessionContextIncrementally`
+	// directly (the layer that owns the chunk counter) so the assertion is
+	// deterministic and never races a timer.
+	async function countRebuildChunks(messages: AgentMessage[]): Promise<number> {
+		const transcript = transcriptWith(messages);
+		const { ctx } = makeRenderCtx(transcript);
+		let chunks = 0;
+		await new UiHelpers(ctx).renderSessionContextIncrementally(
+			transcript,
+			{ updateFooter: true, populateHistory: true },
+			() => {
+				chunks++;
+			},
+		);
+		return chunks;
+	}
+
+	it("splits a large plain transcript rebuild across event-loop turns", async () => {
+		await Settings.init({ inMemory: true });
+		const messages: AgentMessage[] = Array.from({ length: 256 }, (_, index) => ({
+			role: "user",
+			content: `message ${index}`,
+			timestamp: index,
+		}));
+		expect(await countRebuildChunks(messages)).toBeGreaterThan(0);
+	});
+
+	it("yields across a large parallel read-result batch", async () => {
+		// Regression: a single assistant turn whose results are all grouped `read`
+		// toolResults replays entirely through the `isReadGroupResult` early
+		// `continue`. A trailing per-message yield is skipped by every one of
+		// those results, so the whole batch would rebuild in one uninterruptible
+		// event-loop turn and the chunk counter would never trip (zero chunks).
+		// The top-of-loop yield must still hand control back between results.
+		await Settings.init({ inMemory: true });
+		const readCalls = Array.from({ length: 128 }, (_, index) => ({
+			type: "toolCall" as const,
+			id: `read-${index}`,
+			name: "read",
+			arguments: { path: `src/file-${index}.ts` },
+		}));
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: readCalls,
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet",
+			usage: emptyUsage,
+			stopReason: "toolUse",
+			timestamp: 1,
+		};
+		const messages: AgentMessage[] = [assistant];
+		for (let index = 0; index < 128; index++) {
+			messages.push({
+				role: "toolResult",
+				toolCallId: `read-${index}`,
+				toolName: "read",
+				content: [{ type: "text", text: `contents ${index}` }],
+				isError: false,
+				timestamp: index + 2,
+			});
+		}
+		expect(await countRebuildChunks(messages)).toBeGreaterThan(0);
 	});
 });
 
@@ -262,7 +342,7 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 		]);
 		const { ctx, chatContainer } = makeRenderCtx(transcript);
 
-		new UiHelpers(ctx).renderInitialMessages();
+		await new UiHelpers(ctx).renderInitialMessages();
 
 		expect(hasImageComponent(chatContainer)).toBe(true);
 		expect(Bun.stripANSI(chatContainer.render(100).join("\n"))).toContain("Read sample.png");
@@ -289,7 +369,7 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 
 		const { ctx, chatContainer } = makeRenderCtx(transcript);
 
-		new UiHelpers(ctx).renderInitialMessages();
+		await new UiHelpers(ctx).renderInitialMessages();
 
 		expect(hasImageComponent(chatContainer)).toBe(true);
 		expect(Bun.stripANSI(chatContainer.render(100).join("\n"))).toContain("display image 1: 1x1");
@@ -311,7 +391,7 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 		]);
 		const { ctx, chatContainer } = makeRenderCtx(transcript, false);
 
-		new UiHelpers(ctx).renderInitialMessages();
+		await new UiHelpers(ctx).renderInitialMessages();
 
 		expect(hasImageComponent(chatContainer)).toBe(false);
 		const assistant = chatContainer.children.find(
@@ -338,7 +418,7 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 		]);
 		const { ctx, chatContainer } = makeRenderCtx(transcript, true, true);
 
-		new UiHelpers(ctx).renderInitialMessages();
+		await new UiHelpers(ctx).renderInitialMessages();
 
 		expect(hasImageComponent(chatContainer)).toBe(false);
 		const assistant = chatContainer.children.find(
@@ -383,7 +463,7 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 		const transcript = reloaded.buildSessionContext({ transcript: true });
 		const { ctx, chatContainer } = makeRenderCtx(transcript);
 
-		new UiHelpers(ctx).renderInitialMessages({ clearTerminalHistory: true });
+		await new UiHelpers(ctx).renderInitialMessages({ clearTerminalHistory: true });
 
 		expect(countImageComponents(chatContainer)).toBe(2);
 		expect(Bun.stripANSI(chatContainer.render(100).join("\n"))).toContain("Read reopened.png");
@@ -392,7 +472,7 @@ describe("UiHelpers.renderInitialMessages — image replay", () => {
 });
 
 describe("UiHelpers.renderInitialMessages — hidden tool activity", () => {
-	it("hides replayed tool cards without discarding them from the persisted transcript", () => {
+	it("hides replayed tool cards without discarding them from the persisted transcript", async () => {
 		const toolCallId = "replayed-hidden-tool";
 		const toolArgumentMarker = "REPLAYED TOOL ARGUMENT MARKER";
 		const toolResultMarker = "REPLAYED TOOL RESULT MARKER";
@@ -427,7 +507,7 @@ describe("UiHelpers.renderInitialMessages — hidden tool activity", () => {
 		]);
 
 		const hidden = makeRenderCtx(transcript, true, true);
-		new UiHelpers(hidden.ctx).renderInitialMessages();
+		await new UiHelpers(hidden.ctx).renderInitialMessages();
 		const hiddenRender = Bun.stripANSI(hidden.chatContainer.render(120).join("\n"));
 		expect(hiddenRender).toContain(narrationMarker);
 		expect(hiddenRender).toContain(finalMarker);
@@ -435,7 +515,7 @@ describe("UiHelpers.renderInitialMessages — hidden tool activity", () => {
 		expect(hiddenRender).not.toContain(toolResultMarker);
 
 		const visible = makeRenderCtx(transcript, true, false);
-		new UiHelpers(visible.ctx).renderInitialMessages();
+		await new UiHelpers(visible.ctx).renderInitialMessages();
 		const visibleRender = Bun.stripANSI(visible.chatContainer.render(120).join("\n"));
 		expect(visibleRender).toContain(toolArgumentMarker);
 		expect(visibleRender).toContain(toolResultMarker);
@@ -506,7 +586,7 @@ describe("UiHelpers.renderInitialMessages — hidden tool activity", () => {
 		expect(Bun.stripANSI(visible.chatContainer.render(120).join("\n"))).toContain("TODO_WARNING_MARKER");
 	});
 
-	it("hides the stripped-tool-calls placeholder with tool activity and restores it on reveal", () => {
+	it("hides the stripped-tool-calls placeholder with tool activity and restores it on reveal", async () => {
 		const strippedAssistant: AgentMessage & StrippedToolCallsMarker = {
 			role: "assistant",
 			content: [{ type: "text", text: "narration" }],
@@ -521,7 +601,7 @@ describe("UiHelpers.renderInitialMessages — hidden tool activity", () => {
 		const transcript = transcriptWith([strippedAssistant]);
 
 		const hidden = makeRenderCtx(transcript, true, true);
-		new UiHelpers(hidden.ctx).renderInitialMessages();
+		await new UiHelpers(hidden.ctx).renderInitialMessages();
 		expect(Bun.stripANSI(hidden.chatContainer.render(120).join("\n"))).not.toContain(
 			"elided — no result on this branch",
 		);
@@ -567,7 +647,7 @@ describe("UiHelpers.renderSessionContext — error-stop tool calls", () => {
 		]);
 		const { ctx, chatContainer } = makeRenderCtx(transcript);
 
-		new UiHelpers(ctx).renderInitialMessages();
+		await new UiHelpers(ctx).renderInitialMessages();
 
 		const rendered = Bun.stripANSI(chatContainer.render(120).join("\n"));
 		expect(rendered).toContain("synthetic assistant stop error");
@@ -609,7 +689,7 @@ describe("UiHelpers.renderSessionContext — mid-stream tool call rebuild", () =
 		]);
 		const { ctx, chatContainer } = makeRenderCtx(transcript);
 
-		new UiHelpers(ctx).renderInitialMessages();
+		await new UiHelpers(ctx).renderInitialMessages();
 
 		const rendered = Bun.stripANSI(chatContainer.render(120).join("\n"));
 		expect(rendered).toContain("GROWN_TAIL_SENTINEL");

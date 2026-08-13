@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [17.3.0] - 2026-08-13
+
+### Fixed
+
+- Optimized performance of partial JSON parsing for long streaming tool-call arguments.
+- Fixed Mermaid ASCII multi-word edge labels where routed lines would show through spaces.
+
 ## [17.2.15] - 2026-08-12
 
 ### Changed

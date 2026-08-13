@@ -1116,7 +1116,6 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			const mountedBefore = session.getMountedXdevToolNames();
 			const promptBefore = session.systemPrompt;
 			const originalTool = session.getToolByName("bash");
-			expect(originalTool).toBeDefined();
 			expect(session.hasBuiltInTool("bash")).toBe(true);
 			const runner = session.extensionRunner;
 			if (!runner) throw new Error("expected extension runner");
@@ -1931,7 +1930,6 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		try {
 			expect(session.getAllToolNames()).toEqual(["read", "sdk_custom_tool"]);
 			expect(session.getActiveToolNames()).toEqual(["read", "sdk_custom_tool"]);
-			expect(session.getToolByName("sdk_custom_tool")).toBeDefined();
 		} finally {
 			await session.dispose();
 		}

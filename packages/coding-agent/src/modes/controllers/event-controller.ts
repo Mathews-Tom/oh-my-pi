@@ -1908,7 +1908,7 @@ export class EventController {
 		} else if (isHandoffAction) {
 			this.ctx.clearTransientSessionUi();
 			this.ctx.lastAssistantUsage = undefined;
-			this.ctx.renderInitialMessages();
+			await this.ctx.renderInitialMessages();
 			this.ctx.statusLine.invalidate();
 			await this.ctx.reloadTodos();
 			this.ctx.ui.requestRender(true, { clearScrollback: true });
