@@ -403,16 +403,23 @@ export async function checkoutPullRequest(
 	// its ops genuinely carry no path — but `pr_checkout` fetches into and
 	// rewrites branch config under `repoRoot`, and (for a not-yet-checked-out
 	// PR) materializes a new worktree beneath `getWorktreeDir(...)`, which
-	// normally sits outside every workspace root. Both are authorized here,
-	// before any git mutation runs, the same way `task`'s isolation directory
-	// is (`structured-subagent.ts`): `repoRoot` as a read+write target — the
-	// checkout reads existing branch/ref state before rewriting it — and the
-	// worktree path as a write target, since it is materialized fresh.
+	// normally sits outside every workspace root. All three are authorized
+	// here, before any git mutation runs, the same way `task`'s isolation
+	// directory is (`structured-subagent.ts`): `repoRoot` as a read+write
+	// target — the checkout reads existing branch/ref state before rewriting
+	// it — `primaryRepoRoot` the same way, since when `repoRoot` is itself a
+	// linked worktree, `git.config.setBranch`/`git.branch.create`/`git.fetch`
+	// against `repoRoot` actually mutate the *shared* `config`/refs living
+	// under the primary checkout (or the bare-repo common dir), never
+	// authorized on its own before (finding under review) — and the worktree
+	// path as a write target, since it is materialized fresh.
 	enforceResourcePathTargets(
 		"github",
 		[
 			{ raw: repoRoot, access: "read", field: "pr_checkout.repository" },
 			{ raw: repoRoot, access: "write", field: "pr_checkout.repository" },
+			{ raw: primaryRepoRoot, access: "read", field: "pr_checkout.repository" },
+			{ raw: primaryRepoRoot, access: "write", field: "pr_checkout.repository" },
 			{ raw: worktreePath, access: "write", field: "pr_checkout.worktree" },
 		],
 		context,

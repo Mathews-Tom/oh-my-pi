@@ -1499,6 +1499,53 @@ echo ok
 			expect(runGit(fixture.repoRoot, ["worktree", "list", "--porcelain"])).not.toContain("pr-324");
 		});
 
+		it("refuses a checkout from a linked worktree whose primary git directory falls outside workspace roots", async () => {
+			// `repoRoot` (the session's own checkout) can be a *linked* worktree of
+			// a separate primary checkout — `git.config.setBranch`/`git.branch.create`/
+			// `git.fetch` run with cwd = `repoRoot`, but for a linked worktree they
+			// actually mutate the shared `config`/refs living under the primary
+			// checkout's `.git`, never authorized on its own (finding under
+			// review). Confine the session to the linked worktree only; the
+			// primary checkout elsewhere must still gate the mutation.
+			vi.spyOn(git.github, "json").mockResolvedValueOnce({
+				number: 401,
+				title: "Linked worktree checkout",
+				url: "https://github.com/owner/repo/pull/401",
+				baseRefName: "main",
+				headRefName: fixture.headRefName,
+				headRefOid: fixture.headRefOid,
+				isCrossRepository: false,
+				maintainerCanModify: true,
+			});
+
+			const linkedWorktreeDir = path.join(fixture.baseDir, "linked-worktree-401");
+			runGit(fixture.repoRoot, ["worktree", "add", linkedWorktreeDir, "-b", "linked-checkout-401"]);
+			expect(await git.repo.primaryRoot(linkedWorktreeDir, undefined)).toBe(await fs.realpath(fixture.repoRoot));
+
+			const tool = new GithubTool(createSession(linkedWorktreeDir));
+			await expect(
+				tool.execute(
+					"pr-checkout",
+					{ op: "pr_checkout", pr: "401" },
+					undefined,
+					undefined,
+					{
+						sessionManager: {
+							getCwd: () => linkedWorktreeDir,
+							getAdditionalDirectories: () => [],
+							getSessionId: () => "test-session",
+						},
+						settings: Settings.isolated({ "github.enabled": true, "permissions.profile": "workspace" }),
+					} as unknown as AgentToolContext,
+				),
+			).rejects.toThrow(/permissions\.confineWrites/);
+
+			// The refusal happened before any mutation against the primary
+			// checkout: no fetch-derived local branch, no worktree registration.
+			expect(runGit(fixture.repoRoot, ["branch", "--list", "pr-401"])).toBe("");
+			expect(runGit(fixture.repoRoot, ["worktree", "list", "--porcelain"])).not.toContain("pr-401");
+		});
+
 		it("leaves pr_checkout unaffected when the permission profile is off (the default)", async () => {
 			vi.spyOn(git.github, "json").mockResolvedValueOnce({
 				number: 323,
