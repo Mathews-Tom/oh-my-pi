@@ -8,7 +8,7 @@ import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/ex
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { applyGuardedWorkspaceEdit, guardLocationReads } from "@oh-my-pi/pi-coding-agent/lsp";
 import { guardedApplyEditDenial } from "@oh-my-pi/pi-coding-agent/lsp/client";
-import { workspaceEditTargetPaths } from "@oh-my-pi/pi-coding-agent/lsp/edits";
+import { workspaceEditPathTargets } from "@oh-my-pi/pi-coding-agent/lsp/edits";
 import type { LspClient } from "@oh-my-pi/pi-coding-agent/lsp/types";
 import type { ReadonlySessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { ToolChoiceQueue } from "@oh-my-pi/pi-coding-agent/session/tool-choice-queue";
@@ -593,14 +593,58 @@ describe("lsp workspace edits", () => {
 		return `file://${absolutePath}`;
 	}
 
-	it("names every destination a workspace edit would touch, including both rename endpoints", () => {
-		const paths = workspaceEditTargetPaths({
+	it("names every destination a workspace edit would touch, including both rename endpoints", async () => {
+		const targets = await workspaceEditPathTargets({
 			documentChanges: [
 				{ kind: "rename", oldUri: fileUri(path.join(workspace, "src/a.ts")), newUri: fileUri("/tmp/b.ts") },
 				{ kind: "create", uri: fileUri(path.join(workspace, "src/c.ts")) },
 			],
 		} as never);
-		expect(paths).toEqual([path.join(workspace, "src/a.ts"), "/tmp/b.ts", path.join(workspace, "src/c.ts")]);
+		expect(targets.map(t => t.raw)).toEqual([
+			path.join(workspace, "src/a.ts"),
+			"/tmp/b.ts",
+			path.join(workspace, "src/c.ts"),
+		]);
+		// Neither `src/a.ts` (a rename source that doesn't exist, so it isn't
+		// treated as a directory) nor a `create` target is ever read before it's
+		// written — both stay write-only.
+		expect(targets.every(t => t.access === "write")).toBe(true);
+	});
+
+	it("requires both read and write authorization for a text edit target, since applyTextEdits reads before rewriting", async () => {
+		const target = path.join(workspace, "src/main.ts");
+		const targets = await workspaceEditPathTargets({
+			changes: { [fileUri(target)]: [{ range: RANGE_ZERO, newText: "x" }] },
+		} as never);
+		expect(targets).toEqual([
+			{ raw: target, access: "read", field: "workspace edit text" },
+			{ raw: target, access: "write", field: "workspace edit text" },
+		]);
+	});
+
+	it("expands a directory rename to every existing descendant, mapping each to its destination", async () => {
+		const dirPath = path.join(workspace, "pkg-targets");
+		fs.mkdirSync(path.join(dirPath, "nested"), { recursive: true });
+		fs.writeFileSync(path.join(dirPath, "index.ts"), "export {};");
+		fs.writeFileSync(path.join(dirPath, "nested", "inner.ts"), "export {};");
+		const destination = path.join(workspace, "pkg-targets-renamed");
+
+		const targets = await workspaceEditPathTargets({
+			documentChanges: [{ kind: "rename", oldUri: fileUri(dirPath), newUri: fileUri(destination) }],
+		} as never);
+
+		expect(targets.every(t => t.access === "write")).toBe(true);
+		const raws = new Set(targets.map(t => t.raw));
+		expect(raws).toEqual(
+			new Set([
+				dirPath,
+				destination,
+				path.join(dirPath, "index.ts"),
+				path.join(destination, "index.ts"),
+				path.join(dirPath, "nested", "inner.ts"),
+				path.join(destination, "nested", "inner.ts"),
+			]),
+		);
 	});
 
 	it("refuses a server-chosen rename destination outside the workspace, and writes nothing", async () => {
@@ -642,6 +686,56 @@ describe("lsp workspace edits", () => {
 		expect(applied).toHaveLength(1);
 		expect(fs.existsSync(target)).toBe(true);
 	});
+
+	it("refuses a server-supplied text edit the read side denies, even though nothing denies its write", async () => {
+		// A read-only deny rule would have been invisible to the pre-fix,
+		// write-only gate — `applyTextEdits` reads `main.ts` before rewriting it,
+		// so a `deny.read` with no matching `deny.write` must still block it.
+		const target = path.join(workspace, "src", "main.ts");
+		await expect(
+			applyGuardedWorkspaceEdit(
+				{ changes: { [fileUri(target)]: [{ range: RANGE_ZERO, newText: "x" }] } } as never,
+				workspace,
+				contextOf({ "permissions.profile": "workspace", "permissions.deny.read": ["**/main.ts"] }),
+			),
+		).rejects.toThrow("**/main.ts");
+		expect(fs.readFileSync(target, "utf8")).toBe("export {};");
+	});
+
+	it("refuses a directory rename whose descendant is individually denied, leaving the tree untouched", async () => {
+		const dirPath = path.join(workspace, "pkg-apply");
+		fs.mkdirSync(dirPath, { recursive: true });
+		fs.writeFileSync(path.join(dirPath, "index.ts"), "export {};");
+		fs.writeFileSync(path.join(dirPath, "protected.txt"), "secret");
+		const destination = path.join(workspace, "pkg-apply-renamed");
+
+		await expect(
+			applyGuardedWorkspaceEdit(
+				{ documentChanges: [{ kind: "rename", oldUri: fileUri(dirPath), newUri: fileUri(destination) }] } as never,
+				workspace,
+				contextOf({ "permissions.profile": "workspace", "permissions.deny.write": ["**/protected.txt"] }),
+			),
+		).rejects.toThrow("**/protected.txt");
+		expect(fs.existsSync(dirPath)).toBe(true);
+		expect(fs.existsSync(destination)).toBe(false);
+	});
+
+	it("refuses a directory delete whose descendant is individually denied, leaving the tree untouched", async () => {
+		const dirPath = path.join(workspace, "pkg-apply-del");
+		fs.mkdirSync(dirPath, { recursive: true });
+		fs.writeFileSync(path.join(dirPath, "index.ts"), "export {};");
+		fs.writeFileSync(path.join(dirPath, "protected.txt"), "secret");
+
+		await expect(
+			applyGuardedWorkspaceEdit(
+				{ documentChanges: [{ kind: "delete", uri: fileUri(dirPath) }] } as never,
+				workspace,
+				contextOf({ "permissions.profile": "workspace", "permissions.deny.write": ["**/protected.txt"] }),
+			),
+		).rejects.toThrow("**/protected.txt");
+		expect(fs.existsSync(dirPath)).toBe(true);
+		expect(fs.existsSync(path.join(dirPath, "protected.txt"))).toBe(true);
+	});
 });
 
 describe("lsp server-initiated workspace/applyEdit", () => {
@@ -664,35 +758,50 @@ describe("lsp server-initiated workspace/applyEdit", () => {
 		} as unknown as LspClient;
 	}
 
-	it("permits every edit when the client has no recorded permission context, same as an absent-settings caller", () => {
-		const denial = guardedApplyEditDenial(clientWith(undefined), {
+	it("permits every edit when the client has no recorded permission context, same as an absent-settings caller", async () => {
+		const denial = await guardedApplyEditDenial(clientWith(undefined), {
 			changes: { [fileUri(path.join(outside, "loot.txt"))]: [{ range: RANGE_ZERO, newText: "x" }] },
 		} as never);
 		expect(denial).toBeNull();
 	});
 
-	it("refuses a server-pushed edit to a secret path under the session's strict profile", () => {
-		const denial = guardedApplyEditDenial(clientWith(STRICT), {
+	it("refuses a server-pushed edit to a secret path under the session's strict profile", async () => {
+		const denial = await guardedApplyEditDenial(clientWith(STRICT), {
 			changes: { [fileUri(path.join(workspace, ".env"))]: [{ range: RANGE_ZERO, newText: "LEAK=1" }] },
 		} as never);
 		expect(denial).toContain("**/.env");
 	});
 
-	it("refuses a server-chosen create target outside every workspace root", () => {
-		const denial = guardedApplyEditDenial(clientWith(WORKSPACE), {
+	it("refuses a server-chosen create target outside every workspace root", async () => {
+		const denial = await guardedApplyEditDenial(clientWith(WORKSPACE), {
 			documentChanges: [{ kind: "create", uri: fileUri(path.join(outside, "new.ts")) }],
 		} as never);
 		expect(denial).toContain("permissions.confineWrites");
 	});
 
-	it("carries the session's live additionalDirectories, so an edit into an /add-dir root is not falsely denied", () => {
-		const denial = guardedApplyEditDenial(clientWith(WORKSPACE, [sibling]), {
+	it("refuses a server-pushed text edit the read side denies, even though nothing denies its write", async () => {
+		const denial = await guardedApplyEditDenial(clientWith(WORKSPACE), {
+			changes: { [fileUri(path.join(workspace, "src", "main.ts"))]: [{ range: RANGE_ZERO, newText: "x" }] },
+		} as never);
+		expect(denial).toBeNull();
+
+		const denialWithReadDeny = await guardedApplyEditDenial(
+			clientWith({ "permissions.profile": "workspace", "permissions.deny.read": ["**/main.ts"] }),
+			{
+				changes: { [fileUri(path.join(workspace, "src", "main.ts"))]: [{ range: RANGE_ZERO, newText: "x" }] },
+			} as never,
+		);
+		expect(denialWithReadDeny).toContain("**/main.ts");
+	});
+
+	it("carries the session's live additionalDirectories, so an edit into an /add-dir root is not falsely denied", async () => {
+		const denial = await guardedApplyEditDenial(clientWith(WORKSPACE, [sibling]), {
 			documentChanges: [{ kind: "create", uri: fileUri(path.join(sibling, "new.md")) }],
 		} as never);
 		expect(denial).toBeNull();
 	});
 
-	it("re-reads additionalDirectories on every check, so a root removed by /remove-dir is denied without another tool call re-stamping the client", () => {
+	it("re-reads additionalDirectories on every check, so a root removed by /remove-dir is denied without another tool call re-stamping the client", async () => {
 		// `LspTool.permissionContext()` closes over the live session getter
 		// instead of copying its result into an array, so a client stamped
 		// while `sibling` was still an allowed root sees its removal on the
@@ -706,9 +815,9 @@ describe("lsp server-initiated workspace/applyEdit", () => {
 			documentChanges: [{ kind: "create", uri: fileUri(path.join(sibling, "new.md")) }],
 		} as never;
 
-		expect(guardedApplyEditDenial(client, edit)).toBeNull();
+		expect(await guardedApplyEditDenial(client, edit)).toBeNull();
 
 		allowedDirs = [];
-		expect(guardedApplyEditDenial(client, edit)).toContain("permissions.confineWrites");
+		expect(await guardedApplyEditDenial(client, edit)).toContain("permissions.confineWrites");
 	});
 });

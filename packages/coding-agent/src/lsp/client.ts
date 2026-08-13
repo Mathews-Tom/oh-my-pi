@@ -3,9 +3,9 @@ import { isEnoent, logger, postmortem, ptree, untilAborted } from "@oh-my-pi/pi-
 import { MessageFramer } from "../jsonrpc/message-framing";
 import { loadPermissionsConfig } from "../tools/permissions/config";
 import { checkStructuredTargets } from "../tools/permissions/gate";
-import type { PathTarget, PermissionRoots } from "../tools/permissions/types";
+import type { PermissionRoots } from "../tools/permissions/types";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
-import { applyWorkspaceEdit, workspaceEditTargetPaths } from "./edits";
+import { applyWorkspaceEdit, workspaceEditPathTargets } from "./edits";
 import { getLspmuxCommand, isLspmuxSupported } from "./lspmux";
 import { connectSharedLspTransport } from "./mux/daemon";
 import type {
@@ -487,18 +487,14 @@ async function handleConfigurationRequest(client: LspClient, message: LspJsonRpc
  * the same reading `loadPermissionsConfig(undefined)` gives every other
  * caller — not a weaker default invented for this path.
  */
-export function guardedApplyEditDenial(client: LspClient, edit: WorkspaceEdit): string | null {
+export async function guardedApplyEditDenial(client: LspClient, edit: WorkspaceEdit): Promise<string | null> {
 	const policy = loadPermissionsConfig(client.permissionContext?.settings);
 	if (!policy) return null;
 	const roots: PermissionRoots = {
 		cwd: client.cwd,
 		additionalDirectories: client.permissionContext?.getAdditionalDirectories() ?? [],
 	};
-	const targets: PathTarget[] = workspaceEditTargetPaths(edit).map(raw => ({
-		raw,
-		access: "write",
-		field: "workspace edit",
-	}));
+	const targets = await workspaceEditPathTargets(edit);
 	const denial = checkStructuredTargets(targets, policy, roots);
 	return denial ? denial.reason : null;
 }
@@ -518,7 +514,7 @@ async function handleApplyEditRequest(client: LspClient, message: LspJsonRpcRequ
 		return;
 	}
 
-	const denial = guardedApplyEditDenial(client, params.edit);
+	const denial = await guardedApplyEditDenial(client, params.edit);
 	if (denial) {
 		await sendResponse(client, message.id, { applied: false, failureReason: denial }, "workspace/applyEdit");
 		return;

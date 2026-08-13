@@ -49,7 +49,7 @@ import {
 	applyWorkspaceEdit,
 	flattenWorkspaceTextEdits,
 	rangesOverlap,
-	workspaceEditTargetPaths,
+	workspaceEditPathTargets,
 } from "./edits";
 import { detectLspmux } from "./lspmux";
 import {
@@ -191,11 +191,7 @@ export async function applyGuardedWorkspaceEdit(
 	cwd: string,
 	context: AgentToolContext | undefined,
 ): Promise<string[]> {
-	const targets = workspaceEditTargetPaths(edit).map(raw => ({
-		raw,
-		access: "write" as const,
-		field: "workspace edit",
-	}));
+	const targets = await workspaceEditPathTargets(edit);
 	enforceResourcePathTargets("lsp", targets, context);
 	return applyWorkspaceEdit(edit, cwd);
 }
@@ -725,14 +721,19 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			// chooses, which need not be `file` or `new_name` — the only two paths
 			// the permission gate saw. Same surface `applyGuardedWorkspaceEdit`
 			// covers for `rename`/`code_actions`, so it faces the same check here
-			// before any of it is written.
+			// before any of it is written. `applyTextEdits` below reads each file's
+			// current content before writing the patched result, so both accesses
+			// are declared — write-only would miss a `deny.read` rule with no
+			// matching `deny.write`.
 			enforceResourcePathTargets(
 				"lsp",
-				[...acceptedByUri.keys()].map(uri => ({
-					raw: uriToFile(uri),
-					access: "write" as const,
-					field: "willRenameFiles edit",
-				})),
+				[...acceptedByUri.keys()].flatMap(uri => {
+					const filePath = uriToFile(uri);
+					return [
+						{ raw: filePath, access: "read" as const, field: "willRenameFiles edit" },
+						{ raw: filePath, access: "write" as const, field: "willRenameFiles edit" },
+					];
+				}),
 				toolContext,
 			);
 			for (const [uri, bucket] of acceptedByUri) {
