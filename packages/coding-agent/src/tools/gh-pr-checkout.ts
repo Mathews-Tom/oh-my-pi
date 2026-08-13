@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { getWorktreeDir, hashPath, isEnoent } from "@oh-my-pi/pi-utils";
 import * as git from "../utils/git";
 import type { ToolSession } from ".";
@@ -23,6 +23,7 @@ import { formatShortSha } from "./gh-format";
 import type { GhPrViewData, GhRepoViewData, GithubInput } from "./gh-types";
 import { GH_PR_FIELDS_NO_COMMENTS } from "./gh-view";
 import { invalidateAllForNumber } from "./github-cache";
+import { enforceResourcePathTargets } from "./permissions/gate";
 import { ToolError, throwIfAborted } from "./tool-errors";
 
 export const GH_REPO_CLONE_FIELDS = ["nameWithOwner", "sshUrl", "url"];
@@ -288,6 +289,7 @@ export async function executePrCheckout(
 	session: ToolSession,
 	params: GithubInput,
 	signal: AbortSignal | undefined,
+	context: AgentToolContext | undefined,
 ): Promise<AgentToolResult<GhToolDetails>> {
 	const repo = normalizeOptionalString(params.repo);
 	const force = params.force ?? false;
@@ -296,7 +298,7 @@ export async function executePrCheckout(
 	const isMulti = prRefs.length > 1;
 
 	const settled = await Promise.allSettled(
-		prRefs.map(prRef => checkoutPullRequest(session, signal, { prRef, repo, force })),
+		prRefs.map(prRef => checkoutPullRequest(session, signal, { prRef, repo, force }, context)),
 	);
 	const outcomes: PrCheckoutOutcome[] = [];
 	const failures: Array<{ prRef: string | undefined; reason: unknown }> = [];
@@ -372,6 +374,7 @@ export async function checkoutPullRequest(
 	session: ToolSession,
 	signal: AbortSignal | undefined,
 	options: PrCheckoutOptions,
+	context: AgentToolContext | undefined,
 ): Promise<PrCheckoutOutcome> {
 	const { prRef, repo, force } = options;
 	if (prRef?.startsWith("-")) {
@@ -396,6 +399,25 @@ export async function checkoutPullRequest(
 	const primaryRepoRoot = await requirePrimaryGitRepoRoot(repoRoot, signal);
 	const localBranch = `pr-${prNumber}`;
 	const worktreePath = getWorktreeDir(`${prNumber}-${hashPath(primaryRepoRoot)}`);
+
+	// `github` is classified pathless (`tool-path-targets.ts`) because most of
+	// its ops genuinely carry no path — but `pr_checkout` fetches into and
+	// rewrites branch config under `repoRoot`, and (for a not-yet-checked-out
+	// PR) materializes a new worktree beneath `getWorktreeDir(...)`, which
+	// normally sits outside every workspace root. Both are authorized here,
+	// before any git mutation runs, the same way `task`'s isolation directory
+	// is (`structured-subagent.ts`): `repoRoot` as a read+write target — the
+	// checkout reads existing branch/ref state before rewriting it — and the
+	// worktree path as a write target, since it is materialized fresh.
+	enforceResourcePathTargets(
+		"github",
+		[
+			{ raw: repoRoot, access: "read", field: "pr_checkout.repository" },
+			{ raw: repoRoot, access: "write", field: "pr_checkout.repository" },
+			{ raw: worktreePath, access: "write", field: "pr_checkout.worktree" },
+		],
+		context,
+	);
 
 	// Every git mutation against `repoRoot` from here on must run under the
 	// per-repo lock. Worktrees of the same primary repo share `.git/config`,

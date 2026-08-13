@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:te
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { ToolCall } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { validateToolArguments } from "@oh-my-pi/pi-ai/utils/validation";
@@ -1319,6 +1320,118 @@ echo ok
 			expect(summaries?.map(s => s.prNumber)).toEqual([100, 200]);
 			expect(summaries?.every(s => s.reused === false)).toBe(true);
 		}, 30_000);
+	});
+
+	describe("pr_checkout authorizes the repository and worktree it mutates", () => {
+		// `pr_checkout` is classified `pathless` (`tool-path-targets.ts`) because
+		// most `github` ops carry no filesystem path — but the checkout fetches
+		// into and rewrites branch config under the repository root and, for a
+		// not-yet-checked-out PR, materializes a brand-new worktree beneath
+		// `getWorktreeDir(...)`, which normally sits outside every workspace
+		// root. Before `checkoutPullRequest` authorized both, a confining
+		// profile (`workspace`/`strict`) could not stop either mutation (finding
+		// under review).
+		let fixture: PrFixture;
+		let tempHome: TempHome;
+		beforeAll(async () => {
+			fixture = await createPrFixture();
+			tempHome = await setupTempHome();
+		});
+		afterAll(async () => {
+			await tempHome.cleanup();
+			await removeWithRetries(fixture.baseDir);
+		});
+
+		function contextOf(overrides: Record<string, unknown>): AgentToolContext {
+			return {
+				sessionManager: {
+					getCwd: () => fixture.repoRoot,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "test-session",
+				},
+				settings: Settings.isolated({ "github.enabled": true, ...overrides }),
+			} as unknown as AgentToolContext;
+		}
+
+		it("refuses to check out a new PR worktree under a confining profile with no escape hatch", async () => {
+			vi.spyOn(git.github, "json").mockResolvedValueOnce({
+				number: 321,
+				title: "Confined checkout",
+				url: "https://github.com/owner/repo/pull/321",
+				baseRefName: "main",
+				headRefName: fixture.headRefName,
+				headRefOid: fixture.headRefOid,
+				isCrossRepository: false,
+				maintainerCanModify: true,
+			});
+
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			await expect(
+				tool.execute(
+					"pr-checkout",
+					{ op: "pr_checkout", pr: "321" },
+					undefined,
+					undefined,
+					contextOf({ "permissions.profile": "workspace" }),
+				),
+			).rejects.toThrow(/permissions\.confineWrites/);
+
+			// The refusal happened before any git mutation: no worktree, no branch.
+			expect(runGit(fixture.repoRoot, ["worktree", "list", "--porcelain"])).not.toContain("pr-321");
+			expect(runGit(fixture.repoRoot, ["branch", "--list", "pr-321"])).toBe("");
+		});
+
+		it("still checks out the PR when the worktree root is granted via an explicit allow rule", async () => {
+			vi.spyOn(git.github, "json").mockResolvedValueOnce({
+				number: 322,
+				title: "Allowed checkout",
+				url: "https://github.com/owner/repo/pull/322",
+				baseRefName: "main",
+				headRefName: fixture.headRefName,
+				headRefOid: fixture.headRefOid,
+				isCrossRepository: false,
+				maintainerCanModify: true,
+			});
+
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			const result = await tool.execute(
+				"pr-checkout",
+				{ op: "pr_checkout", pr: "322" },
+				undefined,
+				undefined,
+				contextOf({
+					"permissions.profile": "workspace",
+					"permissions.allow.write": [path.join(tempHome.home, "**")],
+				}),
+			);
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+			expect(text).toContain("Checked Out Pull Request #322");
+			expect(runGit(fixture.repoRoot, ["branch", "--list", "pr-322"])).toContain("pr-322");
+		});
+
+		it("leaves pr_checkout unaffected when the permission profile is off (the default)", async () => {
+			vi.spyOn(git.github, "json").mockResolvedValueOnce({
+				number: 323,
+				title: "Default checkout",
+				url: "https://github.com/owner/repo/pull/323",
+				baseRefName: "main",
+				headRefName: fixture.headRefName,
+				headRefOid: fixture.headRefOid,
+				isCrossRepository: false,
+				maintainerCanModify: true,
+			});
+
+			const tool = new GithubTool(createSession(fixture.repoRoot));
+			const result = await tool.execute(
+				"pr-checkout",
+				{ op: "pr_checkout", pr: "323" },
+				undefined,
+				undefined,
+				contextOf({}),
+			);
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+			expect(text).toContain("Checked Out Pull Request #323");
+		});
 	});
 
 	describe("pr_push without checkout metadata", () => {

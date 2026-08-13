@@ -180,7 +180,7 @@ export class GithubTool implements AgentTool<typeof githubSchema, GhToolDetails>
 		params: GithubInput,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<GhToolDetails>,
-		_context?: AgentToolContext,
+		context?: AgentToolContext,
 	): Promise<AgentToolResult<GhToolDetails>> {
 		return untilAborted(signal, async () => {
 			switch (params.op) {
@@ -191,7 +191,7 @@ export class GithubTool implements AgentTool<typeof githubSchema, GhToolDetails>
 				case "pr_create":
 					return executePrCreate(this.session, params, signal);
 				case "pr_checkout":
-					return executePrCheckout(this.session, params, signal);
+					return executePrCheckout(this.session, params, signal, context);
 				case "pr_push":
 					return executePrPush(this.session, params, signal);
 				case "search_issues":
