@@ -1524,20 +1524,14 @@ echo ok
 
 			const tool = new GithubTool(createSession(linkedWorktreeDir));
 			await expect(
-				tool.execute(
-					"pr-checkout",
-					{ op: "pr_checkout", pr: "401" },
-					undefined,
-					undefined,
-					{
-						sessionManager: {
-							getCwd: () => linkedWorktreeDir,
-							getAdditionalDirectories: () => [],
-							getSessionId: () => "test-session",
-						},
-						settings: Settings.isolated({ "github.enabled": true, "permissions.profile": "workspace" }),
-					} as unknown as AgentToolContext,
-				),
+				tool.execute("pr-checkout", { op: "pr_checkout", pr: "401" }, undefined, undefined, {
+					sessionManager: {
+						getCwd: () => linkedWorktreeDir,
+						getAdditionalDirectories: () => [],
+						getSessionId: () => "test-session",
+					},
+					settings: Settings.isolated({ "github.enabled": true, "permissions.profile": "workspace" }),
+				} as unknown as AgentToolContext),
 			).rejects.toThrow(/permissions\.confineWrites/);
 
 			// The refusal happened before any mutation against the primary
