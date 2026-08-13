@@ -1091,8 +1091,17 @@ esac
 		const projectDir = await tempDir("omp-daemon-restart-project-");
 		const runtimeDir = await tempDir("omp-daemon-restart-runtime-");
 		const scriptPath = path.join(projectDir, "flap.ts");
-		// Becomes ready (prints the pattern), then crashes shortly after.
-		await Bun.write(scriptPath, `process.stdout.write("READY\\n"); setTimeout(() => process.exit(1), 50);\n`);
+		const releasePath = path.join(projectDir, "flap-release");
+		// Becomes ready (prints the pattern), then crashes once the test releases it.
+		await Bun.write(
+			scriptPath,
+			`process.stdout.write("READY\\n");
+			while (!(await Bun.file(${JSON.stringify(releasePath)}).exists())) {
+				await Bun.sleep(10);
+			}
+			process.exit(1);
+			`,
+		);
 		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
 		try {
 			const spec: DaemonSpec = {
@@ -1110,6 +1119,10 @@ esac
 			const started = await client.request({ op: "start", spec });
 			if (started.op !== "start") throw new Error("unexpected start result");
 			expect(started.daemon.readyAt).toBeDefined();
+
+			// Only now release the child to crash, so it cannot reach `restarting`
+			// before the ready state above was observed.
+			await Bun.write(releasePath, "go");
 
 			// Catch the backoff window: once restarting, readiness must be cleared.
 			const restarting = await waitUntil(async () => {
