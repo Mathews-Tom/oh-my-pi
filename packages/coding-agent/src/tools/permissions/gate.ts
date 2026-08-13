@@ -88,6 +88,17 @@ export function checkStructuredTargets(
  * native search allowlist. A path absent from the returned list is never opened
  * by the subsequent `grep` or `ast_grep` call.
  */
+function isImmutableReadSource(filePath: string, immutableSourcePaths: ReadonlySet<string> | undefined): boolean {
+	if (!immutableSourcePaths) return false;
+	const resolvedPath = path.resolve(filePath);
+	for (const immutableSourcePath of immutableSourcePaths) {
+		if (resolvedPath === immutableSourcePath || resolvedPath.startsWith(`${immutableSourcePath}${path.sep}`)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 export async function collectPermittedSearchPaths(
 	searchPath: string,
 	globFilter: string | undefined,
@@ -96,6 +107,7 @@ export async function collectPermittedSearchPaths(
 	context: AgentToolContext | undefined,
 	signal?: AbortSignal,
 	accesses: readonly PathAccess[] = ["read"],
+	immutableSourcePaths?: ReadonlySet<string>,
 ): Promise<string[] | undefined> {
 	const policy = loadPermissionsConfig(context?.settings);
 	if (!policy) return undefined;
@@ -112,12 +124,17 @@ export async function collectPermittedSearchPaths(
 	}
 	const metadata = await Bun.file(searchPath).stat();
 	if (!metadata.isDirectory()) {
-		enforceTargets(
-			"search",
-			accesses.map(access => ({ raw: searchPath, access, field: "path" })),
-			policy,
-			context,
+		const requiredAccesses = accesses.filter(
+			access => access !== "read" || !isImmutableReadSource(searchPath, immutableSourcePaths),
 		);
+		if (requiredAccesses.length > 0) {
+			enforceTargets(
+				"search",
+				requiredAccesses.map(access => ({ raw: searchPath, access, field: "path" })),
+				policy,
+				context,
+			);
+		}
 		return undefined;
 	}
 
@@ -132,16 +149,13 @@ export async function collectPermittedSearchPaths(
 		signal,
 	});
 	return candidates.matches
-		.filter(candidate =>
-			accesses.every(access => {
-				const target: PathTarget = {
-					raw: path.resolve(searchPath, candidate.path),
-					access,
-					field: "path",
-				};
-				return decideTarget(target, policy, roots).kind === "allow";
-			}),
-		)
+		.filter(candidate => {
+			const candidatePath = path.resolve(searchPath, candidate.path);
+			return accesses.every(access => {
+				if (access === "read" && isImmutableReadSource(candidatePath, immutableSourcePaths)) return true;
+				return decideTarget({ raw: candidatePath, access, field: "path" }, policy, roots).kind === "allow";
+			});
+		})
 		.map(candidate => candidate.path);
 }
 

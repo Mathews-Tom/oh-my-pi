@@ -1174,6 +1174,8 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 									useGitignore,
 									toolContext,
 									signal,
+									undefined,
+									immutableSourcePaths,
 								);
 								const targetResult = await grep(
 									{
@@ -1230,6 +1232,8 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 								useGitignore,
 								toolContext,
 								signal,
+								undefined,
+								immutableSourcePaths,
 							);
 							result = await grep(
 								{

@@ -2,13 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import * as scrapers from "@oh-my-pi/pi-coding-agent/web/scrapers/types";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
-function createSession(testDir: string): ToolSession {
-	const sessionFile = path.join(testDir, "session.jsonl");
+function createSession(testDir: string, sessionDir = testDir): ToolSession {
+	const sessionFile = path.join(sessionDir, "session.jsonl");
 	const artifactsDir = sessionFile.slice(0, -6);
 	let nextArtifactId = 0;
 	return {
@@ -30,6 +31,16 @@ function createSession(testDir: string): ToolSession {
 			"tools.xdev": false,
 		}),
 	};
+}
+
+function permissionContext(session: ToolSession): AgentToolContext {
+	return {
+		settings: session.settings,
+		sessionManager: {
+			getCwd: () => session.cwd,
+			getAdditionalDirectories: () => [],
+		},
+	} as unknown as AgentToolContext;
 }
 
 function resultText(result: { content: Array<{ type: string; text?: string }> }): string {
@@ -151,6 +162,56 @@ describe("search tools with external URL paths", () => {
 		const text = resultText(result);
 		expect(text).toContain("remoteNeedle");
 		expect(text).not.toContain("Parse issues");
+	});
+
+	it("searches exempt URL materialization under confineReads", async () => {
+		const sessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "search-url-session-"));
+		try {
+			stubLoadPage("alpha\nremote needle\nomega\n", "text/plain");
+			const session = createSession(testDir, sessionDir);
+			session.settings.set("permissions.profile", "workspace");
+			session.settings.set("permissions.confineReads", true);
+			const tools = await createTools(session);
+			const tool = tools.find(entry => entry.name === "grep");
+			expect(tool).toBeDefined();
+
+			const result = await tool!.execute(
+				"search-url-confined",
+				{ pattern: "remote needle", path: "https://example.com/notes.txt" },
+				undefined,
+				undefined,
+				permissionContext(session),
+			);
+
+			expect(resultText(result)).toContain("remote needle");
+		} finally {
+			await removeWithRetries(sessionDir);
+		}
+	});
+
+	it("ast_grep searches exempt URL materialization under confineReads", async () => {
+		const sessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "search-url-session-"));
+		try {
+			stubLoadPage("export function remoteNeedle() {\n\treturn 1;\n}\n", "text/plain");
+			const session = createSession(testDir, sessionDir);
+			session.settings.set("permissions.profile", "workspace");
+			session.settings.set("permissions.confineReads", true);
+			const tools = await createTools(session);
+			const tool = tools.find(entry => entry.name === "ast_grep");
+			expect(tool).toBeDefined();
+
+			const result = await tool!.execute(
+				"ast-grep-url-confined",
+				{ pat: "remoteNeedle", path: "https://example.com/snippet.ts" },
+				undefined,
+				undefined,
+				permissionContext(session),
+			);
+
+			expect(resultText(result)).toContain("remoteNeedle");
+		} finally {
+			await removeWithRetries(sessionDir);
+		}
 	});
 
 	it("search materializes a scheme-less www. scope like its canonical spelling", async () => {

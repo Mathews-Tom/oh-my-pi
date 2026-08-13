@@ -81,6 +81,7 @@ async function runMultiTargetAstGrep(
 		limit: number;
 		signal?: AbortSignal;
 		context?: AgentToolContext;
+		immutableSourcePaths?: ReadonlySet<string>;
 	},
 ): Promise<{
 	matches: AstFindMatch[];
@@ -105,6 +106,8 @@ async function runMultiTargetAstGrep(
 			true,
 			options.context,
 			options.signal,
+			undefined,
+			options.immutableSourcePaths,
 		);
 		const targetResult = await astGrep({
 			patterns: options.patterns,
@@ -228,6 +231,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				rawPaths,
 				cwd: this.session.cwd,
 				internalUrlAction: "search",
+				trackImmutableSources: true,
 				settings: this.session.settings,
 				signal,
 				localProtocolOptions: this.session.localProtocolOptions,
@@ -243,12 +247,27 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 					return { sourcePath: materialized.path, immutable: true };
 				},
 			});
-			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
-
+			const {
+				searchPath: resolvedSearchPath,
+				scopePath,
+				isDirectory,
+				multiTargets,
+				globFilter,
+				immutableSourcePaths,
+			} = scope;
 			const DEFAULT_AST_LIMIT = 50;
 			const allowedPaths = multiTargets
 				? undefined
-				: await collectPermittedSearchPaths(resolvedSearchPath, globFilter, true, true, toolContext, signal);
+				: await collectPermittedSearchPaths(
+						resolvedSearchPath,
+						globFilter,
+						true,
+						true,
+						toolContext,
+						signal,
+						undefined,
+						immutableSourcePaths,
+					);
 			const result = multiTargets
 				? await runMultiTargetAstGrep(multiTargets, {
 						patterns,
@@ -257,6 +276,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 						limit: DEFAULT_AST_LIMIT,
 						context: toolContext,
 						signal,
+						immutableSourcePaths,
 					})
 				: await astGrep({
 						patterns,
