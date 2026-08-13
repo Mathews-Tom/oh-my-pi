@@ -665,13 +665,25 @@ export class StatusLineComponent implements Component {
 			return;
 		}
 
-		const watchPath = git.repo.isReftableSync(repository)
-			? path.join(repository.gitDir, "reftable")
-			: repository.headPath;
+		// Watch the *directory* holding the ref state, not the HEAD file itself.
+		// git rewrites HEAD via a lock file + atomic rename (`HEAD.lock` → `HEAD`),
+		// which unlinks the original inode. An `fs.watch` bound to that file inode
+		// dies after the first branch switch and never fires again, freezing the
+		// displayed branch (issue #8412). A directory watch tracks the stable
+		// gitDir inode and survives the rename.
+		const isReftable = git.repo.isReftableSync(repository);
+		const watchPath = isReftable ? path.join(repository.gitDir, "reftable") : repository.gitDir;
 
 		try {
-			const watcher = fs.watch(watchPath, () => {
+			const watcher = fs.watch(watchPath, (_event, filename) => {
 				if (this.#disposed || this.#gitWatcher !== watcher) return;
+				// The gitDir sees churn from many entries (index, ORIG_HEAD, config,
+				// …); only HEAD moves change the branch. The rename surfaces as a
+				// `HEAD.lock` event, so match the `HEAD` prefix. The reftable dir
+				// holds only ref storage, so every change there is ref-relevant.
+				// `filename` may be null/undefined on some platforms or coalesced
+				// events — react rather than risk missing a HEAD move.
+				if (!isReftable && filename != null && !String(filename).startsWith("HEAD")) return;
 				this.invalidateGitCaches();
 				this.#onBranchChange?.();
 			});

@@ -740,3 +740,76 @@ describe("StatusLineComponent applyCwdChange re-points watcher ownership", () =>
 		component.dispose();
 	});
 });
+
+describe("StatusLineComponent git watcher survives atomic HEAD renames", () => {
+	let repoDir: string;
+
+	beforeAll(async () => {
+		repoDir = await fs.mkdtemp(path.join(os.tmpdir(), "status-line-headwatch-"));
+		const gitDir = path.join(repoDir, ".git");
+		await fs.mkdir(gitDir);
+		await fs.writeFile(path.join(gitDir, "HEAD"), "ref: refs/heads/main\n");
+	});
+
+	afterAll(async () => {
+		setProjectDir(originalProjectDir);
+		await fs.rm(repoDir, { recursive: true, force: true });
+	});
+
+	// git rewrites HEAD via a lock file + atomic rename (HEAD.lock → HEAD), which
+	// unlinks the inode. The pre-fix watcher bound `fs.watch` to the HEAD file, so
+	// it fired for the first switch and then died on the stale inode — freezing the
+	// displayed branch on every subsequent switch (issue #8412). Watching the git
+	// directory instead keeps the watch alive across renames.
+	it("keeps firing #onBranchChange across consecutive branch switches", async () => {
+		vi.spyOn(git.branch, "default").mockReturnValue(Promise.withResolvers<string | null>().promise);
+		vi.spyOn(git.status, "summary").mockReturnValue(Promise.withResolvers<GitStatus | null>().promise);
+		vi.spyOn(jj.repo, "rootSync").mockReturnValue(null);
+		const watchSpy = vi.spyOn(nodeFs, "watch");
+
+		setProjectDir(repoDir);
+		const component = new StatusLineComponent(makeSession());
+		component.updateSettings(gitSegment);
+
+		// Await the watcher's own #onBranchChange signal rather than a wall-clock
+		// delay. Only resolve once the atomically replaced HEAD is observable:
+		// directory watchers may also report creation of HEAD.lock.
+		let branchChanged = Promise.withResolvers<void>();
+		let expectedBranch: string | null = null;
+		component.watchBranch(() => {
+			if (expectedBranch && component.getTopBorder(80).content.includes(expectedBranch)) {
+				branchChanged.resolve();
+			}
+		});
+		// macOS may keep a file watch alive across the rename, so also pin the
+		// platform-independent requirement: the watcher owns the stable git dir.
+		expect(watchSpy).toHaveBeenCalledWith(path.join(repoDir, ".git"), expect.any(Function));
+		// Prime the branch cache off the initial HEAD. The status/default mocks
+		// never resolve, so this cold paint cannot fire #onBranchChange itself.
+		component.getTopBorder(80);
+
+		const switchTo = async (branchName: string) => {
+			const gitDir = path.join(repoDir, ".git");
+			const headLock = path.join(gitDir, "HEAD.lock");
+			// Reproduce Git's relevant integration boundary directly: write the
+			// lock, then atomically replace HEAD. Spawning Git adds process startup
+			// but no coverage to the filesystem-watcher regression.
+			await fs.writeFile(headLock, `ref: refs/heads/${branchName}\n`);
+			branchChanged = Promise.withResolvers<void>();
+			expectedBranch = branchName;
+			const fired = branchChanged.promise;
+			await fs.rename(headLock, path.join(gitDir, "HEAD"));
+			await fired;
+			expectedBranch = null;
+		};
+
+		await switchTo("first");
+		expect(component.getTopBorder(80).content).toContain("first");
+
+		// Regression: the second switch must still reach the display.
+		await switchTo("second");
+		expect(component.getTopBorder(80).content).toContain("second");
+
+		component.dispose();
+	});
+});

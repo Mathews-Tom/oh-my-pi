@@ -12,7 +12,7 @@ import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 
 const recordToolSchema = type({ value: type("string") });
 
@@ -172,12 +172,7 @@ function reminderMessages(messages: AgentMessage[]): AgentMessage[] {
 }
 
 async function expectPromptCompletes(prompt: Promise<boolean>): Promise<void> {
-	await Promise.race([
-		prompt,
-		Bun.sleep(1_000).then(() => {
-			throw new Error("Expected session prompt to settle after empty-stop retry cap");
-		}),
-	]);
+	await withTimeout(prompt, 1_000, "Expected session prompt to settle after empty-stop retry cap");
 }
 
 afterEach(async () => {

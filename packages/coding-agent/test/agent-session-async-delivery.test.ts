@@ -5,10 +5,7 @@
  * THAT session, and `hasPendingAsyncWork()` / `settleAsyncWork()` define the
  * run quiescence the task executor's barrier is built on.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
+import { afterEach, describe, expect, it } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -21,17 +18,10 @@ import type { AsyncResultEntry } from "@oh-my-pi/pi-coding-agent/session/async-j
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
 describe("AgentSession owner-routed async delivery", () => {
 	let session: AgentSession;
-	let tempDir: string;
 	const authStorages: AuthStorage[] = [];
-
-	beforeEach(() => {
-		tempDir = path.join(os.tmpdir(), `pi-async-delivery-test-${Snowflake.next()}`);
-		fs.mkdirSync(tempDir, { recursive: true });
-	});
 
 	afterEach(async () => {
 		if (session) {
@@ -39,9 +29,6 @@ describe("AgentSession owner-routed async delivery", () => {
 		}
 		for (const authStorage of authStorages.splice(0)) {
 			authStorage.close();
-		}
-		if (tempDir && fs.existsSync(tempDir)) {
-			removeSyncWithRetries(tempDir);
 		}
 		AsyncJobManager.resetForTests();
 	});
@@ -55,7 +42,7 @@ describe("AgentSession owner-routed async delivery", () => {
 			convertToLlm,
 			streamFn: mock.stream,
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const manager = new AsyncJobManager({});
@@ -105,7 +92,7 @@ describe("AgentSession owner-routed async delivery", () => {
 			convertToLlm,
 			streamFn: mock.stream,
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const sessionManager = SessionManager.inMemory();
@@ -159,7 +146,7 @@ describe("AgentSession owner-routed async delivery", () => {
 			convertToLlm,
 			streamFn: mock.stream,
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const manager = new AsyncJobManager({ retentionMs: 60_000 });
@@ -213,7 +200,7 @@ describe("AgentSession owner-routed async delivery", () => {
 			convertToLlm,
 			streamFn: mock.stream,
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const manager = new AsyncJobManager({ retentionMs: 60_000 });
@@ -265,7 +252,7 @@ describe("AgentSession owner-routed async delivery", () => {
 			convertToLlm,
 			streamFn: mock.stream,
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const manager = new AsyncJobManager({ retentionMs: 60_000 });
@@ -322,7 +309,7 @@ describe("AgentSession owner-routed async delivery", () => {
 			convertToLlm,
 			streamFn: mock.stream,
 		});
-		const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		const authStorage = await AuthStorage.create(":memory:");
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const manager = new AsyncJobManager({});
