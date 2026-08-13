@@ -637,6 +637,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	async #writeArchiveEntry(
 		content: string,
 		resolvedArchivePath: ResolvedArchiveWritePath,
+		context: AgentToolContext | undefined,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		// Resolve symlinks before the tmp+rename swap: renaming over a symlink
 		// replaces the link itself with a regular file instead of writing
@@ -651,6 +652,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		// Rewrites are whole-archive: write to a temp file and rename so a
 		// crash/disk-full mid-write can't destroy the original archive.
 		const tmpPath = `${finalPath}.tmp-${process.pid}`;
+		// `resolvedArchivePath.archivePath` cleared the resource gate above, but
+		// that check ran against the archive's own path — not this sibling.
+		// realpath can also move `finalPath` off the string the caller
+		// authorized when the archive is a symlink, so the tmp file is
+		// re-checked in full rather than assumed to inherit the archive's
+		// grant.
+		enforceResourcePathTargets("write", [{ raw: tmpPath, access: "write", field: "path" }], context);
 
 		const parentDir = path.dirname(resolvedArchivePath.absolutePath);
 		if (parentDir && parentDir !== ".") {
@@ -1252,7 +1260,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					}`,
 					resolvedArchivePath.absolutePath,
 				);
-				const archiveResult = await this.#writeArchiveEntry(cleanContent, resolvedArchivePath);
+				const archiveResult = await this.#writeArchiveEntry(cleanContent, resolvedArchivePath, context);
 				if (stripped) {
 					const firstText = archiveResult.content.find(
 						(block): block is { type: "text"; text: string } =>
