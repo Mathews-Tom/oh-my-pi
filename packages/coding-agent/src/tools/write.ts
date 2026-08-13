@@ -57,7 +57,7 @@ import {
 	probeLiteralPathExists,
 	splitPathAndSel,
 } from "./path-utils";
-import { enforceResourcePathTargets } from "./permissions/gate";
+import { enforceResourcePathTargets, isResourcePathPermitted } from "./permissions/gate";
 import { enforcePlanModeWrite, resolvePlanPath, unwrapHashlineHeaderPath } from "./plan-mode-guard";
 import {
 	cachedRenderedString,
@@ -596,7 +596,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		this.description = prompt.render(writeDescription);
 	}
 
-	async #resolveArchiveWritePath(writePath: string): Promise<ResolvedArchiveWritePath | null> {
+	async #resolveArchiveWritePath(
+		writePath: string,
+		context: AgentToolContext | undefined,
+	): Promise<ResolvedArchiveWritePath | null> {
 		const candidates = parseArchivePathCandidates(writePath).filter(candidate => candidate.archivePath !== writePath);
 		if (candidates.length === 0) {
 			return null;
@@ -612,6 +615,17 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 		for (const candidate of candidates) {
 			const absolutePath = resolvePlanPath(this.session, candidate.archivePath);
+			// A nested-archive-shaped path (`a.zip:b.tar:c.txt`) yields one
+			// candidate per archive-extension boundary, longest first, and each
+			// one is stat'd here to find which is the real archive — before the
+			// resource gate below ever runs against the winning candidate. Skip
+			// the stat for a candidate the caller has no read access to instead
+			// of probing it: otherwise the presence/absence of a file at an
+			// off-limits path leaks through the exists/not-found branch this
+			// loop takes, independent of whether the call is ultimately allowed.
+			if (!isResourcePathPermitted({ raw: absolutePath, access: "read", field: "path" }, context)) {
+				continue;
+			}
 			try {
 				const stat = await Bun.file(absolutePath).stat();
 				if (stat.isDirectory()) {
@@ -653,12 +667,24 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		// crash/disk-full mid-write can't destroy the original archive.
 		const tmpPath = `${finalPath}.tmp-${process.pid}`;
 		// `resolvedArchivePath.archivePath` cleared the resource gate above, but
-		// that check ran against the archive's own path — not this sibling.
-		// realpath can also move `finalPath` off the string the caller
-		// authorized when the archive is a symlink, so the tmp file is
-		// re-checked in full rather than assumed to inherit the archive's
-		// grant.
-		enforceResourcePathTargets("write", [{ raw: tmpPath, access: "write", field: "path" }], context);
+		// that check ran against the archive's *own* (pre-realpath) spelling —
+		// not `finalPath`, which is what `readArchiveEntries` actually reads and
+		// what `fs.rename` actually overwrites below, nor `tmpPath`, the sibling
+		// the rewrite's bytes land at first. realpath can move `finalPath` off
+		// the string the caller authorized when the archive is a symlink, so
+		// both are re-checked in full rather than assumed to inherit the
+		// archive's grant. Read is only required when an existing archive is
+		// actually read; write covers both the temp file and the rename
+		// destination, which is written to unconditionally (create or update).
+		enforceResourcePathTargets(
+			"write",
+			[
+				...(resolvedArchivePath.exists ? [{ raw: finalPath, access: "read" as const, field: "path" }] : []),
+				{ raw: finalPath, access: "write", field: "path" },
+				{ raw: tmpPath, access: "write", field: "path" },
+			],
+			context,
+		);
 
 		const parentDir = path.dirname(resolvedArchivePath.absolutePath);
 		if (parentDir && parentDir !== ".") {
@@ -1237,7 +1263,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				}
 				return result;
 			}
-			const resolvedArchivePath = await this.#resolveArchiveWritePath(path);
+			const resolvedArchivePath = await this.#resolveArchiveWritePath(path, context);
 			if (resolvedArchivePath) {
 				enforcePlanModeWrite(this.session, resolvedArchivePath.archivePath, {
 					op: resolvedArchivePath.exists ? "update" : "create",
