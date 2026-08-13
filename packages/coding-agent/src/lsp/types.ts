@@ -451,19 +451,23 @@ export interface LspClient {
 	/** Call to signal that project loading has completed */
 	resolveProjectLoaded: () => void;
 	/**
-	 * The calling session's live resource-permission context, refreshed on
-	 * every `getOrCreateClient`/`getActiveOrPendingClient` call.
+	 * The calling session's live resource-permission context, (re)stamped on
+	 * every `getOrCreateClient` call.
 	 *
 	 * A server-initiated `workspace/applyEdit` (`client.ts`'s
 	 * `handleApplyEditRequest`) has no per-call session handle of its own —
 	 * this is how that push path still measures against the calling session's
 	 * current `workspace.additionalDirectories` and permissions settings
-	 * instead of going unguarded. Best-effort when a client outlives the
-	 * session that created it or is shared by cwd across sessions: it reflects
-	 * whichever session most recently touched this client, not a single
-	 * source of truth per client.
+	 * instead of going unguarded. `getAdditionalDirectories` is a live
+	 * accessor bound to the session, not a copied array: `/remove-dir` takes
+	 * effect on the *next* push even if it lands between two tool calls, so a
+	 * client that goes untouched for a while cannot keep guarding against
+	 * roots the session no longer allows. Best-effort when a client outlives
+	 * the session that created it or is shared by cwd across sessions: it
+	 * reflects whichever session most recently touched this client, not a
+	 * single source of truth per client.
 	 */
-	permissionContext?: { readonly settings: Settings; readonly additionalDirectories: readonly string[] };
+	permissionContext?: { readonly settings: Settings; readonly getAdditionalDirectories: () => readonly string[] };
 }
 
 // =============================================================================

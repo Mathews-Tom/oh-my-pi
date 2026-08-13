@@ -238,9 +238,22 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 	 * stamped onto every LSP client this tool touches so a later
 	 * server-initiated `workspace/applyEdit` push can still be guarded — see
 	 * {@link applyGuardedWorkspaceEdit}.
+	 *
+	 * `getAdditionalDirectories` closes over `this.session` rather than
+	 * reading it into an array here: `session.additionalDirectories` is
+	 * itself a live getter onto the session manager, so a root removed by
+	 * `/remove-dir` after this context was stamped is still reflected the
+	 * next time a pushed edit is checked, not just the next time this tool
+	 * runs.
 	 */
-	private permissionContext(): { settings: ToolSession["settings"]; additionalDirectories: readonly string[] } {
-		return { settings: this.session.settings, additionalDirectories: this.session.additionalDirectories ?? [] };
+	private permissionContext(): {
+		settings: ToolSession["settings"];
+		getAdditionalDirectories: () => readonly string[];
+	} {
+		return {
+			settings: this.session.settings,
+			getAdditionalDirectories: () => this.session.additionalDirectories ?? [],
+		};
 	}
 
 	async execute(

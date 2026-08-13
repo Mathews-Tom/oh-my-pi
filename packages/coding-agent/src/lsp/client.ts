@@ -492,7 +492,7 @@ export function guardedApplyEditDenial(client: LspClient, edit: WorkspaceEdit): 
 	if (!policy) return null;
 	const roots: PermissionRoots = {
 		cwd: client.cwd,
-		additionalDirectories: client.permissionContext?.additionalDirectories ?? [],
+		additionalDirectories: client.permissionContext?.getAdditionalDirectories() ?? [],
 	};
 	const targets: PathTarget[] = workspaceEditTargetPaths(edit).map(raw => ({
 		raw,

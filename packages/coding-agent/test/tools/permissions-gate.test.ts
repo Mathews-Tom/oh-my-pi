@@ -659,7 +659,7 @@ describe("lsp server-initiated workspace/applyEdit", () => {
 			cwd: workspace,
 			permissionContext: overrides && {
 				settings: settingsOf(overrides),
-				additionalDirectories: additionalDirectories ?? [sibling],
+				getAdditionalDirectories: () => additionalDirectories ?? [sibling],
 			},
 		} as unknown as LspClient;
 	}
@@ -690,5 +690,25 @@ describe("lsp server-initiated workspace/applyEdit", () => {
 			documentChanges: [{ kind: "create", uri: fileUri(path.join(sibling, "new.md")) }],
 		} as never);
 		expect(denial).toBeNull();
+	});
+
+	it("re-reads additionalDirectories on every check, so a root removed by /remove-dir is denied without another tool call re-stamping the client", () => {
+		// `LspTool.permissionContext()` closes over the live session getter
+		// instead of copying its result into an array, so a client stamped
+		// while `sibling` was still an allowed root sees its removal on the
+		// very next push — not just the next `getOrCreateClient` call.
+		let allowedDirs = [sibling];
+		const client = {
+			cwd: workspace,
+			permissionContext: { settings: settingsOf(WORKSPACE), getAdditionalDirectories: () => allowedDirs },
+		} as unknown as LspClient;
+		const edit = {
+			documentChanges: [{ kind: "create", uri: fileUri(path.join(sibling, "new.md")) }],
+		} as never;
+
+		expect(guardedApplyEditDenial(client, edit)).toBeNull();
+
+		allowedDirs = [];
+		expect(guardedApplyEditDenial(client, edit)).toContain("permissions.confineWrites");
 	});
 });
