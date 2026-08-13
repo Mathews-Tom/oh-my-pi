@@ -215,6 +215,9 @@ import { ToolContextStore } from "./tools/context";
 import { isIrcEnabled } from "./tools/hub";
 import { getImageGenTools } from "./tools/image-gen";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
+import { loadPermissionsConfig } from "./tools/permissions/config";
+import { decideTarget } from "./tools/permissions/resolve";
+import type { PermissionRoots } from "./tools/permissions/types";
 import { isAutoQaEnabled } from "./tools/report-tool-issue";
 import { queueResolveHandler } from "./tools/resolve";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "./tools/todo";
@@ -772,10 +775,12 @@ export async function discoverSkills(
 	cwd?: string,
 	_agentDir?: string,
 	settings?: SkillsSettings,
+	canReadSkill?: (skillPath: string) => boolean,
 ): Promise<{ skills: Skill[]; warnings: SkillWarning[] }> {
 	return await loadSkillsInternal({
 		...settings,
 		cwd: cwd ?? getProjectDir(),
+		...(canReadSkill && { canReadSkill }),
 	});
 }
 
@@ -1318,12 +1323,32 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	slashCommandsPromise.catch(() => {});
 	const skillsSettings = settings.getGroup("skills");
 	const disabledExtensionIds = settings.get("disabledExtensions") ?? [];
+	// Mirrors session-tools.ts's skillReadPermission: sessionManager doesn't exist yet at this
+	// point in startup, so roots are derived straight from settings/options rather than the
+	// (possibly session-header-merged) sessionManager.getAdditionalDirectories().
+	const skillPermissionPolicy = loadPermissionsConfig(settings);
+	const skillPermissionRoots: PermissionRoots = {
+		cwd,
+		additionalDirectories: options.additionalDirectories ?? settings.get("workspace.additionalDirectories"),
+	};
+	const canReadSkill = skillPermissionPolicy
+		? (skillPath: string) =>
+				decideTarget({ raw: skillPath, access: "read", field: "skill" }, skillPermissionPolicy, skillPermissionRoots)
+					.kind !== "deny"
+		: undefined;
 	const discoveredSkillsPromise =
 		options.skills === undefined
-			? logger.time("discoverSkills", discoverSkills, cwd, agentDir, {
-					...skillsSettings,
-					disabledExtensions: disabledExtensionIds,
-				})
+			? logger.time(
+					"discoverSkills",
+					discoverSkills,
+					cwd,
+					agentDir,
+					{
+						...skillsSettings,
+						disabledExtensions: disabledExtensionIds,
+					},
+					canReadSkill,
+				)
 			: undefined;
 	discoveredSkillsPromise?.catch(() => {});
 

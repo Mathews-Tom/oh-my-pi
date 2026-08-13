@@ -366,6 +366,56 @@ This skill is added after session creation.
 		}
 	});
 
+	it("initial discovery drops a skill denied by permissions.deny.read but keeps an authorized sibling", async () => {
+		const originalAgentDir = getAgentDir();
+		const managedAgentDir = path.join(tempHomeDir, ".omp", "agent");
+		setAgentDir(managedAgentDir);
+
+		const deniedSkillDir = path.join(tempDir, ".omp", "skills", "denied-skill");
+		fs.mkdirSync(deniedSkillDir, { recursive: true });
+		const deniedSkillFile = path.join(deniedSkillDir, "SKILL.md");
+		fs.writeFileSync(
+			deniedSkillFile,
+			"---\nname: denied-skill\ndescription: Should never be loaded at session start.\n---\n\nDenied body.\n",
+		);
+
+		const settings = createIsolatedSkillsSettings();
+		settings.set("permissions.profile", "workspace");
+		settings.set("permissions.deny.read", [deniedSkillFile]);
+
+		const originalReadFile = capabilityFs.readFile;
+		const readSkillFile = vi.spyOn(capabilityFs, "readFile").mockImplementation(async filePath => {
+			if (filePath === deniedSkillFile) {
+				throw new Error("A skill denied by permissions.deny.read must not be read during initial discovery");
+			}
+			return await originalReadFile(filePath);
+		});
+
+		let session: AgentSession | undefined;
+		try {
+			({ session } = await createAgentSession({
+				cwd: tempDir,
+				agentDir: managedAgentDir,
+				sessionManager: SessionManager.inMemory(tempDir),
+				modelRegistry: sharedModelRegistry,
+				settings,
+			}));
+
+			expect(readSkillFile).not.toHaveBeenCalledWith(deniedSkillFile);
+			expect(session.skills.some(skill => skill.name === "denied-skill")).toBe(false);
+			expect(session.agent.state.systemPrompt.join("\n")).not.toContain("denied-skill");
+
+			// The unrelated, unauthorized-by-nothing sibling skill created in beforeEach is
+			// still discovered and injected: the deny rule must not collateral-deny the rest.
+			expect(session.skills.some(skill => skill.name === "test-skill")).toBe(true);
+			expect(session.agent.state.systemPrompt.join("\n")).toContain("test-skill");
+		} finally {
+			readSkillFile.mockRestore();
+			await session?.dispose();
+			setAgentDir(originalAgentDir);
+		}
+	});
+
 	it("should have empty skills when options.skills is empty array (--no-skills)", async () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,

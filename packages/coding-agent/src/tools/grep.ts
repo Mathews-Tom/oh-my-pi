@@ -238,6 +238,14 @@ function matchAbsolutePath(matchPath: string, searchPath: string): string {
  * ["**​/bundle.zip"]` does not match. Authorizing the resolved container path
  * here, before {@link openArchive} reads it, is what actually enforces that
  * rule — checking the selector string again post-hoc would keep missing it.
+ *
+ * The scratch directory and each extracted member file get the same
+ * before-the-fact treatment on the write side: `tmpdir()` (the scratch
+ * directory's stable, checkable ancestor) is authorized before `mkdtemp`
+ * creates it, and each member's concrete scratch path is authorized before
+ * {@link writeFile} writes it, so `permissions.deny.write` or an unconfined
+ * `workspace`/`strict` write actually blocks this materialization instead of
+ * letting it land unchecked outside every workspace root.
  */
 async function resolveArchiveSearchPaths(
 	pathSpecs: readonly GrepPathSpec[],
@@ -299,12 +307,27 @@ async function resolveArchiveSearchPaths(
 		}
 
 		if (!tempDir) {
+			// `tempDir`'s own name is minted by `mkdtemp` (OS-random, not knowable
+			// ahead of the call that creates it), so its stable, checkable ancestor —
+			// `tmpdir()` itself — is what's authorized here, same as the PDF snapshot
+			// directory's write check.
+			enforceResourcePathTargets("grep", [{ raw: tmpdir(), access: "write", field: "path" }], context);
 			tempDir = await mkdtemp(path.join(tmpdir(), "omp-search-archive-"));
 		}
 		// Per-entry filename keeps the scratch path unique even when two selectors
 		// resolve to members with the same basename.
 		const safeBase = path.basename(member.subPath).replace(/[^\w.-]+/g, "_") || "entry";
 		const tempPath = path.join(tempDir, `${idx}-${safeBase}`);
+		try {
+			enforceResourcePathTargets("grep", [{ raw: tempPath, access: "write", field: "path" }], context);
+		} catch (err) {
+			// A prior loop iteration may have already written a sibling member into
+			// this same `tempDir`; a denial here must still clean that up rather than
+			// leaking it, since a thrown error here means the caller never receives
+			// (and therefore never invokes) this function's `cleanup` hook.
+			await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+			throw err;
+		}
 		await writeFile(tempPath, text);
 		resolvedPaths[idx] = tempPath;
 		displayMap.set(tempPath, entry);

@@ -77,7 +77,88 @@ describe("grep authorizes an archive's container path before opening it", () => 
 			{ pattern: "needle", path: "bundle.zip:member.txt" } as never,
 			undefined,
 			undefined,
-			contextOf({ "permissions.profile": "workspace" }),
+			// The scratch write always stages through `tmpdir()` itself, which sits
+			// above (not under) the workspace root, so `confineWrites` is relaxed
+			// here to isolate this test's actual point — the container read gate —
+			// from the separate write gate exercised below.
+			contextOf({ "permissions.profile": "workspace", "permissions.confineWrites": false }),
+		);
+		expect(result.isError).toBeUndefined();
+	});
+});
+
+// `resolveArchiveSearchPaths` authorized the archive's container read but never
+// authorized the scratch directory (`tmpdir()`) or the extracted member file it
+// creates and writes before `resolveArchiveSearchPaths` returns — so a confining
+// `workspace`/`strict` profile, or an explicit `permissions.deny.write` rule,
+// could not block the write side at all (finding under review).
+describe("grep authorizes the archive scratch write before creating or writing it", () => {
+	test("refuses an archive member selector whose scratch write falls outside the workspace under a confining profile", async () => {
+		settings = Settings.isolated({});
+		const tool = new GrepTool(session());
+		await expect(
+			tool.execute(
+				"call-1",
+				{ pattern: "needle", path: "bundle.zip:member.txt" } as never,
+				undefined,
+				undefined,
+				contextOf({ "permissions.profile": "workspace" }),
+			),
+		).rejects.toThrow(/permissions\.confineWrites/);
+	});
+
+	test("does not leave a scratch directory behind after refusing", async () => {
+		settings = Settings.isolated({});
+		const tool = new GrepTool(session());
+		const tmpEntriesBefore = await fs.readdir(os.tmpdir());
+
+		await expect(
+			tool.execute(
+				"call-1",
+				{ pattern: "needle", path: "bundle.zip:member.txt" } as never,
+				undefined,
+				undefined,
+				contextOf({ "permissions.profile": "workspace" }),
+			),
+		).rejects.toThrow();
+
+		const tmpEntriesAfter = await fs.readdir(os.tmpdir());
+		const leaked = tmpEntriesAfter
+			.filter(name => !tmpEntriesBefore.includes(name))
+			.filter(name => name.startsWith("omp-search-archive-"));
+		expect(leaked).toEqual([]);
+	});
+
+	test("refuses an archive member selector when permissions.deny.write denies the scratch destination", async () => {
+		// `confineWrites: false` isolates this from the confinement denial the
+		// previous test exercises, so this proves `deny.write` alone is
+		// consulted too, not just workspace containment.
+		settings = Settings.isolated({});
+		const tool = new GrepTool(session());
+		await expect(
+			tool.execute(
+				"call-1",
+				{ pattern: "needle", path: "bundle.zip:member.txt" } as never,
+				undefined,
+				undefined,
+				contextOf({
+					"permissions.profile": "workspace",
+					"permissions.confineWrites": false,
+					"permissions.deny.write": [path.join(os.tmpdir(), "**")],
+				}),
+			),
+		).rejects.toThrow(/resource permission rule/);
+	});
+
+	test("still searches an archive member selector when the scratch write is explicitly allowed", async () => {
+		settings = Settings.isolated({});
+		const tool = new GrepTool(session());
+		const result = await tool.execute(
+			"call-1",
+			{ pattern: "needle", path: "bundle.zip:member.txt" } as never,
+			undefined,
+			undefined,
+			contextOf({ "permissions.profile": "workspace", "permissions.allow.write": ["**"] }),
 		);
 		expect(result.isError).toBeUndefined();
 	});
