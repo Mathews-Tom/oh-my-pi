@@ -16,6 +16,7 @@
  * tool name — MCP, extension, custom — defaults to `opaque`, so a new
  * `filesystem/read_file {path: ".env"}` is scanned rather than waved through.
  */
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Patch } from "@oh-my-pi/hashline";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
@@ -283,6 +284,14 @@ const extractLspPaths: PathTargetExtractor = args => {
  * Managed skills are filesystem mutations even though their storage location
  * is not caller supplied. Resolve the exact regular-file path the executor
  * uses so workspace/strict confinement applies to create, update, and delete.
+ *
+ * `delete` additionally authorizes every existing descendant beneath the
+ * skill directory: `deleteManagedSkill` (`autolearn/managed-skills.ts`) runs
+ * `fs.rm(dir, { recursive: true })` on the whole directory, not just
+ * `SKILL.md`. Authorizing only `SKILL.md` would let a write-denied file
+ * sitting next to it (a `.env` dropped into the managed skill directory) get
+ * deleted without ever facing the gate, since a deny glob matched against the
+ * directory's own path never sees a candidate that names a descendant.
  */
 const extractManagedSkillPaths = (args: Record<string, unknown>, field: string = "name"): PathTarget[] => {
 	const out: PathTarget[] = [];
@@ -294,7 +303,21 @@ const extractManagedSkillPaths = (args: Record<string, unknown>, field: string =
 		// Let ManageSkillTool/LearnTool report invalid names after the gate; this
 		// conservative candidate still prevents a traversal-shaped name escaping.
 	}
-	pushPath(out, path.join(getManagedSkillsDir(), name, "SKILL.md"), "write", field);
+	const dir = path.join(getManagedSkillsDir(), name);
+	if (args.action === "delete") {
+		pushPath(out, dir, "write", field);
+		let descendants: string[] = [];
+		try {
+			descendants = fs.readdirSync(dir, { recursive: true }) as string[];
+		} catch {
+			// Missing/unreadable directory: deleteManagedSkill itself throws before
+			// touching anything in that case, so there is nothing further to
+			// authorize.
+		}
+		for (const entry of descendants) pushPath(out, path.join(dir, entry), "write", field);
+		return out;
+	}
+	pushPath(out, path.join(dir, "SKILL.md"), "write", field);
 	return out;
 };
 
@@ -479,10 +502,14 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 			const out: PathTarget[] = [];
 			const settings = context?.settings;
 			if (settings?.get("memory.backend") === "local") {
-				pushPath(
+				// `saveLearnedLesson` (`memories/index.ts`) is a read-modify-write
+				// through `appendLearnedLine`, which opens the existing file to
+				// dedupe/prepend/cap its bullets before writing it back — the same
+				// reason the mnemopi retain path below registers read+write rather
+				// than write-only.
+				pushReadWrite(
 					out,
 					path.join(getMemoryRoot(settings.getAgentDir(), settings.getCwd()), LEARNED_LESSONS_FILE),
-					"write",
 					"memory",
 				);
 			}

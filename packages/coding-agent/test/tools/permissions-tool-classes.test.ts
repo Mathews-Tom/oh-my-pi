@@ -1,8 +1,11 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { getManagedSkillsDir } from "@oh-my-pi/pi-coding-agent/autolearn/managed-skills";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { getMemoryRoot, LEARNED_LESSONS_FILE } from "@oh-my-pi/pi-coding-agent/memories";
 import { loadMnemopiConfig } from "@oh-my-pi/pi-coding-agent/mnemopi/config";
 import {
 	getMnemopiRetainDbPath,
@@ -18,6 +21,8 @@ import {
 	extractEmbeddedEditPaths,
 	TOOL_PATH_CLASSES,
 } from "@oh-my-pi/pi-coding-agent/tools/permissions/tool-path-targets";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
 
 // Mnemopi is lazy-loaded at runtime; preload it for synchronous bank-path resolution.
 await Promise.all([loadMnemopi(), loadMnemopiCore()]);
@@ -103,6 +108,29 @@ describe("structured extraction", () => {
 				field: "name",
 			},
 		]);
+	});
+
+	it("authorizes only the directory itself when deleting a managed skill that does not exist on disk", () => {
+		const dir = path.join(getManagedSkillsDir(), "never-created-skill");
+		expect(extract("manage_skill", { action: "delete", name: "never-created-skill" })).toEqual([
+			{ raw: dir, access: "write", field: "name" },
+		]);
+	});
+
+	it("registers learned.md as read+write under a local memory backend, not write-only", () => {
+		const settings = Settings.isolated({ "memory.backend": "local" });
+		const context = { settings } as unknown as AgentToolContext;
+		const filePath = path.join(getMemoryRoot(settings.getAgentDir(), settings.getCwd()), LEARNED_LESSONS_FILE);
+		expect(extract("learn", { memory: "persist this lesson" }, context)).toEqual([
+			{ raw: filePath, access: "read", field: "memory" },
+			{ raw: filePath, access: "write", field: "memory" },
+		]);
+	});
+
+	it("contributes no local-backend target under a non-local memory backend", () => {
+		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+		const context = { settings } as unknown as AgentToolContext;
+		expect(extract("learn", { memory: "persist this lesson" }, context)).toEqual([]);
 	});
 
 	it("treats an optional learn skill as the managed write it performs", () => {
@@ -430,5 +458,54 @@ describe("mnemopi memory tool paths", () => {
 		expect(extract("reflect", context)).toEqual([]);
 		expect(extract("recall")).toEqual([]);
 		expect(extract("reflect")).toEqual([]);
+	});
+});
+
+describe("manage_skill delete recursion", () => {
+	// `deleteManagedSkill` (`autolearn/managed-skills.ts`) runs
+	// `fs.rm(dir, { recursive: true })` on the whole skill directory, so every
+	// existing descendant - not just `SKILL.md` - must be authorized before the
+	// removal proceeds (finding under review).
+	let tempHome: string;
+	let originalAgentDir: string;
+
+	beforeEach(async () => {
+		originalAgentDir = getAgentDir();
+		tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-manage-skill-delete-"));
+		spyOn(os, "homedir").mockReturnValue(tempHome);
+		setAgentDir(path.join(tempHome, ".omp", "agent"));
+	});
+
+	afterEach(async () => {
+		spyOn(os, "homedir").mockRestore();
+		setAgentDir(originalAgentDir);
+		await removeWithRetries(tempHome);
+	});
+
+	function extract(args: Record<string, unknown>) {
+		const cls = TOOL_PATH_CLASSES.manage_skill;
+		if (cls?.kind !== "structured") throw new Error("manage_skill is not structured");
+		return cls.extract(args);
+	}
+
+	it("authorizes every descendant found on disk, alongside the directory itself", async () => {
+		const dir = path.join(getManagedSkillsDir(), "demo-skill");
+		await fs.mkdir(path.join(dir, "assets"), { recursive: true });
+		await fs.writeFile(path.join(dir, "SKILL.md"), "---\nname: demo-skill\n---\nbody");
+		await fs.writeFile(path.join(dir, ".env"), "SECRET=1");
+		await fs.writeFile(path.join(dir, "assets", "logo.png"), "");
+
+		const targets = extract({ action: "delete", name: "demo-skill" });
+		expect(targets.every(t => t.access === "write" && t.field === "name")).toBe(true);
+		const raws = new Set(targets.map(t => t.raw));
+		expect(raws).toEqual(
+			new Set([
+				dir,
+				path.join(dir, "SKILL.md"),
+				path.join(dir, ".env"),
+				path.join(dir, "assets"),
+				path.join(dir, "assets", "logo.png"),
+			]),
+		);
 	});
 });
