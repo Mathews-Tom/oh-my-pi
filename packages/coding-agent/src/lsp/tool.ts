@@ -1481,10 +1481,23 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 						const appliedAction = await applyCodeAction(selectedAction, {
 							resolveCodeAction: async actionItem =>
-								(await sendRequest(client, "codeAction/resolve", actionItem, signal)) as CodeAction,
+								(await sendRequest(
+									client,
+									"codeAction/resolve",
+									actionItem,
+									signal,
+									undefined,
+									this.permissionContext(),
+								)) as CodeAction,
 							applyWorkspaceEdit: async edit =>
 								applyGuardedWorkspaceEdit(edit, this.session.cwd, toolContext, signal),
 							executeCommand: async commandItem => {
+								// Resolving or executing a command is the request the server is
+								// mid-handling when it pushes `workspace/applyEdit` — stamping this
+								// session's permission context onto it (see `sendRequest`'s
+								// `permissionContext` param) is what lets `guardedApplyEditDenial`
+								// check that push against this session, not a concurrent one that
+								// merely shares the same client (finding under review).
 								await sendRequest(
 									client,
 									"workspace/executeCommand",
@@ -1493,6 +1506,8 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 										arguments: commandItem.arguments ?? [],
 									},
 									signal,
+									undefined,
+									this.permissionContext(),
 								);
 							},
 						});

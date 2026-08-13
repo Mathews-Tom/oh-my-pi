@@ -485,15 +485,36 @@ async function handleConfigurationRequest(client: LspClient, message: LspJsonRpc
  * caller — not a weaker default invented for this path.
  */
 export async function guardedApplyEditDenial(client: LspClient, edit: WorkspaceEdit): Promise<string | null> {
-	const policy = loadPermissionsConfig(client.permissionContext?.settings);
+	const permissionContext = resolveApplyEditPermissionContext(client);
+	const policy = loadPermissionsConfig(permissionContext?.settings);
 	if (!policy) return null;
 	const roots: PermissionRoots = {
 		cwd: client.cwd,
-		additionalDirectories: client.permissionContext?.getAdditionalDirectories() ?? [],
+		additionalDirectories: permissionContext?.getAdditionalDirectories() ?? [],
 	};
 	const targets = await workspaceEditPathTargets(edit);
 	const denial = checkStructuredTargets(targets, policy, roots);
 	return denial ? denial.reason : null;
+}
+
+/**
+ * Resolve the permission context a server-pushed `workspace/applyEdit`
+ * should be checked against: the context of the oldest still-outstanding
+ * request that carries one (`Map` iteration order is insertion order, so the
+ * first hit is the request that has been in flight longest), falling back to
+ * {@link LspClient.permissionContext} when none do.
+ *
+ * A push almost always arrives while the server is mid-handling the request
+ * that provoked it (`workspace/executeCommand`, `codeAction/resolve`) — that
+ * request is still pending, so its context is the requesting session's, not
+ * whichever session most recently happened to call `getOrCreateClient` on
+ * this shared client.
+ */
+function resolveApplyEditPermissionContext(client: LspClient): LspClient["permissionContext"] {
+	for (const pending of client.pendingRequests?.values() ?? []) {
+		if (pending.permissionContext) return pending.permissionContext;
+	}
+	return client.permissionContext;
 }
 
 /**
@@ -1441,6 +1462,12 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
  *   `timeout: 60`.
  * - Else (no signal, no explicit timeout), fall back to `DEFAULT_REQUEST_TIMEOUT_MS`
  *   to avoid leaking pending requests forever.
+ *
+ * @param permissionContext - The requesting session's permission context.
+ *   Stored on the pending request so a `workspace/applyEdit` the server
+ *   pushes while this request is outstanding is checked against it (see
+ *   {@link guardedApplyEditDenial}) instead of the client's shared, mutable
+ *   default. Callers with no session (warmup, internal polling) omit it.
  */
 export async function sendRequest(
 	client: LspClient,
@@ -1448,6 +1475,7 @@ export async function sendRequest(
 	params: unknown,
 	signal?: AbortSignal,
 	timeoutMs?: number,
+	permissionContext?: LspClient["permissionContext"],
 ): Promise<unknown> {
 	// Atomically increment and capture request ID
 	const id = ++client.requestId;
@@ -1516,6 +1544,7 @@ export async function sendRequest(
 			reject(err);
 		},
 		method,
+		permissionContext,
 	});
 
 	// Write request. `queueWriteMessage(..., signal)` bounds the sink flush

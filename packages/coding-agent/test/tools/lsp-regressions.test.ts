@@ -512,6 +512,88 @@ describe("lsp regressions", () => {
 		}
 	});
 
+	it("checks a server-pushed workspace/applyEdit against the session whose in-flight request provoked it, not a session that merely shares the client", async () => {
+		// Stamping `client.permissionContext` on every `getOrCreateClient` call
+		// (the mechanism the previous two tests exercise) is a single mutable
+		// slot shared by every session that touches this command+cwd client. A
+		// session B that calls `getOrCreateClient` while session A's own
+		// `workspace/executeCommand` is still outstanding must not steal control
+		// of the `workspace/applyEdit` push A's request provokes — that push is
+		// checked against `PendingRequest.permissionContext`, recorded when
+		// `sendRequest` sent A's still-pending request, not the client-wide
+		// default B just overwrote (finding under review).
+		const tempDir = TempDir.createSync("@omp-lsp-applyedit-context-");
+		try {
+			const server = installFakeLsp(async (message, srv) => {
+				if (message.method === "initialize") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+				} else if (message.method === "shutdown") {
+					srv.send({ jsonrpc: "2.0", id: message.id, result: null });
+				} else if (message.method === "exit") {
+					srv.exit(0);
+				}
+			});
+			const config: ServerConfig = {
+				command: "fake-applyedit-context-lsp",
+				fileTypes: ["ts"],
+				rootMarkers: [],
+			};
+
+			const strictContext = {
+				settings: Settings.isolated({ "permissions.profile": "strict" }),
+				getAdditionalDirectories: () => [],
+			};
+			const offContext = { settings: Settings.isolated(), getAdditionalDirectories: () => [] };
+
+			const client = await lspClient.getOrCreateClient(config, tempDir.path(), 1_000, undefined, strictContext);
+
+			// Session A's `workspace/executeCommand` is the request the server is
+			// mid-handling when it pushes the edit below.
+			const executeCommandPromise = lspClient.sendRequest(
+				client,
+				"workspace/executeCommand",
+				{ command: "test.command", arguments: [] },
+				undefined,
+				undefined,
+				strictContext,
+			);
+			const executeCommandMessage = await server.waitFor(message => message.method === "workspace/executeCommand");
+
+			// Session B shares the same server + cwd and calls `getOrCreateClient`
+			// while A's executeCommand is still outstanding, overwriting the
+			// client-wide default with its own laxer context.
+			await lspClient.getOrCreateClient(config, tempDir.path(), 1_000, undefined, offContext);
+			expect(client.permissionContext).toBe(offContext);
+
+			const deniedPath = path.join(tempDir.path(), ".env");
+			server.send({
+				jsonrpc: "2.0",
+				id: "push-1",
+				method: "workspace/applyEdit",
+				params: {
+					edit: {
+						changes: {
+							[fileToUri(deniedPath)]: [
+								{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, newText: "x" },
+							],
+						},
+					},
+				},
+			});
+
+			const response = await server.waitFor(message => message.id === "push-1");
+			const result = response.result as { applied: boolean; failureReason?: string };
+			expect(result.applied).toBe(false);
+			expect(result.failureReason).toContain("**/.env");
+
+			server.send({ jsonrpc: "2.0", id: executeCommandMessage.id, result: null });
+			await executeCommandPromise;
+		} finally {
+			await lspClient.shutdownAll();
+			tempDir.removeSync();
+		}
+	});
+
 	it("stops waiting for a pending client on caller abort without cancelling its initialization", async () => {
 		const tempDir = TempDir.createSync("@omp-lsp-pending-abort-");
 		const initialize = Promise.withResolvers<void>();
