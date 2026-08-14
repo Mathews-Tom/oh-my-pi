@@ -86,6 +86,19 @@ async function snapshotPdfSource(
 	enforceResourcePathTargets("read", [{ raw: os.tmpdir(), access: "write", field: "path" }], context);
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "omp-read-pdf-"));
 	try {
+		// `os.tmpdir()` alone only proves confinement; a descendant `deny.write`
+		// glob (e.g. `**/source.pdf`, or a narrow allow scoped to the temp root
+		// with a descendant deny) never runs against it. Authorize the concrete
+		// minted directory and snapshot file now, before either is written to,
+		// closing the gap the check above leaves open (finding under review).
+		enforceResourcePathTargets(
+			"read",
+			[
+				{ raw: directory, access: "write", field: "path" },
+				{ raw: path.join(directory, "source.pdf"), access: "write", field: "path" },
+			],
+			context,
+		);
 		const bytes = await untilAborted(signal, () => Bun.file(absolutePdfPath).bytes());
 		signal?.throwIfAborted();
 		const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");

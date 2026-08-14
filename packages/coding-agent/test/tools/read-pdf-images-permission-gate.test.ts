@@ -161,6 +161,31 @@ describe("read authorizes PDF image extraction's write destinations", () => {
 		).rejects.toThrow(/resource permission rule/);
 	});
 
+	// The finding: the pre-mkdtemp check only ever authorized `os.tmpdir()`
+	// itself, which proves confinement but never runs a descendant-specific
+	// `deny.write` glob against the concrete minted directory or the
+	// `source.pdf` file written into it. A rule that (unlike the tmpdir-wide
+	// test above) does *not* match `os.tmpdir()` but does match the
+	// snapshot's own file name must still be consulted.
+	it("refuses extraction whose snapshot file matches a deny rule the tmpdir-level check alone would miss", async () => {
+		mockExtraction();
+		const tool = new ReadTool(ephemeralSession());
+
+		await expect(
+			tool.execute(
+				"call-1",
+				{ path: `${pdfPath}:p11-img0.png` } as never,
+				undefined,
+				undefined,
+				contextOf({
+					"permissions.profile": "workspace",
+					"permissions.confineWrites": false,
+					"permissions.deny.write": ["**/source.pdf"],
+				}),
+			),
+		).rejects.toThrow(/\*\*\/source\.pdf/);
+	});
+
 	it("does not additionally block extraction just because the cache directory resolves inside the workspace", async () => {
 		// The persistent cache directory (`imageDir`) sits beside the session
 		// file when one exists, so it can legitimately land inside the
