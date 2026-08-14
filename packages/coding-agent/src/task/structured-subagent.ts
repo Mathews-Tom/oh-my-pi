@@ -22,6 +22,7 @@ import { isIrcEnabled } from "../tools/hub";
 import { buildOutputValidator } from "../tools/output-schema-validator";
 import { loadPermissionsConfig } from "../tools/permissions/config";
 import { checkStructuredTargets, PermissionDeniedError } from "../tools/permissions/gate";
+import { decideTarget } from "../tools/permissions/resolve";
 import type { PathTarget, PermissionRoots } from "../tools/permissions/types";
 import * as git from "../utils/git";
 import { trackLateCleanup } from "../utils/late-cleanup";
@@ -256,6 +257,34 @@ async function authorizeIsolationTargets(session: ToolSession, repoRoot: string,
 	if (denial) throw new PermissionDeniedError("task", denial.rule, denial.reason);
 }
 
+/**
+ * Build the resource-permission read predicate `discoverAgents` should apply
+ * before reading each candidate agent-definition `.md` file, or `undefined`
+ * when no policy is configured — the task-discovery counterpart to
+ * `canReadSkill`/`canReadContextFile` in `sdk.ts`.
+ *
+ * `task`/`eval` are classified pathless (`tool-path-targets.ts`) because
+ * their free-text prompt carries no path, on the theory that enforcement
+ * belongs to the subagent's own later tool calls. That theory doesn't hold
+ * here: `resolveEffectiveSubagentPolicy` always calls `discoverAgents`
+ * before a subagent runs any tool of its own, and `loadAgentsFromDir` reads
+ * and parses every candidate definition — including ones never selected —
+ * before `getAgent` picks the requested one. A denied definition's content
+ * (its `systemPrompt`) would otherwise become the subagent's own
+ * instructions without ever passing through the wrapper gate (finding under
+ * review).
+ */
+function canReadAgentDefinitionFor(session: ToolSession): ((definitionPath: string) => boolean) | undefined {
+	const policy = loadPermissionsConfig(session.settings);
+	if (!policy) return undefined;
+	const roots: PermissionRoots = {
+		cwd: session.cwd,
+		additionalDirectories: [...(session.additionalDirectories ?? [])],
+	};
+	return definitionPath =>
+		decideTarget({ raw: definitionPath, access: "read", field: "agent" }, policy, roots).kind !== "deny";
+}
+
 function resolveSchema(request: StructuredSubagentRequest, agent: AgentDefinition): StructuredSubagentSchemaResolution {
 	const mode = request.schemaMode ?? request.session.outputSchemaMode ?? "permissive";
 	if (Object.hasOwn(request, "outputSchema")) {
@@ -334,7 +363,7 @@ export async function resolveEffectiveSubagentPolicy(
 	assertPlanControlsAllowed(request, planMode);
 	assertDepthAndSpawnAllowed(request, agentName);
 
-	const discovery = await discoverAgents(request.session.cwd);
+	const discovery = await discoverAgents(request.session.cwd, undefined, canReadAgentDefinitionFor(request.session));
 	const agent = getAgent(discovery.agents, agentName);
 	if (!agent) {
 		const available = discovery.agents.map(candidate => candidate.name).join(", ") || "none";

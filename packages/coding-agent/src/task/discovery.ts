@@ -39,13 +39,18 @@ export interface DiscoveryResult {
 /**
  * Load agents from a directory.
  */
-async function loadAgentsFromDir(dir: string, source: AgentSource): Promise<AgentDefinition[]> {
+async function loadAgentsFromDir(
+	dir: string,
+	source: AgentSource,
+	canReadAgentDefinition?: (definitionPath: string) => boolean,
+): Promise<AgentDefinition[]> {
 	const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
 	const files = entries
 		.filter(entry => (entry.isFile() || entry.isSymbolicLink()) && entry.name.endsWith(".md"))
 		.sort((a, b) => a.name.localeCompare(b.name))
 		.map(file => {
 			const filePath = path.join(dir, file.name);
+			if (canReadAgentDefinition?.(filePath) === false) return Promise.resolve(null);
 			return fs
 				.readFile(filePath, "utf-8")
 				.then(content => parseAgent(filePath, content, source, "warn"))
@@ -67,7 +72,11 @@ async function loadAgentsFromDir(dir: string, source: AgentSource): Promise<Agen
  * scope before user), then bundled.
  * @param cwd - Current working directory for project agent discovery
  */
-export async function discoverAgents(cwd: string, home: string = os.homedir()): Promise<DiscoveryResult> {
+export async function discoverAgents(
+	cwd: string,
+	home: string = os.homedir(),
+	canReadAgentDefinition?: (definitionPath: string) => boolean,
+): Promise<DiscoveryResult> {
 	const resolvedCwd = path.resolve(cwd);
 
 	const userDirs = getConfigDirs("agents", { project: false })
@@ -118,7 +127,9 @@ export async function discoverAgents(cwd: string, home: string = os.homedir()): 
 	}
 
 	const seen = new Set<string>();
-	const loadedAgents = (await Promise.all(orderedDirs.map(({ dir, source }) => loadAgentsFromDir(dir, source))))
+	const loadedAgents = (
+		await Promise.all(orderedDirs.map(({ dir, source }) => loadAgentsFromDir(dir, source, canReadAgentDefinition)))
+	)
 		.flat()
 		.filter(agent => {
 			if (seen.has(agent.name)) return false;

@@ -171,4 +171,21 @@ describe("discoverAgents", () => {
 		expect(names).toContain("explicit-agent");
 		expect(names).not.toEqual(expect.arrayContaining(["stale-agent", "settings-agent", "loom-verify-spec"]));
 	});
+
+	test("applies canReadAgentDefinition to a discovered agent before its file is read", async () => {
+		await fs.mkdir(path.join(projectDir, ".omp", "agents"), { recursive: true });
+		const allowedPath = path.join(projectDir, ".omp", "agents", "omp-test-agent.md");
+		const deniedPath = path.join(projectDir, ".omp", "agents", "denied-agent.md");
+		await fs.writeFile(allowedPath, OMP_AGENT_MD);
+		await fs.writeFile(
+			deniedPath,
+			["---", "name: denied-agent", "description: Should not be readable.", "---", "denied body"].join("\n"),
+		);
+
+		const { agents } = await discoverAgents(projectDir, tempHome, definitionPath => definitionPath !== deniedPath);
+		const names = agents.map(agent => agent.name);
+
+		expect(names).toContain("omp-test-agent");
+		expect(names).not.toContain("denied-agent");
+	});
 });
