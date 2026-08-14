@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Model } from "@oh-my-pi/pi-ai";
-import { logger, prompt } from "@oh-my-pi/pi-utils";
+import { getSecurityDir, logger, prompt } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async/job-manager";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
@@ -264,6 +264,25 @@ function assertSecurityBundleWriteAllowed(root: string, host: SecurityCoordinato
 }
 
 /**
+ * Roots for authorizing writes under the security store's own persistence
+ * directory (`~/.omp/security/<project-key>`, {@link getSecurityDir}) —
+ * distinct from {@link assertSecurityWriteAllowed}'s workspace-relative
+ * `roots`. The store directory is agent-internal bookkeeping (scan index,
+ * plan queue), never a workspace artifact the user asked for, so it is
+ * always added as an allowed root here: `permissions.confineWrites` exists
+ * to catch a scan's *output* landing somewhere the user did not approve
+ * (`assertSecurityWriteAllowed`, `assertSecurityBundleWriteAllowed`), not to
+ * gate the tool's own state file the same way a session's log directory or
+ * model cache never routes through this permission layer at all. A `deny.write`
+ * glob the user authored still fires against these targets normally — only
+ * confinement is widened, not the deny-list check `checkStructuredTargets`
+ * also runs.
+ */
+function securityStoreRoots(host: SecurityCoordinatorHost): PermissionRoots {
+	return { cwd: host.cwd, additionalDirectories: [...(host.additionalDirectories ?? []), getSecurityDir()] };
+}
+
+/**
  * Authorize the security store's own persistence directory, distinct from
  * `assertSecurityWriteAllowed`'s `output_root` (the scan's report
  * destination): `SecurityStore.open` creates `projectDirectory` and writes
@@ -282,7 +301,7 @@ function assertSecurityBundleWriteAllowed(root: string, host: SecurityCoordinato
 function assertSecurityStoreWriteAllowed(projectDirectory: string, host: SecurityCoordinatorHost): void {
 	const policy = loadPermissionsConfig(host.settings);
 	if (!policy) return;
-	const roots: PermissionRoots = { cwd: host.cwd, additionalDirectories: host.additionalDirectories ?? [] };
+	const roots = securityStoreRoots(host);
 	const indexPath = path.join(projectDirectory, "index.json");
 	const field = "security_store";
 	const targets: PathTarget[] = [
@@ -305,7 +324,7 @@ function assertSecurityStoreWriteAllowed(projectDirectory: string, host: Securit
 function assertSecurityPlanWriteAllowed(projectDirectory: string, planId: string, host: SecurityCoordinatorHost): void {
 	const policy = loadPermissionsConfig(host.settings);
 	if (!policy) return;
-	const roots: PermissionRoots = { cwd: host.cwd, additionalDirectories: host.additionalDirectories ?? [] };
+	const roots = securityStoreRoots(host);
 	const planPath = path.join(projectDirectory, "plans", `${planId}.json`);
 	const field = "security_store";
 	const targets: PathTarget[] = [
