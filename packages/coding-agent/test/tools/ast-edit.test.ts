@@ -36,7 +36,7 @@ function asSchemaObject(value: unknown): Record<string, unknown> {
 
 describe("ast_edit tool schema", () => {
 	it("uses op entries as [{ pat, out }]", async () => {
-		const tools = await createTools(createTestSession());
+		const tools = await createTools(createTestSession(), ["ast_edit"]);
 		const tool = tools.find(entry => entry.name === "ast_edit");
 		expect(tool).toBeDefined();
 		const schema = toolWireSchema(tool!);
@@ -54,7 +54,7 @@ describe("ast_edit tool schema", () => {
 	});
 
 	it("remains strict-representable after strict adaptation", async () => {
-		const tools = await createTools(createTestSession());
+		const tools = await createTools(createTestSession(), ["ast_edit"]);
 		const tool = tools.find(entry => entry.name === "ast_edit");
 		expect(tool).toBeDefined();
 		const schema = toolWireSchema(tool!);
@@ -69,7 +69,7 @@ describe("ast_edit tool schema", () => {
 			const filePath = path.join(tempDir, "legacy.ts");
 			await Bun.write(filePath, "legacyWrap(x, value)\n");
 
-			const tools = await createTools(createTestSession(tempDir));
+			const tools = await createTools(createTestSession(tempDir), ["ast_edit"]);
 			const tool = tools.find(entry => entry.name === "ast_edit");
 			expect(tool).toBeDefined();
 
@@ -134,6 +134,7 @@ describe("ast_edit tool schema", () => {
 					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
 					steer: () => {},
 				}),
+				["ast_edit"],
 			);
 			const tool = tools.find(entry => entry.name === "ast_edit");
 			expect(tool).toBeDefined();
@@ -178,6 +179,7 @@ describe("ast_edit tool schema", () => {
 					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
 					steer: () => {},
 				}),
+				["ast_edit"],
 			);
 			const tool = tools.find(entry => entry.name === "ast_edit");
 			expect(tool).toBeDefined();
@@ -227,6 +229,7 @@ describe("ast_edit tool schema", () => {
 					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
 					steer: () => {},
 				}),
+				["ast_edit"],
 			);
 			const tool = tools.find(entry => entry.name === "ast_edit");
 			expect(tool).toBeDefined();
@@ -284,6 +287,7 @@ describe("ast_edit tool schema", () => {
 					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
 					steer: () => {},
 				}),
+				["ast_edit"],
 			);
 			const tool = tools.find(entry => entry.name === "ast_edit");
 			expect(tool).toBeDefined();
