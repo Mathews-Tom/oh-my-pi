@@ -444,4 +444,51 @@ describe("read PDF image extraction", () => {
 		expect(result.content.some(c => c.type === "image")).toBe(true);
 		expect(spy).toHaveBeenCalledTimes(2);
 	});
+
+	// The finding: `read`'s wrapper gate declares only a read target for the
+	// `.pdf` path (`tool-path-targets.ts`); the source snapshot under
+	// `os.tmpdir()`, the extraction staging dir, and the persistent image
+	// cache (falling back to `os.tmpdir()` with no session file) had no
+	// declared write target anywhere, so extraction bypassed `confineWrites`
+	// and any `deny.write` rule on those directories entirely.
+	describe("permission gate", () => {
+		it("denies extraction when confineWrites blocks the os.tmpdir() source snapshot directory", async () => {
+			mockExtraction();
+			const session = makeSession(testDir);
+			session.settings.override("permissions.profile", "workspace");
+			const tool = new ReadTool(session);
+			await expect(tool.execute("call", { path: `${pdfPath}:p11-img0.png` })).rejects.toThrow(/confineWrites/);
+		});
+
+		it("denies extraction when the cache directory falls back to os.tmpdir() with no session artifacts", async () => {
+			mockExtraction();
+			const session: ToolSession = {
+				cwd: testDir,
+				hasUI: false,
+				getSessionFile: () => null,
+				getSessionSpawns: () => null,
+				settings: Settings.isolated({ "images.autoResize": false, "permissions.profile": "workspace" }),
+			} as unknown as ToolSession;
+			const tool = new ReadTool(session);
+			await expect(tool.execute("call", { path: `${pdfPath}:p11-img0.png` })).rejects.toThrow(/confineWrites/);
+		});
+
+		it("denies extraction whose marker file matches a deny.write rule", async () => {
+			mockExtraction();
+			const session = makeSession(testDir);
+			session.settings.override("permissions.profile", "workspace");
+			session.settings.override("permissions.confineWrites", false);
+			session.settings.override("permissions.deny.write", ["**/.extracted"]);
+			const tool = new ReadTool(session);
+			await expect(tool.execute("call", { path: `${pdfPath}:p11-img0.png` })).rejects.toThrow(/\*\*\/\.extracted/);
+		});
+
+		it("permits extraction when the policy allows it", async () => {
+			mockExtraction();
+			const session = makeSession(testDir);
+			const tool = new ReadTool(session);
+			const result = await tool.execute("call", { path: `${pdfPath}:p11-img0.png` });
+			expect(result.content.some(c => c.type === "image")).toBe(true);
+		});
+	});
 });

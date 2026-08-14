@@ -6,6 +6,9 @@ import { isEexist, isEnotempty, readImageMetadata, untilAborted } from "@oh-my-p
 import type { ToolSession } from "../sdk";
 import { loadImageInput, MAX_IMAGE_INPUT_BYTES, webpExclusionForModel } from "../utils/image-loading";
 import { convertFileWithMarkit } from "../utils/markit";
+import { loadPermissionsConfig } from "./permissions/config";
+import { checkStructuredTargets, PermissionDeniedError } from "./permissions/gate";
+import type { PermissionRoots } from "./permissions/types";
 import type { ReadToolDetails } from "./read";
 import { prependSuffixResolutionNotice } from "./read-format";
 import { isNotFoundError } from "./read-path-resolution";
@@ -70,6 +73,49 @@ function pdfImageCacheDir(session: ToolSession, absolutePdfPath: string, content
 		.slice(0, PDF_IMAGE_CACHE_BASENAME_MAX_LENGTH);
 	const pathDigest = Bun.hash(absolutePdfPath).toString(36);
 	return path.join(root, "read-pdf-images", `${basename}-${pathDigest}-${contentDigest}`);
+}
+
+/** Placeholder for the parts of an authorization target `mkdtemp`/hashing only mint at write time; confinement and deny-glob matching only care about shape, not the literal random/hash suffix. */
+const PDF_IMAGE_AUTH_PLACEHOLDER = "00000000000000000000000000000000";
+
+/**
+ * Authorize the concrete snapshot, staging, and cache directories
+ * `readPdfImageMember` is about to create, against the calling session's
+ * resource permission policy, before any of them exists.
+ *
+ * `read`'s wrapper gate declares only a read target for the `.pdf` path
+ * argument (`tool-path-targets.ts`); every directory this module writes -
+ * the source snapshot under `os.tmpdir()`, the extraction staging dir, and
+ * the persistent image cache (which itself falls back to `os.tmpdir()` when
+ * the session has no artifacts directory or session file) - has no declared
+ * write target anywhere, so PDF image extraction bypassed `confineWrites`
+ * and any `deny.write` rule on those directories entirely.
+ *
+ * The snapshot directory and cache directory's content-digest suffix are
+ * both minted only after reading the PDF's bytes; a fixed placeholder
+ * stands in for each here, the same reasoning `authorizeGrepScratchTarget`
+ * (`grep.ts`) already uses for its own `mkdtemp`-derived scratch dirs.
+ */
+function authorizePdfImageExtractionTargets(session: ToolSession, placeholderImageDir: string): void {
+	const policy = loadPermissionsConfig(session.settings);
+	if (!policy) return;
+	const roots: PermissionRoots = { cwd: session.cwd, additionalDirectories: session.additionalDirectories ?? [] };
+	const field = "read-pdf-images";
+	const snapshotDir = path.join(os.tmpdir(), `omp-read-pdf-${PDF_IMAGE_AUTH_PLACEHOLDER}`);
+	const stagingDir = `${placeholderImageDir}.tmp-${PDF_IMAGE_AUTH_PLACEHOLDER}`;
+	const denial = checkStructuredTargets(
+		[
+			{ raw: snapshotDir, access: "write", field },
+			{ raw: path.join(snapshotDir, "source.pdf"), access: "write", field },
+			{ raw: placeholderImageDir, access: "write", field },
+			{ raw: path.join(placeholderImageDir, ".extracted"), access: "write", field },
+			{ raw: stagingDir, access: "write", field },
+			{ raw: path.join(stagingDir, ".extracted"), access: "write", field },
+		],
+		policy,
+		roots,
+	);
+	if (denial) throw new PermissionDeniedError("read", denial.rule, denial.reason);
 }
 
 async function snapshotPdfSource(absolutePdfPath: string, signal?: AbortSignal): Promise<PdfImageSnapshot> {
@@ -175,6 +221,8 @@ async function ensurePdfImageCache(
 	absolutePdfPath: string,
 	signal?: AbortSignal,
 ): Promise<string> {
+	const placeholderImageDir = pdfImageCacheDir(session, absolutePdfPath, PDF_IMAGE_AUTH_PLACEHOLDER);
+	authorizePdfImageExtractionTargets(session, placeholderImageDir);
 	const snapshot = await snapshotPdfSource(absolutePdfPath, signal);
 	const imageDir = pdfImageCacheDir(session, absolutePdfPath, snapshot.digest);
 	const existing = pdfImageExtractions.get(imageDir);
