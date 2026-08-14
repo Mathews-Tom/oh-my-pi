@@ -102,6 +102,13 @@ describe("profile strict", () => {
 		expect(decideTarget(target(".env.local"), policy, roots).kind).toBe("deny");
 	});
 
+	it("honours an explicit user deny after the profile carve-out", () => {
+		const tightened = buildPermissionPolicy("strict", { denyRead: ["**/.env.example"] });
+		const denied = decideTarget(target(".env.example"), tightened, roots);
+		expect(denied.kind).toBe("deny");
+		if (denied.kind === "deny") expect(denied.rule).toBe("**/.env.example");
+	});
+
 	it("keeps the .env.example carve-out inside the workspace", () => {
 		// The carve-out exists to relax `**/.env.*`, not `confineWrites`. When it
 		// lived in the same list as a user's allow rules it won outright, so

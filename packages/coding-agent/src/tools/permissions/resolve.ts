@@ -16,8 +16,8 @@ import {
 	splitPathAndSel,
 } from "../path-utils";
 import { confineToRoots, relativeToRoots } from "./confine";
-import { matchGlob, matchGlobCandidate } from "./matcher";
-import { denySuppressingGlobs } from "./profiles";
+import { matchGlob } from "./matcher";
+import { findUnsuppressedDeny } from "./profiles";
 import {
 	ALLOW,
 	type PathAccess,
@@ -146,15 +146,8 @@ export function decidePathTarget(
 		}
 	}
 
-	const deniedMatch = matchGlobCandidate(policy.deny[target.access], candidates);
-	// A carve-out only ever relaxes the exact spelling the deny matched — never
-	// any other candidate in the set. `candidates` mixes a target's lexical
-	// spelling with its symlink-resolved one (see `relativeToRoots`), so a
-	// workspace symlink named `.env.example` that resolves to `.env` would
-	// otherwise have the deny match `.env` (the resolved spelling) suppressed
-	// by the carve-out matching `.env.example` (the lexical spelling) — a
-	// different candidate entirely, not the one the deny actually fired on.
-	if (deniedMatch && !matchGlob(policy.carveOut[target.access], [deniedMatch.candidate])) {
+	const deniedMatch = findUnsuppressedDeny(policy, target.access, candidates);
+	if (deniedMatch) {
 		const denied = deniedMatch.pattern;
 		return {
 			kind: "deny",
@@ -232,8 +225,6 @@ const SSH_URL_RE = /^ssh:\/\/[^/]*(\/.*)?$/i;
  * There is no local root to confine against (the file lives on a remote
  * host), so this checks only the deny/allow globs — the same lists a local
  * path faces — against the URL's remote path component and its basename.
- * Confinement never applies here, so the profile's carve-outs and the user's
- * allow list carry identical weight ({@link denySuppressingGlobs}).
  * Unparseable input (no path component at all, e.g. a bare `ssh://host`)
  * fails closed: there is nothing to verify, and `permissions.profile` being
  * active is not a reason to wave it through.
@@ -258,18 +249,16 @@ function decideSshTarget(target: PathTarget, policy: PermissionPolicy): Permissi
 	}
 	const candidates = [decoded, path.posix.basename(decoded)].filter((c): c is string => !!c);
 
-	const allowed = matchGlob(denySuppressingGlobs(policy, target.access), candidates);
-	if (allowed) return ALLOW;
-
-	const denied = matchGlob(policy.deny[target.access], candidates);
+	if (matchGlob(policy.allow[target.access], candidates)) return ALLOW;
+	const denied = findUnsuppressedDeny(policy, target.access, candidates);
 	if (denied) {
 		return {
 			kind: "deny",
-			rule: denied,
+			rule: denied.pattern,
 			reason:
 				`${target.access === "write" ? "Writing" : "Reading"} "${target.raw}" is blocked by the ` +
-				`resource permission rule "${denied}" (permissions.profile: ${policy.profile}).\n` +
-				`To allow it: add "${denied}" to permissions.allow.${target.access}, ` +
+				`resource permission rule "${denied.pattern}" (permissions.profile: ${policy.profile}).\n` +
+				`To allow it: add "${denied.pattern}" to permissions.allow.${target.access}, ` +
 				`or set permissions.profile: off.`,
 		};
 	}

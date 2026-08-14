@@ -5,6 +5,7 @@
  * glob list. Everything a profile contributes is additive to the user's own
  * lists — a profile can never remove a rule the user asked for.
  */
+import { type GlobMatch, matchGlob, matchGlobCandidate } from "./matcher";
 import type { AccessGlobs, PermissionPolicy, PermissionProfile } from "./types";
 
 // Secrets denied under `strict`, for both read and write.
@@ -99,14 +100,19 @@ export function buildPermissionPolicy(
 	overrides: PermissionOverrides = {},
 ): PermissionPolicy {
 	const defaults = PROFILE_DEFAULTS[profile];
+	const userDeny = {
+		read: mergeGlobs([], overrides.denyRead),
+		write: mergeGlobs([], overrides.denyWrite),
+	};
 	return {
 		profile,
 		confineReads: overrides.confineReads ?? defaults.confineReads,
 		confineWrites: overrides.confineWrites ?? defaults.confineWrites,
 		deny: {
-			read: mergeGlobs(defaults.deny.read, overrides.denyRead),
-			write: mergeGlobs(defaults.deny.write, overrides.denyWrite),
+			read: mergeGlobs(defaults.deny.read, userDeny.read),
+			write: mergeGlobs(defaults.deny.write, userDeny.write),
 		},
+		userDeny,
 		allow: {
 			read: mergeGlobs([], overrides.allowRead),
 			write: mergeGlobs([], overrides.allowWrite),
@@ -117,16 +123,23 @@ export function buildPermissionPolicy(
 }
 
 /**
- * Every glob that can suppress a deny rule for `access` — the profile's
- * carve-outs plus the user's own allow list.
+ * Finds the first deny matching a candidate that remains active.
  *
- * The two are only equivalent where confinement does not apply: the opaque
- * literal scan and the `ssh://` path both consult this union, while
- * {@link PermissionPolicy.allow} alone is what outranks confinement.
+ * Carve-outs are profile defaults, not a general escape hatch: they may relax
+ * only profile deny rules. Explicit user denies always remain authoritative;
+ * user-authored allow rules are evaluated separately before this helper.
  */
-export function denySuppressingGlobs(policy: PermissionPolicy, access: keyof AccessGlobs): readonly string[] {
-	const carveOut = policy.carveOut[access];
-	if (carveOut.length === 0) return policy.allow[access];
-	if (policy.allow[access].length === 0) return carveOut;
-	return [...carveOut, ...policy.allow[access]];
+export function findUnsuppressedDeny(
+	policy: PermissionPolicy,
+	access: keyof AccessGlobs,
+	candidates: readonly string[],
+): GlobMatch | null {
+	for (const pattern of policy.deny[access]) {
+		const match = matchGlobCandidate([pattern], candidates);
+		if (!match) continue;
+		if (policy.userDeny[access].includes(pattern) || !matchGlob(policy.carveOut[access], [match.candidate])) {
+			return match;
+		}
+	}
+	return null;
 }

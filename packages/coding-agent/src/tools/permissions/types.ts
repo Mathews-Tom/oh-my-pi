@@ -45,6 +45,8 @@ export interface PermissionPolicy {
 	readonly confineReads: boolean;
 	readonly confineWrites: boolean;
 	readonly deny: AccessGlobs;
+	/** User-authored deny rules, retained separately so profile carve-outs never suppress them. */
+	readonly userDeny: AccessGlobs;
 	/**
 	 * User-authored `permissions.allow.*`. The full escape hatch: it outranks
 	 * both the deny globs and workspace confinement, because asking for a path

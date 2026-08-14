@@ -17,8 +17,8 @@
 import * as path from "node:path";
 import { tokenizeShellSegments } from "../shell-tokenize";
 import { relativeToRoots } from "./confine";
-import { matchGlob, matchGlobCandidate } from "./matcher";
-import { denySuppressingGlobs } from "./profiles";
+import { matchGlob } from "./matcher";
+import { findUnsuppressedDeny } from "./profiles";
 import { isExemptPathArgument, permissionRootList, resolveTargetPath } from "./resolve";
 import type { PathAccess, PermissionPolicy, PermissionRoots } from "./types";
 
@@ -144,9 +144,6 @@ export function scanOpaqueArguments(
 	if (strings.length === 0) return null;
 
 	const rootList = permissionRootList(roots);
-	// The scan only ever suppresses a deny match — it has no confinement step —
-	// so the profile's carve-outs count exactly as much as the user's allow list.
-	const suppressing = { read: denySuppressingGlobs(policy, "read"), write: denySuppressingGlobs(policy, "write") };
 	const seen = new Set<string>();
 	for (const literal of candidateLiterals(strings, scan)) {
 		if (!looksLikePathReference(literal) || seen.has(literal)) continue;
@@ -162,17 +159,9 @@ export function scanOpaqueArguments(
 		const candidates = [...relatives, absolute, path.basename(absolute), literal];
 
 		for (const access of ["read", "write"] as const) {
-			const deniedMatch = matchGlobCandidate(policy.deny[access], candidates);
-			if (!deniedMatch) continue;
-			// A carve-out only ever relaxes the exact candidate the deny matched —
-			// never the whole set (`decidePathTarget`, resolve.ts, has the same
-			// fix). `candidates` mixes a literal's lexical spelling with its
-			// symlink-resolved one, so a workspace symlink named `.env.example`
-			// that resolves to `.env` would otherwise have the deny match on
-			// `.env` suppressed by the carve-out matching `.env.example` — a
-			// different candidate entirely, not the one the deny actually fired on.
-			if (matchGlob(suppressing[access], [deniedMatch.candidate])) continue;
-			return { literal, rule: deniedMatch.pattern, access };
+			if (matchGlob(policy.allow[access], candidates)) continue;
+			const denied = findUnsuppressedDeny(policy, access, candidates);
+			if (denied) return { literal, rule: denied.pattern, access };
 		}
 	}
 	return null;
