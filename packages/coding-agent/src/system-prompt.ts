@@ -375,7 +375,9 @@ export async function loadProjectContextFiles(
 			const contextFile = item as ContextFile;
 			return {
 				path: contextFile.path,
-				content: await expandAtImports(contextFile.content, contextFile.path),
+				content: await expandAtImports(contextFile.content, contextFile.path, {
+					canReadImport: options.canReadContextFile,
+				}),
 				depth: contextFile.depth,
 			};
 		}),

@@ -159,4 +159,34 @@ describe("expandAtImports", () => {
 
 		expect(expanded).toContain("See INLINED, and then continue.");
 	});
+
+	test("rejects a resolved import the read predicate denies, leaving the token unexpanded", async () => {
+		const guide = await writeFile("secret.md", "SECRET CONTENT");
+		const source = path.join(tmp, "AGENTS.md");
+		const input = "See @./secret.md.\n";
+
+		const expanded = await expandAtImports(input, source, {
+			canReadImport: importPath => importPath !== guide,
+		});
+
+		expect(expanded).not.toContain("SECRET CONTENT");
+		expect(expanded).toContain("@./secret.md");
+	});
+
+	test("applies the read predicate to imports resolved recursively, not just the top-level file", async () => {
+		// A permitted top-level file importing a denied nested file must not
+		// let that nested file's content bypass the same predicate.
+		const secret = await writeFile("secret.md", "SECRET CONTENT");
+		await writeFile("allowed.md", "before @./secret.md after\n");
+		const source = path.join(tmp, "AGENTS.md");
+		const input = "See @./allowed.md.\n";
+
+		const expanded = await expandAtImports(input, source, {
+			canReadImport: importPath => importPath !== secret,
+		});
+
+		expect(expanded).toContain("before");
+		expect(expanded).toContain("after");
+		expect(expanded).not.toContain("SECRET CONTENT");
+	});
 });
