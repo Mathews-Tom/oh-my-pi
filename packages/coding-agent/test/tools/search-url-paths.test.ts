@@ -171,6 +171,11 @@ describe("search tools with external URL paths", () => {
 			const session = createSession(testDir, sessionDir);
 			session.settings.set("permissions.profile", "workspace");
 			session.settings.set("permissions.confineReads", true);
+			// Isolated from the separate write-confinement gate exercised by
+			// `fetch-url-search-permission-gate.test.ts`: the artifacts directory
+			// this materializes into legitimately lives outside the workspace
+			// root, and `additionalDirectories` is empty here.
+			session.settings.set("permissions.confineWrites", false);
 			const tools = await createTools(session);
 			const tool = tools.find(entry => entry.name === "grep");
 			expect(tool).toBeDefined();
@@ -196,6 +201,7 @@ describe("search tools with external URL paths", () => {
 			const session = createSession(testDir, sessionDir);
 			session.settings.set("permissions.profile", "workspace");
 			session.settings.set("permissions.confineReads", true);
+			session.settings.set("permissions.confineWrites", false);
 			const tools = await createTools(session);
 			const tool = tools.find(entry => entry.name === "ast_grep");
 			expect(tool).toBeDefined();

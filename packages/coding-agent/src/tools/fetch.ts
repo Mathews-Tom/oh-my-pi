@@ -28,6 +28,9 @@ import { convertWithMarkit, fetchBinary } from "../web/scrapers/utils";
 import { applyListLimit } from "./list-limit";
 import { formatStyledArtifactReference, type OutputMeta } from "./output-meta";
 import { isReadableUrlPath, type LineRange, parseLineRanges } from "./path-utils";
+import { loadPermissionsConfig } from "./permissions/config";
+import { checkStructuredTargets, PermissionDeniedError } from "./permissions/gate";
+import type { PermissionRoots } from "./permissions/types";
 import { formatBytes, formatExpandHint, getDomain, replaceTabs } from "./render-utils";
 import { listTables, looksLikeSqlite, renderTableList } from "./sqlite-reader";
 import { ToolAbortError, ToolError } from "./tool-errors";
@@ -1619,15 +1622,46 @@ function readUrlContentExtension(finalUrl: string): string {
 	}
 }
 
+/**
+ * Authorize the concrete materialization directory and file against the
+ * calling session's resource permission policy, before either is created.
+ *
+ * `grep`/`ast_grep`'s wrapper gate declares only a read target for the URL
+ * itself (`tool-path-targets.ts`), and the URL is scheme-exempt from that
+ * check entirely — neither authorizes the local file this function writes
+ * beneath `<session-artifacts>/url-search`, which normally lives outside the
+ * workspace root. Without this, a URL search bypasses `confineWrites` and
+ * any descendant `deny.write` rule on the artifacts directory (finding under
+ * review).
+ */
+function authorizeUrlSearchMaterialization(session: ToolSession, dir: string, contentPath: string): void {
+	const policy = loadPermissionsConfig(session.settings);
+	if (!policy) return;
+	const roots: PermissionRoots = {
+		cwd: session.cwd,
+		additionalDirectories: session.additionalDirectories ?? [],
+	};
+	const denial = checkStructuredTargets(
+		[
+			{ raw: dir, access: "write", field: "url-search" },
+			{ raw: contentPath, access: "write", field: "url-search" },
+		],
+		policy,
+		roots,
+	);
+	if (denial) throw new PermissionDeniedError("grep", denial.rule, denial.reason);
+}
+
 async function materializeReadUrlContent(session: ToolSession, entry: ReadUrlEntry, raw: boolean): Promise<string> {
 	const root = session.getArtifactsDir?.();
 	if (!root) {
 		throw new ToolError("Cannot search URL output because this session cannot materialize read artifacts.");
 	}
 	const dir = path.join(root, "url-search");
-	await fs.mkdir(dir, { recursive: true });
 	const hash = Bun.hash(`${raw ? "raw" : "rendered"}:${entry.details.finalUrl}`).toString(36);
 	const contentPath = path.join(dir, `${hash}${readUrlContentExtension(entry.details.finalUrl)}`);
+	authorizeUrlSearchMaterialization(session, dir, contentPath);
+	await fs.mkdir(dir, { recursive: true });
 	await Bun.write(contentPath, entry.content);
 	return contentPath;
 }
