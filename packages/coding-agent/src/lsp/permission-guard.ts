@@ -95,7 +95,6 @@ async function collectDirectoryDeleteTargets(directoryUri: string): Promise<Path
 	}
 	const targets: PathTarget[] = [];
 	for (const entry of entries) {
-		if (entry.isDirectory()) continue;
 		targets.push({
 			raw: path.join(entry.parentPath ?? directoryPath, entry.name),
 			access: "write",

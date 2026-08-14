@@ -153,6 +153,32 @@ describe("assertWorkspaceEditAllowed", () => {
 			}
 		});
 
+		// The finding: the descendant enumeration only ever pushed *files* as
+		// write targets, `continue`-ing past every directory entry. A rule
+		// matching a nested *directory itself* (e.g. `**/protected`, with
+		// nothing individually denied inside it) never fired, so the allowed
+		// parent's recursive delete could still remove a directory a
+		// `deny.write` rule named explicitly.
+		it("denies deleting a directory whose only denied descendant is itself a nested directory", async () => {
+			const dirWithProtectedSubdir = path.join(workspace, "deletable-nested-dir");
+			fs.mkdirSync(path.join(dirWithProtectedSubdir, "protected"), { recursive: true });
+			fs.writeFileSync(path.join(dirWithProtectedSubdir, "ok.ts"), "export {};");
+			try {
+				const edit: WorkspaceEdit = {
+					documentChanges: [{ kind: "delete", uri: `file://${dirWithProtectedSubdir}` }],
+				};
+				await expect(
+					assertWorkspaceEditAllowed(
+						edit,
+						contextOf({ "permissions.profile": "workspace", "permissions.deny.write": ["**/protected"] }),
+						"lsp",
+					),
+				).rejects.toBeInstanceOf(PermissionDeniedError);
+			} finally {
+				fs.rmSync(dirWithProtectedSubdir, { recursive: true, force: true });
+			}
+		});
+
 		it("permits deleting a single denied-descendant-free file (no directory enumeration needed)", async () => {
 			const edit: WorkspaceEdit = { documentChanges: [{ kind: "delete", uri: fileUri("src", "main.ts") }] };
 			await expect(assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).resolves.toBeUndefined();
