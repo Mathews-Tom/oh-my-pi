@@ -38,6 +38,13 @@ describe("BankManager", () => {
 		}
 	});
 
+	it("derives a bank database path without creating its parent directory", () => {
+		const root = join(tmpdir(), `mnemopi-bank-path-${crypto.randomUUID()}`);
+		rmSync(root, { recursive: true, force: true });
+		expect(bankDbPath("read_only", root)).toBe(join(root, "banks", "read_only", "mnemopi.db"));
+		expect(existsSync(root)).toBe(false);
+	});
+
 	it("validates names and protects default deletion", () => {
 		const root = mkdtempSync(join(tmpdir(), "mnemopi-banks-"));
 		try {

@@ -884,8 +884,7 @@ function createMemory(config: MnemopiBackendConfig, bank: string): Mnemopi {
 function resolveBankDbPath(config: MnemopiBackendConfig, bank: string): string {
 	const sharedBank = config.globalBank ?? config.baseBank ?? "default";
 	if (bank === sharedBank) return config.dbPath;
-	const { BankManager } = requireMnemopiCore();
-	return new BankManager(dirname(config.dbPath)).getBankDbPath(bank);
+	return requireMnemopiCore().bankDbPath(bank, dirname(config.dbPath));
 }
 
 function mergeRecallResult(

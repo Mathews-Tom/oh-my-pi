@@ -62,9 +62,7 @@ export class BankManager {
 		return existsSync(join(this.banksDir, name));
 	}
 	getBankDbPath(name: string): string {
-		if (name.length === 0 || name === "default") return join(this.dataDir, DB_FILENAME);
-		this.validateName(name);
-		return join(this.banksDir, name, DB_FILENAME);
+		return bankDbPath(name, this.dataDir);
 	}
 	renameBank(oldName: string, newName: string): string {
 		if (oldName === "default") throw new ValueError("Cannot rename 'default' bank");
@@ -83,19 +81,21 @@ export class BankManager {
 		return { name, exists: present, db_path: dbPath, dbSizeBytes: size, db_size_bytes: size };
 	}
 	private validateName(name: string): void {
-		if (name.length === 0) throw new ValueError("Bank name cannot be empty");
-		if (name === "default") return;
-		if (name.length > 64) throw new ValueError(`Bank name '${name}' exceeds 64 characters`);
-		for (let i = 0; i < name.length; i++) {
-			const code = name.charCodeAt(i);
-			const ok =
-				(code >= 48 && code <= 57) ||
-				(code >= 65 && code <= 90) ||
-				(code >= 97 && code <= 122) ||
-				code === 45 ||
-				code === 95;
-			if (!ok) throw new ValueError(`Invalid bank name '${name}'. Use alphanumeric, hyphens, underscores only.`);
-		}
+		validateBankName(name);
+	}
+}
+
+function validateBankName(name: string): void {
+	if (!name || name === "default") return;
+	for (let i = 0; i < name.length; i++) {
+		const code = name.charCodeAt(i);
+		const ok =
+			(code >= 48 && code <= 57) ||
+			(code >= 65 && code <= 90) ||
+			(code >= 97 && code <= 122) ||
+			code === 45 ||
+			code === 95;
+		if (!ok) throw new ValueError(`Invalid bank name '${name}'. Use alphanumeric, hyphens, underscores only.`);
 	}
 }
 
@@ -117,9 +117,10 @@ export function bankExists(name: string, dataDir?: string): boolean {
 	const manager = new BankManager(dataDir);
 	return manager.bankExists(name);
 }
-export function bankDbPath(name = defaultBank, dataDir?: string): string {
-	const manager = new BankManager(dataDir);
-	return manager.getBankDbPath(name);
+export function bankDbPath(name = defaultBank, dataDir = configuredDataDir()): string {
+	if (name.length === 0 || name === "default") return join(dataDir, DB_FILENAME);
+	validateBankName(name);
+	return join(dataDir, "banks", name, DB_FILENAME);
 }
 
 export function setBank(bank: string): void {
