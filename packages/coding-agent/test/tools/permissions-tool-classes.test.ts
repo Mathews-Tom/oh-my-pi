@@ -105,6 +105,27 @@ describe("structured extraction", () => {
 		expect(targets.map(t => `${t.access}:${t.raw}`)).toEqual(["write:out"]);
 	});
 
+	// The finding: `generate_image` had no entry here at all, so it fell to
+	// the opaque string-scan fallback - `confineWrites` never applied to its
+	// randomly-named temp output, and `confineReads` never applied to a
+	// declared `input[].path` reference image.
+	it("authorizes declared input images for read and the temp root for write", () => {
+		const targets = extract("generate_image", {
+			subject: "a cat",
+			input: [{ path: "ref.png" }, { data: "aGVsbG8=", mime_type: "image/png" }],
+		});
+		expect(targets).toContainEqual({ raw: "ref.png", access: "read", field: "input" });
+		expect(targets).toContainEqual({ raw: os.tmpdir(), access: "write", field: "input" });
+		// The data-only entry has no path to authorize.
+		expect(targets.filter(t => t.access === "read")).toHaveLength(1);
+	});
+
+	it("still authorizes the temp root when generate_image has no input images", () => {
+		expect(extract("generate_image", { subject: "a cat" })).toEqual([
+			{ raw: os.tmpdir(), access: "write", field: "input" },
+		]);
+	});
+
 	it("treats managed-skill storage as a write target", () => {
 		expect(extract("manage_skill", { action: "create", name: "persistent-instruction" })).toEqual([
 			{

@@ -17,6 +17,7 @@
  * `filesystem/read_file {path: ".env"}` is scanned rather than waved through.
  */
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Patch } from "@oh-my-pi/hashline";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
@@ -28,7 +29,7 @@ import { LSP_READONLY_ACTIONS } from "../../lsp/actions";
 import { getMemoryRoot, LEARNED_LESSONS_FILE } from "../../memories";
 import { loadMnemopiConfig } from "../../mnemopi/config";
 import { getMnemopiRetainDbPath, getMnemopiScopedDbPaths } from "../../mnemopi/state";
-import { BUILTIN_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
+import { BUILTIN_TOOL_NAMES, DYNAMIC_TOOL_NAMES, HIDDEN_TOOL_NAMES, normalizeToolName } from "../builtin-names";
 import { unwrapHashlineHeaderPath } from "../plan-mode-guard";
 import type { PathAccess, PathTarget } from "./types";
 
@@ -352,6 +353,28 @@ const extractSecurityScanPaths: PathTargetExtractor = args => {
 };
 
 /**
+ * `generate_image` reads any declared `input[].path` reference images and
+ * always writes its generated output under the process temp root
+ * (`saveImageToTemp`, `image-gen.ts`): a random `omp-image-<id>.<ext>`
+ * filename the tool never exposes as a caller-suppliable argument. Without
+ * an explicit classification the tool fell to the opaque-string-scan
+ * fallback for every unrecognized name, which never enforces confinement
+ * and cannot see a path it has no argument to scan.
+ */
+const extractGenerateImagePaths: PathTargetExtractor = args => {
+	const out: PathTarget[] = [];
+	if (Array.isArray(args.input)) {
+		for (const entry of args.input) {
+			if (entry && typeof entry === "object") {
+				pushPath(out, (entry as Record<string, unknown>).path, "read", "input");
+			}
+		}
+	}
+	out.push({ raw: os.tmpdir(), access: "write", field: "input" });
+	return out;
+};
+
+/**
  * `retain`/`memory_edit`'s config for path derivation: the exact config their
  * own execution path resolves against.
  *
@@ -505,6 +528,7 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	debug: { kind: "structured", extract: extractDebugPaths },
 	inspect_image: { kind: "structured", extract: singlePath("path", "read") },
 	security_scan: { kind: "structured", extract: extractSecurityScanPaths },
+	generate_image: { kind: "structured", extract: extractGenerateImagePaths },
 
 	// ── Class B: opaque — best-effort literal scan, never a sandbox ───────
 	bash: { kind: "opaque", scan: "shell" },
@@ -601,4 +625,8 @@ export function classifyTool(toolName: string, args?: Record<string, unknown> | 
 }
 
 /** The names this table must cover, for the exhaustiveness test. */
-export const CLASSIFIED_TOOL_NAMES: readonly string[] = [...BUILTIN_TOOL_NAMES, ...HIDDEN_TOOL_NAMES];
+export const CLASSIFIED_TOOL_NAMES: readonly string[] = [
+	...BUILTIN_TOOL_NAMES,
+	...HIDDEN_TOOL_NAMES,
+	...DYNAMIC_TOOL_NAMES,
+];
