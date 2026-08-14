@@ -59,6 +59,7 @@ import {
 	toPathList,
 } from "./path-utils";
 import { loadPermissionsConfig } from "./permissions/config";
+import { checkStructuredTargets, PermissionDeniedError } from "./permissions/gate";
 import { isExemptPathArgument } from "./permissions/resolve";
 import { excludeDenyReadSearchTargets } from "./permissions/tool-path-targets";
 import type { PermissionRoots } from "./permissions/types";
@@ -223,6 +224,37 @@ function matchAbsolutePath(matchPath: string, searchPath: string): string {
 }
 
 /**
+ * Authorize a search scratch-file write against the calling session's
+ * resource permission policy, before it is created.
+ *
+ * `grep`'s wrapper gate declares only a read target for the archive/virtual
+ * `path` argument (`tool-path-targets.ts`); the concrete scratch file this
+ * writes under `os.tmpdir()` (an `omp-search-archive-*`/`omp-search-virtual-*`
+ * directory, normally outside every workspace root) has no declared write
+ * target anywhere, so it bypassed `confineWrites` and any `deny.write`
+ * descendant rule entirely. `mkdtemp` mints its directory name only after
+ * creating it, so a fixed placeholder directory name stands in for the real
+ * one here: confinement and deny-glob matching only care about shape, not
+ * the literal random suffix, the same reasoning `assertSecurityBundleWriteAllowed`
+ * (`security/coordinator.ts`) already uses for its own pid/uuid placeholder.
+ */
+function authorizeGrepScratchTarget(session: ToolSession, scratchKind: string, fileName: string): void {
+	const policy = loadPermissionsConfig(session.settings);
+	if (!policy) return;
+	const roots: PermissionRoots = { cwd: session.cwd, additionalDirectories: session.additionalDirectories ?? [] };
+	const placeholderDir = path.join(tmpdir(), `omp-search-${scratchKind}-00000000000000000000000000000000`);
+	const denial = checkStructuredTargets(
+		[
+			{ raw: placeholderDir, access: "write", field: "search-scratch" },
+			{ raw: path.join(placeholderDir, fileName), access: "write", field: "search-scratch" },
+		],
+		policy,
+		roots,
+	);
+	if (denial) throw new PermissionDeniedError("grep", denial.rule, denial.reason);
+}
+
+/**
  * Pre-resolve any `paths` entries that point at a member inside an archive
  * (e.g. `bundle.zip:src/foo.ts`, `release.tar.gz:notes.md`). Native grep
  * cannot read archive members, so we materialize each text member to a
@@ -232,12 +264,12 @@ function matchAbsolutePath(matchPath: string, searchPath: string): string {
  *
  * Returns the rewritten paths array (same length/order as input), a map
  * from absolute scratch path → original selector, a list of entries we
- * could not materialize (binary member, missing archive, etc.), and a
- * cleanup hook the caller MUST invoke in a `finally`.
+ * could not materialize (binary member, missing archive, permission denial,
+ * etc.), and a cleanup hook the caller MUST invoke in a `finally`.
  */
 async function resolveArchiveSearchPaths(
 	pathSpecs: readonly GrepPathSpec[],
-	cwd: string,
+	session: ToolSession,
 ): Promise<{
 	resolvedPaths: string[];
 	displayMap: Map<string, string>;
@@ -245,6 +277,7 @@ async function resolveArchiveSearchPaths(
 	unreadable: string[];
 	cleanup: () => Promise<void>;
 }> {
+	const cwd = session.cwd;
 	const resolvedPaths = pathSpecs.map(spec => spec.clean);
 	const displayMap = new Map<string, string>();
 	const displaySet = new Set<string>();
@@ -292,13 +325,21 @@ async function resolveArchiveSearchPaths(
 			continue;
 		}
 
-		if (!tempDir) {
-			tempDir = await mkdtemp(path.join(tmpdir(), "omp-search-archive-"));
-		}
 		// Per-entry filename keeps the scratch path unique even when two selectors
 		// resolve to members with the same basename.
 		const safeBase = path.basename(member.subPath).replace(/[^\w.-]+/g, "_") || "entry";
-		const tempPath = path.join(tempDir, `${idx}-${safeBase}`);
+		const fileName = `${idx}-${safeBase}`;
+		try {
+			authorizeGrepScratchTarget(session, "archive", fileName);
+		} catch (err) {
+			unreadable.push(`${entry} (${err instanceof Error ? err.message : String(err)})`);
+			continue;
+		}
+
+		if (!tempDir) {
+			tempDir = await mkdtemp(path.join(tmpdir(), "omp-search-archive-"));
+		}
+		const tempPath = path.join(tempDir, fileName);
 		await writeFile(tempPath, text);
 		resolvedPaths[idx] = tempPath;
 		displayMap.set(tempPath, entry);
@@ -644,11 +685,17 @@ async function searchVirtualResources(
 	contextBefore: number,
 	contextAfter: number,
 	maxCount: number,
+	session: ToolSession,
 	signal?: AbortSignal,
 ): Promise<GrepResult> {
 	if (resources.length === 0) {
 		return { matches: [], totalMatches: 0, filesWithMatches: 0, filesSearched: 0, limitReached: false };
 	}
+	// Virtual scratch filenames are the resource's own array index (`${idx}`
+	// or `${idx}-chunk-${n}`), never derived from user/server content, so a
+	// single placeholder name authorizes the whole directory — see
+	// `authorizeGrepScratchTarget`.
+	authorizeGrepScratchTarget(session, "virtual", "0");
 	const matches: GrepMatch[] = [];
 	const filesWithMatches = new Set<string>();
 	let totalMatches = 0;
@@ -1000,7 +1047,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				displaySet: archiveDisplaySet,
 				unreadable: archiveUnreadable,
 				cleanup: cleanupArchiveScratch,
-			} = await resolveArchiveSearchPaths(pathSpecs, this.session.cwd);
+			} = await resolveArchiveSearchPaths(pathSpecs, this.session);
 			try {
 				const internalResolution = await resolveInternalSearchInputs({
 					pathSpecs,
@@ -1308,6 +1355,7 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						normalizedContextBefore,
 						normalizedContextAfter,
 						INTERNAL_TOTAL_CAP,
+						this.session,
 						signal,
 					);
 				} catch (err) {
