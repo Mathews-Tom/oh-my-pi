@@ -540,7 +540,18 @@ export async function checkoutPullRequest(
 			assertGitWriteAllowed(repoRoot, context);
 			const repository = await git.repo.resolve(repoRoot);
 			if (repository) {
-				await assertGitMetadataWriteAllowed(repository.gitDir, repository.commonDir, context);
+				// `ensurePrRemote` below can call `git.remote.add`, which stages its
+				// write through an O_EXCL `commonDir/config.lock` before this scan's
+				// caller-supplied prospective paths were previously checked only
+				// after `ensurePrRemote` already ran — a cross-repository PR whose
+				// fork remote is not yet configured would violate
+				// `deny.write: ["**\/*.lock"]` via that first `git remote add` before
+				// any check that names the transient lock path had run. Authorize
+				// `config` and `config.lock` here, before the first Git mutation.
+				await assertGitMetadataWriteAllowed(repository.gitDir, repository.commonDir, context, [
+					path.join(repository.commonDir, "config"),
+					path.join(repository.commonDir, "config.lock"),
+				]);
 			}
 			const finalWorktreePath = existingWorktree
 				? existingWorktree.path

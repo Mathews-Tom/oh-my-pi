@@ -1115,6 +1115,13 @@ describe("github tool", () => {
 		});
 
 		it("blocks checkout before it can create a transient Git lock file under a deny.write lock rule", async () => {
+			// The clone URL must be genuinely new - a URL matching the fixture's
+			// pre-configured `forksrc` remote would let `ensurePrRemote`'s own
+			// idempotency check (see `git.remote.add idempotency` below) reuse
+			// that remote and skip `git remote add` entirely, never exercising
+			// the mutation this test targets. `git remote add` never dials the
+			// URL, so this fake path never needs to resolve.
+			const newForkUrl = path.join(fixture.baseDir, "contrib-fork.git");
 			vi.spyOn(git.github, "json")
 				.mockResolvedValueOnce({
 					number: 999,
@@ -1130,8 +1137,8 @@ describe("github tool", () => {
 				})
 				.mockResolvedValueOnce({
 					nameWithOwner: "contrib/repo",
-					sshUrl: fixture.forkBare,
-					url: fixture.forkBare,
+					sshUrl: newForkUrl,
+					url: newForkUrl,
 				});
 			const tool = new GithubTool(createSession(fixture.repoRoot));
 			const context = {
@@ -1156,10 +1163,17 @@ describe("github tool", () => {
 			// not the existing-tree scan — reproducing the finding in review thread
 			// PRRT_kwDOQxs0bc6YnDHD: `git.config.setBranch` invokes `git config`,
 			// which stages every write through that lock file.
+			const remotesBefore = runGit(fixture.repoRoot, ["remote"]);
 			await expect(
 				tool.execute("pr-checkout-lock-denied", { op: "pr_checkout", pr: "999" }, undefined, undefined, context),
 			).rejects.toThrow(/blocked by the resource permission rule "\*\*\/\*\.lock"/);
 			expect(runGit(fixture.repoRoot, ["branch", "--list", "pr-999"])).toBe("");
+			// `ensurePrRemote`'s own `git remote add` must not have run either:
+			// authorizing `config`/`config.lock` only *after* that first mutation
+			// (the ordering the review finding names) would let this fresh
+			// cross-repository fork remote get added before this check ever fires -
+			// the remote set must be unchanged, not just missing one guessed name.
+			expect(runGit(fixture.repoRoot, ["remote"])).toBe(remotesBefore);
 		});
 	});
 
