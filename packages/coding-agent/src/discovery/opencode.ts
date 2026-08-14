@@ -114,7 +114,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	// User-level only: ~/.config/opencode/AGENTS.md
 	const userAgentsMd = getUserPath(ctx, "opencode", "AGENTS.md");
 	if (userAgentsMd) {
-		const content = await readFile(userAgentsMd);
+		const content = ctx.canReadContextFile?.(userAgentsMd) === false ? null : await readFile(userAgentsMd);
 		if (content) {
 			items.push({
 				path: userAgentsMd,

@@ -115,4 +115,26 @@ describe("standalone AGENTS.md discovery", () => {
 
 		expect(result.items.map(file => file.path)).toEqual([repoAgents]);
 	});
+
+	test("applies canReadContextFile to a discovered AGENTS.md before it is read", async () => {
+		const home = path.join(tempDir, "home");
+		const repoRoot = path.join(home, "repo");
+		const cwd = path.join(repoRoot, "src");
+		fs.mkdirSync(cwd, { recursive: true });
+
+		const repoAgents = path.join(repoRoot, "AGENTS.md");
+		const deniedAgents = path.join(cwd, "AGENTS.md");
+		writeAgents(repoAgents, "repo context");
+		writeAgents(deniedAgents, "denied context");
+
+		const context: LoadContext = {
+			cwd,
+			home,
+			repoRoot,
+			canReadContextFile: contextFilePath => contextFilePath !== deniedAgents,
+		};
+		const result = await loadAgentsMd(context);
+
+		expect(result.items.map(file => file.path)).toEqual([repoAgents]);
+	});
 });

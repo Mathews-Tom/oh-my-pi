@@ -792,10 +792,12 @@ export async function discoverContextFiles(
 	cwd?: string,
 	_agentDir?: string,
 	disabledExtensions?: string[],
+	canReadContextFile?: (contextFilePath: string) => boolean,
 ): Promise<Array<{ path: string; content: string; depth?: number }>> {
 	return await loadContextFilesInternal({
 		cwd: cwd ?? getProjectDir(),
 		disabledExtensions,
+		canReadContextFile,
 	});
 }
 
@@ -1295,9 +1297,37 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// Independent discoveries that depend only on cwd/agentDir — kicked off in parallel and awaited
 	// at their respective consumer sites. Their work can overlap with model resolution, secret loading,
 	// session-context build, tool creation, MCP discovery, and extension discovery.
+	//
+	// Mirrors session-tools.ts's skillReadPermission: sessionManager doesn't exist yet at this
+	// point in startup, so roots are derived straight from settings/options rather than the
+	// (possibly session-header-merged) sessionManager.getAdditionalDirectories(). Derived before
+	// `contextFilesPromise` is kicked off below so a denied AGENTS.md/CLAUDE.md file is rejected
+	// the same way a denied SKILL.md already is, instead of being read unconditionally into the
+	// system prompt (finding under review).
+	const skillPermissionPolicy = loadPermissionsConfig(settings);
+	const skillPermissionRoots: PermissionRoots = {
+		cwd,
+		additionalDirectories: options.additionalDirectories ?? settings.get("workspace.additionalDirectories"),
+	};
+	const canReadSkill = skillPermissionPolicy
+		? (skillPath: string) =>
+				decideTarget(
+					{ raw: skillPath, access: "read", field: "skill" },
+					skillPermissionPolicy,
+					skillPermissionRoots,
+				).kind !== "deny"
+		: undefined;
+	const canReadContextFile = skillPermissionPolicy
+		? (contextFilePath: string) =>
+				decideTarget(
+					{ raw: contextFilePath, access: "read", field: "context file" },
+					skillPermissionPolicy,
+					skillPermissionRoots,
+				).kind !== "deny"
+		: undefined;
 	const contextFilesPromise = options.contextFiles
 		? Promise.resolve(options.contextFiles)
-		: logger.time("discoverContextFiles", discoverContextFiles, cwd, agentDir);
+		: logger.time("discoverContextFiles", discoverContextFiles, cwd, agentDir, undefined, canReadContextFile);
 	contextFilesPromise.catch(() => {});
 	const resolveRepoContext = async (repoCwd: string) => {
 		try {
@@ -1323,22 +1353,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	slashCommandsPromise.catch(() => {});
 	const skillsSettings = settings.getGroup("skills");
 	const disabledExtensionIds = settings.get("disabledExtensions") ?? [];
-	// Mirrors session-tools.ts's skillReadPermission: sessionManager doesn't exist yet at this
-	// point in startup, so roots are derived straight from settings/options rather than the
-	// (possibly session-header-merged) sessionManager.getAdditionalDirectories().
-	const skillPermissionPolicy = loadPermissionsConfig(settings);
-	const skillPermissionRoots: PermissionRoots = {
-		cwd,
-		additionalDirectories: options.additionalDirectories ?? settings.get("workspace.additionalDirectories"),
-	};
-	const canReadSkill = skillPermissionPolicy
-		? (skillPath: string) =>
-				decideTarget(
-					{ raw: skillPath, access: "read", field: "skill" },
-					skillPermissionPolicy,
-					skillPermissionRoots,
-				).kind !== "deny"
-		: undefined;
 	const discoveredSkillsPromise =
 		options.skills === undefined
 			? logger.time(
@@ -2848,9 +2862,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				? await logger.time("resolveActiveRepoContext", resolveRepoContext, promptCwd)
 				: initialActiveRepoContext;
 			if (hasSession && options.contextFiles === undefined) {
-				contextFiles = await logger.time("discoverContextFiles", discoverContextFiles, promptCwd, agentDir, [
-					...(settings.get("disabledExtensions") ?? []),
-				]);
+				contextFiles = await logger.time(
+					"discoverContextFiles",
+					discoverContextFiles,
+					promptCwd,
+					agentDir,
+					[...(settings.get("disabledExtensions") ?? [])],
+					canReadContextFile,
+				);
 				toolSession.contextFiles = contextFiles;
 				session.setAdvisorContextPrompt(formatAdvisorContextPrompt(contextFiles));
 			}

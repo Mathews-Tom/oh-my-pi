@@ -66,7 +66,7 @@ export async function loadAgentsMd(ctx: LoadContext): Promise<LoadResult<Context
 		const atHome = excludeHome && samePath(current, home);
 		if (!(atHome || (atBoundary && !includeBoundary))) {
 			const candidate = path.join(current, "AGENTS.md");
-			const content = await readFile(candidate);
+			const content = ctx.canReadContextFile?.(candidate) === false ? null : await readFile(candidate);
 
 			if (content !== null) {
 				const parent = path.dirname(candidate);

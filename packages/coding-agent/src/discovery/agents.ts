@@ -290,6 +290,7 @@ registerProvider<SlashCommand>(slashCommandCapability.id, {
 // Context Files (AGENTS.md)
 async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFile>> {
 	const load = async (filePath: string, level: "user" | "project"): Promise<ContextFile | null> => {
+		if (ctx.canReadContextFile?.(filePath) === false) return null;
 		const content = await readFile(filePath);
 		if (!content) return null;
 		// filePath is <ancestor>/.agent(s)/AGENTS.md — go up past the config dir to the ancestor

@@ -270,6 +270,7 @@ export async function loadCapability<T>(
 		home,
 		repoRoot,
 		...(options.canReadSkill && { canReadSkill: options.canReadSkill }),
+		...(options.canReadContextFile && { canReadContextFile: options.canReadContextFile }),
 	};
 	const providers = filterProviders(capability, options);
 

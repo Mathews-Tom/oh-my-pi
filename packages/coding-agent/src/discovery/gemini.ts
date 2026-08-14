@@ -132,7 +132,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	// User-level: ~/.gemini/GEMINI.md
 	const userGeminiMd = getUserPath(ctx, "gemini", "GEMINI.md");
 	if (userGeminiMd) {
-		const content = await readFile(userGeminiMd);
+		const content = ctx.canReadContextFile?.(userGeminiMd) === false ? null : await readFile(userGeminiMd);
 		if (content) {
 			items.push({
 				path: userGeminiMd,
@@ -146,7 +146,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	// Project-level: .gemini/GEMINI.md
 	const projectGeminiMd = getProjectPath(ctx, "gemini", "GEMINI.md");
 	if (projectGeminiMd) {
-		const content = await readFile(projectGeminiMd);
+		const content = ctx.canReadContextFile?.(projectGeminiMd) === false ? null : await readFile(projectGeminiMd);
 		if (content) {
 			const projectBase = getProjectPath(ctx, "gemini", "");
 			const depth = projectBase ? calculateDepth(ctx.cwd, projectBase, path.sep) : 0;

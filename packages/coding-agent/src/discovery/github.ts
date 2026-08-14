@@ -51,7 +51,8 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 
 	const copilotInstructionsPath = getProjectPath(ctx, "github", "copilot-instructions.md");
 	if (copilotInstructionsPath) {
-		const content = await readFile(copilotInstructionsPath);
+		const content =
+			ctx.canReadContextFile?.(copilotInstructionsPath) === false ? null : await readFile(copilotInstructionsPath);
 		if (content) {
 			const fileDir = path.dirname(copilotInstructionsPath);
 			const depth = calculateDepth(ctx.cwd, fileDir, path.sep);
@@ -68,7 +69,8 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 
 	// User-global instructions (~/.copilot/copilot-instructions.md), applied across all repos.
 	const userInstructionsPath = path.join(resolveCopilotHome(ctx.home), "copilot-instructions.md");
-	const userContent = await readFile(userInstructionsPath);
+	const userContent =
+		ctx.canReadContextFile?.(userInstructionsPath) === false ? null : await readFile(userInstructionsPath);
 	if (userContent) {
 		items.push({
 			path: userInstructionsPath,
@@ -83,7 +85,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	// by loadInstructions). copilot-instructions.md is NOT part of the custom-dir spec.
 	for (const dir of copilotCustomInstructionDirs()) {
 		const agentsMdPath = path.join(dir, "AGENTS.md");
-		const agentsMdContent = await readFile(agentsMdPath);
+		const agentsMdContent = ctx.canReadContextFile?.(agentsMdPath) === false ? null : await readFile(agentsMdPath);
 		if (agentsMdContent) {
 			items.push({
 				path: agentsMdPath,

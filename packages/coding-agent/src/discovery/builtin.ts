@@ -908,7 +908,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const warnings: string[] = [];
 
 	const userPath = path.join(getAgentDir(), "AGENTS.md");
-	const userContent = await readFile(userPath);
+	const userContent = ctx.canReadContextFile?.(userPath) === false ? null : await readFile(userPath);
 	if (userContent) {
 		items.push({
 			path: userPath,
@@ -921,7 +921,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
 	if (nearestProjectConfigDir) {
 		const projectPath = path.join(nearestProjectConfigDir.dir, "AGENTS.md");
-		const projectContent = await readFile(projectPath);
+		const projectContent = ctx.canReadContextFile?.(projectPath) === false ? null : await readFile(projectPath);
 		if (projectContent) {
 			items.push({
 				path: projectPath,

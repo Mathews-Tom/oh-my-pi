@@ -57,7 +57,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 
 	// User level only: ~/.codex/AGENTS.md
 	const agentsMd = path.join(ctx.home, SOURCE_PATHS.codex.userBase, "AGENTS.md");
-	const agentsContent = await readFile(agentsMd);
+	const agentsContent = ctx.canReadContextFile?.(agentsMd) === false ? null : await readFile(agentsMd);
 	if (agentsContent) {
 		items.push({
 			path: agentsMd,

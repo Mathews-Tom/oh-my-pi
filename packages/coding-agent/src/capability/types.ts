@@ -18,6 +18,8 @@ export interface LoadContext {
 	repoRoot: string | null;
 	/** Reject a discovered skill before its backing file is read. */
 	canReadSkill?: (skillPath: string) => boolean;
+	/** Reject a discovered context file (AGENTS.md/CLAUDE.md/GEMINI.md/…) before its backing file is read. */
+	canReadContextFile?: (contextFilePath: string) => boolean;
 }
 
 /**
@@ -76,6 +78,8 @@ export interface LoadOptions<T = unknown> {
 	disabledExtensions?: string[];
 	/** Reject a discovered skill before its backing file is read. */
 	canReadSkill?: (skillPath: string) => boolean;
+	/** Reject a discovered context file (AGENTS.md/CLAUDE.md/GEMINI.md/…) before its backing file is read. */
+	canReadContextFile?: (contextFilePath: string) => boolean;
 	/**
 	 * Drop items before deduplication as if they never existed (e.g. scope
 	 * exclusions). A dropped item neither survives nor claims its dedupe key,
