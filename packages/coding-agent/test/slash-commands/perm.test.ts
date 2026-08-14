@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "bun:test";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
-import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
+import { BUILTIN_MODE_SLASH_COMMANDS } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-modes";
+import type {
+	ParsedSlashCommand,
+	SlashCommandRuntime,
+	TuiSlashCommandRuntime,
+} from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 
 type Store = Record<string, unknown>;
 
@@ -12,11 +17,12 @@ function acpRuntime(initial?: Store) {
 	});
 	const set = vi.fn();
 	const output = vi.fn();
+	const refreshSkills = vi.fn(async () => {});
 	const runtime = {
-		session: { settings: { get, override, set } },
+		session: { settings: { get, override, set }, refreshSkills },
 		output,
 	} as unknown as SlashCommandRuntime;
-	return { get, override, set, output, runtime, store };
+	return { get, override, set, output, refreshSkills, runtime, store };
 }
 
 describe("/perm slash command", () => {
@@ -68,6 +74,39 @@ describe("/perm slash command", () => {
 		const text = String(h.output.mock.calls.at(-1)?.[0] ?? "");
 		expect(text).toContain("Permission profile: strict.");
 		expect(text).toContain("Switched for this session only.");
+	});
+
+	it("refreshes cached skills before confirming profile switches in ACP and TUI", async () => {
+		const h = acpRuntime();
+		const pending = Promise.withResolvers<void>();
+		h.refreshSkills.mockReturnValueOnce(pending.promise);
+
+		const acpResult = executeAcpBuiltinSlashCommand("/perm strict", h.runtime);
+
+		await Promise.resolve();
+		expect(h.output).not.toHaveBeenCalled();
+		pending.resolve();
+		await expect(acpResult).resolves.toEqual({ consumed: true });
+		expect(h.refreshSkills).toHaveBeenCalledTimes(1);
+
+		const showStatus = vi.fn();
+		const perm = BUILTIN_MODE_SLASH_COMMANDS.find(command => command.name === "perm");
+		expect(perm?.handleTui).toBeDefined();
+		const tuiCommand: ParsedSlashCommand = { name: "perm", args: "workspace", text: "/perm workspace" };
+		const tuiRuntime = {
+			ctx: {
+				session: h.runtime.session,
+				editor: { setText: vi.fn() },
+				showStatus,
+				statusLine: { invalidate: vi.fn() },
+				ui: { requestRender: vi.fn() },
+			},
+		} as unknown as TuiSlashCommandRuntime;
+
+		await perm?.handleTui?.(tuiCommand, tuiRuntime);
+
+		expect(h.refreshSkills).toHaveBeenCalledTimes(2);
+		expect(showStatus).toHaveBeenCalledWith(expect.stringContaining("Permission profile: workspace."));
 	});
 
 	it("resolves the strict profile's effective rules in the report", async () => {

@@ -159,14 +159,15 @@ function formatPermissionStatus(settings: Settings, note?: string): string {
 }
 
 /**
- * Switch the session's permission profile. Uses `settings.override`, never
- * `settings.set`: the runtime layer is not written to settings.json, so the
- * choice dies with the session and the user is told the key to persist it.
- * Enforcement semantics are untouched — the gate reads the same settings.
+ * Switch the session's permission profile and refresh the prompt-visible skill
+ * set before reporting success. Uses `settings.override`, never `settings.set`:
+ * the runtime layer is not written to settings.json, so the choice dies with
+ * the session and the user is told the key to persist it.
  */
-function applyPermissionProfile(settings: Settings, profile: PermissionProfile): string {
-	settings.override("permissions.profile", profile);
-	return formatPermissionStatus(settings, "Switched for this session only.");
+async function applyPermissionProfile(session: AgentSession, profile: PermissionProfile): Promise<string> {
+	session.settings.override("permissions.profile", profile);
+	await session.refreshSkills();
+	return formatPermissionStatus(session.settings, "Switched for this session only.");
 }
 
 const AUTOCOMPLETE_DETAIL_LIMIT = 48;
@@ -568,10 +569,10 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				return commandConsumed();
 			}
 			if (!isPermissionProfile(arg)) return usage("Usage: /perm [off|workspace|strict]", runtime);
-			await runtime.output(applyPermissionProfile(runtime.session.settings, arg));
+			await runtime.output(await applyPermissionProfile(runtime.session, arg));
 			return commandConsumed();
 		},
-		handleTui: (command, runtime) => {
+		handleTui: async (command, runtime) => {
 			const arg = command.args.trim().toLowerCase();
 			runtime.ctx.editor.setText("");
 			if (!arg) {
@@ -582,7 +583,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.showStatus("Usage: /perm [off|workspace|strict]");
 				return;
 			}
-			runtime.ctx.showStatus(applyPermissionProfile(runtime.ctx.session.settings, arg));
+			runtime.ctx.showStatus(await applyPermissionProfile(runtime.ctx.session, arg));
 			// The chip reads settings at render time, so the bar only picks the
 			// new profile up once the cached status line is invalidated.
 			refreshStatusLine(runtime.ctx);
