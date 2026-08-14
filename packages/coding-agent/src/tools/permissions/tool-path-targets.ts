@@ -375,6 +375,18 @@ const extractGenerateImagePaths: PathTargetExtractor = args => {
 };
 
 /**
+ * `tts` is a dynamically-registered custom tool (gated by `speechgen.enabled`,
+ * outside the synchronous `BUILTIN_TOOLS`/`HIDDEN_TOOLS` factory maps like
+ * `generate_image`), so it had no entry here and fell to the opaque-scan
+ * fallback: `confineWrites` never applied to `output_path`. Registering the
+ * declared path is necessary but not sufficient — the local backend can
+ * rewrite an `.mp3` request to a sibling `.wav` (`resolveLocalWavPath`,
+ * `tts.ts`) after this check runs, so the tool itself re-authorizes the
+ * actual written path when that substitution happens.
+ */
+const extractTtsPaths: PathTargetExtractor = singlePath("output_path", "write");
+
+/**
  * `retain`/`memory_edit`'s config for path derivation: the exact config their
  * own execution path resolves against.
  *
@@ -529,6 +541,7 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 	inspect_image: { kind: "structured", extract: singlePath("path", "read") },
 	security_scan: { kind: "structured", extract: extractSecurityScanPaths },
 	generate_image: { kind: "structured", extract: extractGenerateImagePaths },
+	tts: { kind: "structured", extract: extractTtsPaths },
 
 	// ── Class B: opaque — best-effort literal scan, never a sandbox ───────
 	bash: { kind: "opaque", scan: "shell" },
