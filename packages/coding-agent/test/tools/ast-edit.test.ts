@@ -536,4 +536,63 @@ describe("ast_edit tool schema", () => {
 			await removeWithRetries(tempDir);
 		}
 	});
+
+	// Mirrors ast_grep's "searches an exempt local:// directory despite
+	// deny.read filtering" - the finding: `ast_edit` never passed
+	// `isExemptSourceInput` to `resolveToolSearchScope`, so a `local://`
+	// target's exempt identity was lost the moment it resolved to a
+	// concrete backing path, and a `deny.read: ["**/*"]` policy filtered
+	// the whole directory to nothing even though the raw input was exempt.
+	it("matches an exempt local:// directory despite deny.read filtering", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-edit-local-permissions-"));
+		try {
+			const artifactsDir = path.join(tempDir, "artifacts");
+			const localDir = path.join(artifactsDir, "local", "notes");
+			await fs.mkdir(localDir, { recursive: true });
+			await Bun.write(path.join(localDir, "plan.ts"), "legacyWrap(x, value)\n");
+
+			const settings = Settings.isolated({
+				"tools.xdev": false,
+				"permissions.profile": "strict",
+				"permissions.deny.read": ["**/*"],
+			});
+			const queue = new ToolChoiceQueue();
+			const context = {
+				sessionManager: {
+					getCwd: () => tempDir,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "test-session",
+				},
+				settings,
+			};
+			const tools = await createTools(
+				createTestSession(tempDir, {
+					settings,
+					getToolChoiceQueue: () => queue,
+					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
+					steer: () => {},
+					localProtocolOptions: {
+						getArtifactsDir: () => artifactsDir,
+						getSessionId: () => "ast-edit-local",
+					},
+				}),
+			);
+			const tool = tools.find(entry => entry.name === "ast_edit");
+			expect(tool).toBeDefined();
+
+			const result = await tool!.execute(
+				"ast-edit-local-permissions",
+				{ ops: [{ pat: "legacyWrap($A, $B)", out: "modernWrap($A, $B)" }], paths: ["local://notes"] },
+				undefined,
+				undefined,
+				context as unknown as Parameters<NonNullable<typeof tool>["execute"]>[4],
+			);
+			const text = result.content.find(content => content.type === "text")?.text ?? "";
+
+			expect(text).toContain("plan.ts");
+			expect(queue.hasPendingInvoker).toBe(true);
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
 });

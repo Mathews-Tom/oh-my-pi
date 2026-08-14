@@ -36,6 +36,7 @@ import {
 	PermissionDeniedError,
 	permissionRoots,
 } from "./permissions";
+import { isExemptPathArgument } from "./permissions/resolve";
 import {
 	appendParseErrorsBulletList,
 	capParseErrors,
@@ -206,6 +207,32 @@ function astEditFileTargets(fileList: readonly string[]): PathTarget[] {
 	]);
 }
 
+/**
+ * Whether `absoluteFilePath` sits under one of `exemptRoots` — the same
+ * exempt-source roots {@link resolveToolSearchScope} resolves for a `local://`/
+ * `memory://` scope input. `astEditFileTargets` below checks concrete on-disk
+ * paths with `decideTarget`, which only recognizes an exempt *raw argument*
+ * shape (`local://…`) — a resolved backing path never matches it, so without
+ * this a `deny.read: ["**\/*"]` policy would deny every file this per-file
+ * recheck sees even when the scope itself was exempt.
+ */
+function isUnderExemptRoot(absoluteFilePath: string, exemptRoots: ReadonlySet<string>): boolean {
+	for (const root of exemptRoots) {
+		if (absoluteFilePath === root || absoluteFilePath.startsWith(`${root}${path.sep}`)) return true;
+	}
+	return false;
+}
+
+/** {@link astEditFileTargets}, excluding files under an exempt scope root. */
+function nonExemptFileTargets(
+	fileList: readonly string[],
+	cwd: string,
+	exemptRoots: ReadonlySet<string>,
+): PathTarget[] {
+	if (exemptRoots.size === 0) return astEditFileTargets(fileList);
+	return astEditFileTargets(fileList.filter(filePath => !isUnderExemptRoot(path.resolve(cwd, filePath), exemptRoots)));
+}
+
 export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolDetails> {
 	readonly name = "ast_edit";
 	readonly approval = (args: unknown) => {
@@ -322,6 +349,7 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				signal,
 				localProtocolOptions: this.session.localProtocolOptions,
 				skills: this.session.skills,
+				isExemptSourceInput: isExemptPathArgument,
 				resolveExternalUrl: async rawPath => {
 					if (!parseReadUrlTarget(rawPath)) return undefined;
 					throw new ToolError(
@@ -335,13 +363,31 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			const recursiveTargets =
 				multiTargets ??
 				(isDirectory ? [{ basePath: resolvedSearchPath, glob: globFilter, pathIsFile: false }] : undefined);
+			// `resolveToolSearchScope` replaces an exempt internal/external URL
+			// (e.g. `memory://root`) with its backing filesystem path before this
+			// filter runs; that backing path can legitimately sit outside every
+			// workspace root. Splitting exempt targets out before the deny-read
+			// filter — mirroring `ast_grep`'s own filtering site — keeps their
+			// original exemption from being lost the moment the URL becomes a
+			// concrete path, instead of rejecting every descendant under an
+			// active `deny.read` rule.
 			if (searchPolicy && recursiveTargets) {
 				const roots = {
 					cwd: this.session.cwd,
 					additionalDirectories: this.session.additionalDirectories ?? [],
 				};
-				const filteredTargets = await excludeDenyReadSearchTargets(recursiveTargets, searchPolicy, roots);
-				if (filteredTargets) effectiveTargets = filteredTargets;
+				const exemptTargets = recursiveTargets.filter(target =>
+					scope.exemptSourcePaths.has(path.resolve(target.basePath)),
+				);
+				const targetsToFilter =
+					exemptTargets.length > 0
+						? recursiveTargets.filter(target => !scope.exemptSourcePaths.has(path.resolve(target.basePath)))
+						: recursiveTargets;
+				const filteredTargets =
+					targetsToFilter.length > 0
+						? await excludeDenyReadSearchTargets(targetsToFilter, searchPolicy, roots)
+						: [];
+				if (filteredTargets) effectiveTargets = [...exemptTargets, ...filteredTargets];
 			}
 
 			const result = await runAstEditOnce(effectiveTargets, resolvedSearchPath, globFilter, {
@@ -491,7 +537,11 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				if (permissionsPolicy) {
 					const permissionsRoots = permissionRoots(context);
 					const denial = permissionsRoots
-						? checkStructuredTargets(astEditFileTargets(fileList), permissionsPolicy, permissionsRoots)
+						? checkStructuredTargets(
+								nonExemptFileTargets(fileList, this.session.cwd, scope.exemptSourcePaths),
+								permissionsPolicy,
+								permissionsRoots,
+							)
 						: {
 								rule: "permissions.profile",
 								reason:
@@ -518,7 +568,11 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						if (livePolicy) {
 							const liveRoots = permissionRoots(context);
 							const liveDenial = liveRoots
-								? checkStructuredTargets(astEditFileTargets(fileList), livePolicy, liveRoots)
+								? checkStructuredTargets(
+										nonExemptFileTargets(fileList, this.session.cwd, scope.exemptSourcePaths),
+										livePolicy,
+										liveRoots,
+									)
 								: {
 										rule: "permissions.profile",
 										reason:
@@ -529,12 +583,23 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 							if (liveDenial) throw new PermissionDeniedError(this.name, liveDenial.rule, liveDenial.reason);
 
 							if (liveRoots && recursiveTargets) {
-								const filteredTargets = await excludeDenyReadSearchTargets(
-									recursiveTargets,
-									livePolicy,
-									liveRoots,
+								// Same exempt-target carry-through as the dry-run pass above:
+								// `scope.exemptSourcePaths` is resolved once against the
+								// original raw inputs and stays valid for this re-check.
+								const exemptTargets = recursiveTargets.filter(target =>
+									scope.exemptSourcePaths.has(path.resolve(target.basePath)),
 								);
-								if (filteredTargets) applyTargets = filteredTargets;
+								const targetsToFilter =
+									exemptTargets.length > 0
+										? recursiveTargets.filter(
+												target => !scope.exemptSourcePaths.has(path.resolve(target.basePath)),
+											)
+										: recursiveTargets;
+								const filteredTargets =
+									targetsToFilter.length > 0
+										? await excludeDenyReadSearchTargets(targetsToFilter, livePolicy, liveRoots)
+										: [];
+								if (filteredTargets) applyTargets = [...exemptTargets, ...filteredTargets];
 							}
 
 							// `fileList` is the preview-time discovery; the real (non-dry-run)
@@ -555,7 +620,11 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 							for (const fileChange of freshPreview.fileChanges) recordFreshFile(formatPath(fileChange.path));
 							for (const change of freshPreview.changes) recordFreshFile(formatPath(change.path));
 							const freshDenial = liveRoots
-								? checkStructuredTargets(astEditFileTargets(freshFileList), livePolicy, liveRoots)
+								? checkStructuredTargets(
+										nonExemptFileTargets(freshFileList, this.session.cwd, scope.exemptSourcePaths),
+										livePolicy,
+										liveRoots,
+									)
 								: undefined;
 							if (freshDenial) throw new PermissionDeniedError(this.name, freshDenial.rule, freshDenial.reason);
 						}
