@@ -263,6 +263,59 @@ function assertSecurityBundleWriteAllowed(root: string, host: SecurityCoordinato
 	if (denial) throw new PermissionDeniedError("security_scan", denial.rule, denial.reason);
 }
 
+/**
+ * Authorize the security store's own persistence directory, distinct from
+ * `assertSecurityWriteAllowed`'s `output_root` (the scan's report
+ * destination): `SecurityStore.open` creates `projectDirectory` and writes
+ * `index.json` (`ensurePrivateDirectory` + `#ensureIndex`, `store.ts`) the
+ * moment it opens, under the agent state directory - unrelated to, and
+ * unauthorized by, any `output_root` check. Every `#openStore` call site
+ * (`#recoverInterruptedOperations`, `preflight`, `start`) must clear this
+ * first, or a denied call has already created store state on disk before
+ * anything else in this coordinator has authorized it. `projectDirectory`
+ * is the caller's responsibility to derive — through the injected
+ * `#deriveOutputWorkRoot` dependency, not the bare `SecurityStore` static —
+ * so a test-scoped `stateRoot` and this check agree on where the store
+ * actually lands, the same reasoning `#deriveOutputWorkRoot`'s own call
+ * sites already follow.
+ */
+function assertSecurityStoreWriteAllowed(projectDirectory: string, host: SecurityCoordinatorHost): void {
+	const policy = loadPermissionsConfig(host.settings);
+	if (!policy) return;
+	const roots: PermissionRoots = { cwd: host.cwd, additionalDirectories: host.additionalDirectories ?? [] };
+	const indexPath = path.join(projectDirectory, "index.json");
+	const field = "security_store";
+	const targets: PathTarget[] = [
+		{ raw: projectDirectory, access: "write", field },
+		{ raw: indexPath, access: "write", field },
+		{ raw: `${indexPath}.${process.pid}.00000000-0000-0000-0000-000000000000.tmp`, access: "write", field },
+	];
+	const denial = checkStructuredTargets(targets, policy, roots);
+	if (denial) throw new PermissionDeniedError("security_scan", denial.rule, denial.reason);
+}
+
+/**
+ * Authorize the specific plan file `putPlan` (`store.ts`) is about to write
+ * under the store's `plans/` directory, mirroring
+ * {@link assertSecurityBundleWriteAllowed}'s per-file authorization for
+ * bundle writes rather than treating the project directory's root
+ * authorization as covering every descendant a `deny.write` glob can still
+ * name.
+ */
+function assertSecurityPlanWriteAllowed(projectDirectory: string, planId: string, host: SecurityCoordinatorHost): void {
+	const policy = loadPermissionsConfig(host.settings);
+	if (!policy) return;
+	const roots: PermissionRoots = { cwd: host.cwd, additionalDirectories: host.additionalDirectories ?? [] };
+	const planPath = path.join(projectDirectory, "plans", `${planId}.json`);
+	const field = "security_store";
+	const targets: PathTarget[] = [
+		{ raw: planPath, access: "write", field },
+		{ raw: `${planPath}.${process.pid}.00000000-0000-0000-0000-000000000000.tmp`, access: "write", field },
+	];
+	const denial = checkStructuredTargets(targets, policy, roots);
+	if (denial) throw new PermissionDeniedError("security_scan", denial.rule, denial.reason);
+}
+
 function createOperationId(): string {
 	return `secop_${Bun.randomUUIDv7().replaceAll("-", "")}`;
 }
@@ -514,6 +567,8 @@ export class SecurityCoordinator {
 	}
 
 	async #recoverInterruptedOperations(): Promise<void> {
+		const projectDirectory = path.dirname(await this.#deriveOutputWorkRoot(this.#host.cwd));
+		assertSecurityStoreWriteAllowed(projectDirectory, this.#host);
 		const store = await this.#openStore(this.#host.cwd);
 		for (const summary of await store.listScans()) {
 			const bundle = await store.getBundle(summary.id);
@@ -579,6 +634,7 @@ export class SecurityCoordinator {
 			input.outputRoot ?? path.join(workRoot, Bun.randomUUIDv7()),
 		);
 		assertSecurityWriteAllowed(resolvedOutputRoot, this.#host, "output_root");
+		assertSecurityStoreWriteAllowed(path.dirname(workRoot), this.#host);
 		const store = await this.#openStore(this.#host.cwd);
 		await fs.mkdir(workRoot, { recursive: true, mode: 0o700 });
 		if (process.platform !== "win32") await fs.chmod(workRoot, 0o700);
@@ -598,6 +654,7 @@ export class SecurityCoordinator {
 			this.#gitAdapter,
 			securityPathPolicy(this.#host.settings),
 		);
+		assertSecurityPlanWriteAllowed(store.projectDirectory, plan.id, this.#host);
 		await store.putPlan(plan);
 		return plan;
 	}
@@ -607,6 +664,8 @@ export class SecurityCoordinator {
 			throw new Error("Security is disabled; enable security.enabled before starting a scan");
 		}
 		await this.#ensureRecovered();
+		const projectDirectory = path.dirname(await this.#deriveOutputWorkRoot(this.#host.cwd));
+		assertSecurityStoreWriteAllowed(projectDirectory, this.#host);
 		const store = await this.#openStore(this.#host.cwd);
 		const plan = await store.getPlan(input.planId);
 		if (!plan) throw new Error(`Unknown security scan plan: ${input.planId}`);

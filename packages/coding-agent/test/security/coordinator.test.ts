@@ -297,12 +297,17 @@ describe("native security coordinator", () => {
 	test("authorizes an explicit output_root under an approved additional directory", async () => {
 		const approvedOutputDir = path.join(temporaryRoot, "approved-reports");
 		await fs.mkdir(approvedOutputDir, { recursive: true });
+		// `confineToRoots` drops an unresolvable (not-yet-created) root rather
+		// than trusting it, so the store's own state directory must already
+		// exist before it can act as an approved root, same as any other
+		// approved directory below.
+		await fs.mkdir(stateRoot, { recursive: true });
 		const restrictiveSettings = Settings.isolated({ "security.enabled": true, "permissions.profile": "workspace" });
 		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
 		const coordinator = new SecurityCoordinator(
 			{
 				cwd: repositoryRoot,
-				additionalDirectories: [approvedOutputDir],
+				additionalDirectories: [approvedOutputDir, stateRoot],
 				settings: restrictiveSettings,
 				authStorage,
 				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
@@ -345,16 +350,23 @@ describe("native security coordinator", () => {
 	test("denies start() when a descendant deny rule matches a generated bundle file, even though output_root itself is approved", async () => {
 		const approvedOutputDir = path.join(temporaryRoot, "approved-reports-3");
 		await fs.mkdir(approvedOutputDir, { recursive: true });
+		await fs.mkdir(stateRoot, { recursive: true });
 		const restrictiveSettings = Settings.isolated({
 			"security.enabled": true,
 			"permissions.profile": "workspace",
-			"permissions.deny.write": ["**/*.json"],
+			// Scoped to the output directory rather than a blanket `**/*.json`:
+			// the store's own `index.json`/plan file now also clear the same
+			// resource-permission gate (`assertSecurityStoreWriteAllowed`), so
+			// an unscoped pattern would deny `preflight()` itself instead of
+			// isolating this test's actual target - the bundle writer's
+			// descendant files under an already-approved `output_root`.
+			"permissions.deny.write": ["**/scan-output/*.json"],
 		});
 		const mock = createMockModel({ id: "security-mock", provider: "openai-codex" });
 		const coordinator = new SecurityCoordinator(
 			{
 				cwd: repositoryRoot,
-				additionalDirectories: [approvedOutputDir],
+				additionalDirectories: [approvedOutputDir, stateRoot],
 				settings: restrictiveSettings,
 				authStorage,
 				modelRegistry: new ModelRegistry(authStorage, path.join(temporaryRoot, "models.yml")),
