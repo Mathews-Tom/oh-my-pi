@@ -87,13 +87,23 @@ export function permissionRootList(roots: PermissionRoots): string[] {
  * the plain `resolveToCwd` behavior: there is no existing file to discover a
  * variant spelling of.
  *
+ * `isPathAllowed`, when supplied, gates every filesystem probe `resolveReadPath`
+ * would otherwise run against a `read` candidate — including the very first one
+ * against the plain lexical path — so a denied file is never touched on disk
+ * merely to discover an alternate spelling of it.
+ *
  * A path that resolution refuses (an internal scheme reaching this far) is
  * reported as unresolvable rather than guessed at, and the caller fails
  * closed.
  */
-export function resolveTargetPath(raw: string, cwd: string, access: PathAccess = "write"): string | null {
+export function resolveTargetPath(
+	raw: string,
+	cwd: string,
+	access: PathAccess = "write",
+	isPathAllowed?: (candidate: string) => boolean,
+): string | null {
 	try {
-		return access === "read" ? resolveReadPath(raw, cwd) : resolveToCwd(raw, cwd);
+		return access === "read" ? resolveReadPath(raw, cwd, isPathAllowed) : resolveToCwd(raw, cwd);
 	} catch {
 		return null;
 	}
@@ -295,7 +305,12 @@ export function decideTarget(target: PathTarget, policy: PermissionPolicy, roots
 			if (decision.kind === "deny") return decision;
 			continue;
 		}
-		const absolutePath = resolveTargetPath(spelling.raw, roots.cwd, spelling.access);
+		const absolutePath = resolveTargetPath(
+			spelling.raw,
+			roots.cwd,
+			spelling.access,
+			candidate => decidePathTarget(spelling, candidate, policy, roots).kind !== "deny",
+		);
 		if (!absolutePath) {
 			return {
 				kind: "deny",

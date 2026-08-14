@@ -1210,40 +1210,63 @@ export async function partitionExistingPaths(
 	return { valid, missing };
 }
 
-export function resolveReadPath(filePath: string, cwd: string): string {
+/**
+ * Resolve a read path to its real on-disk spelling, probing filesystem-normalization
+ * variants (shell-escape, macOS AM/PM, NFD, curly-quote) a caller might have meant.
+ *
+ * `isPathAllowed`, when supplied, is consulted before every `fs.accessSync` probe —
+ * including the very first one against the plain lexical candidate — so a candidate
+ * is never touched on disk before its own authorization is known. A candidate the
+ * predicate denies is returned immediately as the resolution result (so the caller's
+ * policy decision fires on the exact spelling that was actually forbidden) instead of
+ * being skipped in favor of guessing whether some other spelling might be allowed —
+ * that would turn `resolveReadPath` into an oracle for finding an unprotected variant
+ * of a forbidden name. Only a candidate the predicate allows is checked for existence.
+ */
+export function resolveReadPath(filePath: string, cwd: string, isPathAllowed?: (candidate: string) => boolean): string {
 	const resolved = resolveToCwd(filePath, cwd);
+	// Denied → this *is* the resolution (caller's policy check must see it).
+	// Allowed and existing → this is the resolution.
+	// Allowed but missing → keep looking at other candidates.
+	const probe = (candidate: string): string | undefined => {
+		if (isPathAllowed?.(candidate) === false) return candidate;
+		return fileExists(candidate) ? candidate : undefined;
+	};
 	const shellEscapedVariant = tryShellEscapedPath(resolved);
 	const baseCandidates = shellEscapedVariant !== resolved ? [resolved, shellEscapedVariant] : [resolved];
 
 	for (const baseCandidate of baseCandidates) {
-		if (fileExists(baseCandidate)) {
-			return baseCandidate;
-		}
+		const result = probe(baseCandidate);
+		if (result !== undefined) return result;
 	}
 
 	for (const baseCandidate of baseCandidates) {
 		// Try macOS AM/PM variant (narrow no-break space before AM/PM)
 		const amPmVariant = tryMacOSScreenshotPath(baseCandidate);
-		if (amPmVariant !== baseCandidate && fileExists(amPmVariant)) {
-			return amPmVariant;
+		if (amPmVariant !== baseCandidate) {
+			const result = probe(amPmVariant);
+			if (result !== undefined) return result;
 		}
 
 		// Try NFD variant (macOS stores filenames in NFD form)
 		const nfdVariant = tryNFDVariant(baseCandidate);
-		if (nfdVariant !== baseCandidate && fileExists(nfdVariant)) {
-			return nfdVariant;
+		if (nfdVariant !== baseCandidate) {
+			const result = probe(nfdVariant);
+			if (result !== undefined) return result;
 		}
 
 		// Try curly quote variant (macOS uses U+2019 in screenshot names)
 		const curlyVariant = tryCurlyQuoteVariant(baseCandidate);
-		if (curlyVariant !== baseCandidate && fileExists(curlyVariant)) {
-			return curlyVariant;
+		if (curlyVariant !== baseCandidate) {
+			const result = probe(curlyVariant);
+			if (result !== undefined) return result;
 		}
 
 		// Try combined NFD + curly quote (for French macOS screenshots like "Capture d'écran")
 		const nfdCurlyVariant = tryCurlyQuoteVariant(nfdVariant);
-		if (nfdCurlyVariant !== baseCandidate && fileExists(nfdCurlyVariant)) {
-			return nfdCurlyVariant;
+		if (nfdCurlyVariant !== baseCandidate) {
+			const result = probe(nfdCurlyVariant);
+			if (result !== undefined) return result;
 		}
 	}
 

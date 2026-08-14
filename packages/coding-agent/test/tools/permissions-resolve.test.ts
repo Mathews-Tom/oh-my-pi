@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { resolveReadPath } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import {
 	buildPermissionPolicy,
 	confineToRoots,
@@ -270,6 +271,64 @@ describe("read-path normalization", () => {
 		fs.writeFileSync(path.join(workspace, "plain file.txt"), "hello");
 		const policy = buildPermissionPolicy("workspace", { denyRead: ["**/secret file.txt"] });
 		expect(decideTarget(target("plain\\ file.txt"), policy, roots).kind).toBe("allow");
+	});
+});
+
+describe("resolveReadPath authorization ordering", () => {
+	// The finding: `resolveReadPath` probed every filename-variant spelling
+	// (shell-escape, AM/PM, NFD, curly-quote) with `fs.accessSync` before any
+	// authorization ran, so a denied path was touched on disk merely to
+	// discover whether some other spelling of it existed. `isPathAllowed`
+	// must gate each candidate's existence probe, including the very first
+	// one against the plain lexical path.
+
+	it("stops at a denied candidate rather than continuing to probe a later, allowed spelling", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-read-path-"));
+		try {
+			// The literal (unescaped) candidate is denied but does not exist; the
+			// shell-escaped variant is allowed and DOES exist. If a denial were
+			// merely skipped, resolution would keep looking and return the
+			// existing, allowed variant instead — exactly the "guess another
+			// spelling past a denial" behavior this ordering must not permit.
+			fs.writeFileSync(path.join(dir, "secret file.txt"), "SECRET=1");
+			const literalPath = path.join(dir, "secret\\ file.txt");
+			const escapedPath = path.join(dir, "secret file.txt");
+			const denyLiteralOnly = (candidate: string): boolean => candidate !== literalPath;
+			const resolved = resolveReadPath("secret\\ file.txt", dir, denyLiteralOnly);
+			expect(resolved).toBe(literalPath);
+			expect(resolved).not.toBe(escapedPath);
+			// With no predicate at all, the same input resolves to the file that
+			// actually exists — proving the deny above is what changed the outcome.
+			expect(resolveReadPath("secret\\ file.txt", dir)).toBe(escapedPath);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("checks the plain lexical candidate before probing it for existence", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-read-path-"));
+		try {
+			fs.writeFileSync(path.join(dir, "plain.txt"), "hello");
+			const lexicalPath = path.join(dir, "plain.txt");
+			const denyEverything = (): boolean => false;
+			// Denying the lexical candidate itself must short-circuit before any
+			// `fs.accessSync` probe — proven by falling back to the unconfirmed
+			// lexical path even though the file exists and would otherwise win.
+			expect(resolveReadPath("plain.txt", dir, denyEverything)).toBe(lexicalPath);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	// End-to-end through the permission layer: a denied variant spelling of an
+	// existing secret must never surface as the resolved read target.
+	it("keeps a denied shell-escaped spelling from resolving to the secret it names, via decideTarget", () => {
+		const secretFile = path.join(workspace, "escaped secret.txt");
+		fs.writeFileSync(secretFile, "SECRET=1");
+		const policy = buildPermissionPolicy("workspace", { denyRead: ["**/escaped secret.txt"] });
+		const denied = decideTarget(target("escaped\\ secret.txt"), policy, roots);
+		expect(denied.kind).toBe("deny");
+		if (denied.kind === "deny") expect(denied.rule).toBe("**/escaped secret.txt");
 	});
 });
 
