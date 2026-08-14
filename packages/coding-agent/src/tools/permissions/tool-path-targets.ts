@@ -154,12 +154,21 @@ function singlePath(field: string, access: PathAccess): PathTargetExtractor {
  * `path` executes against the unwrapped target, so authorizing the raw
  * bracketed literal instead would check a different path than the one that
  * actually gets written.
+ *
+ * `Bun.write` creates every missing parent directory before writing the
+ * file (`WriteTool`'s normal writethrough never `mkdir`s first), so
+ * authorizing only the final path lets `permissions.deny.write: ["**\/blocked"]`
+ * pass a `write({ path: "blocked/file.txt" })` call that still creates the
+ * denied `blocked` directory — the same gap `extractEmbeddedEditPaths` and
+ * `extractEditPaths` already close for `edit`'s create paths.
  */
 function writePath(field: string): PathTargetExtractor {
-	return args => {
+	return (args, roots) => {
 		const out: PathTarget[] = [];
 		const raw = args[field];
-		pushPath(out, typeof raw === "string" ? unwrapHashlineHeaderPath(raw) : raw, "write", field);
+		const target = typeof raw === "string" ? unwrapHashlineHeaderPath(raw) : raw;
+		pushPath(out, target, "write", field);
+		if (typeof target === "string") pushCreateParentDirectories(out, target, roots);
 		return out;
 	};
 }

@@ -597,6 +597,16 @@ describe("write-side settings reach the policy", () => {
 		expect((await run("write", { path: "src/ok.ts" }, context)).calls).toHaveLength(1);
 	});
 
+	it("denies write when a deny rule matches a parent directory it will create", async () => {
+		// `Bun.write` creates every missing parent directory before writing the
+		// file - authorizing only the final path let `deny.write: ["**/blocked"]`
+		// pass a `write({ path: "blocked/file.txt" })` call that still created
+		// the denied `blocked` directory.
+		const context = contextOf({ "permissions.profile": "workspace", "permissions.deny.write": ["**/blocked"] });
+		expect(await denialOf("write", { path: "blocked/file.txt" }, context)).toContain('"**/blocked"');
+		expect((await run("write", { path: "not-blocked/file.txt" }, context)).calls).toHaveLength(1);
+	});
+
 	it("honours permissions.allow.write as a carve-out from a profile rule", async () => {
 		const denied = contextOf({ "permissions.profile": "strict" });
 		expect(await denialOf("write", { path: "svc/.env" }, denied)).toContain("**/.env");
