@@ -119,6 +119,31 @@ describe("debug tool DAP path redaction", () => {
 		expect(denied.details?.disassembly?.[0]?.location?.path).not.toBe(DENIED_PATH);
 	});
 
+	it("redacts a denied scope source path in both rendered output and details", async () => {
+		spyOn(dapModule.dapSessionManager, "scopes").mockResolvedValue({
+			snapshot: makeSnapshot(),
+			scopes: [
+				{
+					name: "Locals",
+					variablesReference: 1,
+					expensive: false,
+					source: { path: DENIED_PATH, name: "secret.js" },
+				},
+			],
+		});
+		const tool = new DebugTool(makeSession());
+
+		const denied = await tool.execute(
+			"call-1",
+			{ action: "scopes", frame_id: 70 },
+			undefined,
+			undefined,
+			makeContext([DENIED_PATH]),
+		);
+		expect(textOf(denied)).not.toContain(DENIED_PATH);
+		expect(denied.details?.scopes?.[0]?.source?.path).not.toBe(DENIED_PATH);
+	});
+
 	it("redacts a denied module path while preserving module id and name", async () => {
 		spyOn(dapModule.dapSessionManager, "getActiveSession").mockReturnValue(makeSnapshot());
 		spyOn(dapModule.dapSessionManager, "getCapabilities").mockReturnValue({ supportsModulesRequest: true });

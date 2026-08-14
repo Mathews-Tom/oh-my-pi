@@ -220,6 +220,11 @@ function sanitizeDapStackFrame(frame: DapStackFrame, context: AgentToolContext |
 	return source === frame.source ? frame : { ...frame, source };
 }
 
+function sanitizeDapScope(scope: DapScope, context: AgentToolContext | undefined): DapScope {
+	const source = sanitizeDapSource(scope.source, context);
+	return source === scope.source ? scope : { ...scope, source };
+}
+
 function sanitizeDapDisassembledInstruction(
 	instruction: DapDisassembledInstruction,
 	context: AgentToolContext | undefined,
@@ -1060,9 +1065,10 @@ export class DebugTool implements AgentTool<typeof debugSchema, DebugToolDetails
 			}
 			case "scopes": {
 				const response = await dapSessionManager.scopes(params.frame_id, combinedSignal, timeoutSec * 1000);
+				const scopes = response.scopes.map(scope => sanitizeDapScope(scope, context));
 				details.snapshot = sanitizeSnapshot(response.snapshot);
-				details.scopes = response.scopes;
-				return result.text(formatScopes(response.scopes)).done();
+				details.scopes = scopes;
+				return result.text(formatScopes(scopes)).done();
 			}
 			case "variables": {
 				const variableReference = params.variable_ref ?? params.scope_id;
