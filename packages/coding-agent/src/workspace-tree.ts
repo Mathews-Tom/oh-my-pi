@@ -43,6 +43,8 @@ export interface BuildDirectoryTreeOptions {
 export interface BuildWorkspaceTreeOptions {
 	/** Abort the native workspace scan after this many milliseconds. */
 	timeoutMs?: number;
+	/** Return false to omit an entry and every descendant from the rendered tree and `agentsMdFiles`. */
+	includePath?: (absolutePath: string) => boolean;
 }
 
 /**
@@ -72,18 +74,7 @@ export async function buildDirectoryTree(cwd: string, options: BuildDirectoryTre
 		return emptyTree(rootPath);
 	}
 
-	const filteredEntries = options.includePath
-		? entries.filter(entry => {
-				let relativePath = entry.path;
-				while (relativePath && relativePath !== ".") {
-					if (!options.includePath!(path.resolve(rootPath, relativePath))) return false;
-					const parent = path.dirname(relativePath);
-					if (parent === relativePath) break;
-					relativePath = parent;
-				}
-				return true;
-			})
-		: entries;
+	const filteredEntries = filterEntriesByIncludePath(rootPath, entries, options.includePath);
 
 	return assembleTree(rootPath, filteredEntries, {
 		perDirLimit,
@@ -112,20 +103,62 @@ export async function buildWorkspaceTree(cwd: string, options: BuildWorkspaceTre
 			collectAgentsMd: true,
 			timeoutMs: options.timeoutMs,
 		});
-		const tree = assembleTree(rootPath, result.entries, {
+		const filteredEntries = filterEntriesByIncludePath(rootPath, result.entries, options.includePath);
+		const tree = assembleTree(rootPath, filteredEntries, {
 			perDirLimit: WORKSPACE_DEFAULTS.perDirLimit,
 			rootLimit: WORKSPACE_DEFAULTS.perDirLimit,
 			lineCap: WORKSPACE_DEFAULTS.lineCap,
+			// Filtering can only drop native-truncation candidates, never restore
+			// them, so the native flag alone still tells the caller whether the
+			// unfiltered scan itself hit its own cap.
 			nativeTruncated: result.truncated,
 			// This tree is embedded in the cached system prompt. Render absolute
 			// mtimes so the block is byte-identical across sessions and does not
 			// bust the prompt cache (a relative "Nm ago" drifts every build).
 			ageMode: "absolute",
 		});
-		return { ...tree, agentsMdFiles: result.agentsMdFiles };
+		const agentsMdFiles = options.includePath
+			? result.agentsMdFiles.filter(filePath => pathIncluded(rootPath, filePath, options.includePath))
+			: result.agentsMdFiles;
+		return { ...tree, agentsMdFiles };
 	} catch {
 		return { ...emptyTree(rootPath), agentsMdFiles: [] };
 	}
+}
+
+/**
+ * `true` when `includePath` accepts `relativePath` and every ancestor up to
+ * (not including) `rootPath`. Walks leaf to root so a denied directory
+ * silently hides everything beneath it, not just an exact path match.
+ * `undefined` is a no-op (always included).
+ */
+function pathIncluded(
+	rootPath: string,
+	relativePath: string,
+	includePath: ((absolutePath: string) => boolean) | undefined,
+): boolean {
+	if (!includePath) return true;
+	let current = relativePath;
+	while (current && current !== ".") {
+		if (!includePath(path.resolve(rootPath, current))) return false;
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	return true;
+}
+
+/**
+ * Drop an entry and every descendant when `includePath` rejects any ancestor
+ * (including the entry itself). `undefined` is a no-op.
+ */
+function filterEntriesByIncludePath(
+	rootPath: string,
+	entries: readonly GlobMatch[],
+	includePath: ((absolutePath: string) => boolean) | undefined,
+): readonly GlobMatch[] {
+	if (!includePath) return entries;
+	return entries.filter(entry => pathIncluded(rootPath, entry.path, includePath));
 }
 
 // ─── internals ──────────────────────────────────────────────────────────────

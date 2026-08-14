@@ -160,4 +160,36 @@ describe("context-file prompt refresh", () => {
 			authStorage.close();
 		}
 	});
+
+	it("re-filters context files by the current resource permission policy after a profile switch", async () => {
+		using tempDir = TempDir.createSync("@omp-context-refresh-permissions-");
+		await Bun.write(tempDir.join("AGENTS.md"), INITIAL_CONTEXT);
+		const settings = Settings.isolated({});
+		const { session, authStorage } = await createContextSession(tempDir.path(), settings);
+
+		try {
+			expect(session.systemPrompt.join("\n")).toContain(INITIAL_CONTEXT);
+
+			// Mirrors `/perm strict`: a session-scoped override, not a fresh
+			// session build. The predicate `refreshSkills` re-derives for context
+			// files must be recomputed from this current policy, not the one
+			// captured when the session started.
+			settings.override("permissions.profile", "strict");
+			settings.override("permissions.deny.read", ["**/AGENTS.md"]);
+			await session.refreshSkills();
+
+			expect(session.systemPrompt.join("\n")).not.toContain(INITIAL_CONTEXT);
+
+			// Switching back off must also take effect immediately, not keep
+			// filtering on the stale strict-profile predicate.
+			settings.override("permissions.profile", "off");
+			settings.clearOverride("permissions.deny.read");
+			await session.refreshSkills();
+
+			expect(session.systemPrompt.join("\n")).toContain(INITIAL_CONTEXT);
+		} finally {
+			await session.dispose();
+			authStorage.close();
+		}
+	});
 });

@@ -221,4 +221,21 @@ describe("buildWorkspaceTree", () => {
 
 		expect(tree.rendered).toContain("ago");
 	});
+
+	it("omits a denied entry, its descendants, and its AGENTS.md from the tree", async () => {
+		const cwd = await makeTempDir();
+		await Bun.write(path.join(cwd, "kept.txt"), "kept");
+		await Bun.write(path.join(cwd, "secrets", "secrets.json"), "{}");
+		await Bun.write(path.join(cwd, "secrets", "AGENTS.md"), "secret rules");
+
+		const deniedDir = path.join(cwd, "secrets");
+		const tree = await buildWorkspaceTree(cwd, {
+			includePath: absolutePath => absolutePath !== deniedDir,
+		});
+
+		expect(tree.rendered).toContain("kept.txt");
+		expect(tree.rendered).not.toContain("secrets");
+		expect(tree.rendered).not.toContain("secrets.json");
+		expect(tree.agentsMdFiles).not.toContain("secrets/AGENTS.md");
+	});
 });

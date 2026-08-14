@@ -1285,12 +1285,36 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// both the rendered-tree input and the AGENTS.md directory-context index, so
 	// startup does not perform a second recursive filesystem search. Subagents
 	// inherit the parent's resolved values via options.
+	//
+	// Derived before the scan starts (not reused from a later closure) so a
+	// denied file is omitted from the tree instead of having its name, size,
+	// and mtime rendered into the system prompt (finding under review) — the
+	// same policy `canReadSkill`/`canReadContextFile` below already enforce for
+	// their own capabilities. Mirrors session-tools.ts's skillReadPermission:
+	// sessionManager doesn't exist yet at this point in startup, so roots are
+	// derived straight from settings/options rather than the (possibly
+	// session-header-merged) sessionManager.getAdditionalDirectories().
+	const startupPermissionPolicy = loadPermissionsConfig(settings);
+	const startupPermissionRoots: PermissionRoots = {
+		cwd,
+		additionalDirectories: options.additionalDirectories ?? settings.get("workspace.additionalDirectories"),
+	};
+	const canReadWorkspacePath = startupPermissionPolicy
+		? (absolutePath: string) =>
+				decideTarget(
+					{ raw: absolutePath, access: "read", field: "workspace tree" },
+					startupPermissionPolicy,
+					startupPermissionRoots,
+				).kind !== "deny"
+		: undefined;
 	const STARTUP_SCAN_DEADLINE_MS = 5000;
 	const includeWorkspaceTree = settings.get("includeWorkspaceTree") ?? false;
 	const workspaceTreePromise: Promise<WorkspaceTree> = options.workspaceTree
 		? Promise.resolve(options.workspaceTree)
 		: includeWorkspaceTree
-			? logger.time("buildWorkspaceTree", () => buildWorkspaceTree(cwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS }))
+			? logger.time("buildWorkspaceTree", () =>
+					buildWorkspaceTree(cwd, { timeoutMs: STARTUP_SCAN_DEADLINE_MS, includePath: canReadWorkspacePath }),
+				)
 			: Promise.resolve({ rootPath: cwd, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] });
 	workspaceTreePromise.catch(() => {});
 
@@ -1304,11 +1328,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// `contextFilesPromise` is kicked off below so a denied AGENTS.md/CLAUDE.md file is rejected
 	// the same way a denied SKILL.md already is, instead of being read unconditionally into the
 	// system prompt (finding under review).
-	const skillPermissionPolicy = loadPermissionsConfig(settings);
-	const skillPermissionRoots: PermissionRoots = {
-		cwd,
-		additionalDirectories: options.additionalDirectories ?? settings.get("workspace.additionalDirectories"),
-	};
+	const skillPermissionPolicy = startupPermissionPolicy;
+	const skillPermissionRoots: PermissionRoots = startupPermissionRoots;
 	const canReadSkill = skillPermissionPolicy
 		? (skillPath: string) =>
 				decideTarget(
@@ -1317,14 +1338,26 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					skillPermissionRoots,
 				).kind !== "deny"
 		: undefined;
-	const canReadContextFile = skillPermissionPolicy
-		? (contextFilePath: string) =>
-				decideTarget(
-					{ raw: contextFilePath, access: "read", field: "context file" },
-					skillPermissionPolicy,
-					skillPermissionRoots,
-				).kind !== "deny"
-		: undefined;
+	// `deriveCanReadContextFile` is called again, live, inside `rebuildSystemPrompt`
+	// below rather than reused from this closure: a mid-session `/perm` switch
+	// (`session.settings.override("permissions.profile", …)`) mutates `settings`
+	// after this point, and `refreshSkills` (session-tools.ts) re-derives
+	// `canReadSkill` fresh from current settings on every call through
+	// `skillReadPermission` — this snapshot alone would otherwise keep gating
+	// context-file re-discovery on the profile active at session start
+	// (finding under review).
+	const deriveCanReadContextFile = (
+		forSettings: Settings,
+		forCwd: string,
+		additionalDirectories: readonly string[],
+	): ((contextFilePath: string) => boolean) | undefined => {
+		const policy = loadPermissionsConfig(forSettings);
+		if (!policy) return undefined;
+		const roots: PermissionRoots = { cwd: forCwd, additionalDirectories: [...additionalDirectories] };
+		return contextFilePath =>
+			decideTarget({ raw: contextFilePath, access: "read", field: "context file" }, policy, roots).kind !== "deny";
+	};
+	const canReadContextFile = deriveCanReadContextFile(settings, cwd, skillPermissionRoots.additionalDirectories);
 	const contextFilesPromise = options.contextFiles
 		? Promise.resolve(options.contextFiles)
 		: logger.time("discoverContextFiles", discoverContextFiles, cwd, agentDir, undefined, canReadContextFile);
@@ -2868,7 +2901,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					promptCwd,
 					agentDir,
 					[...(settings.get("disabledExtensions") ?? [])],
-					canReadContextFile,
+					deriveCanReadContextFile(settings, promptCwd, sessionManager.getAdditionalDirectories()),
 				);
 				toolSession.contextFiles = contextFiles;
 				session.setAdvisorContextPrompt(formatAdvisorContextPrompt(contextFiles));
