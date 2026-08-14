@@ -1118,7 +1118,14 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 						continue;
 					}
 					respondingServers.add(workspaceServerName);
-					aggregatedSymbols.push(...filterWorkspaceSymbols(workspaceResult, normalizedQuery));
+					aggregatedSymbols.push(
+						...filterWorkspaceSymbols(workspaceResult, normalizedQuery).filter(symbol =>
+							isResourcePathPermitted(
+								{ raw: uriToFile(symbol.location.uri), access: "read", field: "workspace symbol" },
+								toolContext,
+							),
+						),
+					);
 				} catch (err) {
 					if (err instanceof ToolAbortError || signal?.aborted) {
 						throw err;
