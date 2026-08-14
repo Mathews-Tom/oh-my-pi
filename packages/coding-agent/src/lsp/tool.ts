@@ -13,7 +13,8 @@ import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { truncateForPrompt } from "../tools/approval";
 import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
-import { enforceResourcePathTargets, isResourcePathPermitted } from "../tools/permissions/gate";
+import { loadPermissionsConfig } from "../tools/permissions/config";
+import { enforceResourcePathTargets, isResourcePathPermitted, PermissionDeniedError } from "../tools/permissions/gate";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
 import {
@@ -330,6 +331,23 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		// Diagnostics can be batch or single-file - queries all applicable servers
 		if (action === "diagnostics") {
 			if (file === "*") {
+				// `runWorkspaceDiagnostics` starts a whole-project compiler subprocess
+				// with no filesystem scope this gate can enforce — every source file
+				// and project config the compiler chooses to open is opaque to us.
+				// Under an active `permissions.deny.read`/`confineReads` restriction
+				// that unconstrained scope could bypass rules a targeted glob request
+				// (below) enforces per file, so refuse rather than run it unchecked
+				// (finding under review).
+				const workspacePolicy = loadPermissionsConfig(toolContext?.settings);
+				if (workspacePolicy && (workspacePolicy.confineReads || workspacePolicy.deny.read.length > 0)) {
+					throw new PermissionDeniedError(
+						"lsp",
+						"permissions.deny.read",
+						'Workspace-wide diagnostics (file: "*") run an unconstrained whole-project subprocess whose ' +
+							"filesystem scope cannot be checked against the active resource permission policy. Request " +
+							"diagnostics for a specific file or glob instead, or set permissions.profile: off.",
+					);
+				}
 				// `*` => run workspace diagnostics across all configured servers
 				const result = await runWorkspaceDiagnostics(this.session.cwd, signal);
 				return {
@@ -367,6 +385,21 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					details: { action, success: true, request: params },
 				};
 			}
+			// The pre-execution gate only ever authorized the declared literal
+			// spelling (`file`, e.g. a glob root). Everything the glob actually
+			// expanded to is opened, refreshed, and read for diagnostics below
+			// without ever reauthorizing it - a `permissions.deny.read`/
+			// `confineReads` rule on a source file or project config bypassed by
+			// requesting the same content through a glob (finding under review).
+			enforceResourcePathTargets(
+				"lsp",
+				targets.map(target => ({
+					raw: resolveToCwd(target, this.session.cwd),
+					access: "read" as const,
+					field: "diagnostics target",
+				})),
+				toolContext,
+			);
 
 			const detailed = targets.length > 1 || truncatedGlobTargets;
 			const diagnosticsWaitTimeoutMs = detailed

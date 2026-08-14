@@ -4470,6 +4470,112 @@ describe("LSP configuration permissions", () => {
 	});
 });
 
+describe("LSP diagnostics permissions", () => {
+	// The finding: the pre-execution gate only ever authorized the declared
+	// literal `file` spelling (a glob root), but every concrete file the glob
+	// actually expands to is opened, refreshed, and read for diagnostics
+	// without ever reauthorizing it.
+	it("denies a diagnostics glob target a deny.read rule matches, before opening it", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-diagnostics-permissions-");
+		const cwd = tempDir.path();
+		const targetFile = path.join(cwd, "secret.ts");
+		try {
+			fs.writeFileSync(targetFile, "export const secret = 1;\n");
+			const settings = Settings.isolated({
+				"permissions.profile": "workspace",
+				"permissions.deny.read": ["**/secret.ts"],
+			});
+			const toolContext = {
+				sessionManager: {
+					getCwd: () => cwd,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "lsp-diagnostics-permissions",
+				},
+				settings,
+			} as unknown as AgentToolContext;
+			const tool = new LspTool(makeLspSession(cwd, settings));
+
+			await expect(
+				tool.execute(
+					"lsp-diagnostics-glob-denied",
+					{ action: "diagnostics", file: targetFile, timeout: 5 },
+					undefined,
+					undefined,
+					toolContext,
+				),
+			).rejects.toThrow("**/secret.ts");
+		} finally {
+			configCache.delete(cwd);
+			tempDir.removeSync();
+		}
+	});
+
+	// The finding: `runWorkspaceDiagnostics` starts an unconstrained
+	// whole-project compiler subprocess with no filesystem scope the gate can
+	// enforce, so a `file: "*"` request bypassed any active read restriction
+	// entirely.
+	it("refuses workspace-wide diagnostics under an active read restriction", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-workspace-diagnostics-permissions-");
+		const cwd = tempDir.path();
+		try {
+			const settings = Settings.isolated({
+				"permissions.profile": "workspace",
+				"permissions.deny.read": ["**/*.env"],
+			});
+			const toolContext = {
+				sessionManager: {
+					getCwd: () => cwd,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "lsp-workspace-diagnostics-permissions",
+				},
+				settings,
+			} as unknown as AgentToolContext;
+			const tool = new LspTool(makeLspSession(cwd, settings));
+
+			await expect(
+				tool.execute(
+					"lsp-workspace-diagnostics-denied",
+					{ action: "diagnostics", file: "*" },
+					undefined,
+					undefined,
+					toolContext,
+				),
+			).rejects.toThrow(/permissions\.deny\.read|unconstrained/);
+		} finally {
+			configCache.delete(cwd);
+			tempDir.removeSync();
+		}
+	});
+
+	it("still permits workspace-wide diagnostics when the permission profile is off (the default)", async () => {
+		const tempDir = TempDir.createSync("@omp-lsp-workspace-diagnostics-off-");
+		const cwd = tempDir.path();
+		try {
+			const toolContext = {
+				sessionManager: {
+					getCwd: () => cwd,
+					getAdditionalDirectories: () => [],
+					getSessionId: () => "lsp-workspace-diagnostics-off",
+				},
+				settings: Settings.isolated(),
+			} as unknown as AgentToolContext;
+			const tool = new LspTool(makeLspSession(cwd));
+
+			const result = await tool.execute(
+				"lsp-workspace-diagnostics-off",
+				{ action: "diagnostics", file: "*" },
+				undefined,
+				undefined,
+				toolContext,
+			);
+			expect(result.details).toMatchObject({ success: true });
+		} finally {
+			configCache.delete(cwd);
+			tempDir.removeSync();
+		}
+	});
+});
+
 describe("expert elixir lsp", () => {
 	it("registers expert for .ex while keeping elixirls primary", () => {
 		const config = { servers: DEFAULTS as unknown as Record<string, ServerConfig> };
