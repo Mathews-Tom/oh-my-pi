@@ -29,19 +29,25 @@ import { uriToFile } from "./utils";
  * Every URI a `WorkspaceEdit` touches, split by how `applyWorkspaceEdit`
  * (`lsp/edits.ts`) actually applies it: a text edit (`edit.changes` map entry
  * or a `TextDocumentEdit`'s `textDocument.uri`) calls `applyTextEdits`, which
- * reads the whole file before rewriting it; a `create` resource op writes
- * empty content with nothing to read, and `rename`/`delete` use
- * `fs.rename`/`fs.rm` — neither reads the file's content either. Kept apart
- * so a text-edit target can be checked for `read` in addition to `write`
- * without over-authorizing the resource ops that never read anything.
+ * reads the whole file before rewriting it; `create` writes empty content
+ * with nothing to read; `rename`/`delete` use `fs.rename`/`fs.rm` — neither
+ * reads the file's content either. `create` and `rename` are kept apart from
+ * a flat URI list (rather than folded into one `resourceOpUris`) because
+ * each needs its own descendant enumeration: a `create`/`rename` can
+ * implicitly create missing parent directories, and a directory `rename`
+ * moves an entire subtree in one syscall — see
+ * {@link collectMissingParentTargets} and
+ * {@link collectDirectoryRenameDescendantTargets}.
  */
 function collectWorkspaceEditUris(edit: WorkspaceEdit): {
 	textEditUris: string[];
-	resourceOpUris: string[];
+	createUris: string[];
+	renamePairs: Array<{ oldUri: string; newUri: string }>;
 	deleteUris: string[];
 } {
 	const textEditUris = new Set<string>();
-	const resourceOpUris = new Set<string>();
+	const createUris = new Set<string>();
+	const renamePairs: Array<{ oldUri: string; newUri: string }> = [];
 	const deleteUris = new Set<string>();
 	if (edit.changes) {
 		for (const uri in edit.changes) textEditUris.add(uri);
@@ -52,18 +58,21 @@ function collectWorkspaceEditUris(edit: WorkspaceEdit): {
 				textEditUris.add(change.textDocument.uri);
 			} else if ("kind" in change && change.kind) {
 				if (change.kind === "create") {
-					resourceOpUris.add(change.uri);
+					createUris.add(change.uri);
 				} else if (change.kind === "rename") {
-					resourceOpUris.add(change.oldUri);
-					resourceOpUris.add(change.newUri);
+					renamePairs.push({ oldUri: change.oldUri, newUri: change.newUri });
 				} else if (change.kind === "delete") {
-					resourceOpUris.add(change.uri);
 					deleteUris.add(change.uri);
 				}
 			}
 		}
 	}
-	return { textEditUris: [...textEditUris], resourceOpUris: [...resourceOpUris], deleteUris: [...deleteUris] };
+	return {
+		textEditUris: [...textEditUris],
+		createUris: [...createUris],
+		renamePairs,
+		deleteUris: [...deleteUris],
+	};
 }
 
 /**
@@ -76,9 +85,8 @@ function collectWorkspaceEditUris(edit: WorkspaceEdit): {
  * `enumerateRenamePairs` (`lsp/tool.ts`) — the same gap already closed for a
  * directory *rename*. Returns no targets (rather than throwing) for a
  * non-directory or unreadable URI: a plain-file delete is already fully
- * authorized by its own URI in `resourceOpUris`, and a directory that
- * vanished between the edit's computation and this check has nothing left
- * to enumerate.
+ * authorized by its own URI, and a directory that vanished between the
+ * edit's computation and this check has nothing left to enumerate.
  */
 async function collectDirectoryDeleteTargets(directoryUri: string): Promise<PathTarget[]> {
 	const directoryPath = uriToFile(directoryUri);
@@ -104,6 +112,75 @@ async function collectDirectoryDeleteTargets(directoryUri: string): Promise<Path
 	return targets;
 }
 
+/**
+ * Every missing ancestor directory `fs.mkdir(path.dirname(filePath), {
+ * recursive: true })` (`applyWorkspaceEdit`) would create, as write-access
+ * targets — walked from `filePath`'s parent up to the first existing
+ * ancestor. `applyWorkspaceEdit` runs this unconditionally for both `create`
+ * and `rename` (against the new path), so a rule like
+ * `permissions.deny.write: ["**\/blocked"]` that only ever sees the leaf
+ * file (`blocked/file.ts`, which the glob does not match) never catches the
+ * denied directory itself being created on the way to writing that file.
+ * Returns no targets once an ancestor already exists — nothing further up
+ * the chain would be created either.
+ */
+async function collectMissingParentTargets(filePath: string): Promise<PathTarget[]> {
+	const targets: PathTarget[] = [];
+	let dir = path.dirname(filePath);
+	for (;;) {
+		try {
+			await stat(dir);
+			break;
+		} catch {
+			// Missing — fs.mkdir(dir, { recursive: true }) would create it.
+		}
+		targets.push({ raw: dir, access: "write", field: "workspaceEdit" });
+		const parent = path.dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return targets;
+}
+
+/**
+ * When `oldUri` resolves to an existing directory, every file inside it
+ * recursively, as a pair of write-access targets — one at its source path,
+ * one at its projected destination under `newUri` — the concrete files
+ * `fs.rename(oldPath, newPath)` (`applyWorkspaceEdit`) actually moves as one
+ * subtree when the resource op names a directory rather than a single file.
+ * A `rename` resource op names only the two directory URIs, so authorizing
+ * those alone lets the whole-subtree move take a write-denied descendant
+ * (`tree/private.key` under an allowed `tree/`) with it, unchecked. Mirrors
+ * `enumerateRenamePairs` (`lsp/tool.ts`), the same gap already closed for the
+ * dedicated `rename_file` action. Returns no targets for a non-directory or
+ * unreadable `oldUri`: a plain-file rename is already fully authorized by
+ * its own oldUri/newUri.
+ */
+async function collectDirectoryRenameDescendantTargets(oldUri: string, newUri: string): Promise<PathTarget[]> {
+	const oldPath = uriToFile(oldUri);
+	const newPath = uriToFile(newUri);
+	try {
+		if (!(await stat(oldPath)).isDirectory()) return [];
+	} catch {
+		return [];
+	}
+	let entries: Dirent[];
+	try {
+		entries = await readdir(oldPath, { recursive: true, withFileTypes: true });
+	} catch {
+		return [];
+	}
+	const targets: PathTarget[] = [];
+	for (const entry of entries) {
+		if (!entry.isFile()) continue;
+		const absOld = path.join(entry.parentPath ?? oldPath, entry.name);
+		const rel = path.relative(oldPath, absOld);
+		targets.push({ raw: absOld, access: "write", field: "workspaceEdit" });
+		targets.push({ raw: path.join(newPath, rel), access: "write", field: "workspaceEdit" });
+	}
+	return targets;
+}
+
 function requireRootsOrDeny(toolName: string, profile: string, roots: PermissionRoots | null): PermissionRoots {
 	if (roots) return roots;
 	throw new PermissionDeniedError(
@@ -123,7 +200,12 @@ function requireRootsOrDeny(toolName: string, profile: string, roots: Permission
  * would have been. A text-edit target is also checked for `read`:
  * `applyTextEdits` reads the whole file before rewriting it, so a target
  * that is write-allowed but read-denied would otherwise let the edit's
- * server-computed content bypass `permissions.deny.read`.
+ * server-computed content bypass `permissions.deny.read`. `create` and
+ * `rename` additionally authorize every missing parent directory
+ * `applyWorkspaceEdit`'s `fs.mkdir(…, { recursive: true })` would create,
+ * and a directory `rename` additionally authorizes every descendant the
+ * underlying `fs.rename` moves as one subtree — both filesystem side
+ * effects a flat URI check alone would miss.
  */
 export async function assertWorkspaceEditAllowed(
 	edit: WorkspaceEdit,
@@ -133,15 +215,33 @@ export async function assertWorkspaceEditAllowed(
 	const policy = loadPermissionsConfig(context?.settings);
 	if (!policy) return;
 	const roots = requireRootsOrDeny(toolName, policy.profile, permissionRoots(context));
-	const { textEditUris, resourceOpUris, deleteUris } = collectWorkspaceEditUris(edit);
-	const deleteDescendantTargets = (await Promise.all(deleteUris.map(collectDirectoryDeleteTargets))).flat();
+	const { textEditUris, createUris, renamePairs, deleteUris } = collectWorkspaceEditUris(edit);
+	const [deleteDescendantTargets, createParentTargets, renameParentTargets, renameDescendantTargets] =
+		await Promise.all([
+			Promise.all(deleteUris.map(collectDirectoryDeleteTargets)).then(groups => groups.flat()),
+			Promise.all(createUris.map(uri => collectMissingParentTargets(uriToFile(uri)))).then(groups => groups.flat()),
+			Promise.all(renamePairs.map(pair => collectMissingParentTargets(uriToFile(pair.newUri)))).then(groups =>
+				groups.flat(),
+			),
+			Promise.all(renamePairs.map(pair => collectDirectoryRenameDescendantTargets(pair.oldUri, pair.newUri))).then(
+				groups => groups.flat(),
+			),
+		]);
 	const targets: PathTarget[] = [
 		...textEditUris.flatMap(uri => [
 			{ raw: uriToFile(uri), access: "write" as const, field: "workspaceEdit" },
 			{ raw: uriToFile(uri), access: "read" as const, field: "workspaceEdit" },
 		]),
-		...resourceOpUris.map(uri => ({ raw: uriToFile(uri), access: "write" as const, field: "workspaceEdit" })),
+		...createUris.map(uri => ({ raw: uriToFile(uri), access: "write" as const, field: "workspaceEdit" })),
+		...renamePairs.flatMap(pair => [
+			{ raw: uriToFile(pair.oldUri), access: "write" as const, field: "workspaceEdit" },
+			{ raw: uriToFile(pair.newUri), access: "write" as const, field: "workspaceEdit" },
+		]),
+		...deleteUris.map(uri => ({ raw: uriToFile(uri), access: "write" as const, field: "workspaceEdit" })),
 		...deleteDescendantTargets,
+		...createParentTargets,
+		...renameParentTargets,
+		...renameDescendantTargets,
 	];
 	const denial = checkStructuredTargets(targets, policy, roots);
 	if (denial) throw new PermissionDeniedError(toolName, denial.rule, denial.reason);

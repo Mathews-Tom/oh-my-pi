@@ -184,6 +184,102 @@ describe("assertWorkspaceEditAllowed", () => {
 			await expect(assertWorkspaceEditAllowed(edit, contextOf(STRICT), "lsp")).resolves.toBeUndefined();
 		});
 	});
+
+	// The finding: `applyWorkspaceEdit` creates every missing parent
+	// directory of a `create`/`rename` target with `fs.mkdir(dir, {
+	// recursive: true })`, but only the leaf file itself was ever checked. A
+	// `deny.write` glob written for the directory (`**/blocked`) never
+	// matches the leaf path (`blocked/file.ts`), so the denied directory got
+	// silently created on the way to writing the (separately checked) file.
+	describe("missing parent directories", () => {
+		const DENY_BLOCKED = { ...WORKSPACE, "permissions.deny.write": ["**/blocked"] };
+
+		it("denies a create op whose missing parent directory matches a deny rule", async () => {
+			const edit: WorkspaceEdit = { documentChanges: [{ kind: "create", uri: fileUri("blocked", "file.ts") }] };
+			await expect(assertWorkspaceEditAllowed(edit, contextOf(DENY_BLOCKED), "lsp")).rejects.toBeInstanceOf(
+				PermissionDeniedError,
+			);
+			expect(fs.existsSync(path.join(workspace, "blocked"))).toBe(false);
+		});
+
+		it("denies a rename op whose destination's missing parent directory matches a deny rule", async () => {
+			const edit: WorkspaceEdit = {
+				documentChanges: [
+					{ kind: "rename", oldUri: fileUri("src", "main.ts"), newUri: fileUri("blocked", "moved.ts") },
+				],
+			};
+			await expect(assertWorkspaceEditAllowed(edit, contextOf(DENY_BLOCKED), "lsp")).rejects.toBeInstanceOf(
+				PermissionDeniedError,
+			);
+			expect(fs.existsSync(path.join(workspace, "blocked"))).toBe(false);
+		});
+
+		it("permits a create op whose missing parent directory has no denial", async () => {
+			try {
+				const edit: WorkspaceEdit = {
+					documentChanges: [{ kind: "create", uri: fileUri("fresh-nested", "dir", "file.ts") }],
+				};
+				await expect(assertWorkspaceEditAllowed(edit, contextOf(WORKSPACE), "lsp")).resolves.toBeUndefined();
+			} finally {
+				fs.rmSync(path.join(workspace, "fresh-nested"), { recursive: true, force: true });
+			}
+		});
+
+		it("permits a create op whose parent directory already exists (no enumeration needed)", async () => {
+			const edit: WorkspaceEdit = { documentChanges: [{ kind: "create", uri: fileUri("src", "new.ts") }] };
+			await expect(assertWorkspaceEditAllowed(edit, contextOf(DENY_BLOCKED), "lsp")).resolves.toBeUndefined();
+		});
+	});
+
+	// The finding: a directory `rename` resource op names only the two
+	// directory URIs, so the declared-target check authorized `tree/` and
+	// `moved-tree/` but never looked inside — yet `applyWorkspaceEdit` moves
+	// the entire subtree with one `fs.rename`. A write-denied descendant must
+	// block the rename even though the directory itself is allowed.
+	describe("directory rename descendants", () => {
+		let renamableDir: string;
+
+		beforeAll(() => {
+			renamableDir = path.join(workspace, "tree");
+			fs.mkdirSync(renamableDir, { recursive: true });
+			fs.writeFileSync(path.join(renamableDir, "ok.ts"), "export {};");
+			fs.writeFileSync(path.join(renamableDir, "private.key"), "SECRET");
+		});
+
+		afterAll(() => {
+			fs.rmSync(renamableDir, { recursive: true, force: true });
+		});
+
+		it("denies renaming an allowed directory that contains a write-denied descendant", async () => {
+			const edit: WorkspaceEdit = {
+				documentChanges: [{ kind: "rename", oldUri: `file://${renamableDir}`, newUri: fileUri("moved-tree") }],
+			};
+			await expect(
+				assertWorkspaceEditAllowed(
+					edit,
+					contextOf({ ...WORKSPACE, "permissions.deny.write": ["**/*.key"] }),
+					"lsp",
+				),
+			).rejects.toBeInstanceOf(PermissionDeniedError);
+			expect(fs.existsSync(renamableDir)).toBe(true);
+			expect(fs.existsSync(path.join(workspace, "moved-tree"))).toBe(false);
+		});
+
+		it("permits renaming a directory whose every descendant is allowed", async () => {
+			const cleanDir = path.join(workspace, "tree-clean");
+			fs.mkdirSync(cleanDir, { recursive: true });
+			fs.writeFileSync(path.join(cleanDir, "ok.ts"), "export {};");
+			try {
+				const edit: WorkspaceEdit = {
+					documentChanges: [{ kind: "rename", oldUri: `file://${cleanDir}`, newUri: fileUri("tree-clean-moved") }],
+				};
+				await expect(assertWorkspaceEditAllowed(edit, contextOf(WORKSPACE), "lsp")).resolves.toBeUndefined();
+			} finally {
+				fs.rmSync(cleanDir, { recursive: true, force: true });
+				fs.rmSync(path.join(workspace, "tree-clean-moved"), { recursive: true, force: true });
+			}
+		});
+	});
 });
 
 describe("assertLspCommandAllowed", () => {
