@@ -17,6 +17,9 @@ import { getDefault, type Settings } from "../config/settings";
 import { formatGroupedDiagnosticMessages } from "../lsp/utils";
 import type { Theme } from "../modes/theme/theme";
 import { type OutputSummary, type TruncationResult, truncateMiddle, truncateTail } from "../session/streaming-output";
+import { loadPermissionsConfig } from "./permissions/config";
+import { checkStructuredTargets, PermissionDeniedError } from "./permissions/gate";
+import type { PermissionRoots } from "./permissions/types";
 import { formatBytes, wrapBrackets } from "./render-utils";
 import { renderError } from "./tool-errors";
 
@@ -670,6 +673,28 @@ export function resolveOutputMaxColumns(s: Settings | undefined): number {
  * is 0, falls back to tail-only truncation. Skips when the tool already
  * saved its own artifact (e.g. bash/python via OutputSink).
  */
+
+/**
+ * Authorize the artifacts directory a spill is about to write into, against
+ * the calling session's resource permission policy. No-op when there is no
+ * session (already handled by the `context?.sessionManager` guard at the
+ * caller) or no policy configured.
+ */
+function authorizeSpillArtifactsDirectory(context: AgentToolContext | undefined): void {
+	const sessionManager = context?.sessionManager;
+	if (!sessionManager) return;
+	const artifactsDir = sessionManager.getArtifactsDir();
+	if (!artifactsDir) return;
+	const policy = loadPermissionsConfig(context?.settings);
+	if (!policy) return;
+	const roots: PermissionRoots = {
+		cwd: sessionManager.getCwd(),
+		additionalDirectories: sessionManager.getAdditionalDirectories(),
+	};
+	const denial = checkStructuredTargets([{ raw: artifactsDir, access: "write", field: "output" }], policy, roots);
+	if (denial) throw new PermissionDeniedError("output", denial.rule, denial.reason);
+}
+
 async function spillLargeResultToArtifact(
 	result: AgentToolResult,
 	toolName: string,
@@ -714,8 +739,16 @@ async function spillLargeResultToArtifact(
 	// error, nor re-expose the full (possibly context-blowing) output. Mirror
 	// `enforceInlineByteCap`: always truncate past the threshold, and only
 	// attach the `artifact://` recovery link when the save actually succeeded.
+	//
+	// The artifacts directory normally lives beside the session file, outside
+	// the workspace root — an otherwise read-only tool's oversized result would
+	// otherwise bypass `confineWrites`/`permissions.deny.write` just by being
+	// large enough to spill (finding under review). A denial degrades the same
+	// way a disk error already does: the elided bytes become unrecoverable
+	// rather than the call failing, since the caller never asked for a write.
 	let artifactId: string | undefined;
 	try {
+		authorizeSpillArtifactsDirectory(context);
 		artifactId = await sessionManager.saveArtifact(fullText, toolName);
 	} catch (error) {
 		logger.warn("Failed to spill large tool result to artifact", {

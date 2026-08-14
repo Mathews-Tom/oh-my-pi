@@ -913,6 +913,59 @@ describe("Coding Agent Tools", () => {
 			}
 		});
 
+		it("denies spilling oversized output to a write-denied artifacts directory, degrading to plain truncation", async () => {
+			const testFile = path.join(testDir, "oversized-read-denied.txt");
+			const line = "0123456789".repeat(20);
+			fs.writeFileSync(testFile, `${Array.from({ length: 3500 }, () => line).join("\n")}\n`);
+			const spillSettings = Settings.isolated({
+				"tools.artifactSpillThreshold": 20,
+				"tools.artifactTailBytes": 1,
+				"tools.artifactTailLines": 10,
+				"tools.artifactHeadBytes": 1,
+				"permissions.profile": "strict",
+				"permissions.deny.write": ["**/spill-denied-sessions/**"],
+			});
+			const spillManager = SessionManager.create(testDir, path.join(testDir, "spill-denied-sessions"));
+			await spillManager.ensureOnDisk();
+			const spillSession = createTestToolSession(testDir, spillSettings, {
+				getSessionFile: () => spillManager.getSessionFile() ?? null,
+				getArtifactsDir: () => spillManager.getArtifactsDir(),
+				localProtocolOptions: {
+					getArtifactsDir: () => spillManager.getArtifactsDir(),
+					getSessionId: () => spillManager.getSessionId(),
+				},
+			});
+			const spillReadTool = wrapToolWithMetaNotice(new ReadTool(spillSession));
+			const context = {
+				...createTestToolContext(["read"]),
+				settings: spillSettings,
+				sessionManager: spillManager,
+			};
+
+			try {
+				const result = await spillReadTool.execute(
+					"test-call-read-spill-denied",
+					{ path: testFile },
+					undefined,
+					undefined,
+					context,
+				);
+				const truncation = result.details?.meta?.truncation;
+
+				// The read itself still succeeds (truncated), but the spill was
+				// denied - no artifact://, no recoverable full output.
+				expect(result.isError).toBeFalsy();
+				expect(truncation?.artifactId).toBeUndefined();
+				expect(getTextOutput(result)).not.toContain("artifact://");
+
+				const artifactsDir = spillManager.getArtifactsDir();
+				expect(artifactsDir).toBeDefined();
+				expect(fs.existsSync(artifactsDir!) && fs.readdirSync(artifactsDir!).length > 0).toBe(false);
+			} finally {
+				await spillManager.close();
+			}
+		});
+
 		it("should render directories as a two-level tree without capping root entries", async () => {
 			const childDir = path.join(testDir, "child");
 			const base = Date.now() - 60_000;
