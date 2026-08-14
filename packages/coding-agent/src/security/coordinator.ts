@@ -1,3 +1,4 @@
+import { mkdirSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Model } from "@oh-my-pi/pi-ai";
@@ -277,9 +278,26 @@ function assertSecurityBundleWriteAllowed(root: string, host: SecurityCoordinato
  * glob the user authored still fires against these targets normally — only
  * confinement is widened, not the deny-list check `checkStructuredTargets`
  * also runs.
+ *
+ * `confineToRoots` realpath-resolves every root and silently drops one that
+ * does not exist yet (an unresolvable root "contributes nothing" rather than
+ * failing open) - on a machine that has never run a security scan,
+ * `getSecurityDir()` itself is absent, which would drop this exemption right
+ * when it is first needed. Create it (state-root only, not the deeper
+ * project directory `ensurePrivateDirectory` still owns) before it is handed
+ * to the confinement check.
  */
 function securityStoreRoots(host: SecurityCoordinatorHost): PermissionRoots {
-	return { cwd: host.cwd, additionalDirectories: [...(host.additionalDirectories ?? []), getSecurityDir()] };
+	const securityDir = getSecurityDir();
+	// Best-effort: a create failure here (e.g. EACCES) must not crash the
+	// authorization check itself - the exemption just does not apply, and
+	// confineWrites falls back to denying the way it did before this fix.
+	try {
+		mkdirSync(securityDir, { recursive: true, mode: 0o700 });
+	} catch {
+		// ignore; see comment above.
+	}
+	return { cwd: host.cwd, additionalDirectories: [...(host.additionalDirectories ?? []), securityDir] };
 }
 
 /**
