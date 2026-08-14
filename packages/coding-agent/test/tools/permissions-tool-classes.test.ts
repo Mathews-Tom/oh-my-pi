@@ -126,6 +126,14 @@ describe("structured extraction", () => {
 		]);
 	});
 
+	// The finding: `tts` had no entry here at all, so it fell to the opaque
+	// string-scan fallback - `confineWrites` never applied to `output_path`.
+	it("authorizes output_path as a write target", () => {
+		expect(extract("tts", { text: "hi", output_path: "speech.mp3" })).toEqual([
+			{ raw: "speech.mp3", access: "write", field: "output_path" },
+		]);
+	});
+
 	it("treats managed-skill storage as a write target", () => {
 		expect(extract("manage_skill", { action: "create", name: "persistent-instruction" })).toEqual([
 			{

@@ -15,6 +15,9 @@ import { DEFAULT_TTS_LOCAL_MODEL_KEY, DEFAULT_TTS_VOICE, isTtsLocalModelKey, KOK
 import { ttsClient } from "../tts/tts-client";
 import { encodeWav } from "../tts/wav";
 import { formatPathRelativeToCwd, resolveToCwd } from "./path-utils";
+import { loadPermissionsConfig } from "./permissions/config";
+import { checkStructuredTargets, PermissionDeniedError } from "./permissions/gate";
+import type { PermissionRoots } from "./permissions/types";
 
 // Hermes tts_tool.py L167-171
 const DEFAULT_XAI_VOICE_ID = "eve" as const;
@@ -78,6 +81,27 @@ export function resolveLocalWavPath(outputPath: string): { wavPath: string; subs
 	const dot = outputPath.lastIndexOf(".");
 	const base = dot > slash ? outputPath.slice(0, dot) : outputPath;
 	return { wavPath: `${base}.wav`, substituted: true };
+}
+
+/**
+ * Re-authorize a concrete write target against the calling session's
+ * resource permission policy. `output_path` is declared to the wrapper gate
+ * (`tool-path-targets.ts`'s `extractTtsPaths`), but the local backend's
+ * `.mp3` -> `.wav` substitution (`resolveLocalWavPath`, above) can produce a
+ * different concrete path than the one the wrapper already cleared — a
+ * descendant-specific `deny.write` glob distinguishing the two suffixes
+ * would otherwise never run against the file actually written (finding
+ * under review).
+ */
+function authorizeTtsWriteTarget(ctx: CustomToolContext, filePath: string): void {
+	const policy = loadPermissionsConfig(ctx.settings);
+	if (!policy) return;
+	const roots: PermissionRoots = {
+		cwd: ctx.sessionManager.getCwd(),
+		additionalDirectories: ctx.sessionManager.getAdditionalDirectories(),
+	};
+	const denial = checkStructuredTargets([{ raw: filePath, access: "write", field: "output_path" }], policy, roots);
+	if (denial) throw new PermissionDeniedError("tts", denial.rule, denial.reason);
 }
 
 function readStringSetting(key: "providers.tts" | "tts.localModel" | "tts.localVoice"): string | undefined {
@@ -191,6 +215,7 @@ async function synthesizeXai(
 
 async function synthesizeLocal(
 	params: TtsSchemaType,
+	ctx: CustomToolContext,
 	cwd: string,
 	outputPath: string,
 	signal: AbortSignal | undefined,
@@ -213,6 +238,7 @@ async function synthesizeLocal(
 	}
 
 	const { wavPath, substituted } = resolveLocalWavPath(outputPath);
+	if (substituted) authorizeTtsWriteTarget(ctx, wavPath);
 	const wav = encodeWav(audio.pcm, audio.sampleRate);
 	await Bun.write(wavPath, wav);
 	const displayPath = formatPathRelativeToCwd(wavPath, cwd);
@@ -261,7 +287,7 @@ export const ttsTool: CustomTool<typeof ttsSchema, TtsToolDetails> = {
 			preference === "local" ? false : (await resolveXAIHttpCredentials(ctx.modelRegistry)) !== null;
 		const backend = resolveTtsBackend({ preference, wantsMp3: codec === "mp3", hasXaiCreds });
 
-		if (backend === "local") return synthesizeLocal(params, cwd, outputPath, signal);
+		if (backend === "local") return synthesizeLocal(params, ctx, cwd, outputPath, signal);
 		return synthesizeXai(params, ctx, outputPath, displayPath, codec, signal);
 	},
 };
