@@ -469,52 +469,64 @@ async function handleConfigurationRequest(client: LspClient, message: LspJsonRpc
 }
 
 /**
- * Refuse a server-pushed `WorkspaceEdit` that names a path the calling
- * session's resource permission policy denies, or `null` when it clears.
+ * Refuse a server-pushed `WorkspaceEdit` that names a path any candidate
+ * requesting session's resource permission policy denies, or `null` when it
+ * clears every candidate.
  *
  * This is the server-initiated counterpart to `lsp/tool.ts`'s
  * `applyGuardedWorkspaceEdit`: same target extraction
  * ({@link workspaceEditTargetPaths}), same decision procedure
- * ({@link checkStructuredTargets}), but measured against
- * {@link LspClient.permissionContext} — the calling session's settings and
- * `workspace.additionalDirectories`, stamped onto the client — since this push
- * arrives with no `AgentToolContext` of its own.
+ * ({@link checkStructuredTargets}) — but a push arrives with no
+ * `AgentToolContext` of its own, and the LSP protocol carries no
+ * correlation between a push and the request that provoked it. A single
+ * "which pending request caused this" heuristic (oldest, newest, …) is
+ * always guessable-wrong when two sessions with different policies share
+ * one client: a push meant for a strict session could get checked against
+ * a concurrent permissive session's context instead. Checking *every*
+ * candidate context and denying if any one of them would deny it is
+ * fail-safe regardless of which request actually caused the push — a
+ * permissive session's long-running request can never let a push bypass a
+ * concurrent strict session's policy.
  *
- * No settings recorded on the client reads as "no policy configured" (`off`),
- * the same reading `loadPermissionsConfig(undefined)` gives every other
- * caller — not a weaker default invented for this path.
+ * No settings recorded on a candidate reads as "no policy configured"
+ * (`off`), the same reading `loadPermissionsConfig(undefined)` gives every
+ * other caller — not a weaker default invented for this path.
  */
 export async function guardedApplyEditDenial(client: LspClient, edit: WorkspaceEdit): Promise<string | null> {
-	const permissionContext = resolveApplyEditPermissionContext(client);
-	const policy = loadPermissionsConfig(permissionContext?.settings);
-	if (!policy) return null;
-	const roots: PermissionRoots = {
-		cwd: client.cwd,
-		additionalDirectories: permissionContext?.getAdditionalDirectories() ?? [],
-	};
 	const targets = await workspaceEditPathTargets(edit);
-	const denial = checkStructuredTargets(targets, policy, roots);
-	return denial ? denial.reason : null;
+	for (const permissionContext of applyEditPermissionContextCandidates(client)) {
+		const policy = loadPermissionsConfig(permissionContext?.settings);
+		if (!policy) continue;
+		const roots: PermissionRoots = {
+			cwd: client.cwd,
+			additionalDirectories: permissionContext?.getAdditionalDirectories() ?? [],
+		};
+		const denial = checkStructuredTargets(targets, policy, roots);
+		if (denial) return denial.reason;
+	}
+	return null;
 }
 
 /**
- * Resolve the permission context a server-pushed `workspace/applyEdit`
- * should be checked against: the context of the oldest still-outstanding
- * request that carries one (`Map` iteration order is insertion order, so the
- * first hit is the request that has been in flight longest), falling back to
- * {@link LspClient.permissionContext} when none do.
- *
- * A push almost always arrives while the server is mid-handling the request
- * that provoked it (`workspace/executeCommand`, `codeAction/resolve`) — that
- * request is still pending, so its context is the requesting session's, not
- * whichever session most recently happened to call `getOrCreateClient` on
- * this shared client.
+ * Every distinct permission context that could plausibly be the one that
+ * provoked this push: every still-outstanding request's own context, plus
+ * the client's shared, mutable, most-recently-touched-by-any-session
+ * default (the fallback every request without its own context effectively
+ * uses). Deduplicated by reference so a client whose every pending request
+ * shares one session's context — the common single-session case — checks
+ * it exactly once.
  */
-function resolveApplyEditPermissionContext(client: LspClient): LspClient["permissionContext"] {
+function applyEditPermissionContextCandidates(client: LspClient): Array<LspClient["permissionContext"]> {
+	const seen = new Set<LspClient["permissionContext"]>();
+	const candidates: Array<LspClient["permissionContext"]> = [];
 	for (const pending of client.pendingRequests?.values() ?? []) {
-		if (pending.permissionContext) return pending.permissionContext;
+		if (pending.permissionContext && !seen.has(pending.permissionContext)) {
+			seen.add(pending.permissionContext);
+			candidates.push(pending.permissionContext);
+		}
 	}
-	return client.permissionContext;
+	if (!seen.has(client.permissionContext)) candidates.push(client.permissionContext);
+	return candidates;
 }
 
 /**

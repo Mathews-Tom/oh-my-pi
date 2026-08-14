@@ -999,4 +999,27 @@ describe("lsp server-initiated workspace/applyEdit", () => {
 		allowedDirs = [];
 		expect(await guardedApplyEditDenial(client, edit)).toContain("permissions.confineWrites");
 	});
+
+	// The finding: a single "which pending request caused this push"
+	// heuristic (oldest, newest, …) can always guess wrong when two sessions
+	// with different policies share one client - a long-running permissive
+	// request in flight must never let a push bypass a concurrent strict
+	// session's policy just because it happened to be inserted first/last.
+	it("denies a push any concurrently pending session's policy would deny, not just the oldest request's", async () => {
+		const permissiveContext = { settings: settingsOf({}), getAdditionalDirectories: () => [] };
+		const strictContext = { settings: settingsOf(STRICT), getAdditionalDirectories: () => [] };
+		const client = {
+			cwd: workspace,
+			permissionContext: permissiveContext,
+			pendingRequests: new Map([
+				[1, { permissionContext: permissiveContext }],
+				[2, { permissionContext: strictContext }],
+			]),
+		} as unknown as LspClient;
+
+		const denial = await guardedApplyEditDenial(client, {
+			changes: { [fileUri(path.join(workspace, ".env"))]: [{ range: RANGE_ZERO, newText: "LEAK=1" }] },
+		} as never);
+		expect(denial).toContain("**/.env");
+	});
 });
