@@ -102,7 +102,11 @@ function pluginDataDir(home: string, manifestName: string, instanceKey: string):
  * deeper descendants are never searched. Invalid skills are skipped with a
  * warning while the rest keep loading.
  */
-async function scanStandardSkills(realRoot: string, level: "user" | "project"): Promise<LoadResult<Skill>> {
+async function scanStandardSkills(
+	ctx: LoadContext,
+	realRoot: string,
+	level: "user" | "project",
+): Promise<LoadResult<Skill>> {
 	const items: Skill[] = [];
 	const warnings: string[] = [];
 
@@ -138,6 +142,7 @@ async function scanStandardSkills(realRoot: string, level: "user" | "project"): 
 				return;
 			}
 			const skillPath = resolved.realPath;
+			if (ctx.canReadSkill?.(skillPath) === false) return;
 			let stat: Stats;
 			try {
 				stat = await fs.stat(skillPath);
@@ -206,7 +211,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 				// reported once here rather than from every capability loader.
 				return { items: [], warnings: [`[agent-plugins] Rejected plugin at ${candidate.path}: ${status.reason}`] };
 			}
-			const scan = await scanStandardSkills(status.realRoot, candidate.level);
+			const scan = await scanStandardSkills(ctx, status.realRoot, candidate.level);
 			return {
 				items: scan.items,
 				warnings: [...status.warnings, ...(scan.warnings ?? [])].map(

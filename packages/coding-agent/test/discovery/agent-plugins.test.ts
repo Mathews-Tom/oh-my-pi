@@ -468,6 +468,27 @@ describe("agent-plugins discovery", () => {
 		expect(skills.warnings.some(warning => warning.includes("SKILL.md resolves outside"))).toBe(true);
 	});
 
+	// The finding: Agent Plugin skills load through `scanStandardSkills`'s own
+	// direct reader, never through `scanSkillsFromDir` (the "standard" loader
+	// despite the similarly named function) - the predicate applied a
+	// `permissions.deny.read`/`confineReads` rule to every other skill
+	// provider except this one, so a denied plugin skill still loaded and
+	// reached the system prompt.
+	test("applies canReadSkill to a plugin skill before its SKILL.md is read", async () => {
+		await writeManifest();
+		await writeSkill("good", "name: good\ndescription: Good skill");
+		await writeSkill("secret", "name: secret\ndescription: Denied skill");
+		await writeRegistry(pluginPath);
+
+		const deniedPath = path.join(pluginPath, "skills", "secret", "SKILL.md");
+		const skills = await loadCapability<Skill>("skills", {
+			cwd: tempDir,
+			canReadSkill: skillPath => skillPath !== deniedPath,
+		});
+		const fromPlugin = skills.all.filter(skill => skill._source.provider === "agent-plugins");
+		expect(fromPlugin.map(skill => skill.name)).toEqual(["good"]);
+	});
+
 	test("disables MCP for an escaping mcp.json symlink without consuming outside content", async () => {
 		await writeManifest();
 		await writeSkill("deploy", "name: deploy\ndescription: Deploy things");
