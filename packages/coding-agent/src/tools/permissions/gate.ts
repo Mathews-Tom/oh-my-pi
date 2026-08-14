@@ -221,8 +221,14 @@ export function enforceResourcePermissions(
 		return scanOutcome("strings");
 	}
 
-	const denial = checkStructuredTargets(toolClass.extract(args, context), policy, roots);
-	if (denial) throw new PermissionDeniedError(toolName, denial.rule, denial.reason);
+	const initialTargets = toolClass.extract(args, context);
+	const initialDenial = checkStructuredTargets(initialTargets, policy, roots);
+	if (initialDenial) throw new PermissionDeniedError(toolName, initialDenial.rule, initialDenial.reason);
+	const postAuthorizationTargets = toolClass.postAuthorizationTargets?.(args, context) ?? [];
+	const postAuthorizationDenial = checkStructuredTargets(postAuthorizationTargets, policy, roots);
+	if (postAuthorizationDenial) {
+		throw new PermissionDeniedError(toolName, postAuthorizationDenial.rule, postAuthorizationDenial.reason);
+	}
 	return null;
 }
 

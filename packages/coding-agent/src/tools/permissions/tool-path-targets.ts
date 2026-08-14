@@ -43,6 +43,13 @@ export type ToolPathClass =
 			readonly kind: "structured";
 			readonly extract: PathTargetExtractor;
 			/**
+			 * Resolves targets whose names are only discoverable by reading a
+			 * declared target. The gate invokes this only after `extract` clears
+			 * policy, so a denied directory is never enumerated merely to decide
+			 * whether its descendants are permitted.
+			 */
+			readonly postAuthorizationTargets?: PathTargetExtractor;
+			/**
 			 * For a tool whose declared scope root can diverge from the files it
 			 * actually opens — `grep`/`ast_grep`/`ast_edit` recurse beneath the
 			 * checked root — this re-derives the real target set from the
@@ -284,14 +291,6 @@ const extractLspPaths: PathTargetExtractor = args => {
  * Managed skills are filesystem mutations even though their storage location
  * is not caller supplied. Resolve the exact regular-file path the executor
  * uses so workspace/strict confinement applies to create, update, and delete.
- *
- * `delete` additionally authorizes every existing descendant beneath the
- * skill directory: `deleteManagedSkill` (`autolearn/managed-skills.ts`) runs
- * `fs.rm(dir, { recursive: true })` on the whole directory, not just
- * `SKILL.md`. Authorizing only `SKILL.md` would let a write-denied file
- * sitting next to it (a `.env` dropped into the managed skill directory) get
- * deleted without ever facing the gate, since a deny glob matched against the
- * directory's own path never sees a candidate that names a descendant.
  */
 const extractManagedSkillPaths = (args: Record<string, unknown>, field: string = "name"): PathTarget[] => {
 	const out: PathTarget[] = [];
@@ -305,19 +304,40 @@ const extractManagedSkillPaths = (args: Record<string, unknown>, field: string =
 	}
 	const dir = path.join(getManagedSkillsDir(), name);
 	if (args.action === "delete") {
-		pushPath(out, dir, "write", field);
-		let descendants: string[] = [];
-		try {
-			descendants = fs.readdirSync(dir, { recursive: true }) as string[];
-		} catch {
-			// Missing/unreadable directory: deleteManagedSkill itself throws before
-			// touching anything in that case, so there is nothing further to
-			// authorize.
-		}
-		for (const entry of descendants) pushPath(out, path.join(dir, entry), "write", field);
+		// `deleteManagedSkill` enumerates the directory before recursively
+		// removing it, so authorization must cover both operations before that
+		// enumeration happens.
+		pushReadWrite(out, dir, field);
 		return out;
 	}
 	pushPath(out, path.join(dir, "SKILL.md"), "write", field);
+	return out;
+};
+
+/**
+ * `deleteManagedSkill` recursively removes every existing descendant. Resolve
+ * those write targets only after `extractManagedSkillPaths` authorized reading
+ * the directory, so a read-denied directory is never enumerated.
+ */
+const extractManagedSkillDeleteDescendants = (args: Record<string, unknown>, field: string = "name"): PathTarget[] => {
+	if (args.action !== "delete" || typeof args.name !== "string") return [];
+	let name = args.name;
+	try {
+		name = sanitizeSkillName(name);
+	} catch {
+		// The initial extractor keeps the conservative traversal-shaped target.
+	}
+	const dir = path.join(getManagedSkillsDir(), name);
+	let descendants: string[] = [];
+	try {
+		descendants = fs.readdirSync(dir, { recursive: true }) as string[];
+	} catch {
+		// Missing/unreadable directory: deleteManagedSkill itself throws before
+		// touching anything in that case, so there is nothing further to
+		// authorize.
+	}
+	const out: PathTarget[] = [];
+	for (const entry of descendants) pushPath(out, path.join(dir, entry), "write", field);
 	return out;
 };
 
@@ -520,8 +540,18 @@ export const TOOL_PATH_CLASSES: Record<string, ToolPathClass> = {
 			}
 			return out;
 		},
+		postAuthorizationTargets: args => {
+			const skill = args.skill;
+			return skill && typeof skill === "object"
+				? extractManagedSkillDeleteDescendants(skill as Record<string, unknown>, "skill.name")
+				: [];
+		},
 	},
-	manage_skill: { kind: "structured", extract: args => extractManagedSkillPaths(args) },
+	manage_skill: {
+		kind: "structured",
+		extract: args => extractManagedSkillPaths(args),
+		postAuthorizationTargets: args => extractManagedSkillDeleteDescendants(args),
+	},
 	memory_edit: { kind: "structured", extract: extractMemoryEditPaths },
 	recall: { kind: "structured", extract: extractMnemopiScopedReadPaths },
 	reflect: { kind: "structured", extract: extractMnemopiScopedReadPaths },

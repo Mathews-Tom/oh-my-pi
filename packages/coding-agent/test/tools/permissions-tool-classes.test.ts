@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,7 +15,11 @@ import {
 	loadMnemopiCore,
 	type MnemopiSessionState,
 } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
-import { buildPermissionPolicy, checkStructuredTargets } from "@oh-my-pi/pi-coding-agent/tools/permissions";
+import {
+	buildPermissionPolicy,
+	checkStructuredTargets,
+	enforceResourcePermissions,
+} from "@oh-my-pi/pi-coding-agent/tools/permissions";
 import {
 	CLASSIFIED_TOOL_NAMES,
 	classifyTool,
@@ -110,9 +115,10 @@ describe("structured extraction", () => {
 		]);
 	});
 
-	it("authorizes only the directory itself when deleting a managed skill that does not exist on disk", () => {
+	it("authorizes directory reads and writes before deleting a managed skill", () => {
 		const dir = path.join(getManagedSkillsDir(), "never-created-skill");
 		expect(extract("manage_skill", { action: "delete", name: "never-created-skill" })).toEqual([
+			{ raw: dir, access: "read", field: "name" },
 			{ raw: dir, access: "write", field: "name" },
 		]);
 	});
@@ -482,30 +488,50 @@ describe("manage_skill delete recursion", () => {
 		await removeWithRetries(tempHome);
 	});
 
-	function extract(args: Record<string, unknown>) {
+	function postAuthorizationTargets(args: Record<string, unknown>) {
 		const cls = TOOL_PATH_CLASSES.manage_skill;
 		if (cls?.kind !== "structured") throw new Error("manage_skill is not structured");
-		return cls.extract(args);
+		return cls.postAuthorizationTargets?.(args) ?? [];
 	}
 
-	it("authorizes every descendant found on disk, alongside the directory itself", async () => {
+	it("authorizes every descendant found on disk after authorizing the directory", async () => {
 		const dir = path.join(getManagedSkillsDir(), "demo-skill");
 		await fs.mkdir(path.join(dir, "assets"), { recursive: true });
 		await fs.writeFile(path.join(dir, "SKILL.md"), "---\nname: demo-skill\n---\nbody");
 		await fs.writeFile(path.join(dir, ".env"), "SECRET=1");
 		await fs.writeFile(path.join(dir, "assets", "logo.png"), "");
 
-		const targets = extract({ action: "delete", name: "demo-skill" });
+		const targets = postAuthorizationTargets({ action: "delete", name: "demo-skill" });
 		expect(targets.every(t => t.access === "write" && t.field === "name")).toBe(true);
 		const raws = new Set(targets.map(t => t.raw));
 		expect(raws).toEqual(
 			new Set([
-				dir,
 				path.join(dir, "SKILL.md"),
 				path.join(dir, ".env"),
 				path.join(dir, "assets"),
 				path.join(dir, "assets", "logo.png"),
 			]),
 		);
+	});
+
+	it("rejects a read-denied directory before enumerating its descendants", async () => {
+		const dir = path.join(getManagedSkillsDir(), "denied-skill");
+		await fs.mkdir(dir, { recursive: true });
+		const readdirSync = spyOn(fsSync, "readdirSync");
+		const context = {
+			settings: Settings.isolated({
+				"permissions.profile": "workspace",
+				"permissions.deny.read": [dir],
+			}),
+			sessionManager: {
+				getCwd: () => tempHome,
+				getAdditionalDirectories: () => [],
+			},
+		} as unknown as AgentToolContext;
+
+		expect(() =>
+			enforceResourcePermissions("manage_skill", { action: "delete", name: "denied-skill" }, context),
+		).toThrow(dir);
+		expect(readdirSync).not.toHaveBeenCalled();
 	});
 });
