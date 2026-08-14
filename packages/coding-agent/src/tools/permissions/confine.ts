@@ -124,6 +124,27 @@ function projectViaDeepestExistingAncestor(resolved: string): string | null {
 }
 
 /**
+ * The real (symlink-resolved) absolute path `absolutePath` names, or the
+ * furthest a realpath-then-deepest-existing-ancestor projection can reach
+ * when the target does not exist yet.
+ *
+ * Exposed separately from {@link relativeToRoots} so a caller can still
+ * consult the canonical spelling when it falls *outside* every workspace
+ * root — {@link relativeToRoots} only ever returns root-relative spellings,
+ * silently dropping a resolved target once it fails every root's
+ * containment check. `decidePathTarget` (`resolve.ts`) needs the canonical
+ * spelling unconditionally: with confinement off, a symlink inside the
+ * workspace pointing outside it (`innocent -> /outside/.env`) must still
+ * match a `deny.read` glob written for the real target's name, not just the
+ * lexical `innocent` spelling relativeToRoots would otherwise be the only
+ * source of.
+ */
+export function resolveCanonicalTarget(absolutePath: string): string {
+	const resolved = path.resolve(absolutePath);
+	return tryRealpath(resolved) ?? projectViaDeepestExistingAncestor(resolved) ?? resolved;
+}
+
+/**
  * Every workspace-relative spelling of `absolutePath` that lands under one of
  * `roots` — the raw (lexical) path plus its realpath-resolved form.
  *
@@ -148,7 +169,7 @@ export function relativeToRoots(absolutePath: string, roots: readonly string[]):
 	// `confineToRoots` itself projects through. `safe -> .ssh` (both inside a
 	// workspace root): without this, `safe/new-config` never surfaces the
 	// `.ssh/new-config` spelling a `**/.ssh/**` deny rule was written for.
-	const realTarget = tryRealpath(resolved) ?? projectViaDeepestExistingAncestor(resolved) ?? resolved;
+	const realTarget = resolveCanonicalTarget(absolutePath);
 	const out: string[] = [];
 	const seen = new Set<string>();
 	for (const root of roots) {

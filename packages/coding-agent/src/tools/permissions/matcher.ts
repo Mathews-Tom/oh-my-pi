@@ -85,7 +85,23 @@ export interface GlobMatch {
  * re-check a *different* glob list against that exact spelling rather than
  * the whole candidate set — see {@link matchGlob}'s callers in `resolve.ts`,
  * where a carve-out must only suppress a deny that matched the same lexical
- * or resolved spelling, never a deny that matched a different one.
+ * or resolved spelling, never a deny that matched a different one. The
+ * returned `candidate` is the original, unnormalized spelling — matching is
+ * separator-agnostic below, but spelling-identity comparisons elsewhere are
+ * not meant to be.
+ *
+ * `path.relative`/`path.resolve`/`path.basename` all yield `\`-separated
+ * candidates on Windows, while `Bun.Glob`'s documented pattern rules use `/`.
+ * A directory-sensitive rule such as `config/secrets.json`, `**\/.aws/credentials`,
+ * or `src/generated/**` therefore matched neither the relative nor the
+ * absolute Windows candidate — only the basename candidate ever compiled a
+ * separator-free string, which rescues a basename-only pattern but nothing
+ * that names an intermediate directory. Normalizing every candidate before
+ * matching, rather than gating on `process.platform`, keeps this path
+ * exercised (and testable) on every OS instead of only on a Windows CI
+ * runner; a POSIX filename containing a literal backslash is accepted
+ * fallout, the same class of tradeoff `path-utils.ts`'s quote-stripping
+ * already makes for a POSIX name literally wrapped in double quotes.
  */
 export function matchGlobCandidate(patterns: readonly string[], candidates: readonly string[]): GlobMatch | null {
 	for (const pattern of patterns) {
@@ -97,7 +113,8 @@ export function matchGlobCandidate(patterns: readonly string[], candidates: read
 			if (GLOB_CACHE.size < GLOB_CACHE_LIMIT) GLOB_CACHE.set(pattern, glob);
 		}
 		for (const candidate of candidates) {
-			if (candidate && glob.match(candidate)) return { pattern, candidate };
+			const normalized = candidate.includes("\\") ? candidate.replace(/\\/g, "/") : candidate;
+			if (normalized && glob.match(normalized)) return { pattern, candidate };
 		}
 	}
 	return null;

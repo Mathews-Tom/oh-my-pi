@@ -15,7 +15,7 @@ import {
 	resolveToCwd,
 	splitPathAndSel,
 } from "../path-utils";
-import { confineToRoots, relativeToRoots } from "./confine";
+import { confineToRoots, relativeToRoots, resolveCanonicalTarget } from "./confine";
 import { matchGlob } from "./matcher";
 import { findUnsuppressedDeny } from "./profiles";
 import {
@@ -132,7 +132,22 @@ export function decidePathTarget(
 ): PermissionDecision {
 	const rootList = permissionRootList(roots);
 	const relatives = relativeToRoots(absolutePath, rootList);
-	const candidates = [...relatives, absolutePath, path.basename(absolutePath)];
+	// `relatives` only ever surfaces a symlink-resolved spelling that itself
+	// lands inside one of `roots` — a target reached through a symlink that
+	// points *outside* every root is silently dropped there. With
+	// confinement off, `**/.env` written for `innocent -> /outside/.env`
+	// would then only ever see the lexical `innocent` path, never the real
+	// target it resolves to. `resolveCanonicalTarget` is unconditional, so
+	// the real target and its basename are always in the candidate set,
+	// matched the same way for both `allow` and `deny` below.
+	const canonicalTarget = resolveCanonicalTarget(absolutePath);
+	const candidates = [
+		...relatives,
+		absolutePath,
+		path.basename(absolutePath),
+		canonicalTarget,
+		path.basename(canonicalTarget),
+	];
 
 	const allowed = matchGlob(policy.allow[target.access], candidates);
 	if (allowed) return ALLOW;

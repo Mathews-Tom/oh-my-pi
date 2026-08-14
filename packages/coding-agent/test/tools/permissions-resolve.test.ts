@@ -196,6 +196,23 @@ describe("symlink containment", () => {
 		expect(result.contained).toBe(false);
 		if (!result.contained) expect(result.reason).toBe("no-roots");
 	});
+
+	// The finding: with confinement off (`workspace`'s read default, or
+	// `strict`'s), `relativeToRoots` only ever surfaces a symlink-resolved
+	// spelling that lands *inside* a root, silently dropping the real target
+	// once it fails every root's containment check. A symlink inside the
+	// workspace pointing at a denied file outside every root was checked
+	// only against its lexical spelling, so `**/.env` never matched.
+	it("matches a deny rule against the real target of a symlink pointing outside every root, with confinement off", () => {
+		const link = path.join(workspace, "innocent");
+		fs.rmSync(link, { force: true });
+		fs.symlinkSync(path.join(outside, ".env"), link);
+		fs.writeFileSync(path.join(outside, ".env"), "SECRET=1");
+		const strictPolicy = buildPermissionPolicy("strict"); // confineReads: false by default
+		const denied = decideTarget(target("innocent"), strictPolicy, roots);
+		expect(denied.kind).toBe("deny");
+		if (denied.kind === "deny") expect(denied.rule).toBe("**/.env");
+	});
 });
 
 describe("scheme exemptions", () => {
@@ -222,6 +239,17 @@ describe("glob dialect", () => {
 	// nothing, so a typo'd rule silently protects nothing rather than throwing.
 	it("treats a malformed pattern as matching nothing, without derailing the rest", () => {
 		expect(matchGlob(["[a-", "**/.env"], ["svc/.env"])).toBe("**/.env");
+	});
+
+	// The finding: `path.relative`/`path.resolve`/`path.basename` all yield
+	// `\`-separated candidates on Windows, while `Bun.Glob`'s documented
+	// pattern rules use `/`. A directory-sensitive rule matched neither the
+	// relative nor absolute Windows-style candidate before matching
+	// normalized every candidate to forward slashes first.
+	it("matches a Windows-style backslash-separated candidate against a forward-slash rule", () => {
+		expect(matchGlob(["config/secrets.json"], ["config\\secrets.json"])).toBe("config/secrets.json");
+		expect(matchGlob(["**/.aws/credentials"], ["C:\\Users\\dev\\.aws\\credentials"])).toBe("**/.aws/credentials");
+		expect(matchGlob(["src/generated/**"], ["src\\generated\\out.ts"])).toBe("src/generated/**");
 	});
 });
 
