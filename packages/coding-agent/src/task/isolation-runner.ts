@@ -26,7 +26,7 @@ import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import type { ExecutorOptions } from "./executor";
-import { runSubprocess } from "./executor";
+import { authorizeSubagentArtifactPath, runSubprocess } from "./executor";
 import type { SingleResult } from "./types";
 import {
 	applyNestedPatches,
@@ -131,9 +131,11 @@ async function writeIsolationPatch(
 	baseline: WorktreeBaseline,
 	artifactsDir: string,
 	agentId: string,
+	baseOptions: ExecutorOptions,
 ): Promise<{ patchPath: string; nestedPatches: NestedRepoPatch[] }> {
 	const delta = await captureDeltaPatch(isolationDir, baseline);
 	const patchPath = path.join(artifactsDir, `${agentId}.patch`);
+	authorizeSubagentArtifactPath(baseOptions, patchPath);
 	await Bun.write(patchPath, delta.rootPatch);
 	return { patchPath, nestedPatches: delta.nestedPatches };
 }
@@ -199,6 +201,7 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 						taskBaseline,
 						opts.artifactsDir,
 						opts.agentId,
+						opts.baseOptions,
 					);
 					return rememberAgentArtifacts({
 						...result,
@@ -217,7 +220,13 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 		}
 		if (result.exitCode === 0) {
 			try {
-				const patchResult = await writeIsolationPatch(isolationDir, taskBaseline, opts.artifactsDir, opts.agentId);
+				const patchResult = await writeIsolationPatch(
+					isolationDir,
+					taskBaseline,
+					opts.artifactsDir,
+					opts.agentId,
+					opts.baseOptions,
+				);
 				return rememberAgentArtifacts({
 					...result,
 					patchPath: patchResult.patchPath,

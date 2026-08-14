@@ -54,6 +54,9 @@ import { resolveEvalBackends } from "../tools/eval-backends";
 import { isIrcEnabled } from "../tools/hub";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
+import { loadPermissionsConfig } from "../tools/permissions/config";
+import { checkStructuredTargets, PermissionDeniedError } from "../tools/permissions/gate";
+import type { PermissionRoots } from "../tools/permissions/types";
 import { ToolAbortError } from "../tools/tool-errors";
 import type { EventBus } from "../utils/event-bus";
 import { trackLateCleanup } from "../utils/late-cleanup";
@@ -2640,6 +2643,35 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 }
 
 /**
+ * Authorize one concrete task-artifact file under `options.artifactsDir`
+ * against the parent session's resource permission policy.
+ *
+ * `structured-subagent.ts`'s `authorizeArtifactsDirectory` only authorizes
+ * the lease directory itself, before it exists — a descendant-specific
+ * `deny.write` glob (or an exact allow scoped to that one outside-workspace
+ * directory) never runs again once execution actually creates and reopens
+ * `<id>.jsonl` (real-time session persistence), `<id>.md` (output), and
+ * `<id>.patch` (isolation diff) beneath it. Checked against `options`
+ * (the parent session's settings/cwd/additionalDirectories, not any
+ * subagent-derived override) at the point each concrete path is minted,
+ * before it is ever opened for read or write.
+ */
+export function authorizeSubagentArtifactPath(options: ExecutorOptions, artifactPath: string): void {
+	const policy = loadPermissionsConfig(options.settings);
+	if (!policy) return;
+	const roots: PermissionRoots = {
+		cwd: options.cwd,
+		additionalDirectories: [...(options.additionalDirectories ?? [])],
+	};
+	const denial = checkStructuredTargets(
+		[{ raw: artifactPath, access: "write", field: "task.artifacts.directory" }],
+		policy,
+		roots,
+	);
+	if (denial) throw new PermissionDeniedError("task", denial.rule, denial.reason);
+}
+
+/**
  * Run a single agent in-process.
  */
 export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
@@ -2694,6 +2726,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	let subtaskSessionFile: string | undefined;
 	if (options.artifactsDir) {
 		subtaskSessionFile = path.join(options.artifactsDir, `${id}.jsonl`);
+		authorizeSubagentArtifactPath(options, subtaskSessionFile);
+		// The `.md` output write happens later in `finalizeRunResult`, which has
+		// no permission context of its own - the path is fully deterministic
+		// from `id`/`artifactsDir` here, so authorize it now rather than thread
+		// settings/cwd/additionalDirectories through that unrelated result-shaping call.
+		authorizeSubagentArtifactPath(options, path.join(options.artifactsDir, `${id}.md`));
 	}
 
 	const settings = options.settings ?? Settings.isolated();

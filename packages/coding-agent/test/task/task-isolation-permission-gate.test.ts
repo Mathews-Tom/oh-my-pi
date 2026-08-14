@@ -351,3 +351,55 @@ describe("task isolation permission gate", () => {
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
 });
+
+describe("task artifact-path permission gate", () => {
+	// The finding: `authorizeArtifactsDirectory` (structured-subagent.ts) only
+	// authorizes the lease directory itself, once, before it exists. A
+	// descendant-specific `deny.write` glob - or an exact allow scoped to
+	// that one outside-workspace directory - never runs again once execution
+	// creates and reopens `<id>.jsonl`, `<id>.md`, and `<id>.patch` beneath
+	// it. `authorizeSubagentArtifactPath` closes that gap at the point each
+	// concrete artifact path is minted.
+	it("denies a concrete artifact path a descendant deny rule matches, even though the parent directory is approved", () => {
+		const artifactsDir = path.join(repoRoot, "artifacts");
+		expect(() =>
+			executorModule.authorizeSubagentArtifactPath(
+				{
+					cwd: repoRoot,
+					additionalDirectories: [artifactsDir],
+					settings: Settings.isolated({
+						"permissions.profile": "workspace",
+						"permissions.deny.write": ["**/*.jsonl"],
+					}),
+				} as unknown as Parameters<typeof executorModule.authorizeSubagentArtifactPath>[0],
+				path.join(artifactsDir, "Worker.jsonl"),
+			),
+		).toThrow(/\*\*\/\*\.jsonl/);
+	});
+
+	it("permits a concrete artifact path nothing denies", () => {
+		const artifactsDir = path.join(repoRoot, "artifacts");
+		expect(() =>
+			executorModule.authorizeSubagentArtifactPath(
+				{
+					cwd: repoRoot,
+					additionalDirectories: [artifactsDir],
+					settings: Settings.isolated({ "permissions.profile": "workspace" }),
+				} as unknown as Parameters<typeof executorModule.authorizeSubagentArtifactPath>[0],
+				path.join(artifactsDir, "Worker.md"),
+			),
+		).not.toThrow();
+	});
+
+	it("no-ops entirely under permissions.profile: off, the default", () => {
+		const artifactsDir = path.join(repoRoot, "artifacts");
+		expect(() =>
+			executorModule.authorizeSubagentArtifactPath(
+				{ cwd: repoRoot, additionalDirectories: [], settings: Settings.isolated() } as unknown as Parameters<
+					typeof executorModule.authorizeSubagentArtifactPath
+				>[0],
+				path.join(artifactsDir, "Worker.patch"),
+			),
+		).not.toThrow();
+	});
+});
