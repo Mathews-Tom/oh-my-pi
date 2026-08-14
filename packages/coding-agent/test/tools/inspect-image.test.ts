@@ -560,4 +560,37 @@ describe("InspectImageTool permissions", () => {
 		).rejects.toThrow('resource permission rule "**/private image.png"');
 		expect(stub.calls).toHaveLength(0);
 	});
+
+	// The finding: `loadImageInput` reads metadata, stats, and fully reads a
+	// file's bytes before the post-load resource-permission check ever runs.
+	// A denied file that fails the format/size probes for a reason *other*
+	// than the permission denial would surface *that* error instead (e.g.
+	// "only supports PNG, JPEG, GIF, and WEBP") - a direct oracle over a
+	// path `deny.read` was meant to prevent touching at all, since the two
+	// error shapes let a caller distinguish "denied" from "denied and not a
+	// real image" without ever legitimately reading the file. The resolved
+	// path must be authorized before any metadata/byte read, so a denied
+	// non-image file surfaces the same PermissionDeniedError as a denied
+	// real image, not the "unsupported format" ToolError.
+	it("denies a non-image file before probing its format, not after", async () => {
+		const garbagePath = path.join(testDir, "denied-not-an-image.png");
+		fs.writeFileSync(garbagePath, Buffer.from("this is not image data, just garbage bytes"));
+		const settings = Settings.isolated({
+			"permissions.profile": "workspace",
+			"permissions.deny.read": ["**/denied-not-an-image.png"],
+		});
+		const stub = createCompleteSimpleForbiddenStub();
+		const tool = new InspectImageTool(createSession(testDir, visionModel, "test-key", settings), stub.fn);
+
+		await expect(
+			tool.execute(
+				"inspect-image-format-oracle",
+				{ path: garbagePath, question: "Describe this image." },
+				undefined,
+				undefined,
+				permissionContext(testDir, settings),
+			),
+		).rejects.toThrow('resource permission rule "**/denied-not-an-image.png"');
+		expect(stub.calls).toHaveLength(0);
+	});
 });

@@ -30,6 +30,7 @@ import {
 	webpExclusionForModel,
 } from "../utils/image-loading";
 import type { ToolSession } from "./index";
+import { resolveReadPath } from "./path-utils";
 import { enforcePostExecutionResourcePermissions } from "./permissions/gate";
 import { ToolError } from "./tool-errors";
 
@@ -212,9 +213,21 @@ export class InspectImageTool implements AgentTool<typeof inspectImageSchema, In
 					excludeWebP,
 				});
 			} else {
+				// Resolve and authorize the effective on-disk path *before*
+				// `loadImageInput` touches it: it independently resolves alternate
+				// spellings (Unicode-space variants, suffix recovery) the way
+				// `read` does, then reads metadata, stats, and fully reads the file
+				// before any check runs. Passing `resolvedPath` through makes it
+				// skip its own resolution and open exactly the path already
+				// authorized here, so a denied file's existence/size/format can no
+				// longer be inferred from which branch (unsupported format, oversized,
+				// success) the call takes.
+				const resolvedPath = resolveReadPath(params.path, this.session.cwd);
+				enforcePostExecutionResourcePermissions(this.name, params, { imagePath: resolvedPath }, context);
 				imageInput = await loadImageInput({
 					path: params.path,
 					cwd: this.session.cwd,
+					resolvedPath,
 					autoResize,
 					maxBytes: MAX_IMAGE_INPUT_BYTES,
 					excludeWebP,
